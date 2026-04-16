@@ -61,6 +61,43 @@
           ]
         },
         {
+          "name": "Bootstrap Alchemy webhooks",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/bootstrap/alchemy-webhooks",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "bootstrap", "alchemy-webhooks"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"webhookUrl\": \"{{baseUrl}}/webhooks/alchemy\",\n  \"chainIds\": [1, 137]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const created = (body.results || []).filter(r => r.status === 'created' && r.signingKey);",
+                  "if (created.length === 1) {",
+                  "  pm.collectionVariables.set('alchemySigningKey', created[0].signingKey);",
+                  "  console.log('Saved alchemySigningKey into the collection variable.');",
+                  "} else if (created.length > 1) {",
+                  "  console.warn('Multiple webhooks created — only ALCHEMY_NOTIFY_SIGNING_KEY env supports one; record them manually.');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "name": "Register fee wallet",
           "request": {
             "method": "POST",

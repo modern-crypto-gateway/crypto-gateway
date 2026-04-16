@@ -276,6 +276,67 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
 
+  /admin/bootstrap/alchemy-webhooks:
+    post:
+      tags: [admin]
+      summary: Idempotently create Alchemy webhooks for the configured chains
+      description: |
+        For each requested chainId, checks whether an Alchemy ADDRESS_ACTIVITY
+        webhook already exists with the target URL + network; creates it if
+        not. Returns per-chain status plus the `signingKey` for any newly
+        created webhook — save that into `ALCHEMY_NOTIFY_SIGNING_KEY` env
+        (Alchemy never shows it again). Requires `ALCHEMY_AUTH_TOKEN` env.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                webhookUrl:
+                  type: string
+                  format: uri
+                  description: Defaults to `ALCHEMY_WEBHOOK_URL` env if unset
+                chainIds:
+                  type: array
+                  items: { type: integer }
+                  description: Defaults to `ALCHEMY_CHAINS` env, then the mainnet set
+                seedAddressByChainId:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: Per-chain placeholder address (Alchemy requires ≥1 at create). Defaults to zero-address.
+      responses:
+        "200":
+          description: Bootstrap complete; per-chain status in body
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        chainId: { type: integer }
+                        status:
+                          type: string
+                          enum: [created, existing, unsupported, failed]
+                        webhookId: { type: string }
+                        signingKey:
+                          type: string
+                          description: Only present when `status=created`. Save into `ALCHEMY_NOTIFY_SIGNING_KEY`.
+                        error: { type: string }
+        "400":
+          description: Missing ALCHEMY_AUTH_TOKEN or webhookUrl
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+
   /admin/fee-wallets:
     post:
       tags: [admin]

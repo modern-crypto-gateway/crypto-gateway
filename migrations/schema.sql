@@ -130,3 +130,21 @@ CREATE TABLE IF NOT EXISTS payouts (
 );
 CREATE INDEX IF NOT EXISTS idx_payouts_merchant ON payouts(merchant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_payouts_status ON payouts(status, chain_id);
+
+-- Alchemy webhook registry. One row per (chain, webhook) — v1 shared a single
+-- ALCHEMY_NOTIFY_SIGNING_KEY env across all chains, so rotating or
+-- compromising one chain's key spoofed all of them. Storing per-chain
+-- prevents that blast radius + lets the inbound ingest route look up the key
+-- by `webhookId` directly from the payload, matching Alchemy's own routing.
+CREATE TABLE IF NOT EXISTS alchemy_webhook_registry (
+  chain_id      INTEGER PRIMARY KEY,
+  -- Alchemy's own id (wh_...). UNIQUE so we can look up by id from the
+  -- inbound payload without scanning.
+  webhook_id    TEXT NOT NULL UNIQUE,
+  -- Plaintext HMAC signing key as returned by Alchemy on create.
+  -- TODO(phase-9+): move to SignerStore under a webhook-signing-key scope.
+  signing_key   TEXT NOT NULL,
+  webhook_url   TEXT NOT NULL,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);

@@ -106,7 +106,9 @@ for the full list. Highlights:
 | `CRON_SECRET`                     | optional        | —          | Enables `POST /internal/cron/tick`                   |
 | `ALCHEMY_API_KEY`                 | optional        | —          | Auto-wires a real EVM chain adapter + RPC-poll detection across the default mainnet set (ETH, OP, Polygon, Base, Arbitrum). See below. |
 | `ALCHEMY_CHAINS`                  | optional        | —          | Comma-separated chainIds to enable via Alchemy (e.g. `1,137`). Defaults to the mainnet set. |
-| `ALCHEMY_NOTIFY_SIGNING_KEY`      | optional        | —          | Enables `POST /webhooks/alchemy` (push-based detection) |
+| `ALCHEMY_AUTH_TOKEN`              | optional        | —          | Webhook-management token (dashboard → Auth Token). Enables the auto-bootstrap admin route below. |
+| `ALCHEMY_WEBHOOK_URL`             | optional        | —          | Default public URL Alchemy POSTs to. Overridable per bootstrap call. |
+| `ALCHEMY_NOTIFY_SIGNING_KEY`      | optional        | —          | Enables `POST /webhooks/alchemy` (push-based detection). Obtained from the bootstrap response — save it or the ingest route stays 404. |
 | `DATABASE_URL`                    | when non-D1     | `file:./local.db` | libSQL URL (Turso or local file)              |
 | `DATABASE_TOKEN`                  | Turso only      | —          | libSQL auth token                                    |
 | `PORT`                            | no              | `8787`     |                                                      |
@@ -144,6 +146,59 @@ to real networks. To use a non-Alchemy RPC (self-hosted Geth, public RPC,
 QuickNode, Infura, Ankr, …) you can edit the relevant entrypoint to pass
 your own `rpcUrls` to `evmChainAdapter` — same construction, different URL
 source.
+
+### Auto-bootstrap Alchemy webhooks (optional)
+
+Rather than click through Alchemy's dashboard to create webhooks manually, set
+`ALCHEMY_AUTH_TOKEN` and POST to the bootstrap endpoint:
+
+```bash
+curl -X POST "$GATEWAY_URL/admin/bootstrap/alchemy-webhooks" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"webhookUrl": "'"$GATEWAY_URL"'/webhooks/alchemy", "chainIds": [1, 137]}'
+```
+
+Response:
+
+```json
+{
+  "results": [
+    { "chainId": 1,   "status": "created",  "webhookId": "wh_…", "signingKey": "whsec_…" },
+    { "chainId": 137, "status": "existing", "webhookId": "wh_…" }
+  ]
+}
+```
+
+The endpoint is **idempotent**: chains already configured with a matching
+`(network, webhookUrl)` pair are reported as `existing` and left alone. Re-run
+as often as you like.
+
+**Save the `signingKey` from each `created` result into `ALCHEMY_NOTIFY_SIGNING_KEY`**
+— Alchemy only returns it once, at creation time. If you lose it you have to
+delete and recreate the webhook. The bootstrap can only create ONE webhook per
+(network, URL) pair, and the env var takes ONE signing key, so if you're
+enabling multiple chains keep them on separate subdomains or accept that
+you'll rotate keys when you expand.
+
+Set `ALCHEMY_WEBHOOK_URL` + `ALCHEMY_CHAINS` env vars to make the bootstrap
+body empty-callable:
+
+```bash
+ALCHEMY_WEBHOOK_URL=https://gateway.example.com/webhooks/alchemy
+ALCHEMY_CHAINS=1,137
+
+curl -X POST "$GATEWAY_URL/admin/bootstrap/alchemy-webhooks" \
+  -H "Authorization: Bearer $ADMIN_KEY" -d '{}'
+```
+
+Alchemy requires at least one address at webhook creation time; the bootstrap
+seeds the zero address as a placeholder. Real HD-derived addresses get
+registered via Alchemy's `/update-webhook-addresses` endpoint — an automated
+reconciliation job for this is flagged as a follow-up (see *Known follow-ups*
+below).
+
+### Manual push-wiring (alternative to auto-bootstrap)
 
 For push-based detection (lower latency than polling), also set
 `ALCHEMY_NOTIFY_SIGNING_KEY` and wire `alchemyNotifyDetection()` into the

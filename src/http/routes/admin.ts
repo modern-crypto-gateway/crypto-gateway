@@ -5,6 +5,13 @@ import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import { registerFeeWallet } from "../../core/domain/payout.service.js";
 import type { ChainFamily } from "../../core/types/chain.js";
 import { sha256Hex, bytesToHex, getRandomValues } from "../../adapters/crypto/subtle.js";
+import { parseAlchemyChainsEnv } from "../../adapters/chains/evm/alchemy-rpc.js";
+import {
+  alchemyAdminClient,
+  type AlchemyAdminClient
+} from "../../adapters/detection/alchemy-admin-client.js";
+import { bootstrapAlchemyWebhooks } from "../../adapters/detection/bootstrap-alchemy-webhooks.js";
+import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registry-store.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 
@@ -31,9 +38,30 @@ const RegisterFeeWalletSchema = z.object({
   family: z.enum(["evm", "tron", "solana"] as const)
 });
 
-export function adminRouter(deps: AppDeps): Hono {
+// Bootstrap input. Every field optional — falls back to env / defaults so the
+// simplest possible call is `POST /admin/bootstrap/alchemy-webhooks {}`.
+const BootstrapAlchemyWebhooksSchema = z.object({
+  // Public URL Alchemy will POST to. Defaults to ALCHEMY_WEBHOOK_URL env.
+  webhookUrl: z.string().url().optional(),
+  // Narrow the chain set. Defaults to ALCHEMY_CHAINS env, then the mainnet list.
+  chainIds: z.array(z.number().int().positive()).optional(),
+  // Per-chain initial address to seed the webhook with. Alchemy requires at
+  // least one address at creation; leave empty to use the zero-address placeholder.
+  seedAddressByChainId: z.record(z.string(), z.string()).optional()
+});
+
+// Router options allow tests to inject a fake Alchemy admin client without
+// spinning up an HTTP mock. Production constructs the client from env inside
+// the handler.
+export interface AdminRouterOptions {
+  alchemyAdminClientFactory?: (authToken: string) => AlchemyAdminClient;
+}
+
+export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono {
   const app = new Hono();
   app.use("*", adminAuth(deps));
+  const clientFactory =
+    opts.alchemyAdminClientFactory ?? ((authToken) => alchemyAdminClient({ authToken }));
 
   app.post("/merchants", async (c) => {
     const body = (await c.req.json().catch(() => null)) as unknown;
@@ -111,6 +139,87 @@ export function adminRouter(deps: AppDeps): Hono {
         parsed.privateKey
       );
       return c.json({ feeWallet: { chainId: parsed.chainId, address: canonical, label: parsed.label } }, 201);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  app.post("/bootstrap/alchemy-webhooks", async (c) => {
+    const authToken = deps.secrets.getOptional("ALCHEMY_AUTH_TOKEN");
+    if (authToken === undefined) {
+      return c.json(
+        {
+          error: {
+            code: "NOT_CONFIGURED",
+            message: "ALCHEMY_AUTH_TOKEN is not set. Generate one at https://dashboard.alchemy.com/webhooks > Auth Token."
+          }
+        },
+        400
+      );
+    }
+
+    const body = (await c.req.json().catch(() => ({}))) as unknown;
+    let parsed: z.infer<typeof BootstrapAlchemyWebhooksSchema>;
+    try {
+      parsed = BootstrapAlchemyWebhooksSchema.parse(body);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+
+    const webhookUrl = parsed.webhookUrl ?? deps.secrets.getOptional("ALCHEMY_WEBHOOK_URL");
+    if (webhookUrl === undefined) {
+      return c.json(
+        {
+          error: {
+            code: "MISSING_WEBHOOK_URL",
+            message: "Provide `webhookUrl` in the body or set ALCHEMY_WEBHOOK_URL env."
+          }
+        },
+        400
+      );
+    }
+
+    const chainIds =
+      parsed.chainIds ?? parseAlchemyChainsEnv(deps.secrets.getOptional("ALCHEMY_CHAINS"));
+
+    const seedAddressByChainId: Record<number, string> = {};
+    if (parsed.seedAddressByChainId !== undefined) {
+      for (const [k, v] of Object.entries(parsed.seedAddressByChainId)) {
+        const chainId = Number(k);
+        if (Number.isFinite(chainId)) seedAddressByChainId[chainId] = v;
+      }
+    }
+
+    try {
+      const client = clientFactory(authToken);
+      const registryStore = dbAlchemyRegistryStore(deps.db);
+      const bootstrapArgs: Parameters<typeof bootstrapAlchemyWebhooks>[0] = {
+        client,
+        webhookUrl,
+        chainIds,
+        registryStore,
+        now: () => deps.clock.now().getTime()
+      };
+      if (Object.keys(seedAddressByChainId).length > 0) {
+        bootstrapArgs.seedAddressByChainId = seedAddressByChainId;
+      }
+      const results = await bootstrapAlchemyWebhooks(bootstrapArgs);
+
+      // Surface a note for any `created` row whose persistence failed — the
+      // operator needs to manually paste that row into the registry or
+      // delete-and-recreate. `persisted=true` rows need no action: the inbound
+      // ingest route will resolve the signing key from the DB.
+      const needsManualAction = results.filter(
+        (r) => r.status === "created" && r.persisted === false
+      );
+      if (needsManualAction.length > 0) {
+        deps.logger.warn(
+          "alchemy: webhook created but registry write failed; signingKey returned in response only",
+          { chainIds: needsManualAction.map((r) => r.chainId) }
+        );
+      }
+
+      return c.json({ results }, 200);
     } catch (err) {
       return renderError(c, err, deps.logger);
     }

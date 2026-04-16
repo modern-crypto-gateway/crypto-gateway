@@ -5,17 +5,7 @@ import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import type { DetectedTransfer } from "../../core/types/transaction.js";
 import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
 import type { AmountRaw } from "../../core/types/money.js";
-
-// Alchemy Notify network names -> chainId. Extend as new networks are enabled.
-// Canonical reference: https://docs.alchemy.com/reference/notify-api-quickstart
-const ALCHEMY_NETWORK_TO_CHAIN_ID: Readonly<Record<string, number>> = {
-  ETH_MAINNET: 1,
-  ETH_SEPOLIA: 11155111,
-  OPT_MAINNET: 10,
-  ARB_MAINNET: 42161,
-  BASE_MAINNET: 8453,
-  MATIC_MAINNET: 137
-};
+import { CHAIN_ID_BY_ALCHEMY_NETWORK } from "./alchemy-network.js";
 
 // Alchemy's ADDRESS_ACTIVITY payload shape. Pared down to the fields we read;
 // ignored fields (webhookId, hash confirmations, contractMetadata, etc.) stay out
@@ -58,7 +48,7 @@ export function alchemyNotifyDetection(): DetectionStrategy {
 
       const network = payload.event?.network;
       if (!network) return [];
-      const chainIdNumber = ALCHEMY_NETWORK_TO_CHAIN_ID[network];
+      const chainIdNumber = CHAIN_ID_BY_ALCHEMY_NETWORK[network];
       if (chainIdNumber === undefined) {
         // Unknown network — the operator added a webhook for a chain we don't
         // serve. Silently drop so a misconfigured webhook never poisons the
