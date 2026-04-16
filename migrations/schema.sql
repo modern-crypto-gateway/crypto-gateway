@@ -148,3 +148,29 @@ CREATE TABLE IF NOT EXISTS alchemy_webhook_registry (
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
 );
+
+-- Alchemy address-subscription queue. Each row is one `add` or `remove`
+-- operation against an Alchemy webhook's watched-addresses set. Event
+-- subscribers enqueue rows with status='pending'; the cron sweep batches
+-- pending rows by chain and POSTs one /update-webhook-addresses call per
+-- chain. Follows v1's pattern (persistent state, decoupled cron) but adds a
+-- max-attempts cap so permanently failing rows don't retry forever.
+CREATE TABLE IF NOT EXISTS alchemy_address_subscriptions (
+  id                TEXT PRIMARY KEY,
+  chain_id          INTEGER NOT NULL,
+  address           TEXT NOT NULL,
+  -- 'add' (order created) or 'remove' (order reached a terminal state).
+  action            TEXT NOT NULL CHECK (action IN ('add','remove')),
+  -- pending  -> not yet synced with Alchemy
+  -- synced   -> sync succeeded; row is historical (kept for audit)
+  -- failed   -> max attempts exceeded; needs manual intervention
+  status            TEXT NOT NULL CHECK (status IN ('pending','synced','failed')),
+  attempts          INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at   INTEGER,
+  last_error        TEXT,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL
+);
+-- Sweep filter index: find pending rows per chain that are due for retry.
+CREATE INDEX IF NOT EXISTS idx_alchemy_subs_pending
+  ON alchemy_address_subscriptions(status, chain_id, last_attempt_at);

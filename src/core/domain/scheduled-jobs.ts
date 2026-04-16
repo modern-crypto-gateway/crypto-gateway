@@ -18,17 +18,25 @@ export interface ScheduledJobsResult {
   confirmTransactions: JobOutcome;
   executeReservedPayouts: JobOutcome;
   confirmPayouts: JobOutcome;
+  // Present only when Alchemy is configured for this deployment
+  // (`deps.alchemy` set). Absent otherwise — callers should not treat the
+  // missing key as a failure.
+  alchemySyncAddresses?: JobOutcome;
 }
 
 export type JobOutcome = { ok: true; value: unknown } | { ok: false; error: string };
 
 export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResult> {
-  return {
+  const result: ScheduledJobsResult = {
     pollPayments: await run(() => pollPayments(deps)),
     confirmTransactions: await run(() => confirmTransactions(deps)),
     executeReservedPayouts: await run(() => executeReservedPayouts(deps)),
     confirmPayouts: await run(() => confirmPayouts(deps))
   };
+  if (deps.alchemy !== undefined) {
+    result.alchemySyncAddresses = await run(() => deps.alchemy!.syncAddresses());
+  }
+  return result;
 }
 
 async function run<T>(fn: () => Promise<T>): Promise<JobOutcome> {

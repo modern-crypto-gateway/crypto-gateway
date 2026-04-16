@@ -4,6 +4,10 @@ import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
+import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
+import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
+import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
+import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
@@ -63,6 +67,18 @@ async function main(): Promise<void> {
     logger.info("Alchemy EVM chains wired", { chainIds });
   }
 
+  let alchemy: AppDeps["alchemy"];
+  const alchemyAuthToken = secrets.getOptional("ALCHEMY_AUTH_TOKEN");
+  if (alchemyAuthToken !== undefined) {
+    const sweep = makeAlchemySyncSweep({
+      adminClient: alchemyAdminClient({ authToken: alchemyAuthToken }),
+      registryStore: dbAlchemyRegistryStore(db),
+      subscriptionStore: dbAlchemySubscriptionStore(db),
+      logger
+    });
+    alchemy = { syncAddresses: sweep };
+  }
+
   const deps: AppDeps = {
     db,
     cache,
@@ -84,7 +100,8 @@ async function main(): Promise<void> {
     chains,
     detectionStrategies,
     pushStrategies: {},
-    clock: { now: () => new Date() }
+    clock: { now: () => new Date() },
+    ...(alchemy !== undefined ? { alchemy } : {})
   };
 
   const app = buildApp(deps);

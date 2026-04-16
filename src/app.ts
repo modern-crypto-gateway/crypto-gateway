@@ -4,6 +4,8 @@ import { confirmTransactions } from "./core/domain/payment.service.js";
 import { confirmPayouts, executeReservedPayouts } from "./core/domain/payout.service.js";
 import { pollPayments } from "./core/domain/poll-payments.js";
 import { registerWebhookSubscriber } from "./core/domain/webhook-subscriber.js";
+import { dbAlchemySubscriptionStore } from "./adapters/detection/alchemy-subscription-store.js";
+import { registerAlchemySubscriptionTracker } from "./adapters/detection/alchemy-subscription-tracker.js";
 import { renderError } from "./http/middleware/error-handler.js";
 import { requestIdMiddleware, type RequestIdVariables } from "./http/middleware/request-id.js";
 import { adminRouter } from "./http/routes/admin.js";
@@ -28,6 +30,17 @@ export function buildApp(deps: AppDeps): App {
   // Wire event-bus subscribers. Subscriptions stay active for the lifetime of
   // this buildApp call — one set per AppDeps is the contract.
   registerWebhookSubscriber(deps);
+  // Alchemy subscription tracker is registered only when the deployment has
+  // Alchemy configured (deps.alchemy present). Orders created on chains
+  // Alchemy doesn't serve are silently skipped inside the tracker.
+  if (deps.alchemy !== undefined) {
+    registerAlchemySubscriptionTracker({
+      events: deps.events,
+      store: dbAlchemySubscriptionStore(deps.db),
+      logger: deps.logger,
+      clock: deps.clock
+    });
+  }
 
   // Request-id propagation sits at the root so every downstream route sees
   // the id in the context and echoes it in the response header.

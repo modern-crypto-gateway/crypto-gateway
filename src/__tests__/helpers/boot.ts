@@ -43,6 +43,11 @@ export interface BootTestAppOptions {
   // Rate-limit overrides. Defaults are set high enough that existing integration
   // tests never trip them; rate-limit-specific tests pass small numbers here.
   rateLimits?: Partial<RateLimitConfig>;
+  // When provided, wires the Alchemy subscription tracker (subscribes to
+  // order events, writes rows to alchemy_address_subscriptions) and exposes
+  // the caller-supplied sync function as `deps.alchemy.syncAddresses`.
+  // Most tests leave this undefined so the Alchemy path is silent.
+  alchemy?: AppDeps["alchemy"];
 }
 
 export interface BootedTestApp {
@@ -187,7 +192,8 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     chains: options.chains ?? [devChainAdapter()],
     detectionStrategies: options.detectionStrategies ?? {},
     pushStrategies: options.pushStrategies ?? {},
-    clock: { now: () => options.now ?? new Date() }
+    clock: { now: () => options.now ?? new Date() },
+    ...(options.alchemy !== undefined ? { alchemy: options.alchemy } : {})
   };
 
   const app = buildApp(deps);

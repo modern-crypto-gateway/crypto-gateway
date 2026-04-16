@@ -17,6 +17,10 @@ import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
+import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
+import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
+import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
+import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { loadConfig, ConfigValidationError } from "../config/config.schema.js";
 import type { ChainAdapter } from "../core/ports/chain.port.js";
 import type { DetectionStrategy } from "../core/ports/detection.port.js";
@@ -95,6 +99,22 @@ async function main(): Promise<void> {
     logger.info("Alchemy EVM chains wired", { chainIds });
   }
 
+  // Alchemy subscription lifecycle: if ALCHEMY_AUTH_TOKEN is set, wire a sync
+  // sweep that batches pending add/remove ops from the event-driven subscription
+  // queue and posts them to Alchemy's /update-webhook-addresses endpoint.
+  let alchemy: AppDeps["alchemy"];
+  const alchemyAuthToken = secrets.getOptional("ALCHEMY_AUTH_TOKEN");
+  if (alchemyAuthToken !== undefined) {
+    const admin = alchemyAdminClient({ authToken: alchemyAuthToken });
+    const sweep = makeAlchemySyncSweep({
+      adminClient: admin,
+      registryStore: dbAlchemyRegistryStore(db),
+      subscriptionStore: dbAlchemySubscriptionStore(db),
+      logger
+    });
+    alchemy = { syncAddresses: sweep };
+  }
+
   const deps: AppDeps = {
     db,
     cache,
@@ -118,7 +138,8 @@ async function main(): Promise<void> {
     // No push providers by default. Wire up alchemyNotifyDetection() here and
     // set ALCHEMY_NOTIFY_SIGNING_KEY in env to enable /webhooks/alchemy.
     pushStrategies: {},
-    clock: { now: () => new Date() }
+    clock: { now: () => new Date() },
+    ...(alchemy !== undefined ? { alchemy } : {})
   };
 
   const app = buildApp(deps);

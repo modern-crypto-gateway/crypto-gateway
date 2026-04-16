@@ -5,6 +5,10 @@ import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
+import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
+import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
+import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
+import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { d1Adapter } from "../adapters/db/d1.adapter.js";
 import { waitUntilJobs } from "../adapters/jobs/wait-until.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
@@ -68,8 +72,24 @@ function depsFor(env: WorkerEnv, ctx: ExecutionContext): AppDeps {
     logger.info("Alchemy EVM chains wired", { chainIds });
   }
 
+  // Alchemy subscription-sync sweep (9b) — only when ALCHEMY_AUTH_TOKEN is set
+  // AND a D1 binding is available. Same pattern as node.ts; both entrypoints
+  // compose the same adapter graph.
+  const db = d1Adapter(env.DB);
+  let alchemy: AppDeps["alchemy"];
+  const alchemyAuthToken = typeof env["ALCHEMY_AUTH_TOKEN"] === "string" ? env["ALCHEMY_AUTH_TOKEN"] : undefined;
+  if (alchemyAuthToken !== undefined && alchemyAuthToken.length > 0) {
+    const sweep = makeAlchemySyncSweep({
+      adminClient: alchemyAdminClient({ authToken: alchemyAuthToken }),
+      registryStore: dbAlchemyRegistryStore(db),
+      subscriptionStore: dbAlchemySubscriptionStore(db),
+      logger
+    });
+    alchemy = { syncAddresses: sweep };
+  }
+
   return {
-    db: d1Adapter(env.DB),
+    db,
     cache,
     jobs: waitUntilJobs(ctx),
     secrets: workersEnvSecrets(env as unknown as Record<string, unknown>),
@@ -87,7 +107,8 @@ function depsFor(env: WorkerEnv, ctx: ExecutionContext): AppDeps {
     chains,
     detectionStrategies,
     pushStrategies: {},
-    clock: { now: () => new Date() }
+    clock: { now: () => new Date() },
+    ...(alchemy !== undefined ? { alchemy } : {})
   };
 }
 

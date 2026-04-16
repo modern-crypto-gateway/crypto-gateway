@@ -193,10 +193,53 @@ curl -X POST "$GATEWAY_URL/admin/bootstrap/alchemy-webhooks" \
 ```
 
 Alchemy requires at least one address at webhook creation time; the bootstrap
-seeds the zero address as a placeholder. Real HD-derived addresses get
-registered via Alchemy's `/update-webhook-addresses` endpoint — an automated
-reconciliation job for this is flagged as a follow-up (see *Known follow-ups*
-below).
+seeds the zero address as a placeholder. Real HD-derived addresses are
+registered **automatically** via the subscription-sync lifecycle below.
+
+### Address subscription lifecycle (automatic)
+
+When `ALCHEMY_AUTH_TOKEN` is set, the gateway tracks which of your HD-derived
+receive addresses should be registered with Alchemy's webhooks — no manual
+calls to the management API.
+
+Event-driven enqueue (via the in-process event bus):
+
+| Domain event      | Enqueued op                            |
+| ----------------- | -------------------------------------- |
+| `order.created`   | `add` row for `(chainId, receiveAddress)` |
+| `order.confirmed` | `remove` row (frees a slot toward Alchemy's 50k-per-webhook cap) |
+| `order.expired`   | `remove` row                           |
+| `order.canceled`  | `remove` row                           |
+
+Rows land in `alchemy_address_subscriptions` with `status='pending'`. The
+minute-cadence `scheduledJobs` cron invokes the sweep:
+
+1. Claims all pending rows eligible for an attempt (never attempted OR last
+   attempt was > `retryBackoffMs` ago — default 5 min).
+2. Groups by `chain_id`; looks up the webhook for each chain from
+   `alchemy_webhook_registry`.
+3. Issues **one** `PATCH /update-webhook-addresses` per chain batching every
+   pending add + remove for that chain.
+4. Marks each row `synced` on success, or bumps `attempts` + stores
+   `last_error` on failure. After `maxAttempts` failures (default 10) the
+   row flips to `failed` — it stops retrying, and operators can inspect it
+   via direct DB query (`SELECT * FROM alchemy_address_subscriptions WHERE status = 'failed'`).
+
+Chains Alchemy doesn't serve (dev 999, Tron, Solana) are silently skipped at
+enqueue time — their orders never produce subscription rows. Chains with
+pending rows but no webhook bootstrapped yet are reported as
+`skipped-no-webhook` in the sweep result and are NOT counted toward
+`attempts` — bootstrap + next sweep resolves them.
+
+Improvements over v1's equivalent flow (studied before this was built):
+- **Bounded retries** — v1 retried forever; we cap at 10 so a permanently
+  malformed address doesn't look identical to an Alchemy outage.
+- **Automatic deregistration on terminal order states** — v1 let addresses
+  accumulate toward the 50k-per-webhook cap and required manual cleanup;
+  we enqueue `remove` on `order.confirmed | expired | canceled`.
+- **Per-chain signing keys** — v1 shared one `ALCHEMY_NOTIFY_SIGNING_KEY`
+  env var across every chain; the registry stores per-chain, so compromise
+  of one key doesn't spoof the others.
 
 ### Manual push-wiring (alternative to auto-bootstrap)
 

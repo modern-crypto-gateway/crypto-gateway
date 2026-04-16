@@ -20,6 +20,7 @@ function mountAdminWith(booted: BootedTestApp, factory: (authToken: string) => A
 function fakeClient(overrides: {
   listWebhooks?: () => Promise<readonly AlchemyWebhookSummary[]>;
   createWebhook?: (args: Parameters<AlchemyAdminClient["createWebhook"]>[0]) => Promise<AlchemyWebhookSummary>;
+  updateWebhookAddresses?: (args: Parameters<AlchemyAdminClient["updateWebhookAddresses"]>[0]) => Promise<void>;
 }): AlchemyAdminClient {
   return {
     listWebhooks: overrides.listWebhooks ?? (async () => []),
@@ -27,6 +28,11 @@ function fakeClient(overrides: {
       overrides.createWebhook ??
       (async () => {
         throw new Error("unexpected createWebhook call");
+      }),
+    updateWebhookAddresses:
+      overrides.updateWebhookAddresses ??
+      (async () => {
+        throw new Error("unexpected updateWebhookAddresses call");
       })
   };
 }

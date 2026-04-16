@@ -50,6 +50,14 @@ export interface AppDeps {
   // Clock indirection so domain code is deterministic under test
   // (mock clock) and portable (no `Date.now()` leaks in services).
   readonly clock: { now(): Date };
+
+  // Optional Alchemy sync surface. Populated only when ALCHEMY_AUTH_TOKEN
+  // is set; the scheduled-jobs sweep invokes `syncAddresses` if present.
+  // The function is pre-bound to the rest of deps — core/domain never sees
+  // an AlchemyAdminClient directly.
+  readonly alchemy?: {
+    syncAddresses: () => Promise<unknown>;
+  };
 }
 
 // Per-surface rate-limit caps. Populated from AppConfig by the entrypoint so

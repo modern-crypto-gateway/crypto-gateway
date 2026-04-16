@@ -41,9 +41,21 @@ export interface CreateWebhookArgs {
   addresses: readonly string[];
 }
 
+export interface UpdateWebhookAddressesArgs {
+  webhookId: string;
+  // Empty arrays are allowed — Alchemy accepts a no-op call. Callers may want
+  // to skip the round-trip when both lists are empty; this client does not.
+  addressesToAdd?: readonly string[];
+  addressesToRemove?: readonly string[];
+}
+
 export interface AlchemyAdminClient {
   listWebhooks(): Promise<readonly AlchemyWebhookSummary[]>;
   createWebhook(args: CreateWebhookArgs): Promise<AlchemyWebhookSummary>;
+  // Mutate the watched-addresses set of an existing webhook. Alchemy's
+  // `/update-webhook-addresses` endpoint accepts both add + remove in one
+  // call, so the sweep batches both per chain.
+  updateWebhookAddresses(args: UpdateWebhookAddressesArgs): Promise<void>;
 }
 
 export function alchemyAdminClient(config: AlchemyAdminClientConfig): AlchemyAdminClient {
@@ -98,6 +110,17 @@ export function alchemyAdminClient(config: AlchemyAdminClientConfig): AlchemyAdm
         })
       });
       return body.data;
+    },
+
+    async updateWebhookAddresses(args) {
+      await request<unknown>("/update-webhook-addresses", {
+        method: "PATCH",
+        body: JSON.stringify({
+          webhook_id: args.webhookId,
+          addresses_to_add: args.addressesToAdd ?? [],
+          addresses_to_remove: args.addressesToRemove ?? []
+        })
+      });
     }
   };
 }
