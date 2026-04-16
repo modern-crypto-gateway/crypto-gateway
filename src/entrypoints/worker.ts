@@ -10,6 +10,7 @@ import { alchemyNotifyDetection } from "../adapters/detection/alchemy-notify.ada
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
+import { readAlchemyNotifyTokenFromEnv } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { d1Adapter } from "../adapters/db/d1.adapter.js";
@@ -130,15 +131,16 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     logger.warn("SECRETS_ENCRYPTION_KEY not set; using dev cipher (NOT safe for production)");
   }
 
-  // Alchemy subscription-sync sweep (9b) — only when ALCHEMY_AUTH_TOKEN is set
-  // AND a D1 binding is available. Same pattern as node.ts; both entrypoints
-  // compose the same adapter graph.
+  // Alchemy subscription-sync sweep (9b) — only when ALCHEMY_NOTIFY_TOKEN
+  // (or the deprecated ALCHEMY_AUTH_TOKEN) is set AND a D1 binding is
+  // available. Same pattern as node.ts; both entrypoints compose the same
+  // adapter graph.
   const db = d1Adapter(env.DB);
   let alchemy: AppDeps["alchemy"];
-  const alchemyAuthToken = typeof env["ALCHEMY_AUTH_TOKEN"] === "string" ? env["ALCHEMY_AUTH_TOKEN"] : undefined;
-  if (alchemyAuthToken !== undefined && alchemyAuthToken.length > 0) {
+  const alchemyNotifyToken = readAlchemyNotifyTokenFromEnv(env as unknown as Record<string, unknown>, logger);
+  if (alchemyNotifyToken !== undefined) {
     const sweep = makeAlchemySyncSweep({
-      adminClient: alchemyAdminClient({ authToken: alchemyAuthToken }),
+      adminClient: alchemyAdminClient({ authToken: alchemyNotifyToken }),
       registryStore: dbAlchemyRegistryStore(db),
       subscriptionStore: dbAlchemySubscriptionStore(db),
       logger

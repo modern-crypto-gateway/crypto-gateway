@@ -16,6 +16,17 @@ export const ALCHEMY_NETWORK_BY_CHAIN_ID: Readonly<Record<number, string>> = {
   84532: "BASE_SEPOLIA",
   137: "MATIC_MAINNET",
   80002: "MATIC_AMOY",
+  // BNB Smart Chain + Avalanche C-Chain. The enum strings below follow
+  // Alchemy's observed naming convention (`<shortname>_MAINNET`) and the
+  // confirmed RPC subdomains `bnb-mainnet` / `avax-mainnet`. If Alchemy's
+  // webhook API rejects these with an "invalid network" error, adjust the
+  // string here — the RPC-level calls don't need the map at all (they use
+  // the subdomain directly via alchemy-rpc.ts), so switching detection
+  // strategies to poll is a workaround until the mapping is corrected.
+  56: "BNB_MAINNET",
+  97: "BNB_TESTNET",
+  43114: "AVAX_MAINNET",
+  43113: "AVAX_FUJI",
   // Solana. ChainIds 900/901 are our own synthetic values (Solana has no
   // EVM-style chain id). Alchemy exposes Solana ADDRESS_ACTIVITY webhooks
   // whose payload shape differs from EVM — the alchemy-notify adapter

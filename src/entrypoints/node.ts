@@ -24,6 +24,7 @@ import { alchemyNotifyDetection } from "../adapters/detection/alchemy-notify.ada
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
+import { readAlchemyNotifyToken } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { loadConfig, ConfigValidationError } from "../config/config.schema.js";
@@ -156,13 +157,14 @@ async function main(): Promise<void> {
     );
   }
 
-  // Alchemy subscription lifecycle: if ALCHEMY_AUTH_TOKEN is set, wire a sync
-  // sweep that batches pending add/remove ops from the event-driven subscription
-  // queue and posts them to Alchemy's /update-webhook-addresses endpoint.
+  // Alchemy subscription lifecycle: if ALCHEMY_NOTIFY_TOKEN is set (or the
+  // deprecated ALCHEMY_AUTH_TOKEN), wire a sync sweep that batches pending
+  // add/remove ops from the event-driven subscription queue and posts them
+  // to Alchemy's /update-webhook-addresses endpoint.
   let alchemy: AppDeps["alchemy"];
-  const alchemyAuthToken = secrets.getOptional("ALCHEMY_AUTH_TOKEN");
-  if (alchemyAuthToken !== undefined) {
-    const admin = alchemyAdminClient({ authToken: alchemyAuthToken });
+  const alchemyNotifyToken = readAlchemyNotifyToken(secrets, logger);
+  if (alchemyNotifyToken !== undefined) {
+    const admin = alchemyAdminClient({ authToken: alchemyNotifyToken });
     const sweep = makeAlchemySyncSweep({
       adminClient: admin,
       registryStore: dbAlchemyRegistryStore(db),

@@ -1,8 +1,10 @@
 // Thin fetch wrapper around Alchemy's webhook-management API (distinct from
 // their JSON-RPC API — different base URL, different auth).
 //
-// Auth: `X-Alchemy-Token: <auth-token>` where the token comes from
-// https://dashboard.alchemy.com/webhooks > Auth Token.
+// Auth: `X-Alchemy-Token: <notify-token>` where the token comes from the top
+// of https://dashboard.alchemy.com/apps/latest/webhooks (labelled "Auth
+// Token"). This is distinct from the per-app JSON-RPC API key despite the
+// similar-looking UI labels — env var name is `ALCHEMY_NOTIFY_TOKEN`.
 //
 // Used by `bootstrapAlchemyWebhooks` to list + create webhooks idempotently,
 // and by future address-sync jobs to add/remove addresses on the existing
@@ -78,6 +80,18 @@ export function alchemyAdminClient(config: AlchemyAdminClientConfig): AlchemyAdm
       });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
+        // 401 on this API is nearly always operator confusion between the
+        // webhook auth token (X-Alchemy-Token, dashboard.alchemy.com/apps/
+        // latest/webhooks — top of page) and the per-app JSON-RPC API key.
+        // Both strings look similar and both are labelled "key" in the UI.
+        // Surface a pointer rather than forcing the operator to grep docs.
+        if (res.status === 401) {
+          throw new Error(
+            `Alchemy admin ${path} returned 401: invalid ALCHEMY_NOTIFY_TOKEN. ` +
+              "This is the webhook management token (dashboard.alchemy.com/apps/latest/webhooks — 'Auth Token' at the top), NOT your JSON-RPC API key. " +
+              `Raw: ${text.slice(0, 128)}`
+          );
+        }
         throw new Error(`Alchemy admin ${path} returned ${res.status}: ${text.slice(0, 256)}`);
       }
       return (await res.json()) as T;

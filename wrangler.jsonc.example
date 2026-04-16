@@ -18,7 +18,14 @@
 //   npx wrangler secret put ADMIN_KEY                   # random 32+ chars
 //   npx wrangler secret put ALCHEMY_NOTIFY_SIGNING_KEY  # optional, only if using Alchemy ingest
 //   npx wrangler secret put CRON_SECRET                 # optional, only for /internal/cron/tick
-//   npx wrangler secret put ALCHEMY_API_KEY                 # optional, but recommended
+//   npx wrangler secret put ALCHEMY_API_KEY                 # optional, but recommended (per-app JSON-RPC key)
+//   npx wrangler secret put ALCHEMY_NOTIFY_TOKEN            # optional; required for /admin/bootstrap/alchemy-webhooks
+//                                                           # NOT the same as ALCHEMY_API_KEY — get it from
+//                                                           # https://dashboard.alchemy.com/apps/latest/webhooks
+//                                                           # (top of page: "Auth Token"). Using the API key
+//                                                           # here returns 401 from Alchemy's webhook admin API.
+//                                                           # (Old name ALCHEMY_AUTH_TOKEN still accepted for one release.)
+//   npx wrangler secret put GATEWAY_PUBLIC_URL              # required for webhook bootstrap — e.g. https://your-worker.workers.dev
 //
 // When a new migration is added (e.g. `migrations/0002_foo.sql`): re-run the
 // loop above. D1 has no runtime filesystem access, so the wrangler CLI is the

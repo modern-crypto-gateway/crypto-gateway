@@ -12,18 +12,24 @@ const ALCHEMY_SUBDOMAIN_BY_CHAIN_ID: Readonly<Record<number, string>> = {
   137: "polygon-mainnet",
   8453: "base-mainnet",
   42161: "arb-mainnet",
+  43114: "avax-mainnet",
+  56: "bnb-mainnet",
   // Testnets — opt-in (not in the default mainnet set below)
   11155111: "eth-sepolia",
   11155420: "opt-sepolia",
   80002: "polygon-amoy",
   84532: "base-sepolia",
-  421614: "arb-sepolia"
+  421614: "arb-sepolia",
+  43113: "avax-fuji",
+  97: "bnb-testnet"
 };
 
 // Default set enabled when `ALCHEMY_API_KEY` is set and the operator hasn't
 // narrowed it via `ALCHEMY_CHAINS`. Mainnets only — testnets should be opt-in
 // so we don't surprise someone into signing keys against a real chain.
-export const DEFAULT_ALCHEMY_MAINNET_CHAIN_IDS: readonly number[] = [1, 10, 137, 8453, 42161];
+export const DEFAULT_ALCHEMY_MAINNET_CHAIN_IDS: readonly number[] = [
+  1, 10, 137, 8453, 42161, 43114, 56
+];
 
 // Build a chainId -> RPC URL map for the given chain ids using the supplied
 // API key. Chains Alchemy doesn't serve are skipped; the caller is expected

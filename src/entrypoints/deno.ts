@@ -9,6 +9,7 @@ import { alchemyNotifyDetection } from "../adapters/detection/alchemy-notify.ada
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
+import { readAlchemyNotifyToken } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
@@ -130,10 +131,10 @@ async function main(): Promise<void> {
   }
 
   let alchemy: AppDeps["alchemy"];
-  const alchemyAuthToken = secrets.getOptional("ALCHEMY_AUTH_TOKEN");
-  if (alchemyAuthToken !== undefined) {
+  const alchemyNotifyToken = readAlchemyNotifyToken(secrets, logger);
+  if (alchemyNotifyToken !== undefined) {
     const sweep = makeAlchemySyncSweep({
-      adminClient: alchemyAdminClient({ authToken: alchemyAuthToken }),
+      adminClient: alchemyAdminClient({ authToken: alchemyNotifyToken }),
       registryStore: dbAlchemyRegistryStore(db),
       subscriptionStore: dbAlchemySubscriptionStore(db),
       logger

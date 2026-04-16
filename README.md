@@ -109,7 +109,7 @@ for the full list. Highlights:
 | `CRON_SECRET`                     | optional        | —          | Enables `POST /internal/cron/tick`                   |
 | `ALCHEMY_API_KEY`                 | optional        | —          | Auto-wires a real EVM chain adapter + RPC-poll detection across the default mainnet set (ETH, OP, Polygon, Base, Arbitrum). See below. |
 | `ALCHEMY_CHAINS`                  | optional        | —          | Comma-separated chainIds to enable via Alchemy (e.g. `1,137`). Defaults to the mainnet set. |
-| `ALCHEMY_AUTH_TOKEN`              | optional        | —          | Webhook-management token (dashboard → Auth Token). Enables the auto-bootstrap admin route below. |
+| `ALCHEMY_NOTIFY_TOKEN`            | required for webhook bootstrap | — | **NOT the same as `ALCHEMY_API_KEY`.** Webhook-management ("Notify") token at the top of [`dashboard.alchemy.com/apps/latest/webhooks`](https://dashboard.alchemy.com/apps/latest/webhooks) → "Auth Token". The JSON-RPC API key will return 401 from this endpoint; they look similar but are distinct strings. Old name `ALCHEMY_AUTH_TOKEN` still works for one release cycle with a deprecation warning. |
 | `GATEWAY_PUBLIC_URL`              | required for webhook bootstrap | — | Public origin of this gateway (e.g. `https://gateway.example.com`). Bootstrap appends per-provider paths like `/webhooks/alchemy`. Env-only to prevent ADMIN_KEY-leak redirect attacks. |
 | `ALCHEMY_NOTIFY_SIGNING_KEY`      | optional        | —          | Enables `POST /webhooks/alchemy` (push-based detection). Obtained from the bootstrap response — save it or the ingest route stays 404. |
 | `DATABASE_URL`                    | when non-D1     | `file:./local.db` | libSQL URL (Turso or local file)              |
@@ -153,7 +153,16 @@ source.
 ### Auto-bootstrap Alchemy webhooks (optional)
 
 Rather than click through Alchemy's dashboard to create webhooks manually, set
-`ALCHEMY_AUTH_TOKEN` + `GATEWAY_PUBLIC_URL` and POST to the bootstrap endpoint:
+`ALCHEMY_NOTIFY_TOKEN` + `GATEWAY_PUBLIC_URL` and POST to the bootstrap endpoint:
+
+> **Footgun alert.** `ALCHEMY_NOTIFY_TOKEN` is the **webhook management token**
+> from the top of [`dashboard.alchemy.com/apps/latest/webhooks`](https://dashboard.alchemy.com/apps/latest/webhooks)
+> (labelled "Auth Token"). It is **not** your JSON-RPC API key (`ALCHEMY_API_KEY`),
+> even though both strings look similar in the UI. Using the API key here
+> returns `401 Unauthenticated request. AuthError` from Alchemy's webhook
+> admin API — the bootstrap route surfaces a pointer to this note when that
+> happens. The old name `ALCHEMY_AUTH_TOKEN` still works (with a
+> deprecation warning in logs) so existing deployments don't break.
 
 ```bash
 # Set once in your deployment env:
@@ -209,7 +218,7 @@ registered **automatically** via the subscription-sync lifecycle below.
 
 ### Address subscription lifecycle (automatic)
 
-When `ALCHEMY_AUTH_TOKEN` is set, the gateway tracks which of your HD-derived
+When `ALCHEMY_NOTIFY_TOKEN` is set, the gateway tracks which of your HD-derived
 receive addresses should be registered with Alchemy's webhooks — no manual
 calls to the management API.
 
@@ -275,9 +284,28 @@ just hit the ingest's idempotency gate the second time.
 
 ## API reference
 
-Full spec: [`openapi.yaml`](openapi.yaml). Import it into Postman, Bruno, or
-Insomnia for an interactive client. A ready-made Postman collection is at
-[`postman/crypto-gateway.postman_collection.json`](postman/crypto-gateway.postman_collection.json).
+Full spec: [`openapi.yaml`](openapi.yaml). Import into Postman, Bruno, or Insomnia
+for an interactive client.
+
+A full-coverage Postman setup lives in [`postman/`](postman/):
+
+- [`crypto-gateway.postman_collection.json`](postman/crypto-gateway.postman_collection.json)
+  — every route (admin bootstrap, merchant API, public checkout, Alchemy
+  webhook ingest simulator, internal cron) grouped into folders. Per-chain
+  quick-start requests under `Orders / Quick starts` for Ethereum, OP,
+  Polygon, Base, Arbitrum, Avalanche, BSC, Tron, Solana, and the local dev
+  chain. Chained flow: the merchant-create test script writes `apiKey`,
+  `merchantId`, `webhookSecret` into the environment; create-order writes
+  `orderId` + `orderReceiveAddress`; bootstrap writes per-chain signing keys.
+- [`crypto-gateway.local.postman_environment.json`](postman/crypto-gateway.local.postman_environment.json)
+  — import as an environment. Pre-declares every variable the collection
+  reads and writes. Only `adminKey` needs to be filled by hand; everything
+  else populates as you run the setup folder.
+
+The `Webhooks (simulate)` folder fires synthetic Alchemy payloads (both EVM
+and Solana SPL shapes) at `/webhooks/alchemy` with a correct HMAC — useful
+for replaying the detection path locally without waiting for a real on-chain
+transfer.
 
 ## Database migrations
 

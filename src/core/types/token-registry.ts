@@ -100,6 +100,44 @@ export const TOKEN_REGISTRY: readonly TokenInfo[] = [
     isStable: true,
     displayName: "USD Coin (Sepolia)"
   },
+  // Avalanche C-Chain. chainId 43114. Native USDC/USDT mints (6 decimals,
+  // same as most EVMs — NOT the 18-decimal BSC-style bridged tokens).
+  {
+    symbol: "USDC" as TokenSymbol,
+    chainId: 43114 as ChainId,
+    contractAddress: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E" as Address,
+    decimals: 6,
+    isStable: true,
+    displayName: "USD Coin (Avalanche)"
+  },
+  {
+    symbol: "USDT" as TokenSymbol,
+    chainId: 43114 as ChainId,
+    contractAddress: "0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7" as Address,
+    decimals: 6,
+    isStable: true,
+    displayName: "Tether (Avalanche)"
+  },
+  // BNB Smart Chain. chainId 56. These are the Binance-Peg BEP-20 tokens
+  // bridged from Ethereum — 18 decimals, NOT 6 like most USDC/USDT. If you
+  // display amounts, quote them against the token's declared decimals, never
+  // assume 6.
+  {
+    symbol: "USDC" as TokenSymbol,
+    chainId: 56 as ChainId,
+    contractAddress: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d" as Address,
+    decimals: 18,
+    isStable: true,
+    displayName: "USD Coin (BSC)"
+  },
+  {
+    symbol: "USDT" as TokenSymbol,
+    chainId: 56 as ChainId,
+    contractAddress: "0x55d398326f99059fF775485246999027B3197955" as Address,
+    decimals: 18,
+    isStable: true,
+    displayName: "Tether (BSC)"
+  },
   // Tron mainnet (chain id 728126428 = 0x2b6653dc).
   {
     symbol: "USDT" as TokenSymbol,

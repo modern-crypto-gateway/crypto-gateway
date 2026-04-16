@@ -12,6 +12,7 @@ import {
 } from "../../adapters/detection/alchemy-admin-client.js";
 import { bootstrapAlchemyWebhooks } from "../../adapters/detection/bootstrap-alchemy-webhooks.js";
 import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registry-store.js";
+import { readAlchemyNotifyToken } from "../../adapters/detection/alchemy-token.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 
@@ -158,13 +159,14 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
   });
 
   app.post("/bootstrap/alchemy-webhooks", async (c) => {
-    const authToken = deps.secrets.getOptional("ALCHEMY_AUTH_TOKEN");
+    const authToken = readAlchemyNotifyToken(deps.secrets, deps.logger);
     if (authToken === undefined) {
       return c.json(
         {
           error: {
             code: "NOT_CONFIGURED",
-            message: "ALCHEMY_AUTH_TOKEN is not set. Generate one at https://dashboard.alchemy.com/webhooks > Auth Token."
+            message:
+              "ALCHEMY_NOTIFY_TOKEN is not set. Get it from the top of https://dashboard.alchemy.com/apps/latest/webhooks (labelled 'Auth Token') — NOT the JSON-RPC API key."
           }
         },
         400

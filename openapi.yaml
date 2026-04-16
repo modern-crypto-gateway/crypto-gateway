@@ -285,7 +285,7 @@ paths:
         webhook already exists with the target URL + network; creates it if
         not. Returns per-chain status plus the `signingKey` for any newly
         created webhook — save that into `ALCHEMY_NOTIFY_SIGNING_KEY` env
-        (Alchemy never shows it again). Requires `ALCHEMY_AUTH_TOKEN` env.
+        (Alchemy never shows it again). Requires `ALCHEMY_NOTIFY_TOKEN` env.
       security:
         - AdminKey: []
       requestBody:
@@ -331,7 +331,7 @@ paths:
                           description: Only present when `status=created`. Save into `ALCHEMY_NOTIFY_SIGNING_KEY`.
                         error: { type: string }
         "400":
-          description: Missing ALCHEMY_AUTH_TOKEN or GATEWAY_PUBLIC_URL env
+          description: Missing ALCHEMY_NOTIFY_TOKEN or GATEWAY_PUBLIC_URL env
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

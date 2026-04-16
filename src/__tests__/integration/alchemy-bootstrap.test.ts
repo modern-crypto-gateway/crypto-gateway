@@ -48,7 +48,7 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     booted = await bootTestApp({
       secretsOverrides: {
         ADMIN_KEY,
-        ALCHEMY_AUTH_TOKEN: "alch_auth_test",
+        ALCHEMY_NOTIFY_TOKEN: "notify_test",
         GATEWAY_PUBLIC_URL: "https://gateway.example.com"
       }
     });
@@ -58,7 +58,7 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     await booted.close();
   });
 
-  it("400 when ALCHEMY_AUTH_TOKEN is not set (endpoint needs it)", async () => {
+  it("400 when ALCHEMY_NOTIFY_TOKEN is not set (endpoint needs it)", async () => {
     const noToken = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
     try {
       const app = mountAdminWith(noToken, () => fakeClient({}));
@@ -79,7 +79,7 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
 
   it("400 when GATEWAY_PUBLIC_URL env is not set", async () => {
     const noUrl = await bootTestApp({
-      secretsOverrides: { ADMIN_KEY, ALCHEMY_AUTH_TOKEN: "alch_auth_test" }
+      secretsOverrides: { ADMIN_KEY, ALCHEMY_NOTIFY_TOKEN: "notify_test" }
     });
     try {
       const app = mountAdminWith(noUrl, () => fakeClient({}));
