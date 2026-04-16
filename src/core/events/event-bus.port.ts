@@ -1,0 +1,44 @@
+import type { Order, OrderId } from "../types/order.js";
+import type { Payout, PayoutId } from "../types/payout.js";
+import type { Transaction, TransactionId } from "../types/transaction.js";
+
+// Domain events. Every state transition in order/tx/payout emits exactly one event.
+// Subscribers (webhook composer, reconciliation, audit log) react without the
+// emitting service having to know about them — so adding a new reaction does
+// not touch the state machine.
+//
+// Event shapes are intentionally flat JSON-safe objects, not references, so a
+// future queue-backed EventBus (CF Queues / Redis Streams) can serialize them.
+
+export type DomainEvent =
+  | { type: "order.created"; orderId: OrderId; order: Order; at: Date }
+  | { type: "order.partial"; orderId: OrderId; order: Order; at: Date }
+  | { type: "order.detected"; orderId: OrderId; order: Order; at: Date }
+  | { type: "order.confirmed"; orderId: OrderId; order: Order; at: Date }
+  | { type: "order.expired"; orderId: OrderId; order: Order; at: Date }
+  | { type: "order.canceled"; orderId: OrderId; order: Order; at: Date }
+  | { type: "tx.detected"; txId: TransactionId; tx: Transaction; at: Date }
+  | { type: "tx.confirmed"; txId: TransactionId; tx: Transaction; at: Date }
+  | { type: "tx.orphaned"; txId: TransactionId; tx: Transaction; at: Date }
+  | { type: "payout.planned"; payoutId: PayoutId; payout: Payout; at: Date }
+  | { type: "payout.submitted"; payoutId: PayoutId; payout: Payout; at: Date }
+  | { type: "payout.confirmed"; payoutId: PayoutId; payout: Payout; at: Date }
+  | { type: "payout.failed"; payoutId: PayoutId; payout: Payout; at: Date };
+
+export type DomainEventType = DomainEvent["type"];
+
+export type EventHandler<E extends DomainEvent = DomainEvent> = (event: E) => Promise<void> | void;
+
+export interface EventBus {
+  publish(event: DomainEvent): Promise<void>;
+
+  // Type-narrowed subscription: subscribe("order.confirmed", ...) gets an
+  // Extract<DomainEvent, { type: "order.confirmed" }> typed argument.
+  subscribe<T extends DomainEventType>(
+    type: T,
+    handler: EventHandler<Extract<DomainEvent, { type: T }>>
+  ): () => void;
+
+  // Useful for cross-cutting listeners (audit log, tracing) that want every event.
+  subscribeAll(handler: EventHandler): () => void;
+}

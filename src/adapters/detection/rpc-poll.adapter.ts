@@ -1,0 +1,55 @@
+import type { AppDeps } from "../../core/app-deps.js";
+import type { DetectionStrategy } from "../../core/ports/detection.port.ts";
+import type { Address, ChainId } from "../../core/types/chain.js";
+import type { DetectedTransfer } from "../../core/types/transaction.js";
+import { findChainAdapter } from "../../core/domain/chain-lookup.js";
+import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
+
+export interface RpcPollConfig {
+  // Fallback scan window when no "last poll" checkpoint exists in cache.
+  // Defaults to 5 minutes.
+  defaultLookbackMs?: number;
+  // Cache key prefix for per-chain "last poll since" checkpoints.
+  // Defaults to "poll:last_since_ms:".
+  cachePrefix?: string;
+}
+
+// Generic pull-based detection: delegates to the chain adapter's scanIncoming,
+// which each family implements against its own RPC surface (viem for EVM,
+// TronGrid for Tron). Works for any family; the strategy is intentionally
+// thin — all RPC-shape knowledge lives in the chain adapter.
+//
+// Maintains a per-chain "last poll since" checkpoint in the cache so each
+// call scans only new blocks. On a cold cache it defaults to `defaultLookbackMs`.
+
+export function rpcPollDetection(config: RpcPollConfig = {}): DetectionStrategy {
+  const defaultLookbackMs = config.defaultLookbackMs ?? 5 * 60 * 1000;
+  const prefix = config.cachePrefix ?? "poll:last_since_ms:";
+
+  return {
+    async poll(deps: AppDeps, chainId: ChainId, addresses: readonly Address[]): Promise<readonly DetectedTransfer[]> {
+      if (addresses.length === 0) return [];
+      const chainAdapter = findChainAdapter(deps, chainId);
+
+      const cacheKey = `${prefix}${chainId}`;
+      const lastSinceRaw = await deps.cache.get(cacheKey);
+      const now = deps.clock.now().getTime();
+      const sinceMs = lastSinceRaw !== null ? Number(lastSinceRaw) : now - defaultLookbackMs;
+
+      // Tokens registered on this chain — the strategy scans all of them. For
+      // performance-sensitive deployments, a future refinement can narrow this
+      // to tokens actually referenced by active orders.
+      const tokens = TOKEN_REGISTRY.filter((t) => t.chainId === chainId).map((t) => t.symbol);
+      if (tokens.length === 0) return [];
+
+      const transfers = await chainAdapter.scanIncoming({ chainId, addresses, tokens, sinceMs });
+
+      // Advance the checkpoint to `now` regardless of how many transfers the
+      // scan returned. A transient provider outage just surfaces as 0 hits;
+      // re-scanning the same window repeatedly is wasteful.
+      await deps.cache.put(cacheKey, now.toString(), { ttlSeconds: 7 * 24 * 3600 });
+
+      return transfers;
+    }
+  };
+}

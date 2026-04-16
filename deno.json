@@ -1,0 +1,25 @@
+{
+  "name": "crypto-gateway",
+  "version": "0.0.0",
+  "tasks": {
+    "dev": "deno run --allow-net --allow-read --allow-env --unstable-cron src/entrypoints/deno.ts",
+    "deploy": "deployctl deploy --project=crypto-gateway src/entrypoints/deno.ts"
+  },
+  "imports": {
+    "hono": "npm:hono@^4.6.0",
+    "zod": "npm:zod@^3.23.8",
+    "@libsql/client": "npm:@libsql/client@^0.17.2",
+    "viem": "npm:viem@^2.0.0",
+    "viem/accounts": "npm:viem@^2.0.0/accounts",
+    "@noble/curves": "npm:@noble/curves@^2.0.0",
+    "@noble/hashes": "npm:@noble/hashes@^2.0.0",
+    "@scure/base": "npm:@scure/base@^1.2.0",
+    "@scure/bip32": "npm:@scure/bip32@^2.0.0",
+    "@scure/bip39": "npm:@scure/bip39@^2.0.0"
+  },
+  "compilerOptions": {
+    "lib": ["deno.window", "deno.ns", "deno.unstable"],
+    "strict": true
+  },
+  "nodeModulesDir": "auto"
+}

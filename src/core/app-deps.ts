@@ -1,0 +1,48 @@
+import type { CacheStore } from "./ports/cache.port.ts";
+import type { ChainAdapter } from "./ports/chain.port.ts";
+import type { DbAdapter } from "./ports/db.port.ts";
+import type { DetectionStrategy } from "./ports/detection.port.ts";
+import type { JobRunner } from "./ports/jobs.port.ts";
+import type { PriceOracle } from "./ports/price-oracle.port.ts";
+import type { SecretsProvider } from "./ports/secrets.port.ts";
+import type { SignerStore } from "./ports/signer-store.port.ts";
+import type { WebhookDispatcher } from "./ports/webhook-delivery.port.ts";
+import type { EventBus } from "./events/event-bus.port.ts";
+
+// The full set of injected ports that domain services and adapters receive.
+// Entrypoints construct a concrete AppDeps using adapters for the current runtime,
+// then pass it to `buildApp(deps)` to produce a runtime-agnostic app.
+//
+// Every field is a port interface — never a concrete class. That is the whole
+// point: swapping D1 for libSQL is changing one line in one entrypoint.
+export interface AppDeps {
+  readonly db: DbAdapter;
+  readonly cache: CacheStore;
+  readonly jobs: JobRunner;
+  readonly secrets: SecretsProvider;
+  readonly signerStore: SignerStore;
+  readonly priceOracle: PriceOracle;
+  readonly webhookDispatcher: WebhookDispatcher;
+  readonly events: EventBus;
+
+  // Registered chain adapters. The domain resolves chainId -> adapter via
+  // `findChainAdapter(deps, chainId)`; the array is open so Phase 2 can boot
+  // with a single dev adapter and Phase 3+ adds EVM/Tron/Solana.
+  readonly chains: readonly ChainAdapter[];
+
+  // Per-chain DetectionStrategy. A chain with no entry here simply isn't
+  // polled — pushed-only deployments (Alchemy Notify) leave this empty.
+  readonly detectionStrategies: Readonly<Record<number, DetectionStrategy>>;
+
+  // Push-based detection strategies, keyed by provider name. The corresponding
+  // webhook ingest route is mounted only when the entry is present. Keys:
+  //   - "alchemy-notify"   : Alchemy ADDRESS_ACTIVITY webhooks
+  //   - "helius"           : Helius Solana webhooks (Phase 7)
+  // The signing key for each provider is read from SecretsProvider at request
+  // time (ALCHEMY_NOTIFY_SIGNING_KEY, HELIUS_WEBHOOK_SECRET, ...).
+  readonly pushStrategies: Readonly<Record<string, DetectionStrategy>>;
+
+  // Clock indirection so domain code is deterministic under test
+  // (mock clock) and portable (no `Date.now()` leaks in services).
+  readonly clock: { now(): Date };
+}

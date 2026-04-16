@@ -1,0 +1,19 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
+  "regions": ["iad1"],
+  "crons": [
+    {
+      "path": "/internal/cron/tick",
+      "schedule": "* * * * *"
+    }
+  ],
+  "functions": {
+    "src/entrypoints/vercel-edge.ts": {
+      "runtime": "edge"
+    }
+  },
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/src/entrypoints/vercel-edge.ts" }
+  ]
+}

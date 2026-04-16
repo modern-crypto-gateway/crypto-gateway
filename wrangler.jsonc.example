@@ -1,0 +1,70 @@
+// Cloudflare Workers deployment config.
+//
+// >>> For local dev / deployment, copy this file to `wrangler.jsonc` and fill
+//     in your own D1 + KV ids (the real file is gitignored). <<<
+//
+// First-time setup:
+//   cp wrangler.jsonc.example wrangler.jsonc
+//   npx wrangler d1 create crypto-gateway-dev           # paste database_id below
+//   npx wrangler d1 execute crypto-gateway-dev --file=migrations/schema.sql
+//   npx wrangler kv namespace create CACHE              # paste id below
+//   npx wrangler secret put MASTER_SEED                 # BIP39 mnemonic
+//   npx wrangler secret put ADMIN_KEY                   # random 32+ chars
+//   npx wrangler secret put ALCHEMY_NOTIFY_SIGNING_KEY  # optional, only if using Alchemy ingest
+//   npx wrangler secret put CRON_SECRET                 # optional, only for /internal/cron/tick
+//
+// Deploy:
+//   npx wrangler deploy -e dev
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crypto-gateway",
+  "main": "src/entrypoints/worker.ts",
+  "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Scheduled cron — runs every minute. The worker entrypoint's `scheduled`
+  // handler invokes pollPayments + confirmTransactions + executeReservedPayouts
+  // + confirmPayouts in sequence. Runtime stays alive via waitUntil.
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+
+  // D1 database binding. See setup steps above; paste your `database_id` here.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "crypto-gateway-dev",
+      "database_id": "REPLACE_WITH_D1_ID"
+    }
+  ],
+
+  // KV namespace for CacheStore. See setup steps above; paste your `id` here.
+  // Add `preview_id` as well if you run `wrangler dev`.
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "REPLACE_WITH_KV_ID"
+    }
+  ],
+
+  // Public env vars. Secrets (MASTER_SEED, ADMIN_KEY, ALCHEMY_NOTIFY_SIGNING_KEY,
+  // CRON_SECRET) are set via `wrangler secret put <NAME>` and do NOT go here.
+  "vars": {
+    "DB_ADAPTER": "d1",
+    "CACHE_ADAPTER": "cf-kv",
+    "JOBS_ADAPTER": "wait-until"
+  },
+
+  // Named per-environment overrides. Start with a dev env; staging / production
+  // get their own D1 + KV ids to keep data isolated.
+  "env": {
+    "dev": {
+      "name": "crypto-gateway-dev",
+      "vars": { "ENV": "dev" }
+    }
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

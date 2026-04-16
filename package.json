@@ -1,0 +1,44 @@
+{
+  "name": "crypto-gateway",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Runtime-agnostic crypto payment gateway (Workers / Node / Bun / Deno / Vercel Edge) with pluggable chain, DB, cache, jobs, detection, and price adapters.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p src/core/tsconfig.json --noEmit",
+    "typecheck:core": "tsc -p src/core/tsconfig.json --noEmit",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:node": "vitest run --project node",
+    "dev:node": "tsx watch src/entrypoints/node.ts",
+    "dev:worker": "wrangler dev",
+    "build:worker": "wrangler deploy --dry-run --outdir dist"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.14",
+    "@libsql/client": "^0.17.2",
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
+    "@scure/base": "^2.0.0",
+    "hono": "^4.6.0",
+    "viem": "^2.48.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260416.2",
+    "@types/node": "^20.12.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "dotenv": "^16.4.5",
+    "eslint": "^9.9.0",
+    "eslint-plugin-import": "^2.31.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5",
+    "wrangler": "^4.83.0"
+  }
+}

@@ -1,0 +1,39 @@
+node_modules/
+dist/
+coverage/
+.wrangler/
+.vercel/
+*.tsbuildinfo
+
+# Cloudflare Workers deployment config — account-specific D1/KV ids.
+# Contributors copy wrangler.jsonc.example -> wrangler.jsonc and fill in their own.
+wrangler.jsonc
+# Cloudflare's local-secrets convention (used by `wrangler dev`).
+.dev.vars
+.dev.vars.*
+
+# env
+.env
+.env.*
+!.env.example
+!example.env
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# editor / os
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# local data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

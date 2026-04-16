@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": [],
+    // WebWorker gives the web-standard globals (Crypto, SubtleCrypto, fetch,
+    // Request, Response, console) that every target runtime provides. It does
+    // NOT include Node/Workers-specific types (process, D1Database,
+    // KVNamespace, etc.), so portability enforcement stays intact.
+    "lib": ["ES2022", "WebWorker"],
+    "rootDir": ".",
+    "outDir": "../../dist/core",
+    "noEmit": true
+  },
+  "include": ["./**/*.ts"],
+  "exclude": ["../../node_modules", "../../dist"]
+}
