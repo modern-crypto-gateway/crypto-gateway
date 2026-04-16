@@ -197,7 +197,7 @@ async function main(): Promise<void> {
     detectionStrategies,
     // Push-based detection. The Alchemy Notify adapter is wired unconditionally
     // — it's inert without incoming webhook POSTs, and this way operators only
-    // have to set ALCHEMY_NOTIFY_SIGNING_KEY (+ bootstrap via admin API) to
+    // have to run the admin bootstrap (or manual signing-key register) to
     // enable /webhooks/alchemy end-to-end without touching this file.
     pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },

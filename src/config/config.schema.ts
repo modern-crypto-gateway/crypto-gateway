@@ -41,7 +41,6 @@ export const AppConfigSchema = z
     // Polygon / Base / Arbitrum). Useful for narrowing to a subset, or for
     // adding testnets that aren't in the default set.
     alchemyChains: z.string().optional(),
-    alchemyNotifySigningKey: z.string().optional(),
 
     // Tron provider selection.
     //   - TRONGRID_API_KEY alone: detection + payouts via TronGrid (required
@@ -161,7 +160,6 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     secretsEncryptionKey: env["SECRETS_ENCRYPTION_KEY"],
     alchemyApiKey: env["ALCHEMY_API_KEY"],
     alchemyChains: env["ALCHEMY_CHAINS"],
-    alchemyNotifySigningKey: env["ALCHEMY_NOTIFY_SIGNING_KEY"],
     trongridApiKey: env["TRONGRID_API_KEY"],
     tronNetwork: env["TRON_NETWORK"],
     tronPollIntervalMs: env["TRON_POLL_INTERVAL_MS"],

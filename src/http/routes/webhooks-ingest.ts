@@ -15,8 +15,9 @@ import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
 //      before we've authenticated the caller)
 //   3. Parse the JSON body to extract `webhookId` — needed BEFORE HMAC verify
 //      because the signing key is per-webhook in the registry
-//   4. Resolve the HMAC signing key: registry lookup by `webhookId`, then env
-//      `ALCHEMY_NOTIFY_SIGNING_KEY` fallback (legacy/single-chain deployments)
+//   4. Resolve the HMAC signing key by `webhookId` from the encrypted-at-rest
+//      `alchemy_webhook_registry`. Populated by bootstrap, or manually via
+//      `POST /admin/alchemy-webhooks/signing-keys` for dashboard-created webhooks.
 //   5. Verify HMAC-SHA256 in constant time against the resolved key
 //   6. Hand parsed payload to the DetectionStrategy and ingest transfers
 //
@@ -74,9 +75,11 @@ export function webhooksIngestRouter(deps: AppDeps): Hono {
       return c.json({ error: { code: "BAD_JSON" } }, 400);
     }
 
-    // Resolve the signing key: DB registry by webhookId first, env var as
-    // legacy fallback. Single-chain deployments that set only the env var
-    // keep working without a bootstrap-registry row.
+    // Resolve the signing key via the DB registry keyed on webhookId. The DB
+    // is the only source of truth — bootstrap persists keys at creation time,
+    // and dashboard-created webhooks register via the manual admin endpoint.
+    // There used to be an `ALCHEMY_NOTIFY_SIGNING_KEY` env fallback; it was
+    // removed because a single env var can't serve multi-chain deployments.
     const registryStore = dbAlchemyRegistryStore(deps.db);
     let signingKey: string | undefined;
     if (typeof payload.webhookId === "string" && payload.webhookId.length > 0) {
@@ -97,12 +100,9 @@ export function webhooksIngestRouter(deps: AppDeps): Hono {
       }
     }
     if (signingKey === undefined) {
-      signingKey = deps.secrets.getOptional("ALCHEMY_NOTIFY_SIGNING_KEY");
-    }
-    if (signingKey === undefined) {
-      // No key resolvable. Return 404 (matches the strategy-not-configured
-      // path earlier) so operators see a consistent "not set up" signal vs
-      // the 401 reserved for bad signatures.
+      // No registry row for this webhookId. 404 matches the
+      // strategy-not-configured path above so operators see "not set up"
+      // consistently; real bad signatures get 401.
       return c.json({ error: { code: "NOT_CONFIGURED", message: "Alchemy ingest not enabled" } }, 404);
     }
 

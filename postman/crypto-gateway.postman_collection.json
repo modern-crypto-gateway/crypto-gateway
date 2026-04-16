@@ -112,6 +112,42 @@
           }
         },
         {
+          "name": "4b. Manually register a signing key (dashboard-created webhook)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/alchemy-webhooks/signing-keys",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "alchemy-webhooks", "signing-keys"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 1,\n  \"webhookId\": \"wh_paste_from_alchemy_dashboard\",\n  \"signingKey\": \"whsec_paste_from_create_response\",\n  \"webhookUrl\": \"https://gateway.example.com/webhooks/alchemy\"\n}"
+            },
+            "description": "Only needed when you created a webhook directly in the Alchemy dashboard UI (skipping bootstrap) OR when a bootstrap run returned `persisted: false` on a `created` row. Encrypts the signingKey via `SECRETS_ENCRYPTION_KEY` and upserts into `alchemy_webhook_registry`. Re-running with the same `chainId` rotates (dashboard delete+recreate workflow).\n\nMost operators should NOT need this — bootstrap persists signing keys automatically."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('registered object echoes chainId + webhookId', () => {",
+                  "  pm.expect(body.registered).to.have.property('chainId');",
+                  "  pm.expect(body.registered).to.have.property('webhookId');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "name": "4. Bootstrap Alchemy webhooks",
           "request": {
             "method": "POST",

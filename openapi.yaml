@@ -202,9 +202,11 @@ paths:
       tags: [webhooks]
       summary: Ingest Alchemy Notify ADDRESS_ACTIVITY webhooks
       description: |
-        HMAC-SHA256 of the raw body under the `ALCHEMY_NOTIFY_SIGNING_KEY`
-        secret must match `X-Alchemy-Signature`. Returns 200 fast and
-        processes the payload in the background; Alchemy retries on non-2xx.
+        HMAC-SHA256 of the raw body under the per-webhook signing key
+        (looked up by `event.webhookId` in the encrypted-at-rest
+        `alchemy_webhook_registry` table) must match `X-Alchemy-Signature`.
+        Returns 200 fast and processes the payload in the background;
+        Alchemy retries on non-2xx.
       security:
         - AlchemySignature: []
       requestBody:
@@ -284,8 +286,10 @@ paths:
         For each requested chainId, checks whether an Alchemy ADDRESS_ACTIVITY
         webhook already exists with the target URL + network; creates it if
         not. Returns per-chain status plus the `signingKey` for any newly
-        created webhook — save that into `ALCHEMY_NOTIFY_SIGNING_KEY` env
-        (Alchemy never shows it again). Requires `ALCHEMY_NOTIFY_TOKEN` env.
+        created webhook. Signing keys are persisted encrypted into
+        `alchemy_webhook_registry` automatically; the `signingKey` field in
+        the response is a one-shot safety net in case persistence raced.
+        Requires `ALCHEMY_NOTIFY_TOKEN` env.
       security:
         - AdminKey: []
       requestBody:
@@ -328,13 +332,56 @@ paths:
                         webhookId: { type: string }
                         signingKey:
                           type: string
-                          description: Only present when `status=created`. Save into `ALCHEMY_NOTIFY_SIGNING_KEY`.
+                          description: Only present when `status=created`. Automatically persisted to `alchemy_webhook_registry`; kept in the response as a one-shot safety net if `persisted=false`.
                         error: { type: string }
         "400":
           description: Missing ALCHEMY_NOTIFY_TOKEN or GATEWAY_PUBLIC_URL env
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+
+  /admin/alchemy-webhooks/signing-keys:
+    post:
+      tags: [admin]
+      summary: Register an Alchemy webhook's signing key manually
+      description: |
+        For operators who created a webhook through the Alchemy dashboard UI
+        (not via bootstrap) or who need to push a key back in after a
+        persistence failure. The signing key is encrypted via
+        `SECRETS_ENCRYPTION_KEY` before being written to
+        `alchemy_webhook_registry`. Re-running with the same chainId upserts
+        (rotation after a dashboard delete+recreate).
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chainId, webhookId, signingKey, webhookUrl]
+              properties:
+                chainId: { type: integer }
+                webhookId: { type: string, minLength: 1, maxLength: 128 }
+                signingKey: { type: string, minLength: 1, maxLength: 256 }
+                webhookUrl: { type: string, format: uri }
+      responses:
+        "201":
+          description: Signing key persisted encrypted-at-rest
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  registered:
+                    type: object
+                    properties:
+                      chainId: { type: integer }
+                      webhookId: { type: string }
+                      webhookUrl: { type: string, format: uri }
+        "400": { $ref: "#/components/responses/ValidationError" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
 
@@ -415,7 +462,7 @@ components:
       type: apiKey
       in: header
       name: X-Alchemy-Signature
-      description: HMAC-SHA256 hex of the raw body under `ALCHEMY_NOTIFY_SIGNING_KEY`.
+      description: HMAC-SHA256 hex of the raw body under the per-webhook signing key stored in `alchemy_webhook_registry` (looked up by `event.webhookId`).
     CronSecret:
       type: http
       scheme: bearer

@@ -20,7 +20,7 @@ const noopTransport = custom({
 });
 
 async function bootAlchemy(): Promise<BootedTestApp> {
-  return bootTestApp({
+  const booted = await bootTestApp({
     merchants: [
       {
         id: MERCHANT_ID,
@@ -30,8 +30,24 @@ async function bootAlchemy(): Promise<BootedTestApp> {
     ],
     chains: [evmChainAdapter({ chainIds: [1], transports: { 1: noopTransport } })],
     pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
-    secretsOverrides: { ALCHEMY_NOTIFY_SIGNING_KEY: SIGNING_KEY, MASTER_SEED: HARDHAT_MNEMONIC }
+    secretsOverrides: { MASTER_SEED: HARDHAT_MNEMONIC }
   });
+  // The ingest path resolves signing keys exclusively via the DB registry
+  // (the previous env-var fallback was removed because it could only hold one
+  // key and thus never worked for multi-chain). Seed a registry row for the
+  // chainId=1 webhook so `webhookId: "wh_test"` payloads verify against
+  // SIGNING_KEY.
+  const now = Date.now();
+  const ciphertext = await booted.deps.secretsCipher.encrypt(SIGNING_KEY);
+  await booted.deps.db
+    .prepare(
+      `INSERT INTO alchemy_webhook_registry
+         (chain_id, webhook_id, signing_key_ciphertext, webhook_url, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(1, "wh_test", ciphertext, "https://test.local/webhooks/alchemy", now, now)
+    .run();
+  return booted;
 }
 
 function buildPayload(activity: ReadonlyArray<Record<string, unknown>>, network = "ETH_MAINNET"): string {
@@ -112,7 +128,7 @@ describe("POST /webhooks/alchemy", () => {
   it("returns 404 when the strategy is not configured for this deployment", async () => {
     const noStrategy = await bootTestApp({
       // Deliberately omit pushStrategies.
-      secretsOverrides: { ALCHEMY_NOTIFY_SIGNING_KEY: SIGNING_KEY }
+      secretsOverrides: {}
     });
     try {
       const body = buildPayload([]);
@@ -283,11 +299,13 @@ describe("POST /webhooks/alchemy", () => {
   });
 });
 
-// Per-webhook signing key resolution: when the registry has a row for the
-// payload's webhookId, that key takes precedence over the ALCHEMY_NOTIFY_SIGNING_KEY
-// env var. Fixes v1's single-shared-key-spoofs-every-chain issue.
+// Per-webhook signing key resolution via the DB registry. The env-var
+// fallback was removed: one env var can't serve multi-chain, and having
+// both an env path and a DB path created a spoofability surface (sign a
+// registered webhook's payload with the env key to bypass the per-chain
+// key). Now: registry is the single source of truth.
 describe("POST /webhooks/alchemy — per-webhook signing key from DB registry", () => {
-  it("resolves the signing key from the registry by webhookId (env var NOT set)", async () => {
+  it("resolves the signing key from the registry by webhookId", async () => {
     const perChainKey = "per-chain-signing-key-abc";
     const booted = await bootTestApp({
       merchants: [
@@ -299,14 +317,12 @@ describe("POST /webhooks/alchemy — per-webhook signing key from DB registry", 
       ],
       chains: [evmChainAdapter({ chainIds: [1], transports: { 1: noopTransport } })],
       pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
-      // Deliberately NOT setting ALCHEMY_NOTIFY_SIGNING_KEY — forces the
-      // registry path to carry the whole verification.
       secretsOverrides: { MASTER_SEED: HARDHAT_MNEMONIC }
     });
     try {
-      // Seed the registry directly (simulating a prior `POST /admin/bootstrap/alchemy-webhooks`).
-      // Secret is stored encrypted at rest; bootstrap would have run it through
-      // deps.secretsCipher.encrypt — we replicate that here.
+      // Seed the registry directly (simulating a prior `POST /admin/bootstrap/alchemy-webhooks`
+      // or `POST /admin/alchemy-webhooks/signing-keys`). Secret is stored
+      // encrypted via secretsCipher — the ingest handler decrypts on read.
       const now = Date.now();
       const ciphertext = await booted.deps.secretsCipher.encrypt(perChainKey);
       await booted.deps.db
@@ -325,7 +341,6 @@ describe("POST /webhooks/alchemy — per-webhook signing key from DB registry", 
         type: "ADDRESS_ACTIVITY",
         event: { network: "ETH_MAINNET", activity: [] }
       });
-      // Sign with the DB-registered key, not the env key (which isn't set).
       const sig = bytesToHex(await hmacSha256(perChainKey, body));
       const res = await booted.app.fetch(
         new Request("http://test.local/webhooks/alchemy", {
@@ -340,74 +355,10 @@ describe("POST /webhooks/alchemy — per-webhook signing key from DB registry", 
     }
   });
 
-  it("rejects 401 when payload's webhookId is in the registry but signature was made with the env key", async () => {
-    const perChainKey = "per-chain-signing-key-abc";
-    const envKey = "env-legacy-key-xyz";
+  it("404 when the payload's webhookId has no registry row (no env fallback)", async () => {
     const booted = await bootTestApp({
       chains: [evmChainAdapter({ chainIds: [1], transports: { 1: noopTransport } })],
       pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
-      secretsOverrides: { ALCHEMY_NOTIFY_SIGNING_KEY: envKey, MASTER_SEED: HARDHAT_MNEMONIC }
-    });
-    try {
-      const now = Date.now();
-      const ciphertext = await booted.deps.secretsCipher.encrypt(perChainKey);
-      await booted.deps.db
-        .prepare(
-          `INSERT INTO alchemy_webhook_registry
-             (chain_id, webhook_id, signing_key_ciphertext, webhook_url, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)`
-        )
-        .bind(1, "wh_registered", ciphertext, "https://x", now, now)
-        .run();
-
-      const body = JSON.stringify({ webhookId: "wh_registered", event: { network: "ETH_MAINNET", activity: [] } });
-      // Attacker-style: sign with the env key to try to spoof the registered webhook.
-      const sig = bytesToHex(await hmacSha256(envKey, body));
-      const res = await booted.app.fetch(
-        new Request("http://test.local/webhooks/alchemy", {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-alchemy-signature": sig },
-          body
-        })
-      );
-      expect(res.status).toBe(401);
-    } finally {
-      await booted.close();
-    }
-  });
-
-  it("falls back to env ALCHEMY_NOTIFY_SIGNING_KEY when webhookId has no registry row", async () => {
-    const envKey = "env-legacy-key-xyz";
-    const booted = await bootTestApp({
-      chains: [evmChainAdapter({ chainIds: [1], transports: { 1: noopTransport } })],
-      pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
-      secretsOverrides: { ALCHEMY_NOTIFY_SIGNING_KEY: envKey, MASTER_SEED: HARDHAT_MNEMONIC }
-    });
-    try {
-      // Registry is empty — the env fallback carries verification.
-      const body = JSON.stringify({
-        webhookId: "wh_unknown",
-        event: { network: "ETH_MAINNET", activity: [] }
-      });
-      const sig = bytesToHex(await hmacSha256(envKey, body));
-      const res = await booted.app.fetch(
-        new Request("http://test.local/webhooks/alchemy", {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-alchemy-signature": sig },
-          body
-        })
-      );
-      expect(res.status).toBe(200);
-    } finally {
-      await booted.close();
-    }
-  });
-
-  it("404 when neither registry nor env has a matching signing key", async () => {
-    const booted = await bootTestApp({
-      chains: [evmChainAdapter({ chainIds: [1], transports: { 1: noopTransport } })],
-      pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
-      // No env signing key, no registry row, provider is configured though.
       secretsOverrides: { MASTER_SEED: HARDHAT_MNEMONIC }
     });
     try {

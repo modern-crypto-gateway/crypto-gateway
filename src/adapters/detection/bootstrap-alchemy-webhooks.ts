@@ -6,8 +6,11 @@ import type { AlchemyRegistryStore } from "./alchemy-registry-store.js";
 // Idempotent bootstrap: for each desired chain, ensure Alchemy has an
 // ADDRESS_ACTIVITY webhook pointed at our URL. Webhooks that already match
 // (same URL + same network) are reported as "existing" and nothing is changed.
-// Webhooks missing are created and their signing_key is returned ONCE for the
-// operator to stash in env as `ALCHEMY_NOTIFY_SIGNING_KEY`.
+// Webhooks missing are created and their signing_key is returned ONCE; the
+// bootstrap persists it (encrypted) into `alchemy_webhook_registry` by
+// default when a registryStore + secretsCipher are supplied. Operators who
+// created their webhook through the Alchemy dashboard UI can push the key
+// into the registry via `POST /admin/alchemy-webhooks/signing-keys`.
 //
 // Design notes:
 //   - Per Alchemy's API, `/create-webhook` requires at least one address at

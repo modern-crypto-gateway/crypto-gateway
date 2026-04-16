@@ -44,7 +44,6 @@ export interface WorkerEnv {
   ADMIN_KEY?: string;
   ALCHEMY_API_KEY?: string;
   ALCHEMY_CHAINS?: string;
-  ALCHEMY_NOTIFY_SIGNING_KEY?: string;
 
   // String env vars from wrangler.jsonc [vars]
   [key: string]: unknown;

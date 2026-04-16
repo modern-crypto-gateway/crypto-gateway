@@ -47,9 +47,10 @@ export interface AppDeps {
   // Push-based detection strategies, keyed by provider name. The corresponding
   // webhook ingest route is mounted only when the entry is present. Keys:
   //   - "alchemy-notify"   : Alchemy ADDRESS_ACTIVITY webhooks
-  //   - "helius"           : Helius Solana webhooks (Phase 7)
-  // The signing key for each provider is read from SecretsProvider at request
-  // time (ALCHEMY_NOTIFY_SIGNING_KEY, HELIUS_WEBHOOK_SECRET, ...).
+  //   - "helius"           : Helius Solana webhooks (future)
+  // Signing keys are stored per-webhook in the DB (`alchemy_webhook_registry`,
+  // encrypted via `secretsCipher`) so multi-chain deployments work correctly.
+  // Populated by bootstrap or the manual-register admin endpoint.
   readonly pushStrategies: Readonly<Record<string, DetectionStrategy>>;
 
   // Clock indirection so domain code is deterministic under test

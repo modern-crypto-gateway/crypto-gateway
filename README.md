@@ -67,7 +67,9 @@ npx wrangler kv namespace create CACHE
 # Set secrets (not in wrangler.jsonc — they go to Cloudflare's store):
 npx wrangler secret put MASTER_SEED                 # BIP39 mnemonic
 npx wrangler secret put ADMIN_KEY                   # random 32+ chars
-npx wrangler secret put ALCHEMY_NOTIFY_SIGNING_KEY  # optional
+npx wrangler secret put SECRETS_ENCRYPTION_KEY      # 64 hex chars (AES-256 master key)
+npx wrangler secret put ALCHEMY_API_KEY             # optional — per-app JSON-RPC key
+npx wrangler secret put ALCHEMY_NOTIFY_TOKEN        # optional — webhook-mgmt token (NOT the API key above)
 npx wrangler secret put CRON_SECRET                 # optional
 
 npx wrangler deploy -e dev
@@ -111,7 +113,6 @@ for the full list. Highlights:
 | `ALCHEMY_CHAINS`                  | optional        | —          | Comma-separated chainIds to enable via Alchemy (e.g. `1,137`). Defaults to the mainnet set. |
 | `ALCHEMY_NOTIFY_TOKEN`            | required for webhook bootstrap | — | **NOT the same as `ALCHEMY_API_KEY`.** Webhook-management ("Notify") token at the top of [`dashboard.alchemy.com/apps/latest/webhooks`](https://dashboard.alchemy.com/apps/latest/webhooks) → "Auth Token". The JSON-RPC API key will return 401 from this endpoint; they look similar but are distinct strings. Old name `ALCHEMY_AUTH_TOKEN` still works for one release cycle with a deprecation warning. |
 | `GATEWAY_PUBLIC_URL`              | required for webhook bootstrap | — | Public origin of this gateway (e.g. `https://gateway.example.com`). Bootstrap appends per-provider paths like `/webhooks/alchemy`. Env-only to prevent ADMIN_KEY-leak redirect attacks. |
-| `ALCHEMY_NOTIFY_SIGNING_KEY`      | optional        | —          | Enables `POST /webhooks/alchemy` (push-based detection). Obtained from the bootstrap response — save it or the ingest route stays 404. |
 | `DATABASE_URL`                    | when non-D1     | `file:./local.db` | libSQL URL (Turso or local file)              |
 | `DATABASE_TOKEN`                  | Turso only      | —          | libSQL auth token                                    |
 | `PORT`                            | no              | `8787`     |                                                      |
@@ -194,12 +195,36 @@ The endpoint is **idempotent**: chains already configured with a matching
 `(network, webhookUrl)` pair are reported as `existing` and left alone. Re-run
 as often as you like.
 
-**Save the `signingKey` from each `created` result into `ALCHEMY_NOTIFY_SIGNING_KEY`**
-— Alchemy only returns it once, at creation time. If you lose it you have to
-delete and recreate the webhook. The bootstrap can only create ONE webhook per
-(network, URL) pair, and the env var takes ONE signing key, so if you're
-enabling multiple chains keep them on separate subdomains or accept that
-you'll rotate keys when you expand.
+The per-chain `signingKey` returned in each `created` result is automatically
+persisted (encrypted-at-rest via `SECRETS_ENCRYPTION_KEY`) into
+`alchemy_webhook_registry`, keyed on Alchemy's `webhookId`. The
+`/webhooks/alchemy` ingest route resolves the right key on every incoming
+POST — no env vars, no manual copy-paste, and multi-chain Just Works.
+
+Alchemy only returns each `signingKey` once at creation time. If `persisted`
+comes back `false` on a `created` row (the registry insert raced or failed),
+the response's `signingKey` is your only chance to recover it — push it back
+in manually via the endpoint below.
+
+### Manual signing-key registration
+
+For operators who created webhooks through the Alchemy dashboard UI (not via
+bootstrap) or who need to re-insert a key after a persistence failure:
+
+```bash
+curl -X POST "$GATEWAY_URL/admin/alchemy-webhooks/signing-keys" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 1,
+    "webhookId": "wh_abc",
+    "signingKey": "whsec_xyz",
+    "webhookUrl": "https://gateway.example.com/webhooks/alchemy"
+  }'
+```
+
+Same encrypt-and-insert path bootstrap uses. Re-running with an existing
+chainId rotates the webhookId + signingKey (for dashboard delete+recreate).
 
 With both `GATEWAY_PUBLIC_URL` and `ALCHEMY_CHAINS` env vars set the bootstrap
 request body can be empty:
@@ -257,16 +282,18 @@ Improvements over v1's equivalent flow (studied before this was built):
 - **Automatic deregistration on terminal order states** — v1 let addresses
   accumulate toward the 50k-per-webhook cap and required manual cleanup;
   we enqueue `remove` on `order.confirmed | expired | canceled`.
-- **Per-chain signing keys** — v1 shared one `ALCHEMY_NOTIFY_SIGNING_KEY`
-  env var across every chain; the registry stores per-chain, so compromise
-  of one key doesn't spoof the others.
+- **Per-chain signing keys in the DB** — v1 shared one env var across every
+  chain; that approach could never serve multi-chain correctly. We persist
+  per-(chainId, webhookId) rows in `alchemy_webhook_registry`, encrypted via
+  `SECRETS_ENCRYPTION_KEY`. Compromise of one key doesn't spoof the others,
+  and rotation is a DB upsert.
 
-### Manual push-wiring (alternative to auto-bootstrap)
+### Push detection is wired by default
 
-For push-based detection (lower latency than polling), also set
-`ALCHEMY_NOTIFY_SIGNING_KEY` and wire `alchemyNotifyDetection()` into the
-entrypoint's `pushStrategies`. Push + pull can coexist; the same tx will
-just hit the ingest's idempotency gate the second time.
+Every entrypoint now registers `alchemyNotifyDetection()` as the
+`"alchemy-notify"` push strategy unconditionally. Push + pull can coexist;
+duplicate detection of the same tx hits the ingest's idempotency gate and
+silently drops the second one.
 
 ## Authentication
 

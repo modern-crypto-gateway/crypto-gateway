@@ -57,6 +57,20 @@ const BootstrapAlchemyWebhooksSchema = z.object({
   seedAddressByChainId: z.record(z.string(), z.string()).optional()
 });
 
+// Manual-register input. Used when an operator created a webhook through the
+// Alchemy dashboard UI (not via our bootstrap) and needs to push the
+// returned signing key into our registry so the ingest route can verify
+// inbound HMACs. Each field comes directly from Alchemy's create-webhook
+// response.
+const RegisterSigningKeySchema = z.object({
+  chainId: z.number().int().positive(),
+  webhookId: z.string().min(1).max(128),
+  signingKey: z.string().min(1).max(256),
+  // Must match GATEWAY_PUBLIC_URL/webhooks/alchemy in practice. Stored for
+  // operator visibility (registry list endpoints, debugging).
+  webhookUrl: z.string().url()
+});
+
 // Router options allow tests to inject a fake Alchemy admin client without
 // spinning up an HTTP mock. Production constructs the client from env inside
 // the handler.
@@ -242,6 +256,42 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       }
 
       return c.json({ results }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Manually register an Alchemy webhook's signing key — for operators who
+  // created the webhook through Alchemy's dashboard UI instead of our
+  // bootstrap endpoint. The signing key is encrypted via `secretsCipher`
+  // before it hits the registry, same path bootstrap uses. Re-running with
+  // the same chainId overwrites (intended: rotation after a dashboard
+  // delete+recreate produces a new key).
+  app.post("/alchemy-webhooks/signing-keys", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as unknown;
+    if (body === null) {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const parsed = RegisterSigningKeySchema.parse(body);
+      const ciphertext = await deps.secretsCipher.encrypt(parsed.signingKey);
+      await dbAlchemyRegistryStore(deps.db).upsert({
+        chainId: parsed.chainId,
+        webhookId: parsed.webhookId,
+        signingKeyCiphertext: ciphertext,
+        webhookUrl: parsed.webhookUrl,
+        now: deps.clock.now().getTime()
+      });
+      return c.json(
+        {
+          registered: {
+            chainId: parsed.chainId,
+            webhookId: parsed.webhookId,
+            webhookUrl: parsed.webhookUrl
+          }
+        },
+        201
+      );
     } catch (err) {
       return renderError(c, err, deps.logger);
     }

@@ -16,7 +16,6 @@
 //   npx wrangler kv namespace create CACHE              # paste id below
 //   npx wrangler secret put MASTER_SEED                 # BIP39 mnemonic
 //   npx wrangler secret put ADMIN_KEY                   # random 32+ chars
-//   npx wrangler secret put ALCHEMY_NOTIFY_SIGNING_KEY  # optional, only if using Alchemy ingest
 //   npx wrangler secret put CRON_SECRET                 # optional, only for /internal/cron/tick
 //   npx wrangler secret put ALCHEMY_API_KEY                 # optional, but recommended (per-app JSON-RPC key)
 //   npx wrangler secret put ALCHEMY_NOTIFY_TOKEN            # optional; required for /admin/bootstrap/alchemy-webhooks
@@ -66,8 +65,9 @@
     }
   ],
 
-  // Public env vars. Secrets (MASTER_SEED, ADMIN_KEY, ALCHEMY_NOTIFY_SIGNING_KEY,
-  // CRON_SECRET) are set via `wrangler secret put <NAME>` and do NOT go here.
+  // Public env vars. Secrets (MASTER_SEED, ADMIN_KEY, CRON_SECRET,
+  // ALCHEMY_NOTIFY_TOKEN, SECRETS_ENCRYPTION_KEY, ...) are set via
+  // `wrangler secret put <NAME>` and do NOT go here.
   "vars": {
     "DB_ADAPTER": "d1",
     "CACHE_ADAPTER": "cf-kv",

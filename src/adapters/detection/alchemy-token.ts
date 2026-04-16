@@ -6,9 +6,8 @@ import type { SecretsProvider } from "../../core/ports/secrets.port.js";
 // The env var was originally named ALCHEMY_AUTH_TOKEN, which turned out to
 // be confusingly close to "auth token for RPC" — operators consistently
 // fed the JSON-RPC API key into it and got 401s. The canonical name is now
-// ALCHEMY_NOTIFY_TOKEN (parallels ALCHEMY_NOTIFY_SIGNING_KEY). The old name
-// still works for one release cycle with a deprecation warning so existing
-// deployments don't break on upgrade.
+// ALCHEMY_NOTIFY_TOKEN. The old name still works for one release cycle with
+// a deprecation warning so existing deployments don't break on upgrade.
 
 export function readAlchemyNotifyToken(
   secrets: SecretsProvider,
