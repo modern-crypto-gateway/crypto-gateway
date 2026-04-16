@@ -10,6 +10,7 @@ import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-s
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { d1Adapter } from "../adapters/db/d1.adapter.js";
+import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { waitUntilJobs } from "../adapters/jobs/wait-until.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
 import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
@@ -18,6 +19,7 @@ import { workersEnvSecrets } from "../adapters/secrets/workers-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import type { AppDeps } from "../core/app-deps.js";
+import { runScheduledJobs } from "../core/domain/scheduled-jobs.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
 
 // Cloudflare Workers entrypoint. Exports { fetch, scheduled } as required by
@@ -44,7 +46,7 @@ export interface WorkerEnv {
   [key: string]: unknown;
 }
 
-function depsFor(env: WorkerEnv, ctx: ExecutionContext): AppDeps {
+async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> {
   const logger = consoleLogger({
     format: "json",
     minLevel: "info",
@@ -72,6 +74,18 @@ function depsFor(env: WorkerEnv, ctx: ExecutionContext): AppDeps {
     logger.info("Alchemy EVM chains wired", { chainIds });
   }
 
+  // Secrets-at-rest cipher. SECRETS_ENCRYPTION_KEY is required in
+  // production — prod Workers don't run loadConfig (D1/KV-driven boot, not
+  // an env-schema); the admin routes fail fast if a ciphertext can't be
+  // produced, so misconfiguration is visible at first merchant creation.
+  const secretsEncryptionKey = typeof env["SECRETS_ENCRYPTION_KEY"] === "string" ? env["SECRETS_ENCRYPTION_KEY"] : undefined;
+  const secretsCipher = secretsEncryptionKey !== undefined && secretsEncryptionKey.length > 0
+    ? await makeSecretsCipher(secretsEncryptionKey)
+    : await devCipher();
+  if (secretsEncryptionKey === undefined || secretsEncryptionKey.length === 0) {
+    logger.warn("SECRETS_ENCRYPTION_KEY not set; using dev cipher (NOT safe for production)");
+  }
+
   // Alchemy subscription-sync sweep (9b) — only when ALCHEMY_AUTH_TOKEN is set
   // AND a D1 binding is available. Same pattern as node.ts; both entrypoints
   // compose the same adapter graph.
@@ -93,6 +107,7 @@ function depsFor(env: WorkerEnv, ctx: ExecutionContext): AppDeps {
     cache,
     jobs: waitUntilJobs(ctx),
     secrets: workersEnvSecrets(env as unknown as Record<string, unknown>),
+    secretsCipher,
     signerStore: memorySignerStore(),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: inlineFetchDispatcher(),
@@ -123,17 +138,22 @@ function envNumber(env: WorkerEnv, key: string, fallback: number): number {
 
 export default {
   async fetch(request: Request, env: WorkerEnv, ctx: ExecutionContext): Promise<Response> {
-    const app = buildApp(depsFor(env, ctx));
+    const app = buildApp(await depsFor(env, ctx));
     return app.fetch(request) as Promise<Response>;
   },
 
   async scheduled(_event: ScheduledController, env: WorkerEnv, ctx: ExecutionContext): Promise<void> {
-    const app = buildApp(depsFor(env, ctx));
-    // Run each job sequentially so one slow step doesn't starve the others'
-    // error surfaces. Errors bubble — the Workers runtime logs them.
-    await app.jobs["pollPayments"]?.();
-    await app.jobs["confirmTransactions"]?.();
-    await app.jobs["executeReservedPayouts"]?.();
-    await app.jobs["confirmPayouts"]?.();
+    // Delegate to the runtime-agnostic runner so every scheduler (Workers
+    // scheduled, Node cron, Deno.cron, Vercel cron) runs the identical job
+    // set — including `alchemy.syncAddresses` when configured. runScheduledJobs
+    // catches per-step errors and returns outcomes; we surface them via logger
+    // so the Workers runtime sees them.
+    const deps = await depsFor(env, ctx);
+    const result = await runScheduledJobs(deps);
+    for (const [name, outcome] of Object.entries(result)) {
+      if (outcome && !outcome.ok) {
+        deps.logger.error("scheduled job failed", { job: name, error: outcome.error });
+      }
+    }
   }
 };

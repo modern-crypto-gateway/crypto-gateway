@@ -48,23 +48,25 @@ async function dispatchEvent(deps: AppDeps, event: DomainEvent): Promise<void> {
 
   const merchant = await deps.db
     .prepare(
-      "SELECT webhook_url, webhook_secret_hash FROM merchants WHERE id = ? AND active = 1"
+      "SELECT webhook_url, webhook_secret_ciphertext FROM merchants WHERE id = ? AND active = 1"
     )
     .bind(composed.merchantId)
-    .first<{ webhook_url: string | null; webhook_secret_hash: string | null }>();
+    .first<{ webhook_url: string | null; webhook_secret_ciphertext: string | null }>();
 
-  if (!merchant?.webhook_url || !merchant.webhook_secret_hash) {
+  if (!merchant?.webhook_url || !merchant.webhook_secret_ciphertext) {
     // Merchant has not configured webhooks (or is inactive). Not an error.
     return;
   }
 
+  // The secret is stored encrypted at rest (AES-GCM via secretsCipher). We
+  // decrypt only to HMAC the outgoing body and throw away the plaintext
+  // immediately — no secret should outlive this function's stack frame.
+  const secret = await deps.secretsCipher.decrypt(merchant.webhook_secret_ciphertext);
+
   await deps.webhookDispatcher.dispatch({
     url: merchant.webhook_url,
     payload: composed.payload,
-    // Column is called `webhook_secret_hash` for historical reasons, but Phase 4a
-    // uses it as the plaintext HMAC signing secret. Phase 5+ will encrypt at rest
-    // via a separate signer-store scope; the dispatcher surface won't change.
-    secret: merchant.webhook_secret_hash,
+    secret,
     idempotencyKey: composed.idempotencyKey
   });
 }

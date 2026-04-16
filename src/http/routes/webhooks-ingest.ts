@@ -81,7 +81,20 @@ export function webhooksIngestRouter(deps: AppDeps): Hono {
     let signingKey: string | undefined;
     if (typeof payload.webhookId === "string" && payload.webhookId.length > 0) {
       const row = await registryStore.findByWebhookId(payload.webhookId);
-      if (row !== null) signingKey = row.signingKey;
+      if (row !== null) {
+        // Stored ciphertext -> plaintext HMAC key, on demand. Any decryption
+        // failure here means the row is corrupt or the SECRETS_ENCRYPTION_KEY
+        // was rotated without re-encrypting; treat as "not configured" so a
+        // sane 404 beats a 500 to the provider's retry loop.
+        try {
+          signingKey = await deps.secretsCipher.decrypt(row.signingKeyCiphertext);
+        } catch (err) {
+          deps.logger.error("alchemy registry signing key could not be decrypted", {
+            webhookId: payload.webhookId,
+            error: err instanceof Error ? err.message : String(err)
+          });
+        }
+      }
     }
     if (signingKey === undefined) {
       signingKey = deps.secrets.getOptional("ALCHEMY_NOTIFY_SIGNING_KEY");

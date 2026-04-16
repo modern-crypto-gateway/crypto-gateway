@@ -305,14 +305,17 @@ describe("POST /webhooks/alchemy — per-webhook signing key from DB registry", 
     });
     try {
       // Seed the registry directly (simulating a prior `POST /admin/bootstrap/alchemy-webhooks`).
+      // Secret is stored encrypted at rest; bootstrap would have run it through
+      // deps.secretsCipher.encrypt — we replicate that here.
       const now = Date.now();
+      const ciphertext = await booted.deps.secretsCipher.encrypt(perChainKey);
       await booted.deps.db
         .prepare(
           `INSERT INTO alchemy_webhook_registry
-             (chain_id, webhook_id, signing_key, webhook_url, created_at, updated_at)
+             (chain_id, webhook_id, signing_key_ciphertext, webhook_url, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?)`
         )
-        .bind(1, "wh_eth_mainnet", perChainKey, "https://test.local/webhooks/alchemy", now, now)
+        .bind(1, "wh_eth_mainnet", ciphertext, "https://test.local/webhooks/alchemy", now, now)
         .run();
 
       const body = JSON.stringify({
@@ -347,13 +350,14 @@ describe("POST /webhooks/alchemy — per-webhook signing key from DB registry", 
     });
     try {
       const now = Date.now();
+      const ciphertext = await booted.deps.secretsCipher.encrypt(perChainKey);
       await booted.deps.db
         .prepare(
           `INSERT INTO alchemy_webhook_registry
-             (chain_id, webhook_id, signing_key, webhook_url, created_at, updated_at)
+             (chain_id, webhook_id, signing_key_ciphertext, webhook_url, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?)`
         )
-        .bind(1, "wh_registered", perChainKey, "https://x", now, now)
+        .bind(1, "wh_registered", ciphertext, "https://x", now, now)
         .run();
 
       const body = JSON.stringify({ webhookId: "wh_registered", event: { network: "ETH_MAINNET", activity: [] } });

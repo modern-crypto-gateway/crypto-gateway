@@ -1,3 +1,4 @@
+import type { SecretsCipher } from "../../core/ports/secrets-cipher.port.js";
 import { ALCHEMY_NETWORK_BY_CHAIN_ID } from "./alchemy-network.js";
 import type { AlchemyAdminClient, AlchemyWebhookSummary } from "./alchemy-admin-client.js";
 import type { AlchemyRegistryStore } from "./alchemy-registry-store.js";
@@ -52,6 +53,10 @@ export interface BootstrapAlchemyWebhooksArgs {
   // payload's `webhookId`. Existing webhooks are NOT upserted (Alchemy
   // doesn't return signing_key on list — we only have it at create time).
   registryStore?: AlchemyRegistryStore;
+  // Required when `registryStore` is set: the signingKey is encrypted before
+  // writing so the row is useless to anyone with DB-read-only access. Without
+  // this, bootstrap refuses to persist (would be silently storing plaintext).
+  secretsCipher?: SecretsCipher;
   // Clock injection so tests can assert persisted timestamps deterministically.
   now?: () => number;
 }
@@ -98,20 +103,27 @@ export async function bootstrapAlchemyWebhooks(
       // re-running bootstrap would find the webhook via `listWebhooks`
       // but wouldn't know the signing key (Alchemy doesn't return it on list).
       if (args.registryStore !== undefined && created.signing_key !== undefined) {
-        try {
-          await args.registryStore.upsert({
-            chainId,
-            webhookId: created.id,
-            signingKey: created.signing_key,
-            webhookUrl: args.webhookUrl,
-            now: (args.now ?? Date.now)()
-          });
-          result.persisted = true;
-        } catch (persistErr) {
+        if (args.secretsCipher === undefined) {
           result.persisted = false;
           result.error =
-            "webhook created in Alchemy but registry upsert failed: " +
-            (persistErr instanceof Error ? persistErr.message : String(persistErr));
+            "webhook created in Alchemy but registry upsert skipped: missing secretsCipher (refusing to store signingKey plaintext)";
+        } else {
+          try {
+            const ciphertext = await args.secretsCipher.encrypt(created.signing_key);
+            await args.registryStore.upsert({
+              chainId,
+              webhookId: created.id,
+              signingKeyCiphertext: ciphertext,
+              webhookUrl: args.webhookUrl,
+              now: (args.now ?? Date.now)()
+            });
+            result.persisted = true;
+          } catch (persistErr) {
+            result.persisted = false;
+            result.error =
+              "webhook created in Alchemy but registry upsert failed: " +
+              (persistErr instanceof Error ? persistErr.message : String(persistErr));
+          }
         }
       }
 

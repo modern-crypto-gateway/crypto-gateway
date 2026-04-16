@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS merchants (
   name                TEXT NOT NULL,
   api_key_hash        TEXT NOT NULL UNIQUE,
   webhook_url         TEXT,
-  webhook_secret_hash TEXT,
+  webhook_secret_ciphertext TEXT,
   active              INTEGER NOT NULL DEFAULT 1,
   created_at          INTEGER NOT NULL,
   updated_at          INTEGER NOT NULL
@@ -141,9 +141,11 @@ CREATE TABLE IF NOT EXISTS alchemy_webhook_registry (
   -- Alchemy's own id (wh_...). UNIQUE so we can look up by id from the
   -- inbound payload without scanning.
   webhook_id    TEXT NOT NULL UNIQUE,
-  -- Plaintext HMAC signing key as returned by Alchemy on create.
-  -- TODO(phase-9+): move to SignerStore under a webhook-signing-key scope.
-  signing_key   TEXT NOT NULL,
+  -- AES-GCM ciphertext of the HMAC signing key returned by Alchemy on create,
+  -- in the wire format produced by `SecretsCipher.encrypt` (`v1:<base64>`).
+  -- Decrypted per request in the /webhooks/alchemy ingest handler; plaintext
+  -- never lands in the DB.
+  signing_key_ciphertext TEXT NOT NULL,
   webhook_url   TEXT NOT NULL,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL

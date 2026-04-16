@@ -1,6 +1,10 @@
 import type { AppDeps } from "../app-deps.js";
 import { confirmTransactions } from "./payment.service.js";
-import { confirmPayouts, executeReservedPayouts } from "./payout.service.js";
+import {
+  confirmPayouts,
+  executeReservedPayouts,
+  sweepStuckFeeWalletReservations
+} from "./payout.service.js";
 import { pollPayments } from "./poll-payments.js";
 
 // Runs every scheduled job in sequence. Shared between the Workers `scheduled`
@@ -18,6 +22,7 @@ export interface ScheduledJobsResult {
   confirmTransactions: JobOutcome;
   executeReservedPayouts: JobOutcome;
   confirmPayouts: JobOutcome;
+  sweepStuckFeeWalletReservations: JobOutcome;
   // Present only when Alchemy is configured for this deployment
   // (`deps.alchemy` set). Absent otherwise — callers should not treat the
   // missing key as a failure.
@@ -31,7 +36,8 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     pollPayments: await run(() => pollPayments(deps)),
     confirmTransactions: await run(() => confirmTransactions(deps)),
     executeReservedPayouts: await run(() => executeReservedPayouts(deps)),
-    confirmPayouts: await run(() => confirmPayouts(deps))
+    confirmPayouts: await run(() => confirmPayouts(deps)),
+    sweepStuckFeeWalletReservations: await run(() => sweepStuckFeeWalletReservations(deps))
   };
   if (deps.alchemy !== undefined) {
     result.alchemySyncAddresses = await run(() => deps.alchemy!.syncAddresses());

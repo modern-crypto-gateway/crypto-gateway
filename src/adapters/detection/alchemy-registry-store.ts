@@ -1,9 +1,14 @@
 import type { DbAdapter } from "../../core/ports/db.port.js";
 
 // Per-chain Alchemy webhook registry. Persists the { chainId, webhookId,
-// signingKey, webhookUrl } tuple so the inbound /webhooks/alchemy route can
-// resolve the right HMAC key from the payload's `webhookId` — no shared env
-// var spoofable across chains.
+// signingKeyCiphertext, webhookUrl } tuple so the inbound /webhooks/alchemy
+// route can resolve the right HMAC key from the payload's `webhookId` — no
+// shared env var spoofable across chains.
+//
+// The store is a pure DB-row shuttle — encrypting the signing key on write
+// and decrypting on read is the caller's responsibility (via
+// `deps.secretsCipher`). This keeps the store free of crypto dependencies
+// and makes the encrypted-at-rest boundary explicit at every call site.
 //
 // Not a port. Alchemy-specific storage; if/when we add Helius, it'll get its
 // own registry with a different shape (Solana webhooks have different
@@ -12,7 +17,9 @@ import type { DbAdapter } from "../../core/ports/db.port.js";
 export interface AlchemyWebhookRegistryRow {
   chainId: number;
   webhookId: string;
-  signingKey: string;
+  // Ciphertext as stored — caller must decrypt via `SecretsCipher.decrypt`
+  // before using as an HMAC key.
+  signingKeyCiphertext: string;
   webhookUrl: string;
   createdAt: Date;
   updatedAt: Date;
@@ -21,7 +28,9 @@ export interface AlchemyWebhookRegistryRow {
 export interface UpsertArgs {
   chainId: number;
   webhookId: string;
-  signingKey: string;
+  // Already-encrypted ciphertext. Callers (bootstrap, sync-sweep) must have
+  // passed the plaintext through `SecretsCipher.encrypt` before calling.
+  signingKeyCiphertext: string;
   webhookUrl: string;
   now: number;
 }
@@ -30,8 +39,9 @@ export interface AlchemyRegistryStore {
   findByWebhookId(webhookId: string): Promise<AlchemyWebhookRegistryRow | null>;
   findByChainId(chainId: number): Promise<AlchemyWebhookRegistryRow | null>;
   // Upsert keyed by chainId — one webhook per chain in this deployment.
-  // Overwrites signing_key on re-create, so a delete+recreate-in-dashboard
-  // flow from the operator is recoverable via bootstrap.
+  // Overwrites signing_key_ciphertext on re-create, so a
+  // delete+recreate-in-dashboard flow from the operator is recoverable via
+  // bootstrap.
   upsert(args: UpsertArgs): Promise<void>;
   list(): Promise<readonly AlchemyWebhookRegistryRow[]>;
 }
@@ -39,7 +49,7 @@ export interface AlchemyRegistryStore {
 interface Row {
   chain_id: number;
   webhook_id: string;
-  signing_key: string;
+  signing_key_ciphertext: string;
   webhook_url: string;
   created_at: number;
   updated_at: number;
@@ -49,7 +59,7 @@ function rowToRegistry(row: Row): AlchemyWebhookRegistryRow {
   return {
     chainId: row.chain_id,
     webhookId: row.webhook_id,
-    signingKey: row.signing_key,
+    signingKeyCiphertext: row.signing_key_ciphertext,
     webhookUrl: row.webhook_url,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at)
@@ -74,19 +84,19 @@ export function dbAlchemyRegistryStore(db: DbAdapter): AlchemyRegistryStore {
       return row === null ? null : rowToRegistry(row);
     },
 
-    async upsert({ chainId, webhookId, signingKey, webhookUrl, now }) {
+    async upsert({ chainId, webhookId, signingKeyCiphertext, webhookUrl, now }) {
       await db
         .prepare(
           `INSERT INTO alchemy_webhook_registry
-             (chain_id, webhook_id, signing_key, webhook_url, created_at, updated_at)
+             (chain_id, webhook_id, signing_key_ciphertext, webhook_url, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(chain_id) DO UPDATE
              SET webhook_id = excluded.webhook_id,
-                 signing_key = excluded.signing_key,
+                 signing_key_ciphertext = excluded.signing_key_ciphertext,
                  webhook_url = excluded.webhook_url,
                  updated_at = excluded.updated_at`
         )
-        .bind(chainId, webhookId, signingKey, webhookUrl, now, now)
+        .bind(chainId, webhookId, signingKeyCiphertext, webhookUrl, now, now)
         .run();
     },
 

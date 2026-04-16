@@ -14,6 +14,7 @@ describe("loadConfig", () => {
       PORT: "9000",
       MASTER_SEED: "cat ".repeat(11) + "ranch",
       ADMIN_KEY: "x".repeat(32),
+      SECRETS_ENCRYPTION_KEY: "a".repeat(64),
       DB_ADAPTER: "libsql",
       DATABASE_URL: "file:./foo.db"
     });
@@ -21,6 +22,7 @@ describe("loadConfig", () => {
     expect(config.port).toBe(9000);
     expect(config.masterSeed).toContain("ranch");
     expect(config.adminKey).toHaveLength(32);
+    expect(config.secretsEncryptionKey).toHaveLength(64);
     expect(config.dbAdapter).toBe("libsql");
     expect(config.databaseUrl).toBe("file:./foo.db");
   });
@@ -66,6 +68,38 @@ describe("loadConfig", () => {
     it("allows dev with no MASTER_SEED (the node entrypoint fills in a placeholder)", () => {
       const config = loadConfig({ NODE_ENV: "development" });
       expect(config.masterSeed).toBeUndefined();
+    });
+
+    it("allows the 'test' environment to skip MASTER_SEED + ADMIN_KEY refinements", () => {
+      expect(() => loadConfig({ NODE_ENV: "test" })).not.toThrow();
+    });
+
+    it("requires SECRETS_ENCRYPTION_KEY as 64 hex chars in production", () => {
+      const baseline = {
+        NODE_ENV: "production",
+        MASTER_SEED: "cat ".repeat(11) + "ranch",
+        ADMIN_KEY: "x".repeat(32)
+      };
+      expect(() => loadConfig(baseline)).toThrow(/SECRETS_ENCRYPTION_KEY/);
+      expect(() => loadConfig({ ...baseline, SECRETS_ENCRYPTION_KEY: "short" })).toThrow(/SECRETS_ENCRYPTION_KEY/);
+      expect(() =>
+        loadConfig({ ...baseline, SECRETS_ENCRYPTION_KEY: "zzzz".repeat(16) })
+      ).toThrow(/SECRETS_ENCRYPTION_KEY/);
+      expect(() =>
+        loadConfig({ ...baseline, SECRETS_ENCRYPTION_KEY: "a".repeat(64) })
+      ).not.toThrow();
+    });
+
+    it("applies production guards to NODE_ENV=staging (prevents pre-prod with placeholder secrets)", () => {
+      expect(() =>
+        loadConfig({ NODE_ENV: "staging", ADMIN_KEY: "x".repeat(32) })
+      ).toThrow(/MASTER_SEED/);
+      expect(() =>
+        loadConfig({ NODE_ENV: "staging", MASTER_SEED: "dev-seed", ADMIN_KEY: "x".repeat(32) })
+      ).toThrow(/MASTER_SEED/);
+      expect(() =>
+        loadConfig({ NODE_ENV: "staging", MASTER_SEED: "real mnemonic", ADMIN_KEY: "short" })
+      ).toThrow(/ADMIN_KEY/);
     });
   });
 

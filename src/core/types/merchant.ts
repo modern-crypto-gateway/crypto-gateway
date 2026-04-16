@@ -10,11 +10,10 @@ export const MerchantSchema = z.object({
   // SHA-256 hex of the plaintext API key. Plaintext is shown once at creation and never stored.
   apiKeyHash: z.string().length(64).regex(/^[0-9a-f]+$/),
   webhookUrl: z.string().url().nullable(),
-  // PLAINTEXT 32-byte HMAC signing secret (hex-encoded), used as-is to sign
-  // outgoing webhook bodies. The column name `webhook_secret_hash` is a
-  // misnomer kept for DDL stability; it is NOT a hash of anything.
-  // TODO(phase-5): move to SignerStore for encryption-at-rest.
-  webhookSecretHash: z.string().length(64).regex(/^[0-9a-f]+$/).nullable(),
+  // AES-GCM ciphertext of the 32-byte HMAC signing secret, in the wire format
+  // produced by `SecretsCipher.encrypt` (`v1:<base64>`). Decrypted on demand
+  // in webhook-subscriber.ts; plaintext never lands in the DB.
+  webhookSecretCiphertext: z.string().nullable(),
   // SQLite stores booleans as INTEGER (0/1). We expose the row value directly
   // rather than coercing, because every query site reads it as a number and
   // comparing against 1 is clearer than flipping to boolean midway.

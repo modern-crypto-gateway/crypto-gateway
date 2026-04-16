@@ -9,6 +9,9 @@ import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-s
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
+import { loadMigrationsFromDir } from "../adapters/db/fs-migration-loader.js";
+import { applyMigrations } from "../adapters/db/migration-runner.js";
+import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
@@ -50,6 +53,14 @@ async function main(): Promise<void> {
     baseFields: { service: "crypto-gateway", runtime: "deno" }
   });
 
+  // Apply migrations at boot. Deno supports node:fs + node:url natively, so
+  // the shared fs loader works here too. Must run before any route handler.
+  const migrationsDir = new URL("../../migrations/", import.meta.url);
+  const migrationResult = await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
+  if (migrationResult.applied.length > 0) {
+    logger.info("migrations applied", { applied: migrationResult.applied });
+  }
+
   const cache = memoryCacheAdapter();
   const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
 
@@ -65,6 +76,14 @@ async function main(): Promise<void> {
       detectionStrategies[chainId] = rpcPollDetection();
     }
     logger.info("Alchemy EVM chains wired", { chainIds });
+  }
+
+  const secretsEncryptionKey = secrets.getOptional("SECRETS_ENCRYPTION_KEY");
+  const secretsCipher = secretsEncryptionKey !== undefined
+    ? await makeSecretsCipher(secretsEncryptionKey)
+    : await devCipher();
+  if (secretsEncryptionKey === undefined) {
+    logger.warn("SECRETS_ENCRYPTION_KEY not set; using dev cipher (NOT safe for production)");
   }
 
   let alchemy: AppDeps["alchemy"];
@@ -86,6 +105,7 @@ async function main(): Promise<void> {
       onError: (err, name) => logger.error("deferred job failed", { name, error: String(err) })
     }),
     secrets,
+    secretsCipher,
     signerStore: memorySignerStore(),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: inlineFetchDispatcher(),

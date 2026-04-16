@@ -40,9 +40,14 @@ const RegisterFeeWalletSchema = z.object({
 
 // Bootstrap input. Every field optional — falls back to env / defaults so the
 // simplest possible call is `POST /admin/bootstrap/alchemy-webhooks {}`.
+//
+// The webhook URL is intentionally NOT accepted in the body: it is read from
+// the ALCHEMY_WEBHOOK_URL env exclusively. An attacker with a leaked ADMIN_KEY
+// would otherwise be able to point Alchemy's webhook traffic at an arbitrary
+// host (leaking transfer patterns and burning through the 50k-address cap).
+// Operators who need to target a different URL should change the env and
+// redeploy, not call the API with a different body.
 const BootstrapAlchemyWebhooksSchema = z.object({
-  // Public URL Alchemy will POST to. Defaults to ALCHEMY_WEBHOOK_URL env.
-  webhookUrl: z.string().url().optional(),
   // Narrow the chain set. Defaults to ALCHEMY_CHAINS env, then the mainnet list.
   chainIds: z.array(z.number().int().positive()).optional(),
   // Per-chain initial address to seed the webhook with. Alchemy requires at
@@ -76,10 +81,17 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       const id = globalThis.crypto.randomUUID();
       const now = deps.clock.now().getTime();
 
+      // HMAC signing requires the plaintext secret, so hashing isn't an option.
+      // We encrypt at rest via secretsCipher (AES-GCM, master key in
+      // SECRETS_ENCRYPTION_KEY) and decrypt per dispatch in webhook-subscriber.
+      const webhookSecretCiphertext = parsed.webhookUrl
+        ? await deps.secretsCipher.encrypt(webhookSecret)
+        : null;
+
       await deps.db
         .prepare(
           `INSERT INTO merchants
-             (id, name, api_key_hash, webhook_url, webhook_secret_hash, active, created_at, updated_at)
+             (id, name, api_key_hash, webhook_url, webhook_secret_ciphertext, active, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
         )
         .bind(
@@ -87,7 +99,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
           parsed.name,
           apiKeyHash,
           parsed.webhookUrl ?? null,
-          parsed.webhookUrl ? webhookSecret : null,
+          webhookSecretCiphertext,
           now,
           now
         )
@@ -166,13 +178,13 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       return renderError(c, err, deps.logger);
     }
 
-    const webhookUrl = parsed.webhookUrl ?? deps.secrets.getOptional("ALCHEMY_WEBHOOK_URL");
+    const webhookUrl = deps.secrets.getOptional("ALCHEMY_WEBHOOK_URL");
     if (webhookUrl === undefined) {
       return c.json(
         {
           error: {
             code: "MISSING_WEBHOOK_URL",
-            message: "Provide `webhookUrl` in the body or set ALCHEMY_WEBHOOK_URL env."
+            message: "Set ALCHEMY_WEBHOOK_URL env to the public URL Alchemy should POST to."
           }
         },
         400
@@ -198,6 +210,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         webhookUrl,
         chainIds,
         registryStore,
+        secretsCipher: deps.secretsCipher,
         now: () => deps.clock.now().getTime()
       };
       if (Object.keys(seedAddressByChainId).length > 0) {

@@ -77,7 +77,7 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     }
   });
 
-  it("400 when neither body.webhookUrl nor ALCHEMY_WEBHOOK_URL is set", async () => {
+  it("400 when ALCHEMY_WEBHOOK_URL env is not set", async () => {
     const noUrl = await bootTestApp({
       secretsOverrides: { ADMIN_KEY, ALCHEMY_AUTH_TOKEN: "alch_auth_test" }
     });
@@ -144,12 +144,22 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     // route can resolve signing keys by webhookId.
     expect(body.results.every((r) => r.persisted === true)).toBe(true);
     const rows = await booted.deps.db
-      .prepare("SELECT chain_id, webhook_id, signing_key FROM alchemy_webhook_registry ORDER BY chain_id")
-      .all<{ chain_id: number; webhook_id: string; signing_key: string }>();
-    expect(rows.results).toEqual([
-      { chain_id: 1, webhook_id: "wh_1", signing_key: "whsec_1" },
-      { chain_id: 137, webhook_id: "wh_137", signing_key: "whsec_137" }
+      .prepare("SELECT chain_id, webhook_id, signing_key_ciphertext FROM alchemy_webhook_registry ORDER BY chain_id")
+      .all<{ chain_id: number; webhook_id: string; signing_key_ciphertext: string }>();
+    expect(rows.results.map((r) => ({ chain_id: r.chain_id, webhook_id: r.webhook_id }))).toEqual([
+      { chain_id: 1, webhook_id: "wh_1" },
+      { chain_id: 137, webhook_id: "wh_137" }
     ]);
+    // Stored signing keys are ciphertext, not plaintext — the security fix.
+    for (const r of rows.results) {
+      expect(r.signing_key_ciphertext).toMatch(/^v1:/);
+      expect(r.signing_key_ciphertext).not.toContain("whsec_");
+    }
+    // Round-trip: decrypted ciphertext matches what Alchemy returned.
+    const decrypted1 = await booted.deps.secretsCipher.decrypt(rows.results[0]!.signing_key_ciphertext);
+    const decrypted137 = await booted.deps.secretsCipher.decrypt(rows.results[1]!.signing_key_ciphertext);
+    expect(decrypted1).toBe("whsec_1");
+    expect(decrypted137).toBe("whsec_137");
   });
 
   it("re-bootstrapping with new signing keys rotates the DB row", async () => {
@@ -187,9 +197,12 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     );
 
     const row = await booted.deps.db
-      .prepare("SELECT webhook_id, signing_key FROM alchemy_webhook_registry WHERE chain_id = 1")
-      .first<{ webhook_id: string; signing_key: string }>();
-    expect(row).toEqual({ webhook_id: "wh_1_v2", signing_key: "whsec_1_v2" });
+      .prepare("SELECT webhook_id, signing_key_ciphertext FROM alchemy_webhook_registry WHERE chain_id = 1")
+      .first<{ webhook_id: string; signing_key_ciphertext: string }>();
+    expect(row?.webhook_id).toBe("wh_1_v2");
+    // Ciphertext rotated too — decrypting yields the new plaintext from v2.
+    const decrypted = await booted.deps.secretsCipher.decrypt(row!.signing_key_ciphertext);
+    expect(decrypted).toBe("whsec_1_v2");
   });
 
   it("idempotent: re-running with the same URL reports 'existing' without creating again", async () => {
@@ -229,6 +242,42 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     const body = (await res.json()) as { results: Array<{ status: string }> };
     expect(body.results[0]?.status).toBe("existing");
     expect(createCalls).toBe(0);
+  });
+
+  it("ignores body.webhookUrl — env-only gating prevents ADMIN_KEY-leak escalation", async () => {
+    // Security regression: a prior version let the caller specify webhookUrl
+    // in the body. That turned a leaked ADMIN_KEY into an arbitrary-redirect
+    // primitive against Alchemy. The handler now sources the URL from
+    // ALCHEMY_WEBHOOK_URL env exclusively and silently drops the body field.
+    const seenWebhookUrls: string[] = [];
+    const app = mountAdminWith(booted, () =>
+      fakeClient({
+        listWebhooks: async () => [],
+        createWebhook: async (args) => {
+          seenWebhookUrls.push(args.webhookUrl);
+          return {
+            id: `wh_${args.chainId}`,
+            network: "ETH_MAINNET",
+            webhook_type: "ADDRESS_ACTIVITY",
+            webhook_url: args.webhookUrl,
+            is_active: true,
+            signing_key: `whsec_${args.chainId}`
+          };
+        }
+      })
+    );
+    const res = await app.fetch(
+      new Request("http://test.local/admin/bootstrap/alchemy-webhooks", {
+        method: "POST",
+        headers: authHeader(),
+        body: JSON.stringify({
+          chainIds: [1],
+          webhookUrl: "https://evil.example.com/exfil"
+        })
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(seenWebhookUrls).toEqual(["https://gateway.example.com/webhooks/alchemy"]);
   });
 
   it("flags unsupported chainIds without creating a webhook for them", async () => {

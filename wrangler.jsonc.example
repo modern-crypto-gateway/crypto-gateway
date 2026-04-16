@@ -6,13 +6,24 @@
 // First-time setup:
 //   cp wrangler.jsonc.example wrangler.jsonc
 //   npx wrangler d1 create crypto-gateway-dev           # paste database_id below
-//   npx wrangler d1 execute crypto-gateway-dev --file=migrations/schema.sql
+//   # Apply every SQL file in migrations/ in order against the REMOTE D1.
+//   # Workers cannot read the filesystem at runtime, so migrations are applied
+//   # CLI-side. Omitting --remote writes only to the local .wrangler sandbox,
+//   # which is fine for `wrangler dev` but NOT for a deployed worker:
+//   for f in migrations/*.sql; do npx wrangler d1 execute crypto-gateway-dev --remote --file="$f"; done
+//   # For local dev against `wrangler dev`, repeat without --remote:
+//   # for f in migrations/*.sql; do npx wrangler d1 execute crypto-gateway-dev --file="$f"; done
 //   npx wrangler kv namespace create CACHE              # paste id below
 //   npx wrangler secret put MASTER_SEED                 # BIP39 mnemonic
 //   npx wrangler secret put ADMIN_KEY                   # random 32+ chars
 //   npx wrangler secret put ALCHEMY_NOTIFY_SIGNING_KEY  # optional, only if using Alchemy ingest
 //   npx wrangler secret put CRON_SECRET                 # optional, only for /internal/cron/tick
 //   npx wrangler secret put ALCHEMY_API_KEY                 # optional, but recommended
+//
+// When a new migration is added (e.g. `migrations/0002_foo.sql`): re-run the
+// loop above. D1 has no runtime filesystem access, so the wrangler CLI is the
+// canonical migration applier for Workers deployments. Node / Deno run the
+// migration-runner at boot and apply any new files automatically.
 //
 // Deploy:
 //   npx wrangler deploy -e dev

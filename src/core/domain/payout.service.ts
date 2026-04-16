@@ -167,6 +167,14 @@ export async function executeReservedPayouts(deps: AppDeps): Promise<ExecuteSwee
     // 3. Build -> sign -> broadcast. Any throw here moves us to 'failed' and
     //    releases the wallet so a retry (with a different or the same wallet)
     //    can proceed.
+    //
+    // DEFERRED (Stage B.2, double-spend hardening): we do NOT persist the
+    // unsigned tx + nonce before broadcast. If the process crashes AFTER
+    // broadcast but BEFORE the status='submitted' write below, a retry will
+    // call buildTransfer again with a fresh nonce and broadcast a second tx.
+    // Fix requires a `broadcast_intent` row written in the same batch as the
+    // 'reserved' transition, then idempotent re-broadcast on retry. Tracked
+    // as Stage B.2 — NOT safe to enable real-money payouts until resolved.
     try {
       const unsigned = await chainAdapter.buildTransfer({
         chainId: row.chain_id,
@@ -201,13 +209,15 @@ export async function executeReservedPayouts(deps: AppDeps): Promise<ExecuteSwee
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const now2 = deps.clock.now().getTime();
-      await deps.db
-        .prepare(
-          "UPDATE payouts SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?"
-        )
-        .bind(message.slice(0, 2048), now2, row.id)
-        .run();
-      await releaseFeeWallet(deps, row.id);
+      // Terminal transition: flip payout to 'failed' AND release the fee wallet
+      // in a single atomic batch. A crash between the two statements would
+      // otherwise leave the wallet reserved forever.
+      await deps.db.batch([
+        deps.db
+          .prepare("UPDATE payouts SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?")
+          .bind(message.slice(0, 2048), now2, row.id),
+        releaseFeeWalletStmt(deps, row.id)
+      ]);
 
       const updated = await fetchPayout(deps, row.id);
       if (updated) {
@@ -248,13 +258,13 @@ export async function confirmPayouts(deps: AppDeps): Promise<ConfirmPayoutsResul
     const threshold = confirmationThreshold(row.chain_id);
 
     if (status.reverted) {
-      await deps.db
-        .prepare(
-          "UPDATE payouts SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?"
-        )
-        .bind("Transaction reverted on-chain", now, row.id)
-        .run();
-      await releaseFeeWallet(deps, row.id);
+      // Batched with releaseFeeWallet so the two writes commit together.
+      await deps.db.batch([
+        deps.db
+          .prepare("UPDATE payouts SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?")
+          .bind("Transaction reverted on-chain", now, row.id),
+        releaseFeeWalletStmt(deps, row.id)
+      ]);
       const updated = await fetchPayout(deps, row.id);
       if (updated) {
         await deps.events.publish({ type: "payout.failed", payoutId: updated.id, payout: updated, at: new Date(now) });
@@ -264,13 +274,13 @@ export async function confirmPayouts(deps: AppDeps): Promise<ConfirmPayoutsResul
     }
 
     if (status.confirmations >= threshold) {
-      await deps.db
-        .prepare(
-          "UPDATE payouts SET status = 'confirmed', confirmed_at = ?, updated_at = ? WHERE id = ?"
-        )
-        .bind(now, now, row.id)
-        .run();
-      await releaseFeeWallet(deps, row.id);
+      // Batched with releaseFeeWallet so the two writes commit together.
+      await deps.db.batch([
+        deps.db
+          .prepare("UPDATE payouts SET status = 'confirmed', confirmed_at = ?, updated_at = ? WHERE id = ?")
+          .bind(now, now, row.id),
+        releaseFeeWalletStmt(deps, row.id)
+      ]);
       const updated = await fetchPayout(deps, row.id);
       if (updated) {
         await deps.events.publish({ type: "payout.confirmed", payoutId: updated.id, payout: updated, at: new Date(now) });
@@ -284,6 +294,93 @@ export async function confirmPayouts(deps: AppDeps): Promise<ConfirmPayoutsResul
 
 export async function getPayout(deps: AppDeps, id: PayoutId): Promise<Payout | null> {
   return fetchPayout(deps, id);
+}
+
+export interface FeeWalletSweepResult {
+  // Reservations cleared because the owning payout was already in a terminal
+  // state (confirmed / failed / canceled) — defense-in-depth for the atomic
+  // batch fix; expected to be zero on a healthy system.
+  releasedTerminal: number;
+  // Reservations older than `stuckThresholdMs` whose payout is still `reserved`
+  // (i.e. mid-broadcast crash). NOT auto-released — we can't tell whether the
+  // broadcast landed on-chain without a tx_hash. Logged for operator review.
+  stuckPending: number;
+}
+
+export interface SweepStuckFeeWalletReservationsOptions {
+  // Reservations older than this in 'reserved' state are flagged as stuck.
+  // Defaults to 30 minutes — well above any realistic broadcast time, below
+  // any cron that a human operator would tolerate as silent.
+  stuckThresholdMs?: number;
+}
+
+// Cron-triggered watchdog. Two responsibilities:
+//
+// 1. **Terminal-state release (defense-in-depth)** — find any fee wallet whose
+//    `reserved_by_payout_id` points at a payout in a terminal state and clear
+//    it. The atomic batch in confirmPayouts / executeReservedPayouts.failed
+//    path makes this a no-op on new rows; it catches legacy strands and
+//    covers the (rare) case where the batch itself partially committed
+//    under a D1/libSQL failure.
+//
+// 2. **Stuck-pending alert** — any fee wallet reserved > `stuckThresholdMs` ago
+//    whose payout is still `reserved` (no tx_hash recorded) is logged at WARN.
+//    We intentionally do NOT auto-release: if the broadcast did land on-chain
+//    but we crashed before writing tx_hash, releasing the wallet would let a
+//    second payout reuse it while the ghost tx still settles. Operator
+//    intervention required.
+export async function sweepStuckFeeWalletReservations(
+  deps: AppDeps,
+  opts: SweepStuckFeeWalletReservationsOptions = {}
+): Promise<FeeWalletSweepResult> {
+  const stuckThresholdMs = opts.stuckThresholdMs ?? 30 * 60 * 1000;
+  const now = deps.clock.now().getTime();
+
+  const terminalRelease = await deps.db
+    .prepare(
+      `UPDATE fee_wallets
+          SET reserved_by_payout_id = NULL, reserved_at = NULL
+        WHERE reserved_by_payout_id IS NOT NULL
+          AND reserved_by_payout_id IN (
+            SELECT id FROM payouts WHERE status IN ('confirmed', 'failed', 'canceled')
+          )`
+    )
+    .run();
+
+  const stuck = await deps.db
+    .prepare(
+      `SELECT fw.id AS wallet_id, fw.address, fw.reserved_by_payout_id AS payout_id,
+              fw.reserved_at, p.status AS payout_status
+         FROM fee_wallets fw
+         JOIN payouts p ON p.id = fw.reserved_by_payout_id
+        WHERE fw.reserved_at IS NOT NULL
+          AND fw.reserved_at < ?
+          AND p.status = 'reserved'`
+    )
+    .bind(now - stuckThresholdMs)
+    .all<{
+      wallet_id: string;
+      address: string;
+      payout_id: string;
+      reserved_at: number;
+      payout_status: string;
+    }>();
+
+  for (const row of stuck.results) {
+    deps.logger.warn("fee wallet reservation stuck mid-broadcast; operator review required", {
+      walletId: row.wallet_id,
+      address: row.address,
+      payoutId: row.payout_id,
+      payoutStatus: row.payout_status,
+      reservedAt: new Date(row.reserved_at).toISOString(),
+      heldMinutes: Math.round((now - row.reserved_at) / 60_000)
+    });
+  }
+
+  return {
+    releasedTerminal: terminalRelease.meta.changes ?? 0,
+    stuckPending: stuck.results.length
+  };
 }
 
 // ---- Internals ----
@@ -324,13 +421,15 @@ async function tryReserveFeeWallet(
   return claim ?? null;
 }
 
-async function releaseFeeWallet(deps: AppDeps, payoutId: string): Promise<void> {
-  await deps.db
+// Returns the prepared statement without executing it, so callers can include
+// it in a `db.batch([...])` alongside the terminal status update. The two
+// writes must commit atomically — a crash between them strands the wallet.
+function releaseFeeWalletStmt(deps: AppDeps, payoutId: string) {
+  return deps.db
     .prepare(
       "UPDATE fee_wallets SET reserved_by_payout_id = NULL, reserved_at = NULL WHERE reserved_by_payout_id = ?"
     )
-    .bind(payoutId)
-    .run();
+    .bind(payoutId);
 }
 
 function feeWalletScope(chainAdapter: ChainAdapter, label: string): SignerScope {

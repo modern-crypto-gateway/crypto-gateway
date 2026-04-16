@@ -9,6 +9,7 @@ import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-s
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
+import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
@@ -34,7 +35,7 @@ export const runtime = "edge";
 // net sockets — no code change required vs the Node path.
 
 let cachedDeps: AppDeps | null = null;
-function getDeps(): AppDeps {
+async function getDeps(): Promise<AppDeps> {
   const existing = cachedDeps;
   if (existing !== null) return existing;
   const secrets = processEnvSecrets();
@@ -65,6 +66,14 @@ function getDeps(): AppDeps {
     logger.info("Alchemy EVM chains wired", { chainIds });
   }
 
+  const secretsEncryptionKey = secrets.getOptional("SECRETS_ENCRYPTION_KEY");
+  const secretsCipher = secretsEncryptionKey !== undefined
+    ? await makeSecretsCipher(secretsEncryptionKey)
+    : await devCipher();
+  if (secretsEncryptionKey === undefined) {
+    logger.warn("SECRETS_ENCRYPTION_KEY not set; using dev cipher (NOT safe for production)");
+  }
+
   let alchemy: AppDeps["alchemy"];
   const alchemyAuthToken = secrets.getOptional("ALCHEMY_AUTH_TOKEN");
   if (alchemyAuthToken !== undefined) {
@@ -84,6 +93,7 @@ function getDeps(): AppDeps {
       onError: (err, name) => logger.error("deferred job failed", { name, error: String(err) })
     }),
     secrets,
+    secretsCipher,
     signerStore: memorySignerStore(),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: inlineFetchDispatcher(),
@@ -108,6 +118,6 @@ function getDeps(): AppDeps {
 // Vercel Edge invokes the default export with (Request) and expects Response
 // (or Promise<Response>). Hono's `.fetch` matches that signature exactly.
 export default async function handler(req: Request): Promise<Response> {
-  const app = buildApp(getDeps());
+  const app = buildApp(await getDeps());
   return app.fetch(req) as Promise<Response>;
 }

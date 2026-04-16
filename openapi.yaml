@@ -295,10 +295,6 @@ paths:
             schema:
               type: object
               properties:
-                webhookUrl:
-                  type: string
-                  format: uri
-                  description: Defaults to `ALCHEMY_WEBHOOK_URL` env if unset
                 chainIds:
                   type: array
                   items: { type: integer }
@@ -307,6 +303,10 @@ paths:
                   type: object
                   additionalProperties: { type: string }
                   description: Per-chain placeholder address (Alchemy requires ≥1 at create). Defaults to zero-address.
+              description: |
+                The target webhook URL is NOT accepted in the body. It is sourced from
+                `ALCHEMY_WEBHOOK_URL` env exclusively so a leaked ADMIN_KEY cannot be
+                used to redirect Alchemy's traffic to an arbitrary host.
       responses:
         "200":
           description: Bootstrap complete; per-chain status in body
@@ -330,7 +330,7 @@ paths:
                           description: Only present when `status=created`. Save into `ALCHEMY_NOTIFY_SIGNING_KEY`.
                         error: { type: string }
         "400":
-          description: Missing ALCHEMY_AUTH_TOKEN or webhookUrl
+          description: Missing ALCHEMY_AUTH_TOKEN or ALCHEMY_WEBHOOK_URL env
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

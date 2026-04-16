@@ -58,7 +58,10 @@ the merchant API.
 cp wrangler.jsonc.example wrangler.jsonc
 # Create bindings + paste the ids into wrangler.jsonc:
 npx wrangler d1 create crypto-gateway-dev
-npx wrangler d1 execute crypto-gateway-dev --file=migrations/schema.sql
+# Apply every SQL file in migrations/ in order against REMOTE D1 (the one
+# your deployed worker will read). Without --remote, wrangler writes to the
+# local .wrangler sandbox only — fine for `wrangler dev`, invisible to prod.
+for f in migrations/*.sql; do npx wrangler d1 execute crypto-gateway-dev --remote --file="$f"; done
 npx wrangler kv namespace create CACHE
 
 # Set secrets (not in wrangler.jsonc — they go to Cloudflare's store):
@@ -150,14 +153,21 @@ source.
 ### Auto-bootstrap Alchemy webhooks (optional)
 
 Rather than click through Alchemy's dashboard to create webhooks manually, set
-`ALCHEMY_AUTH_TOKEN` and POST to the bootstrap endpoint:
+`ALCHEMY_AUTH_TOKEN` + `ALCHEMY_WEBHOOK_URL` and POST to the bootstrap endpoint:
 
 ```bash
+# Set once in your deployment env:
+# ALCHEMY_WEBHOOK_URL=https://gateway.example.com/webhooks/alchemy
+
 curl -X POST "$GATEWAY_URL/admin/bootstrap/alchemy-webhooks" \
   -H "Authorization: Bearer $ADMIN_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"webhookUrl": "'"$GATEWAY_URL"'/webhooks/alchemy", "chainIds": [1, 137]}'
+  -d '{"chainIds": [1, 137]}'
 ```
+
+The target URL is read from `ALCHEMY_WEBHOOK_URL` only — passing it in the body
+is intentionally rejected so a leaked `ADMIN_KEY` can't redirect Alchemy's
+webhook traffic to an arbitrary host.
 
 Response:
 
@@ -181,8 +191,8 @@ delete and recreate the webhook. The bootstrap can only create ONE webhook per
 enabling multiple chains keep them on separate subdomains or accept that
 you'll rotate keys when you expand.
 
-Set `ALCHEMY_WEBHOOK_URL` + `ALCHEMY_CHAINS` env vars to make the bootstrap
-body empty-callable:
+With both `ALCHEMY_WEBHOOK_URL` and `ALCHEMY_CHAINS` env vars set the bootstrap
+request body can be empty:
 
 ```bash
 ALCHEMY_WEBHOOK_URL=https://gateway.example.com/webhooks/alchemy
@@ -267,6 +277,25 @@ just hit the ingest's idempotency gate the second time.
 Full spec: [`openapi.yaml`](openapi.yaml). Import it into Postman, Bruno, or
 Insomnia for an interactive client. A ready-made Postman collection is at
 [`postman/crypto-gateway.postman_collection.json`](postman/crypto-gateway.postman_collection.json).
+
+## Database migrations
+
+Migrations live as sortable SQL files in [`migrations/`](migrations/) (e.g.
+`0001_initial.sql`). A `schema_migrations` tracking table records which files
+have been applied, so re-running is idempotent and only adds new files.
+
+| Runtime        | Applied how                                                               |
+| -------------- | ------------------------------------------------------------------------- |
+| Node           | At boot by `applyMigrations(db, loadMigrationsFromDir(…))` in `node.ts`. |
+| Deno           | At boot, same call in `deno.ts`. Deno supports `node:fs` + `node:url`.    |
+| Cloudflare Workers | CLI-side via wrangler (Workers have no FS at runtime). Run `for f in migrations/*.sql; do npx wrangler d1 execute <db> --remote --file="$f"; done` once per new migration. Add `--remote` or you're writing to the local `.wrangler` sandbox, NOT the D1 your deployed worker reads. |
+| Vercel Edge    | CLI-side against the Turso libSQL endpoint (Edge runtime also has no FS). Point a Node environment at `DATABASE_URL` + `DATABASE_TOKEN` and call `applyMigrations` from a small script, or run each file via the Turso CLI. |
+
+Adding a new migration: drop a new `NNNN_description.sql` file into
+`migrations/`. Must be **strictly numerically newer** than all predecessors
+(filename sort is lexicographic), and must be idempotent — D1 and libSQL
+cannot wrap DDL in a rollback, so we only mark the tracking row written
+after the SQL succeeds, meaning a failed partial run can retry.
 
 ## Development
 

@@ -1,10 +1,12 @@
-import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import "dotenv/config";
 import { buildApp } from "../app.js";
 import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
+import { loadMigrationsFromDir } from "../adapters/db/fs-migration-loader.js";
+import { applyMigrations } from "../adapters/db/migration-runner.js";
+import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
@@ -12,7 +14,7 @@ import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adap
 import { processEnvSecrets } from "../adapters/secrets/process-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
-import { noopWebhookDispatcher } from "../adapters/webhook-delivery/noop.adapter.js";
+import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
@@ -69,7 +71,11 @@ async function main(): Promise<void> {
     dbAuthToken !== undefined ? { url: databaseUrl, authToken: dbAuthToken } : { url: databaseUrl }
   );
 
-  await applySchema(db);
+  const migrationsDir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "migrations");
+  const migrationResult = await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
+  if (migrationResult.applied.length > 0) {
+    logger.info("migrations applied", { applied: migrationResult.applied });
+  }
   if (!production) {
     await seedDefaultMerchantIfMissing(db, logger);
   }
@@ -99,6 +105,18 @@ async function main(): Promise<void> {
     logger.info("Alchemy EVM chains wired", { chainIds });
   }
 
+  // Secrets-at-rest cipher. In prod/staging `SECRETS_ENCRYPTION_KEY` is
+  // required (config.schema.ts enforces); in dev/test we fall back to the
+  // well-known dev key so `npm run dev:node` works out of the box.
+  const secretsCipher = config.secretsEncryptionKey !== undefined
+    ? await makeSecretsCipher(config.secretsEncryptionKey)
+    : await devCipher();
+  if (config.secretsEncryptionKey === undefined) {
+    logger.warn(
+      "SECRETS_ENCRYPTION_KEY not set; using dev cipher (NOT safe for production). Generate one with `node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"`"
+    );
+  }
+
   // Alchemy subscription lifecycle: if ALCHEMY_AUTH_TOKEN is set, wire a sync
   // sweep that batches pending add/remove ops from the event-driven subscription
   // queue and posts them to Alchemy's /update-webhook-addresses endpoint.
@@ -122,9 +140,10 @@ async function main(): Promise<void> {
       onError: (err, name) => logger.error("deferred job failed", { name, error: String(err) })
     }),
     secrets,
+    secretsCipher,
     signerStore: memorySignerStore(),
     priceOracle: staticPegPriceOracle(),
-    webhookDispatcher: noopWebhookDispatcher(),
+    webhookDispatcher: inlineFetchDispatcher(),
     events: createInMemoryEventBus(),
     logger,
     rateLimiter,
@@ -159,14 +178,6 @@ async function main(): Promise<void> {
   });
 }
 
-async function applySchema(db: AppDeps["db"]): Promise<void> {
-  const here = dirname(fileURLToPath(import.meta.url));
-  // src/entrypoints/node.ts  ->  repo root is two dirs up.
-  const schemaPath = resolve(here, "..", "..", "migrations", "schema.sql");
-  const sql = readFileSync(schemaPath, "utf8");
-  await db.exec(sql);
-}
-
 // Dev-only helper. Guarded at the call site by `if (!production)`; this
 // function itself remains single-purpose so the dev-only behavior is obvious.
 async function seedDefaultMerchantIfMissing(db: AppDeps["db"], logger: AppDeps["logger"]): Promise<void> {
@@ -175,7 +186,7 @@ async function seedDefaultMerchantIfMissing(db: AppDeps["db"], logger: AppDeps["
   const now = Date.now();
   await db
     .prepare(
-      `INSERT INTO merchants (id, name, api_key_hash, webhook_url, webhook_secret_hash, active, created_at, updated_at)
+      `INSERT INTO merchants (id, name, api_key_hash, webhook_url, webhook_secret_ciphertext, active, created_at, updated_at)
        VALUES (?, ?, ?, NULL, NULL, 1, ?, ?)`
     )
     .bind(

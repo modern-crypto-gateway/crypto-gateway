@@ -1,8 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { libsqlAdapter } from "../../adapters/db/libsql.adapter.js";
+import { loadMigrationsFromDir } from "../../adapters/db/fs-migration-loader.js";
+import { applyMigrations } from "../../adapters/db/migration-runner.js";
 import {
   dbAlchemySubscriptionStore,
   type AlchemySubscriptionStore
@@ -10,9 +9,8 @@ import {
 
 async function freshStore(): Promise<{ store: AlchemySubscriptionStore; db: ReturnType<typeof libsqlAdapter> }> {
   const db = libsqlAdapter({ url: ":memory:" });
-  const here = dirname(fileURLToPath(import.meta.url));
-  const schemaPath = resolve(here, "..", "..", "..", "migrations", "schema.sql");
-  await db.exec(readFileSync(schemaPath, "utf8"));
+  const migrationsDir = new URL("../../../migrations/", import.meta.url);
+  await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
   return { store: dbAlchemySubscriptionStore(db), db };
 }
 

@@ -29,6 +29,10 @@ export const AppConfigSchema = z
     adminKey: z.string().optional(),
     sweepMasterKey: z.string().optional(),
     cronSecret: z.string().optional(),
+    // 32 bytes hex (64 chars) — AES-256-GCM master key for encrypting secrets
+    // at rest (merchant webhook HMAC secrets, Alchemy signing keys). Dev/test
+    // fall back to a fixed dev key; prod/staging require a real one.
+    secretsEncryptionKey: z.string().optional(),
 
     // Provider secrets.
     alchemyApiKey: z.string().optional(),
@@ -52,16 +56,27 @@ export const AppConfigSchema = z
     rateLimitCheckoutPerMinute: z.coerce.number().int().min(1).default(60),
     rateLimitWebhookIngestPerMinute: z.coerce.number().int().min(1).default(300)
   })
+  // Production-grade guards also apply to `staging` so a pre-prod deploy can't
+  // quietly run with placeholder secrets. Only `development` and `test` are
+  // exempt — any other value (including the default "production") is treated
+  // as a live environment.
   .refine(
-    (c) => c.environment !== "production" || (c.masterSeed !== undefined && c.masterSeed !== "" && c.masterSeed !== "dev-seed"),
+    (c) => isRelaxedEnvironment(c.environment) || (c.masterSeed !== undefined && c.masterSeed !== "" && c.masterSeed !== "dev-seed"),
     {
-      message: "MASTER_SEED must be a real BIP39 mnemonic in production (not empty or the 'dev-seed' placeholder)",
+      message: "MASTER_SEED must be a real BIP39 mnemonic in production/staging (not empty or the 'dev-seed' placeholder)",
       path: ["masterSeed"]
     }
   )
   .refine(
-    (c) => c.environment !== "production" || (c.adminKey !== undefined && c.adminKey.length >= 32),
-    { message: "ADMIN_KEY must be at least 32 characters in production", path: ["adminKey"] }
+    (c) => isRelaxedEnvironment(c.environment) || (c.adminKey !== undefined && c.adminKey.length >= 32),
+    { message: "ADMIN_KEY must be at least 32 characters in production/staging", path: ["adminKey"] }
+  )
+  .refine(
+    (c) => isRelaxedEnvironment(c.environment) || (c.secretsEncryptionKey !== undefined && /^[0-9a-fA-F]{64}$/.test(c.secretsEncryptionKey)),
+    {
+      message: "SECRETS_ENCRYPTION_KEY must be 64 hex chars (32 bytes) in production/staging — generate via `node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"`",
+      path: ["secretsEncryptionKey"]
+    }
   )
   .refine(
     (c) => c.dbAdapter !== "libsql" || c.databaseUrl !== undefined,
@@ -77,6 +92,13 @@ export const AppConfigSchema = z
   );
 
 export type AppConfig = z.infer<typeof AppConfigSchema>;
+
+// Environments that are allowed to skip the strict production refinements
+// (missing MASTER_SEED / short ADMIN_KEY). Anything else — including the
+// default "production" — is treated as a live environment.
+function isRelaxedEnvironment(env: string): boolean {
+  return env === "development" || env === "test";
+}
 
 // Typed error class so entrypoints can differentiate misconfiguration from
 // runtime failures in their top-level catch handler.
@@ -102,6 +124,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     adminKey: env["ADMIN_KEY"],
     sweepMasterKey: env["SWEEP_MASTER_KEY"],
     cronSecret: env["CRON_SECRET"],
+    secretsEncryptionKey: env["SECRETS_ENCRYPTION_KEY"],
     alchemyApiKey: env["ALCHEMY_API_KEY"],
     alchemyChains: env["ALCHEMY_CHAINS"],
     alchemyNotifySigningKey: env["ALCHEMY_NOTIFY_SIGNING_KEY"],

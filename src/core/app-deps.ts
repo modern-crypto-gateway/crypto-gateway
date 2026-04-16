@@ -6,6 +6,7 @@ import type { JobRunner } from "./ports/jobs.port.ts";
 import type { Logger } from "./ports/logger.port.ts";
 import type { PriceOracle } from "./ports/price-oracle.port.ts";
 import type { RateLimiter } from "./ports/rate-limit.port.ts";
+import type { SecretsCipher } from "./ports/secrets-cipher.port.ts";
 import type { SecretsProvider } from "./ports/secrets.port.ts";
 import type { SignerStore } from "./ports/signer-store.port.ts";
 import type { WebhookDispatcher } from "./ports/webhook-delivery.port.ts";
@@ -22,6 +23,10 @@ export interface AppDeps {
   readonly cache: CacheStore;
   readonly jobs: JobRunner;
   readonly secrets: SecretsProvider;
+  // AES-GCM encrypt/decrypt for secrets-at-rest (merchant webhook HMAC secrets,
+  // Alchemy signing keys). Every call site that persists or reads such a secret
+  // goes through this port — storing plaintext is a layering violation.
+  readonly secretsCipher: SecretsCipher;
   readonly signerStore: SignerStore;
   readonly priceOracle: PriceOracle;
   readonly webhookDispatcher: WebhookDispatcher;

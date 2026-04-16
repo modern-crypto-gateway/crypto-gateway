@@ -1,10 +1,10 @@
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { buildApp, type App } from "../../app.js";
 import { memoryCacheAdapter } from "../../adapters/cache/memory.adapter.js";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
 import { libsqlAdapter } from "../../adapters/db/libsql.adapter.js";
+import { loadMigrationsFromDir } from "../../adapters/db/fs-migration-loader.js";
+import { applyMigrations } from "../../adapters/db/migration-runner.js";
+import { devCipher } from "../../adapters/crypto/secrets-cipher.js";
 import { promiseSetJobs } from "../../adapters/jobs/promise-set.adapter.js";
 import { staticPegPriceOracle } from "../../adapters/price-oracle/static-peg.adapter.js";
 import { memorySignerStore } from "../../adapters/signer-store/memory.adapter.js";
@@ -114,10 +114,11 @@ export async function createOrderViaApi(
 export async function bootTestApp(options: BootTestAppOptions = {}): Promise<BootedTestApp> {
   const db = libsqlAdapter({ url: ":memory:" });
 
-  const here = dirname(fileURLToPath(import.meta.url));
   // src/__tests__/helpers/boot.ts  ->  repo root is three dirs up.
-  const schemaPath = resolve(here, "..", "..", "..", "migrations", "schema.sql");
-  await db.exec(readFileSync(schemaPath, "utf8"));
+  const migrationsDir = new URL("../../../migrations/", import.meta.url);
+  await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
+
+  const secretsCipher = await devCipher();
 
   // Seed merchants + generate their plaintext API keys.
   const merchants =
@@ -132,9 +133,12 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     const plaintextKey = `sk_test_${m.id.replace(/-/g, "")}`;
     const apiKeyHash = await sha256Hex(plaintextKey);
     apiKeys[m.id] = plaintextKey;
+    const webhookSecretCiphertext = m.webhookSecret !== undefined
+      ? await secretsCipher.encrypt(m.webhookSecret)
+      : null;
     await db
       .prepare(
-        `INSERT INTO merchants (id, name, api_key_hash, webhook_url, webhook_secret_hash, active, created_at, updated_at)
+        `INSERT INTO merchants (id, name, api_key_hash, webhook_url, webhook_secret_ciphertext, active, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
@@ -142,7 +146,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
         m.name ?? "Test Merchant",
         apiKeyHash,
         m.webhookUrl ?? null,
-        m.webhookSecret ?? null,
+        webhookSecretCiphertext,
         m.active === false ? 0 : 1,
         seedNow,
         seedNow
@@ -182,6 +186,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     cache,
     jobs: promiseSetJobs(),
     secrets,
+    secretsCipher,
     signerStore: memorySignerStore(),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: options.webhookDispatcher ?? capturingDispatcher!,

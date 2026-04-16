@@ -1,8 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { libsqlAdapter } from "../../adapters/db/libsql.adapter.js";
+import { loadMigrationsFromDir } from "../../adapters/db/fs-migration-loader.js";
+import { applyMigrations } from "../../adapters/db/migration-runner.js";
 import {
   dbAlchemyRegistryStore,
   type AlchemyRegistryStore
@@ -11,10 +10,8 @@ import {
 // Each test gets its own :memory: DB + schema so rows don't bleed between cases.
 async function freshStore(): Promise<AlchemyRegistryStore> {
   const db = libsqlAdapter({ url: ":memory:" });
-  const here = dirname(fileURLToPath(import.meta.url));
-  // src/__tests__/unit/... -> repo root is three dirs up.
-  const schemaPath = resolve(here, "..", "..", "..", "migrations", "schema.sql");
-  await db.exec(readFileSync(schemaPath, "utf8"));
+  const migrationsDir = new URL("../../../migrations/", import.meta.url);
+  await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
   return dbAlchemyRegistryStore(db);
 }
 
@@ -35,7 +32,7 @@ describe("dbAlchemyRegistryStore", () => {
     await store.upsert({
       chainId: 1,
       webhookId: "wh_eth_mainnet",
-      signingKey: "whsec_abc",
+      signingKeyCiphertext: "whsec_abc",
       webhookUrl: "https://gw.example.com/webhooks/alchemy",
       now
     });
@@ -45,7 +42,7 @@ describe("dbAlchemyRegistryStore", () => {
     expect(byId).toMatchObject({
       chainId: 1,
       webhookId: "wh_eth_mainnet",
-      signingKey: "whsec_abc",
+      signingKeyCiphertext: "whsec_abc",
       webhookUrl: "https://gw.example.com/webhooks/alchemy"
     });
     expect(byId!.createdAt.getTime()).toBe(now);
@@ -58,21 +55,21 @@ describe("dbAlchemyRegistryStore", () => {
     await store.upsert({
       chainId: 1,
       webhookId: "wh_old",
-      signingKey: "whsec_old",
+      signingKeyCiphertext: "whsec_old",
       webhookUrl: "https://gw.example.com/webhooks/alchemy",
       now: 1_000
     });
     await store.upsert({
       chainId: 1,
       webhookId: "wh_new",
-      signingKey: "whsec_new",
+      signingKeyCiphertext: "whsec_new",
       webhookUrl: "https://gw.example.com/webhooks/alchemy",
       now: 2_000
     });
     // The old webhookId lookup returns null now — the replacement is canonical.
     expect(await store.findByWebhookId("wh_old")).toBeNull();
     const fresh = await store.findByWebhookId("wh_new");
-    expect(fresh?.signingKey).toBe("whsec_new");
+    expect(fresh?.signingKeyCiphertext).toBe("whsec_new");
     expect(fresh?.updatedAt.getTime()).toBe(2_000);
   });
 
@@ -80,15 +77,15 @@ describe("dbAlchemyRegistryStore", () => {
     await store.upsert({
       chainId: 137,
       webhookId: "wh_polygon",
-      signingKey: "k137",
+      signingKeyCiphertext: "k137",
       webhookUrl: "u",
       now: 1_000
     });
-    await store.upsert({ chainId: 1, webhookId: "wh_eth", signingKey: "k1", webhookUrl: "u", now: 1_000 });
+    await store.upsert({ chainId: 1, webhookId: "wh_eth", signingKeyCiphertext: "k1", webhookUrl: "u", now: 1_000 });
     await store.upsert({
       chainId: 8453,
       webhookId: "wh_base",
-      signingKey: "k8453",
+      signingKeyCiphertext: "k8453",
       webhookUrl: "u",
       now: 1_000
     });
@@ -101,13 +98,13 @@ describe("dbAlchemyRegistryStore", () => {
     await store.upsert({
       chainId: 1,
       webhookId: "wh_dupe",
-      signingKey: "k",
+      signingKeyCiphertext: "k",
       webhookUrl: "u",
       now: 1_000
     });
     // Another chain trying to claim the same Alchemy webhook id: UNIQUE fires.
     await expect(
-      store.upsert({ chainId: 137, webhookId: "wh_dupe", signingKey: "k2", webhookUrl: "u", now: 2_000 })
+      store.upsert({ chainId: 137, webhookId: "wh_dupe", signingKeyCiphertext: "k2", webhookUrl: "u", now: 2_000 })
     ).rejects.toThrow(/UNIQUE|webhook_id/i);
   });
 });

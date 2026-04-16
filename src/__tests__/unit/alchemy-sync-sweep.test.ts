@@ -1,8 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { libsqlAdapter } from "../../adapters/db/libsql.adapter.js";
+import { loadMigrationsFromDir } from "../../adapters/db/fs-migration-loader.js";
+import { applyMigrations } from "../../adapters/db/migration-runner.js";
 import { bufferingLogger } from "../../adapters/logging/console.adapter.js";
 import type {
   AlchemyAdminClient,
@@ -34,9 +33,8 @@ interface Harness {
 
 async function freshHarness(): Promise<Harness> {
   const db = libsqlAdapter({ url: ":memory:" });
-  const here = dirname(fileURLToPath(import.meta.url));
-  const schemaPath = resolve(here, "..", "..", "..", "migrations", "schema.sql");
-  await db.exec(readFileSync(schemaPath, "utf8"));
+  const migrationsDir = new URL("../../../migrations/", import.meta.url);
+  await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
 
   const subscriptionStore = dbAlchemySubscriptionStore(db);
   const registryStore = dbAlchemyRegistryStore(db);
@@ -81,7 +79,7 @@ describe("makeAlchemySyncSweep", () => {
     await h.registryStore.upsert({
       chainId: 1,
       webhookId: "wh_eth",
-      signingKey: "whsec",
+      signingKeyCiphertext: "whsec",
       webhookUrl: "https://x",
       now: 1_000
     });
@@ -110,8 +108,8 @@ describe("makeAlchemySyncSweep", () => {
   });
 
   it("makes one API call per chain when multiple chains have pending rows", async () => {
-    await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKey: "k", webhookUrl: "u", now: 1_000 });
-    await h.registryStore.upsert({ chainId: 137, webhookId: "wh_poly", signingKey: "k", webhookUrl: "u", now: 1_000 });
+    await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKeyCiphertext: "k", webhookUrl: "u", now: 1_000 });
+    await h.registryStore.upsert({ chainId: 137, webhookId: "wh_poly", signingKeyCiphertext: "k", webhookUrl: "u", now: 1_000 });
 
     await h.subscriptionStore.insertPending({ chainId: 1, address: "0xa", action: "add", now: 1_000 });
     await h.subscriptionStore.insertPending({ chainId: 137, address: "0xb", action: "add", now: 1_000 });
@@ -152,7 +150,7 @@ describe("makeAlchemySyncSweep", () => {
   });
 
   it("on API failure, bumps attempts and keeps rows pending until maxAttempts", async () => {
-    await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKey: "k", webhookUrl: "u", now: 1_000 });
+    await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKeyCiphertext: "k", webhookUrl: "u", now: 1_000 });
     await h.subscriptionStore.insertPending({ chainId: 1, address: "0xa", action: "add", now: 1_000 });
 
     h.fakeClient.nextError = "alchemy returned 500";
@@ -175,7 +173,7 @@ describe("makeAlchemySyncSweep", () => {
   });
 
   it("flips rows to 'failed' after maxAttempts failures (no infinite retry)", async () => {
-    await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKey: "k", webhookUrl: "u", now: 1_000 });
+    await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKeyCiphertext: "k", webhookUrl: "u", now: 1_000 });
     await h.subscriptionStore.insertPending({ chainId: 1, address: "0xa", action: "add", now: 1_000 });
 
     let elapsed = 0;
@@ -208,7 +206,7 @@ describe("makeAlchemySyncSweep", () => {
   });
 
   it("dedupes repeated adds of the same address in a single batch", async () => {
-    await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKey: "k", webhookUrl: "u", now: 1_000 });
+    await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKeyCiphertext: "k", webhookUrl: "u", now: 1_000 });
     await h.subscriptionStore.insertPending({ chainId: 1, address: "0xa", action: "add", now: 1_000 });
     await h.subscriptionStore.insertPending({ chainId: 1, address: "0xa", action: "add", now: 1_000 });
 
