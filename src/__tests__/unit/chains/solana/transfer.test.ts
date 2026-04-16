@@ -80,16 +80,17 @@ describe("solanaChainAdapter.buildTransfer (native SOL)", () => {
     expect(raw.message[3]).toBe(3);
   });
 
-  it("rejects SPL tokens in Phase 7 with a clear not-yet-implemented message", async () => {
-    // Tempt the adapter with a non-native token to ensure the SPL path throws
-    // rather than silently mis-building.
+  it("rejects SPL-token buildTransfer with a clear payouts-deferred message", async () => {
+    // SPL mints are now in the registry (webhook detection relies on them),
+    // so buildTransfer reaches the mint-is-non-null branch and fails with the
+    // deferred-payouts message — not the "unknown token" path. When SPL
+    // payouts ship this test becomes the one to update.
     const adapter = solanaChainAdapter({
       chainIds: [SOLANA_MAINNET_CHAIN_ID],
       clients: { [SOLANA_MAINNET_CHAIN_ID]: fakeClient({}) }
     });
     const from = "4LLm2rsDjYxSp3N5yXYBY4xA3mo7JLEhRaVA3yZJvZfV";
     const to = "6UQJxnM4fZMzWWLMb72Lhzk9hWV1tJmwSZH3AGHNzR9G";
-    // USDC isn't in the Solana slice of the registry yet; buildTransfer sees "unknown token".
     await expect(
       adapter.buildTransfer({
         chainId: SOLANA_MAINNET_CHAIN_ID,
@@ -98,7 +99,7 @@ describe("solanaChainAdapter.buildTransfer (native SOL)", () => {
         token: "USDC",
         amountRaw: "1"
       })
-    ).rejects.toThrow(/unknown token/i);
+    ).rejects.toThrow(/SPL payouts.*not implemented|payouts are deferred/i);
   });
 });
 

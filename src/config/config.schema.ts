@@ -61,6 +61,15 @@ export const AppConfigSchema = z
     // to ~1/5 of cron frequency at the cost of proportional detection lag.
     tronPollIntervalMs: z.coerce.number().int().min(0).optional(),
 
+    // Solana wiring:
+    //   - SOLANA_RPC_URL (explicit; wins over Alchemy auto-construction)
+    //   - ALCHEMY_API_KEY (reused for EVM) auto-builds the Solana URL when
+    //     SOLANA_RPC_URL is absent.
+    //   - SOLANA_NETWORK picks mainnet vs devnet.
+    // Receive-only today: SPL webhook detection works, SPL payouts are deferred.
+    solanaRpcUrl: z.string().optional(),
+    solanaNetwork: z.enum(["mainnet", "devnet"]).default("mainnet"),
+
     // DB
     databaseUrl: z.string().optional(),
     databaseToken: z.string().optional(),
@@ -149,6 +158,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     trongridApiKey: env["TRONGRID_API_KEY"],
     tronNetwork: env["TRON_NETWORK"],
     tronPollIntervalMs: env["TRON_POLL_INTERVAL_MS"],
+    solanaRpcUrl: env["SOLANA_RPC_URL"],
+    solanaNetwork: env["SOLANA_NETWORK"],
     databaseUrl: env["DATABASE_URL"],
     databaseToken: env["DATABASE_TOKEN"],
     redisUrl: env["REDIS_URL"],

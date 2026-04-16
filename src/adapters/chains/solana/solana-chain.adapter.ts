@@ -109,9 +109,12 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       const client = getClient(chainId);
 
       const nativeSymbol = "SOL" as TokenSymbol;
-      // Phase 7 only detects SOL native transfers. SPL token detection arrives
-      // in Phase 7.5 — it needs the associated-token-account PDA derivation
-      // and a different parsed-instruction shape.
+      // Pull-based SPL detection (scanning `getTransaction` + pre/post token
+      // balances per signature) is DEFERRED. The Alchemy Notify webhook path
+      // carries SPL today — see alchemy-notify.adapter.ts `parseSolanaEvent`.
+      // Until the pull path catches up, `scanIncoming` stays native-SOL-only:
+      // SPL support here needs jsonParsed token-balance extraction plus an
+      // ATA-owner cross-check per signature, which is a separate piece of work.
       const wantsNative = tokens.some((t) => t === nativeSymbol);
       if (!wantsNative) return [];
       void tokens;
@@ -205,10 +208,15 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
         throw new Error(`Solana buildTransfer: unknown token ${args.token} on chain ${args.chainId}`);
       }
       if (token.contractAddress !== null) {
-        // SPL tokens have a non-null contractAddress (the mint).
+        // SPL tokens have a non-null contractAddress (the mint). Payouts for
+        // SPL are DEFERRED: they need Associated Token Account resolution
+        // (getOrCreate ATA for the destination), an SPL Token Program
+        // `TransferChecked` instruction encoding, and typically a ComputeBudget
+        // instruction prefix. Receive-side detection already works via the
+        // Alchemy Notify webhook path; only outbound sends are gated here.
         throw new Error(
-          `Solana buildTransfer: SPL token ${args.token} not supported in Phase 7. ` +
-            "Track the SPL extension; native SOL works."
+          `Solana buildTransfer: SPL payouts for ${args.token} are not implemented ` +
+            "— receiving SPL works via Alchemy webhook; payouts are deferred."
         );
       }
 

@@ -3,7 +3,9 @@ import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
+import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
+import { alchemyNotifyDetection } from "../adapters/detection/alchemy-notify.adapter.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
@@ -105,6 +107,20 @@ async function main(): Promise<void> {
     });
   }
 
+  // Solana wiring.
+  const solanaRpcUrl = secrets.getOptional("SOLANA_RPC_URL");
+  const solanaNetwork = secrets.getOptional("SOLANA_NETWORK") === "devnet" ? "devnet" : "mainnet";
+  const solanaWiringInput: Parameters<typeof wireSolana>[0] = {
+    network: solanaNetwork,
+    logger
+  };
+  if (solanaRpcUrl !== undefined) solanaWiringInput.rpcUrl = solanaRpcUrl;
+  if (alchemyApiKey !== undefined) solanaWiringInput.alchemyApiKey = alchemyApiKey;
+  const solanaWiring = wireSolana(solanaWiringInput);
+  if (solanaWiring.chainAdapter) {
+    chains.push(solanaWiring.chainAdapter);
+  }
+
   const secretsEncryptionKey = secrets.getOptional("SECRETS_ENCRYPTION_KEY");
   const secretsCipher = secretsEncryptionKey !== undefined
     ? await makeSecretsCipher(secretsEncryptionKey)
@@ -146,7 +162,7 @@ async function main(): Promise<void> {
     },
     chains,
     detectionStrategies,
-    pushStrategies: {},
+    pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {})
   };

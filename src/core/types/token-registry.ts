@@ -49,6 +49,31 @@ export const TOKEN_REGISTRY: readonly TokenInfo[] = [
     isStable: true,
     displayName: "USD Coin (Base)"
   },
+  {
+    symbol: "USDT" as TokenSymbol,
+    chainId: 8453 as ChainId,
+    contractAddress: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2" as Address,
+    decimals: 6,
+    isStable: true,
+    displayName: "Tether (Base)"
+  },
+  // OP Mainnet (Optimism). chainId 10.
+  {
+    symbol: "USDC" as TokenSymbol,
+    chainId: 10 as ChainId,
+    contractAddress: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85" as Address,
+    decimals: 6,
+    isStable: true,
+    displayName: "USD Coin (Optimism)"
+  },
+  {
+    symbol: "USDT" as TokenSymbol,
+    chainId: 10 as ChainId,
+    contractAddress: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58" as Address,
+    decimals: 6,
+    isStable: true,
+    displayName: "Tether (Optimism)"
+  },
   // Arbitrum One
   {
     symbol: "USDC" as TokenSymbol,
@@ -114,7 +139,6 @@ export const TOKEN_REGISTRY: readonly TokenInfo[] = [
   },
   // Solana native asset. chainId 900 = mainnet-beta, 901 = devnet (synthetic ids;
   // Solana has no EVM-style chain id so we assign our own).
-  // SPL tokens (USDC/USDT mints) arrive with the Phase 7.5 SPL extension.
   {
     symbol: "SOL" as TokenSymbol,
     chainId: 900 as ChainId,
@@ -130,6 +154,26 @@ export const TOKEN_REGISTRY: readonly TokenInfo[] = [
     decimals: 9,
     isStable: false,
     displayName: "Solana (devnet)"
+  },
+  // SPL tokens on Solana mainnet. The `contractAddress` field holds the SPL
+  // token MINT address (a pubkey, not an EVM-style contract). Detection
+  // matches by owner+mint in the Alchemy Notify webhook branch. Payouts
+  // (signAndBroadcast for SPL) are still deferred — native SOL works.
+  {
+    symbol: "USDC" as TokenSymbol,
+    chainId: 900 as ChainId,
+    contractAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" as Address,
+    decimals: 6,
+    isStable: true,
+    displayName: "USD Coin (Solana)"
+  },
+  {
+    symbol: "USDT" as TokenSymbol,
+    chainId: 900 as ChainId,
+    contractAddress: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" as Address,
+    decimals: 6,
+    isStable: true,
+    displayName: "Tether (Solana)"
   }
 ];
 

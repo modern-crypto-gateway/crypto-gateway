@@ -18,7 +18,9 @@ import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
+import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
+import { alchemyNotifyDetection } from "../adapters/detection/alchemy-notify.adapter.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
@@ -129,6 +131,19 @@ async function main(): Promise<void> {
     });
   }
 
+  // Solana wiring. Receive-only for SPL today (native SOL payouts work).
+  // RPC URL from SOLANA_RPC_URL, or auto-built from ALCHEMY_API_KEY.
+  const solanaWiringInput: Parameters<typeof wireSolana>[0] = {
+    network: config.solanaNetwork,
+    logger
+  };
+  if (config.solanaRpcUrl !== undefined) solanaWiringInput.rpcUrl = config.solanaRpcUrl;
+  if (config.alchemyApiKey !== undefined) solanaWiringInput.alchemyApiKey = config.alchemyApiKey;
+  const solanaWiring = wireSolana(solanaWiringInput);
+  if (solanaWiring.chainAdapter) {
+    chains.push(solanaWiring.chainAdapter);
+  }
+
   // Secrets-at-rest cipher. In prod/staging `SECRETS_ENCRYPTION_KEY` is
   // required (config.schema.ts enforces); in dev/test we fall back to the
   // well-known dev key so `npm run dev:node` works out of the box.
@@ -178,9 +193,11 @@ async function main(): Promise<void> {
     },
     chains,
     detectionStrategies,
-    // No push providers by default. Wire up alchemyNotifyDetection() here and
-    // set ALCHEMY_NOTIFY_SIGNING_KEY in env to enable /webhooks/alchemy.
-    pushStrategies: {},
+    // Push-based detection. The Alchemy Notify adapter is wired unconditionally
+    // — it's inert without incoming webhook POSTs, and this way operators only
+    // have to set ALCHEMY_NOTIFY_SIGNING_KEY (+ bootstrap via admin API) to
+    // enable /webhooks/alchemy end-to-end without touching this file.
+    pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {})
   };

@@ -15,7 +15,13 @@ export const ALCHEMY_NETWORK_BY_CHAIN_ID: Readonly<Record<number, string>> = {
   8453: "BASE_MAINNET",
   84532: "BASE_SEPOLIA",
   137: "MATIC_MAINNET",
-  80002: "MATIC_AMOY"
+  80002: "MATIC_AMOY",
+  // Solana. ChainIds 900/901 are our own synthetic values (Solana has no
+  // EVM-style chain id). Alchemy exposes Solana ADDRESS_ACTIVITY webhooks
+  // whose payload shape differs from EVM — the alchemy-notify adapter
+  // branches on network to pick the right parser.
+  900: "SOLANA_MAINNET",
+  901: "SOLANA_DEVNET"
 };
 
 export const CHAIN_ID_BY_ALCHEMY_NETWORK: Readonly<Record<string, number>> = Object.freeze(

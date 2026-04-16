@@ -4,7 +4,9 @@ import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
+import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
+import { alchemyNotifyDetection } from "../adapters/detection/alchemy-notify.adapter.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
@@ -102,6 +104,20 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     });
   }
 
+  // Solana wiring.
+  const solanaRpcUrl = typeof env["SOLANA_RPC_URL"] === "string" ? env["SOLANA_RPC_URL"] : undefined;
+  const solanaNetwork = env["SOLANA_NETWORK"] === "devnet" ? "devnet" : "mainnet";
+  const solanaWiringInput: Parameters<typeof wireSolana>[0] = {
+    network: solanaNetwork,
+    logger
+  };
+  if (solanaRpcUrl !== undefined && solanaRpcUrl.length > 0) solanaWiringInput.rpcUrl = solanaRpcUrl;
+  if (alchemyApiKey !== undefined && alchemyApiKey.length > 0) solanaWiringInput.alchemyApiKey = alchemyApiKey;
+  const solanaWiring = wireSolana(solanaWiringInput);
+  if (solanaWiring.chainAdapter) {
+    chains.push(solanaWiring.chainAdapter);
+  }
+
   // Secrets-at-rest cipher. SECRETS_ENCRYPTION_KEY is required in
   // production — prod Workers don't run loadConfig (D1/KV-driven boot, not
   // an env-schema); the admin routes fail fast if a ciphertext can't be
@@ -149,7 +165,7 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     },
     chains,
     detectionStrategies,
-    pushStrategies: {},
+    pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {})
   };
