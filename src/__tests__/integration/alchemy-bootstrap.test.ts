@@ -49,7 +49,7 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
       secretsOverrides: {
         ADMIN_KEY,
         ALCHEMY_AUTH_TOKEN: "alch_auth_test",
-        ALCHEMY_WEBHOOK_URL: "https://gateway.example.com/webhooks/alchemy"
+        GATEWAY_PUBLIC_URL: "https://gateway.example.com"
       }
     });
   });
@@ -77,7 +77,7 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     }
   });
 
-  it("400 when ALCHEMY_WEBHOOK_URL env is not set", async () => {
+  it("400 when GATEWAY_PUBLIC_URL env is not set", async () => {
     const noUrl = await bootTestApp({
       secretsOverrides: { ADMIN_KEY, ALCHEMY_AUTH_TOKEN: "alch_auth_test" }
     });
@@ -92,7 +92,7 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
       );
       expect(res.status).toBe(400);
       const body = (await res.json()) as { error: { code: string } };
-      expect(body.error.code).toBe("MISSING_WEBHOOK_URL");
+      expect(body.error.code).toBe("MISSING_GATEWAY_PUBLIC_URL");
     } finally {
       await noUrl.close();
     }
@@ -248,7 +248,7 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     // Security regression: a prior version let the caller specify webhookUrl
     // in the body. That turned a leaked ADMIN_KEY into an arbitrary-redirect
     // primitive against Alchemy. The handler now sources the URL from
-    // ALCHEMY_WEBHOOK_URL env exclusively and silently drops the body field.
+    // GATEWAY_PUBLIC_URL env exclusively and silently drops the body field.
     const seenWebhookUrls: string[] = [];
     const app = mountAdminWith(booted, () =>
       fakeClient({

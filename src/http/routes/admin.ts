@@ -41,10 +41,11 @@ const RegisterFeeWalletSchema = z.object({
 // Bootstrap input. Every field optional — falls back to env / defaults so the
 // simplest possible call is `POST /admin/bootstrap/alchemy-webhooks {}`.
 //
-// The webhook URL is intentionally NOT accepted in the body: it is read from
-// the ALCHEMY_WEBHOOK_URL env exclusively. An attacker with a leaked ADMIN_KEY
-// would otherwise be able to point Alchemy's webhook traffic at an arbitrary
-// host (leaking transfer patterns and burning through the 50k-address cap).
+// The webhook URL is intentionally NOT accepted in the body: it is derived
+// from `GATEWAY_PUBLIC_URL` env (base origin) + the provider's canonical
+// path (`/webhooks/alchemy`). An attacker with a leaked ADMIN_KEY would
+// otherwise be able to point Alchemy's webhook traffic at an arbitrary host
+// (leaking transfer patterns and burning through the 50k-address cap).
 // Operators who need to target a different URL should change the env and
 // redeploy, not call the API with a different body.
 const BootstrapAlchemyWebhooksSchema = z.object({
@@ -178,18 +179,24 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       return renderError(c, err, deps.logger);
     }
 
-    const webhookUrl = deps.secrets.getOptional("ALCHEMY_WEBHOOK_URL");
-    if (webhookUrl === undefined) {
+    // Base URL of this gateway (no trailing path). Bootstrap appends the
+    // per-provider path (`/webhooks/alchemy`) so operators only have to set
+    // one env var that applies to every current and future webhook provider.
+    const publicBaseUrl = deps.secrets.getOptional("GATEWAY_PUBLIC_URL");
+    if (publicBaseUrl === undefined) {
       return c.json(
         {
           error: {
-            code: "MISSING_WEBHOOK_URL",
-            message: "Set ALCHEMY_WEBHOOK_URL env to the public URL Alchemy should POST to."
+            code: "MISSING_GATEWAY_PUBLIC_URL",
+            message:
+              "Set GATEWAY_PUBLIC_URL env to this gateway's public origin (e.g. https://gateway.example.com)."
           }
         },
         400
       );
     }
+
+    const webhookUrl = publicBaseUrl.replace(/\/+$/, "") + "/webhooks/alchemy";
 
     const chainIds =
       parsed.chainIds ?? parseAlchemyChainsEnv(deps.secrets.getOptional("ALCHEMY_CHAINS"));

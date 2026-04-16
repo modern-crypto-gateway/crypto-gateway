@@ -110,7 +110,7 @@ for the full list. Highlights:
 | `ALCHEMY_API_KEY`                 | optional        | —          | Auto-wires a real EVM chain adapter + RPC-poll detection across the default mainnet set (ETH, OP, Polygon, Base, Arbitrum). See below. |
 | `ALCHEMY_CHAINS`                  | optional        | —          | Comma-separated chainIds to enable via Alchemy (e.g. `1,137`). Defaults to the mainnet set. |
 | `ALCHEMY_AUTH_TOKEN`              | optional        | —          | Webhook-management token (dashboard → Auth Token). Enables the auto-bootstrap admin route below. |
-| `ALCHEMY_WEBHOOK_URL`             | optional        | —          | Default public URL Alchemy POSTs to. Overridable per bootstrap call. |
+| `GATEWAY_PUBLIC_URL`              | required for webhook bootstrap | — | Public origin of this gateway (e.g. `https://gateway.example.com`). Bootstrap appends per-provider paths like `/webhooks/alchemy`. Env-only to prevent ADMIN_KEY-leak redirect attacks. |
 | `ALCHEMY_NOTIFY_SIGNING_KEY`      | optional        | —          | Enables `POST /webhooks/alchemy` (push-based detection). Obtained from the bootstrap response — save it or the ingest route stays 404. |
 | `DATABASE_URL`                    | when non-D1     | `file:./local.db` | libSQL URL (Turso or local file)              |
 | `DATABASE_TOKEN`                  | Turso only      | —          | libSQL auth token                                    |
@@ -153,11 +153,11 @@ source.
 ### Auto-bootstrap Alchemy webhooks (optional)
 
 Rather than click through Alchemy's dashboard to create webhooks manually, set
-`ALCHEMY_AUTH_TOKEN` + `ALCHEMY_WEBHOOK_URL` and POST to the bootstrap endpoint:
+`ALCHEMY_AUTH_TOKEN` + `GATEWAY_PUBLIC_URL` and POST to the bootstrap endpoint:
 
 ```bash
 # Set once in your deployment env:
-# ALCHEMY_WEBHOOK_URL=https://gateway.example.com/webhooks/alchemy
+# GATEWAY_PUBLIC_URL=https://gateway.example.com
 
 curl -X POST "$GATEWAY_URL/admin/bootstrap/alchemy-webhooks" \
   -H "Authorization: Bearer $ADMIN_KEY" \
@@ -165,9 +165,10 @@ curl -X POST "$GATEWAY_URL/admin/bootstrap/alchemy-webhooks" \
   -d '{"chainIds": [1, 137]}'
 ```
 
-The target URL is read from `ALCHEMY_WEBHOOK_URL` only — passing it in the body
-is intentionally rejected so a leaked `ADMIN_KEY` can't redirect Alchemy's
-webhook traffic to an arbitrary host.
+The bootstrap constructs the target URL as `$GATEWAY_PUBLIC_URL/webhooks/alchemy`.
+The base is env-only — passing any URL override in the body is intentionally
+rejected so a leaked `ADMIN_KEY` can't redirect Alchemy's webhook traffic to
+an attacker-controlled host.
 
 Response:
 
@@ -191,11 +192,11 @@ delete and recreate the webhook. The bootstrap can only create ONE webhook per
 enabling multiple chains keep them on separate subdomains or accept that
 you'll rotate keys when you expand.
 
-With both `ALCHEMY_WEBHOOK_URL` and `ALCHEMY_CHAINS` env vars set the bootstrap
+With both `GATEWAY_PUBLIC_URL` and `ALCHEMY_CHAINS` env vars set the bootstrap
 request body can be empty:
 
 ```bash
-ALCHEMY_WEBHOOK_URL=https://gateway.example.com/webhooks/alchemy
+GATEWAY_PUBLIC_URL=https://gateway.example.com
 ALCHEMY_CHAINS=1,137
 
 curl -X POST "$GATEWAY_URL/admin/bootstrap/alchemy-webhooks" \

@@ -305,7 +305,8 @@ paths:
                   description: Per-chain placeholder address (Alchemy requires ≥1 at create). Defaults to zero-address.
               description: |
                 The target webhook URL is NOT accepted in the body. It is sourced from
-                `ALCHEMY_WEBHOOK_URL` env exclusively so a leaked ADMIN_KEY cannot be
+                `GATEWAY_PUBLIC_URL` env (base origin) plus the canonical path
+                `/webhooks/alchemy`. Env-only so a leaked ADMIN_KEY cannot be
                 used to redirect Alchemy's traffic to an arbitrary host.
       responses:
         "200":
@@ -330,7 +331,7 @@ paths:
                           description: Only present when `status=created`. Save into `ALCHEMY_NOTIFY_SIGNING_KEY`.
                         error: { type: string }
         "400":
-          description: Missing ALCHEMY_AUTH_TOKEN or ALCHEMY_WEBHOOK_URL env
+          description: Missing ALCHEMY_AUTH_TOKEN or GATEWAY_PUBLIC_URL env
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

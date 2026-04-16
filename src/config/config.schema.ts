@@ -77,6 +77,13 @@ export const AppConfigSchema = z
     // Cache
     redisUrl: z.string().optional(),
 
+    // Public origin of this gateway (no trailing path). The admin bootstrap
+    // handler appends per-provider webhook paths (`/webhooks/alchemy`, future
+    // `/webhooks/helius`, …) so operators set ONE URL for every provider.
+    // Intentionally env-only — a body-supplied URL would let a leaked
+    // ADMIN_KEY redirect Alchemy traffic to attacker-controlled hosts.
+    gatewayPublicUrl: z.string().url().optional(),
+
     // Rate limits. Defaults are generous enough that dev + integration tests
     // don't trip them; tune down in production via env vars.
     rateLimitMerchantPerMinute: z.coerce.number().int().min(1).default(1000),
@@ -160,6 +167,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     tronPollIntervalMs: env["TRON_POLL_INTERVAL_MS"],
     solanaRpcUrl: env["SOLANA_RPC_URL"],
     solanaNetwork: env["SOLANA_NETWORK"],
+    gatewayPublicUrl: env["GATEWAY_PUBLIC_URL"],
     databaseUrl: env["DATABASE_URL"],
     databaseToken: env["DATABASE_TOKEN"],
     redisUrl: env["REDIS_URL"],
