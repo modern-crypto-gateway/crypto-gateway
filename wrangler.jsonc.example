@@ -12,6 +12,7 @@
 //   npx wrangler secret put ADMIN_KEY                   # random 32+ chars
 //   npx wrangler secret put ALCHEMY_NOTIFY_SIGNING_KEY  # optional, only if using Alchemy ingest
 //   npx wrangler secret put CRON_SECRET                 # optional, only for /internal/cron/tick
+//   npx wrangler secret put ALCHEMY_API_KEY                 # optional, but recommended
 //
 // Deploy:
 //   npx wrangler deploy -e dev

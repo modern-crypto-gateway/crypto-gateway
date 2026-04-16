@@ -32,6 +32,11 @@ export const AppConfigSchema = z
 
     // Provider secrets.
     alchemyApiKey: z.string().optional(),
+    // Comma-separated chain-id override for which chains to wire via Alchemy
+    // when `alchemyApiKey` is set. Absent = default mainnet set (ETH / OP /
+    // Polygon / Base / Arbitrum). Useful for narrowing to a subset, or for
+    // adding testnets that aren't in the default set.
+    alchemyChains: z.string().optional(),
     alchemyNotifySigningKey: z.string().optional(),
 
     // DB
@@ -98,6 +103,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     sweepMasterKey: env["SWEEP_MASTER_KEY"],
     cronSecret: env["CRON_SECRET"],
     alchemyApiKey: env["ALCHEMY_API_KEY"],
+    alchemyChains: env["ALCHEMY_CHAINS"],
     alchemyNotifySigningKey: env["ALCHEMY_NOTIFY_SIGNING_KEY"],
     databaseUrl: env["DATABASE_URL"],
     databaseToken: env["DATABASE_TOKEN"],

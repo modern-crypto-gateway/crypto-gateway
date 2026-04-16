@@ -1,6 +1,9 @@
 import { buildApp } from "../app.js";
 import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
+import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
+import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
+import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
@@ -43,6 +46,21 @@ function getDeps(): AppDeps {
   });
   const cache = memoryCacheAdapter();
   const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
+
+  const chains = [devChainAdapter()];
+  const detectionStrategies: Record<number, ReturnType<typeof rpcPollDetection>> = {};
+  const alchemyApiKey = secrets.getOptional("ALCHEMY_API_KEY");
+  if (alchemyApiKey !== undefined) {
+    const chainIds = parseAlchemyChainsEnv(secrets.getOptional("ALCHEMY_CHAINS"));
+    chains.push(
+      evmChainAdapter({ chainIds, rpcUrls: alchemyRpcUrls(alchemyApiKey, chainIds) })
+    );
+    for (const chainId of chainIds) {
+      detectionStrategies[chainId] = rpcPollDetection();
+    }
+    logger.info("Alchemy EVM chains wired", { chainIds });
+  }
+
   const fresh: AppDeps = {
     db,
     cache,
@@ -61,8 +79,8 @@ function getDeps(): AppDeps {
       checkoutPerMinute: Number(secrets.getOptional("RATE_LIMIT_CHECKOUT_PER_MINUTE") ?? "60"),
       webhookIngestPerMinute: Number(secrets.getOptional("RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE") ?? "300")
     },
-    chains: [devChainAdapter()],
-    detectionStrategies: {},
+    chains,
+    detectionStrategies,
     pushStrategies: {},
     clock: { now: () => new Date() }
   };

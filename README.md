@@ -104,13 +104,51 @@ for the full list. Highlights:
 | `MASTER_SEED`                     | **prod only**   | —          | BIP39 mnemonic. Rejects the literal `dev-seed` in prod |
 | `ADMIN_KEY`                       | **prod only**   | —          | ≥32 chars required in prod                           |
 | `CRON_SECRET`                     | optional        | —          | Enables `POST /internal/cron/tick`                   |
-| `ALCHEMY_NOTIFY_SIGNING_KEY`      | optional        | —          | Enables `POST /webhooks/alchemy`                     |
+| `ALCHEMY_API_KEY`                 | optional        | —          | Auto-wires a real EVM chain adapter + RPC-poll detection across the default mainnet set (ETH, OP, Polygon, Base, Arbitrum). See below. |
+| `ALCHEMY_CHAINS`                  | optional        | —          | Comma-separated chainIds to enable via Alchemy (e.g. `1,137`). Defaults to the mainnet set. |
+| `ALCHEMY_NOTIFY_SIGNING_KEY`      | optional        | —          | Enables `POST /webhooks/alchemy` (push-based detection) |
 | `DATABASE_URL`                    | when non-D1     | `file:./local.db` | libSQL URL (Turso or local file)              |
 | `DATABASE_TOKEN`                  | Turso only      | —          | libSQL auth token                                    |
 | `PORT`                            | no              | `8787`     |                                                      |
 | `RATE_LIMIT_MERCHANT_PER_MINUTE`  | no              | `1000`     | Per-merchant cap on `/api/v1/*`                      |
 | `RATE_LIMIT_CHECKOUT_PER_MINUTE`  | no              | `60`       | Per-IP cap on `/checkout/*`                          |
 | `RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE` | no         | `300`      | Per-IP cap on `/webhooks/*`                          |
+
+## Enabling Alchemy (optional)
+
+Setting `ALCHEMY_API_KEY` alone is sufficient — every entrypoint will:
+
+1. Register a real `evmChainAdapter` pointing at Alchemy RPC URLs for the
+   default mainnet set (chainIds `1, 10, 137, 8453, 42161` — Ethereum,
+   Optimism, Polygon, Base, Arbitrum).
+2. Enable `rpcPollDetection` on those chains so the minute-cadence cron job
+   picks up incoming transfers.
+
+Narrow the set by listing chainIds in `ALCHEMY_CHAINS`. Example for
+mainnet-ETH + Polygon only:
+
+```bash
+ALCHEMY_API_KEY=alch_...
+ALCHEMY_CHAINS=1,137
+```
+
+Testnets are **opt-in** — not in the default set. To include Sepolia:
+
+```bash
+ALCHEMY_CHAINS=1,137,11155111
+```
+
+Without `ALCHEMY_API_KEY` the gateway runs with just the dev chain adapter,
+which is enough for local development and integration tests but can't talk
+to real networks. To use a non-Alchemy RPC (self-hosted Geth, public RPC,
+QuickNode, Infura, Ankr, …) you can edit the relevant entrypoint to pass
+your own `rpcUrls` to `evmChainAdapter` — same construction, different URL
+source.
+
+For push-based detection (lower latency than polling), also set
+`ALCHEMY_NOTIFY_SIGNING_KEY` and wire `alchemyNotifyDetection()` into the
+entrypoint's `pushStrategies`. Push + pull can coexist; the same tx will
+just hit the ingest's idempotency gate the second time.
 
 ## Authentication
 

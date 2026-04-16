@@ -2,6 +2,9 @@ import type { D1Database, ExecutionContext, KVNamespace, ScheduledController } f
 import { buildApp } from "../app.js";
 import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
+import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
+import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
+import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { d1Adapter } from "../adapters/db/d1.adapter.js";
 import { waitUntilJobs } from "../adapters/jobs/wait-until.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
@@ -29,6 +32,8 @@ export interface WorkerEnv {
   // Secrets (set via `wrangler secret put`)
   MASTER_SEED: string;
   ADMIN_KEY?: string;
+  ALCHEMY_API_KEY?: string;
+  ALCHEMY_CHAINS?: string;
   ALCHEMY_NOTIFY_SIGNING_KEY?: string;
 
   // String env vars from wrangler.jsonc [vars]
@@ -45,6 +50,24 @@ function depsFor(env: WorkerEnv, ctx: ExecutionContext): AppDeps {
   // CF KV enforces a 60s TTL floor already, so the limiter's 60s+1 setting lands
   // at 60 anyway. Fixed-window bucketing still rolls correctly per minute.
   const rateLimiter = cacheBackedRateLimiter(cache);
+
+  // Same Alchemy-optional pattern as the Node entrypoint: dev adapter always,
+  // real EVM + RPC-poll detection when ALCHEMY_API_KEY is set.
+  const chains = [devChainAdapter()];
+  const detectionStrategies: Record<number, ReturnType<typeof rpcPollDetection>> = {};
+  const alchemyApiKey = typeof env["ALCHEMY_API_KEY"] === "string" ? env["ALCHEMY_API_KEY"] : undefined;
+  if (alchemyApiKey !== undefined && alchemyApiKey.length > 0) {
+    const chainIdsRaw = typeof env["ALCHEMY_CHAINS"] === "string" ? env["ALCHEMY_CHAINS"] : undefined;
+    const chainIds = parseAlchemyChainsEnv(chainIdsRaw);
+    chains.push(
+      evmChainAdapter({ chainIds, rpcUrls: alchemyRpcUrls(alchemyApiKey, chainIds) })
+    );
+    for (const chainId of chainIds) {
+      detectionStrategies[chainId] = rpcPollDetection();
+    }
+    logger.info("Alchemy EVM chains wired", { chainIds });
+  }
+
   return {
     db: d1Adapter(env.DB),
     cache,
@@ -61,10 +84,8 @@ function depsFor(env: WorkerEnv, ctx: ExecutionContext): AppDeps {
       checkoutPerMinute: envNumber(env, "RATE_LIMIT_CHECKOUT_PER_MINUTE", 60),
       webhookIngestPerMinute: envNumber(env, "RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE", 300)
     },
-    // Phase 5 boots with the dev adapter only — production deployments wire
-    // the real evmChainAdapter / tronChainAdapter here with their RPC urls.
-    chains: [devChainAdapter()],
-    detectionStrategies: {},
+    chains,
+    detectionStrategies,
     pushStrategies: {},
     clock: { now: () => new Date() }
   };

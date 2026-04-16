@@ -14,7 +14,12 @@ import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
 import { noopWebhookDispatcher } from "../adapters/webhook-delivery/noop.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
+import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
+import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
+import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { loadConfig, ConfigValidationError } from "../config/config.schema.js";
+import type { ChainAdapter } from "../core/ports/chain.port.js";
+import type { DetectionStrategy } from "../core/ports/detection.port.js";
 import type { AppDeps } from "../core/app-deps.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
 
@@ -70,6 +75,26 @@ async function main(): Promise<void> {
   // has no TTL floor of its own, so sub-minute windows work correctly here.
   const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
 
+  // Chain adapters + their matching detection strategies. The dev adapter is
+  // always present (cheap, no network). When ALCHEMY_API_KEY is set we also
+  // wire a real EVM adapter across the mainnet chain set (overridable via
+  // ALCHEMY_CHAINS) and enable RPC-poll detection for those chains.
+  const chains: ChainAdapter[] = [devChainAdapter()];
+  const detectionStrategies: Record<number, DetectionStrategy> = {};
+  if (config.alchemyApiKey !== undefined) {
+    const chainIds = parseAlchemyChainsEnv(config.alchemyChains);
+    chains.push(
+      evmChainAdapter({
+        chainIds,
+        rpcUrls: alchemyRpcUrls(config.alchemyApiKey, chainIds)
+      })
+    );
+    for (const chainId of chainIds) {
+      detectionStrategies[chainId] = rpcPollDetection();
+    }
+    logger.info("Alchemy EVM chains wired", { chainIds });
+  }
+
   const deps: AppDeps = {
     db,
     cache,
@@ -88,11 +113,8 @@ async function main(): Promise<void> {
       checkoutPerMinute: config.rateLimitCheckoutPerMinute,
       webhookIngestPerMinute: config.rateLimitWebhookIngestPerMinute
     },
-    chains: [devChainAdapter()],
-    // Push-only for local dev by default: no detection strategies wired. Uncomment
-    // and add an RPC poll strategy per chain when pointing the dev server at real
-    // testnets.
-    detectionStrategies: {},
+    chains,
+    detectionStrategies,
     // No push providers by default. Wire up alchemyNotifyDetection() here and
     // set ALCHEMY_NOTIFY_SIGNING_KEY in env to enable /webhooks/alchemy.
     pushStrategies: {},
