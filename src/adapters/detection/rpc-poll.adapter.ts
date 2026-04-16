@@ -12,6 +12,16 @@ export interface RpcPollConfig {
   // Cache key prefix for per-chain "last poll since" checkpoints.
   // Defaults to "poll:last_since_ms:".
   cachePrefix?: string;
+  // Minimum wall-clock gap between consecutive `poll` calls for this chain.
+  // Returns an empty transfer list without touching the RPC if the last
+  // successful poll was more recent. Undefined = run on every cron tick.
+  //
+  // Useful for rate-limited providers: TronGrid's free tier is 100k req/day,
+  // so setting minIntervalMs=300_000 (5 min) cuts detection traffic to ~20%
+  // of a 1-minute cron at the cost of proportionally more detection latency.
+  // Per-chain checkpoints persist in the same cache entry used for the
+  // scan window, so throttle + lookback stay consistent across restarts.
+  minIntervalMs?: number;
 }
 
 // Generic pull-based detection: delegates to the chain adapter's scanIncoming,
@@ -25,6 +35,7 @@ export interface RpcPollConfig {
 export function rpcPollDetection(config: RpcPollConfig = {}): DetectionStrategy {
   const defaultLookbackMs = config.defaultLookbackMs ?? 5 * 60 * 1000;
   const prefix = config.cachePrefix ?? "poll:last_since_ms:";
+  const minIntervalMs = config.minIntervalMs;
 
   return {
     async poll(deps: AppDeps, chainId: ChainId, addresses: readonly Address[]): Promise<readonly DetectedTransfer[]> {
@@ -35,6 +46,15 @@ export function rpcPollDetection(config: RpcPollConfig = {}): DetectionStrategy 
       const lastSinceRaw = await deps.cache.get(cacheKey);
       const now = deps.clock.now().getTime();
       const sinceMs = lastSinceRaw !== null ? Number(lastSinceRaw) : now - defaultLookbackMs;
+
+      // Throttle: if the last successful poll was more recent than
+      // `minIntervalMs`, return without touching the provider. The scan
+      // window stays open (we don't advance the checkpoint) so when the
+      // next call does run it catches everything since the last actual
+      // scan — no missed blocks, just delayed detection.
+      if (minIntervalMs !== undefined && lastSinceRaw !== null && now - sinceMs < minIntervalMs) {
+        return [];
+      }
 
       // Tokens registered on this chain — the strategy scans all of them. For
       // performance-sensitive deployments, a future refinement can narrow this

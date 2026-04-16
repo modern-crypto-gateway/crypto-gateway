@@ -19,6 +19,10 @@ import type { SecretsProvider } from "../../core/ports/secrets.port.js";
 export interface BootTestAppOptions {
   // Fixed clock for deterministic timestamps in assertions. Defaults to Date.now().
   now?: Date;
+  // Full clock override, takes precedence over `now`. Useful for tests that
+  // need to advance time across multiple calls (throttle windows, reservation
+  // sweeps) without rebooting the app.
+  clock?: AppDeps["clock"];
   // Overrides merged into the secrets provider. `MASTER_SEED` defaults to "test-seed".
   secretsOverrides?: Record<string, string>;
   // Chain adapters to register. Defaults to a single dev adapter on chainId 999.
@@ -197,7 +201,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     chains: options.chains ?? [devChainAdapter()],
     detectionStrategies: options.detectionStrategies ?? {},
     pushStrategies: options.pushStrategies ?? {},
-    clock: { now: () => options.now ?? new Date() },
+    clock: options.clock ?? { now: () => options.now ?? new Date() },
     ...(options.alchemy !== undefined ? { alchemy: options.alchemy } : {})
   };
 

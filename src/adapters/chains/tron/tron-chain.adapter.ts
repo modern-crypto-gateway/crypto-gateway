@@ -15,7 +15,11 @@ import {
   privateKeyToTronAddress,
   tronToEvmCoreHex
 } from "./tron-address.js";
-import { tronGridClient, type TronGridClient, type TronGridClientConfig } from "./trongrid-client.js";
+import {
+  tronGridBackend,
+  type TronGridBackendConfig,
+  type TronRpcBackend
+} from "./tron-rpc.js";
 
 // Known Tron chain ids. Values match what Tron's own tooling reports in the
 // genesis block timestamp heuristic; we just use them as identifiers.
@@ -29,12 +33,15 @@ const DEFAULT_CHANGE_INDEX = 0;
 export interface TronChainConfig {
   // Which chainIds this adapter serves. Defaults to Tron mainnet only.
   chainIds?: readonly number[];
-  // Per-chain TronGrid configuration. If a chainId is served by this adapter
-  // but absent from this map, operations against it will throw.
-  trongrid?: Readonly<Record<number, TronGridClientConfig>>;
-  // Per-chain pre-built clients, for testing: inject a fake TronGridClient and
-  // bypass HTTP entirely.
-  clients?: Readonly<Record<number, TronGridClient>>;
+  // Per-chain TronGrid configuration. Shortcut for the common single-backend
+  // case — entries here build a `tronGridBackend` automatically. Ignored for
+  // any chainId where `clients` already has an entry (which takes precedence
+  // so operators can supply a composite with failover).
+  trongrid?: Readonly<Record<number, TronGridBackendConfig>>;
+  // Per-chain pre-built RPC clients. Use this (via `tronCompositeClient(...)`)
+  // when you want TronGrid + Alchemy Tron failover, or to inject a fake
+  // backend in tests and bypass HTTP entirely.
+  clients?: Readonly<Record<number, TronRpcBackend>>;
   // BIP44 accountIndex (default 0).
   accountIndex?: number;
   // Cap on the lookback window for `scanIncoming`, ms. Defaults to 6 hours.
@@ -49,8 +56,8 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
   const feeLimit = config.feeLimitSun ?? DEFAULT_FEE_LIMIT_SUN;
   const maxScanWindowMs = config.maxScanWindowMs ?? 6 * 60 * 60 * 1000;
 
-  const clientCache = new Map<number, TronGridClient>();
-  function getClient(chainId: number): TronGridClient {
+  const clientCache = new Map<number, TronRpcBackend>();
+  function getClient(chainId: number): TronRpcBackend {
     const cached = clientCache.get(chainId);
     if (cached) return cached;
     const injected = config.clients?.[chainId];
@@ -60,9 +67,9 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
     }
     const cfg = config.trongrid?.[chainId];
     if (!cfg) {
-      throw new Error(`tronChainAdapter: no TronGrid configuration for chainId ${chainId}`);
+      throw new Error(`tronChainAdapter: no Tron RPC configuration for chainId ${chainId}`);
     }
-    const client = tronGridClient(cfg);
+    const client = tronGridBackend(cfg);
     clientCache.set(chainId, client);
     return client;
   }

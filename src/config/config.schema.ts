@@ -43,6 +43,24 @@ export const AppConfigSchema = z
     alchemyChains: z.string().optional(),
     alchemyNotifySigningKey: z.string().optional(),
 
+    // Tron provider selection.
+    //   - TRONGRID_API_KEY alone: detection + payouts via TronGrid (required
+    //     for detection; Alchemy's Tron API doesn't expose the paginated
+    //     transfer-history endpoint).
+    //   - ALCHEMY_API_KEY alone: payouts only — detection is disabled with a
+    //     startup warning.
+    //   - Both: TronGrid primary (detection + payouts), Alchemy fallback for
+    //     `/wallet/*` (build/broadcast/confirm). Frees up TronGrid's 100k/day
+    //     budget to spend almost entirely on detection.
+    trongridApiKey: z.string().optional(),
+    // mainnet (default) or nile. Shasta is Alchemy-only; operators using Shasta
+    // should rely on the Alchemy backend and accept detection-disabled mode.
+    tronNetwork: z.enum(["mainnet", "nile"]).default("mainnet"),
+    // Minimum interval between Tron detection polls, in ms. Defaults to
+    // undefined (every cron tick). Set e.g. 300000 to cut TronGrid traffic
+    // to ~1/5 of cron frequency at the cost of proportional detection lag.
+    tronPollIntervalMs: z.coerce.number().int().min(0).optional(),
+
     // DB
     databaseUrl: z.string().optional(),
     databaseToken: z.string().optional(),
@@ -128,6 +146,9 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     alchemyApiKey: env["ALCHEMY_API_KEY"],
     alchemyChains: env["ALCHEMY_CHAINS"],
     alchemyNotifySigningKey: env["ALCHEMY_NOTIFY_SIGNING_KEY"],
+    trongridApiKey: env["TRONGRID_API_KEY"],
+    tronNetwork: env["TRON_NETWORK"],
+    tronPollIntervalMs: env["TRON_POLL_INTERVAL_MS"],
     databaseUrl: env["DATABASE_URL"],
     databaseToken: env["DATABASE_TOKEN"],
     redisUrl: env["REDIS_URL"],

@@ -3,6 +3,7 @@ import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
+import { wireTron } from "../adapters/chains/tron/wire.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
@@ -64,6 +65,32 @@ async function getDeps(): Promise<AppDeps> {
       detectionStrategies[chainId] = rpcPollDetection();
     }
     logger.info("Alchemy EVM chains wired", { chainIds });
+  }
+
+  // Tron wiring.
+  const trongridApiKey = secrets.getOptional("TRONGRID_API_KEY");
+  const tronNetwork = secrets.getOptional("TRON_NETWORK") === "nile" ? "nile" : "mainnet";
+  const tronPollIntervalMsRaw = secrets.getOptional("TRON_POLL_INTERVAL_MS");
+  const tronPollIntervalMs = tronPollIntervalMsRaw !== undefined ? Number.parseInt(tronPollIntervalMsRaw, 10) : undefined;
+  const tronWiringInput: Parameters<typeof wireTron>[0] = {
+    network: tronNetwork,
+    logger
+  };
+  if (trongridApiKey !== undefined) tronWiringInput.trongridApiKey = trongridApiKey;
+  if (alchemyApiKey !== undefined) tronWiringInput.alchemyApiKey = alchemyApiKey;
+  if (tronPollIntervalMs !== undefined && Number.isFinite(tronPollIntervalMs)) {
+    tronWiringInput.pollIntervalMs = tronPollIntervalMs;
+  }
+  const tronWiring = wireTron(tronWiringInput);
+  if (tronWiring.chainAdapter && tronWiring.chainId !== undefined) {
+    chains.push(tronWiring.chainAdapter);
+    if (tronWiring.detectionStrategy) {
+      detectionStrategies[tronWiring.chainId] = tronWiring.detectionStrategy;
+    }
+    logger.info("Tron wired", {
+      chainId: tronWiring.chainId,
+      detection: tronWiring.detectionStrategy !== undefined
+    });
   }
 
   const secretsEncryptionKey = secrets.getOptional("SECRETS_ENCRYPTION_KEY");

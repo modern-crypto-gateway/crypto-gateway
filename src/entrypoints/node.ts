@@ -18,6 +18,7 @@ import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
+import { wireTron } from "../adapters/chains/tron/wire.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
@@ -103,6 +104,29 @@ async function main(): Promise<void> {
       detectionStrategies[chainId] = rpcPollDetection();
     }
     logger.info("Alchemy EVM chains wired", { chainIds });
+  }
+
+  // Tron wiring. See wireTron for provider-selection semantics:
+  //   - TRONGRID_API_KEY alone: detection + payouts via TronGrid.
+  //   - + ALCHEMY_API_KEY: TronGrid primary, Alchemy fallback for /wallet/*.
+  //   - ALCHEMY_API_KEY alone: payouts only; detection logs disabled.
+  const tronWiringInput: Parameters<typeof wireTron>[0] = {
+    network: config.tronNetwork,
+    logger
+  };
+  if (config.trongridApiKey !== undefined) tronWiringInput.trongridApiKey = config.trongridApiKey;
+  if (config.alchemyApiKey !== undefined) tronWiringInput.alchemyApiKey = config.alchemyApiKey;
+  if (config.tronPollIntervalMs !== undefined) tronWiringInput.pollIntervalMs = config.tronPollIntervalMs;
+  const tronWiring = wireTron(tronWiringInput);
+  if (tronWiring.chainAdapter && tronWiring.chainId !== undefined) {
+    chains.push(tronWiring.chainAdapter);
+    if (tronWiring.detectionStrategy) {
+      detectionStrategies[tronWiring.chainId] = tronWiring.detectionStrategy;
+    }
+    logger.info("Tron wired", {
+      chainId: tronWiring.chainId,
+      detection: tronWiring.detectionStrategy !== undefined
+    });
   }
 
   // Secrets-at-rest cipher. In prod/staging `SECRETS_ENCRYPTION_KEY` is

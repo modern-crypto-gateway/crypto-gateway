@@ -1,14 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { tronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../../../adapters/chains/tron/tron-chain.adapter.js";
-import type { TronGridClient } from "../../../../adapters/chains/tron/trongrid-client.js";
+import type { TronRpcBackend } from "../../../../adapters/chains/tron/tron-rpc.js";
 
 // USDT TRC-20 contract on Tron mainnet, matching the token registry entry.
 const USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 
-// Build a fake TronGridClient that only implements the methods the test exercises.
-// Any method we didn't stub throws loudly, so we notice accidental extra calls.
-function fakeClient(overrides: Partial<TronGridClient>): TronGridClient {
-  const stub: TronGridClient = {
+// Build a fake Tron RPC backend that only implements the methods the test
+// exercises. Any method we didn't stub throws loudly, so we notice accidental
+// extra calls.
+function fakeClient(overrides: Partial<TronRpcBackend>): TronRpcBackend {
+  const stub: TronRpcBackend = {
+    name: "fake",
+    supportsDetection: true,
     async listTrc20Transfers() {
       throw new Error("unexpected listTrc20Transfers call");
     },
