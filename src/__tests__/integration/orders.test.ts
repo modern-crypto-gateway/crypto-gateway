@@ -199,7 +199,7 @@ describe("GET /health", () => {
       const res = await booted.app.fetch(new Request("http://test.local/health"));
       expect(res.status).toBe(200);
       const body = (await res.json()) as { status: string; phase: number };
-      expect(body).toEqual({ status: "ok", phase: 4 });
+      expect(body).toEqual({ status: "ok", phase: 8 });
     } finally {
       await booted.close();
     }

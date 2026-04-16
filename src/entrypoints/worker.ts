@@ -4,7 +4,9 @@ import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { d1Adapter } from "../adapters/db/d1.adapter.js";
 import { waitUntilJobs } from "../adapters/jobs/wait-until.adapter.js";
+import { consoleLogger } from "../adapters/logging/console.adapter.js";
 import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
+import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { workersEnvSecrets } from "../adapters/secrets/workers-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
@@ -34,15 +36,31 @@ export interface WorkerEnv {
 }
 
 function depsFor(env: WorkerEnv, ctx: ExecutionContext): AppDeps {
+  const logger = consoleLogger({
+    format: "json",
+    minLevel: "info",
+    baseFields: { service: "crypto-gateway", runtime: "workers" }
+  });
+  const cache = cfKvAdapter(env.KV);
+  // CF KV enforces a 60s TTL floor already, so the limiter's 60s+1 setting lands
+  // at 60 anyway. Fixed-window bucketing still rolls correctly per minute.
+  const rateLimiter = cacheBackedRateLimiter(cache);
   return {
     db: d1Adapter(env.DB),
-    cache: cfKvAdapter(env.KV),
+    cache,
     jobs: waitUntilJobs(ctx),
     secrets: workersEnvSecrets(env as unknown as Record<string, unknown>),
     signerStore: memorySignerStore(),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: inlineFetchDispatcher(),
     events: createInMemoryEventBus(),
+    logger,
+    rateLimiter,
+    rateLimits: {
+      merchantPerMinute: envNumber(env, "RATE_LIMIT_MERCHANT_PER_MINUTE", 1000),
+      checkoutPerMinute: envNumber(env, "RATE_LIMIT_CHECKOUT_PER_MINUTE", 60),
+      webhookIngestPerMinute: envNumber(env, "RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE", 300)
+    },
     // Phase 5 boots with the dev adapter only — production deployments wire
     // the real evmChainAdapter / tronChainAdapter here with their RPC urls.
     chains: [devChainAdapter()],
@@ -50,6 +68,15 @@ function depsFor(env: WorkerEnv, ctx: ExecutionContext): AppDeps {
     pushStrategies: {},
     clock: { now: () => new Date() }
   };
+}
+
+function envNumber(env: WorkerEnv, key: string, fallback: number): number {
+  const raw = env[key];
+  if (typeof raw === "string" && raw.length > 0) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return fallback;
 }
 
 export default {

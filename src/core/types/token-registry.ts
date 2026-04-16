@@ -111,6 +111,25 @@ export const TOKEN_REGISTRY: readonly TokenInfo[] = [
     decimals: 6,
     isStable: true,
     displayName: "Dev Token"
+  },
+  // Solana native asset. chainId 900 = mainnet-beta, 901 = devnet (synthetic ids;
+  // Solana has no EVM-style chain id so we assign our own).
+  // SPL tokens (USDC/USDT mints) arrive with the Phase 7.5 SPL extension.
+  {
+    symbol: "SOL" as TokenSymbol,
+    chainId: 900 as ChainId,
+    contractAddress: null,
+    decimals: 9,
+    isStable: false,
+    displayName: "Solana"
+  },
+  {
+    symbol: "SOL" as TokenSymbol,
+    chainId: 901 as ChainId,
+    contractAddress: null,
+    decimals: 9,
+    isStable: false,
+    displayName: "Solana (devnet)"
   }
 ];
 

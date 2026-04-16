@@ -1,10 +1,11 @@
-import { Hono, type Context } from "hono";
-import { z, ZodError } from "zod";
+import { Hono } from "hono";
+import { z } from "zod";
 import type { AppDeps } from "../../core/app-deps.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import { registerFeeWallet } from "../../core/domain/payout.service.js";
 import type { ChainFamily } from "../../core/types/chain.js";
 import { sha256Hex, bytesToHex, getRandomValues } from "../../adapters/crypto/subtle.js";
+import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 
 // Operator-only surface. All routes require the shared admin key; the rest of
@@ -81,7 +82,7 @@ export function adminRouter(deps: AppDeps): Hono {
         201
       );
     } catch (err) {
-      return handleError(c, err);
+      return renderError(c, err, deps.logger);
     }
   });
 
@@ -111,7 +112,7 @@ export function adminRouter(deps: AppDeps): Hono {
       );
       return c.json({ feeWallet: { chainId: parsed.chainId, address: canonical, label: parsed.label } }, 201);
     } catch (err) {
-      return handleError(c, err);
+      return renderError(c, err, deps.logger);
     }
   });
 
@@ -124,13 +125,3 @@ function bytesToRandomHex(numBytes: number): string {
   return bytesToHex(bytes);
 }
 
-function handleError(c: Context, err: unknown): Response {
-  if (err instanceof ZodError) {
-    return c.json({ error: { code: "VALIDATION", details: err.issues } }, 400);
-  }
-  if (err instanceof Error) {
-    console.error("[admin] unhandled error:", err);
-    return c.json({ error: { code: "INTERNAL", message: err.message } }, 500);
-  }
-  return c.json({ error: { code: "INTERNAL" } }, 500);
-}

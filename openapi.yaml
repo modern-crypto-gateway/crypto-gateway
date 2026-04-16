@@ -1,0 +1,523 @@
+openapi: 3.1.0
+info:
+  title: crypto-gateway
+  version: 0.0.0
+  description: |
+    Runtime-agnostic crypto payment gateway with pluggable chain adapters
+    (EVM / Tron / Solana), DB adapters (D1 / libSQL / Postgres), cache
+    adapters, detection strategies, and webhook delivery.
+
+    Deploys on Cloudflare Workers, Node/Bun, Deno, and Vercel Edge from one
+    codebase.
+
+servers:
+  - url: http://localhost:8787
+    description: Local Node dev
+  - url: https://crypto-gateway-dev.workers.dev
+    description: Dev Workers (placeholder — replace with your subdomain)
+
+tags:
+  - name: orders
+    description: Merchant-facing order lifecycle
+  - name: payouts
+    description: Merchant-facing payout lifecycle
+  - name: checkout
+    description: Public order view (for hosted checkout UIs)
+  - name: webhooks
+    description: Inbound webhook ingest from on-chain providers
+  - name: admin
+    description: Operator-only setup
+  - name: internal
+    description: Scheduler-driven maintenance
+  - name: health
+
+security:
+  - MerchantApiKey: []
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Service up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, phase]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  phase: { type: integer }
+
+  /api/v1/orders:
+    post:
+      tags: [orders]
+      summary: Create an order
+      description: |
+        Creates an order and allocates a receive address derived from the
+        gateway's HD seed. The merchant is resolved from the API key — the
+        caller MUST NOT include `merchantId` in the body; if they do, it's
+        ignored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOrderInput" }
+      responses:
+        "201":
+          description: Order created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order]
+                properties:
+                  order: { $ref: "#/components/schemas/Order" }
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/orders/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [orders]
+      summary: Fetch an order
+      responses:
+        "200":
+          description: Order found
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order]
+                properties:
+                  order: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/orders/{id}/expire:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [orders]
+      summary: Force-expire an order before its expiry window elapses
+      responses:
+        "200":
+          description: Order expired
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Order is in a terminal state and cannot be expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/payouts:
+    post:
+      tags: [payouts]
+      summary: Plan a payout
+      description: |
+        Creates a payout in `planned` state. A background job
+        (`executeReservedPayouts`) reserves a fee wallet, signs, and
+        broadcasts. Confirmation is surfaced via `payout.*` webhooks or a
+        subsequent GET.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlanPayoutInput" }
+      responses:
+        "201":
+          description: Payout planned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payout: { $ref: "#/components/schemas/Payout" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/payouts/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [payouts]
+      summary: Fetch a payout
+      responses:
+        "200":
+          description: Payout found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payout: { $ref: "#/components/schemas/Payout" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /checkout/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [checkout]
+      summary: Public order snapshot (for checkout UIs)
+      description: |
+        Narrow projection of an order suitable for end-user pages. The merchant
+        identity and any merchant-private metadata are deliberately excluded.
+        Rate limited per IP.
+      security: []
+      responses:
+        "200":
+          description: Order snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order: { $ref: "#/components/schemas/PublicOrder" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /webhooks/alchemy:
+    post:
+      tags: [webhooks]
+      summary: Ingest Alchemy Notify ADDRESS_ACTIVITY webhooks
+      description: |
+        HMAC-SHA256 of the raw body under the `ALCHEMY_NOTIFY_SIGNING_KEY`
+        secret must match `X-Alchemy-Signature`. Returns 200 fast and
+        processes the payload in the background; Alchemy retries on non-2xx.
+      security:
+        - AlchemySignature: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Acknowledged; ingest happens in background
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: boolean, const: true }
+        "400": { description: Malformed JSON after a valid signature }
+        "401": { description: Missing or bad signature }
+        "404": { description: Alchemy ingest not enabled on this deployment }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /admin/merchants:
+    post:
+      tags: [admin]
+      summary: Create a merchant
+      description: |
+        Returns the plaintext API key ONCE in the response. The hash is
+        stored; the plaintext is unrecoverable afterward.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 128 }
+                webhookUrl: { type: string, format: uri }
+                webhookSecret:
+                  type: string
+                  description: Optional hex-encoded 32-byte HMAC signing secret. Generated if omitted.
+                  pattern: "^[0-9a-f]{64}$"
+      responses:
+        "201":
+          description: Merchant created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      webhookUrl: { type: [string, "null"] }
+                      active: { type: boolean }
+                      createdAt: { type: string, format: date-time }
+                  apiKey:
+                    type: string
+                    description: Plaintext API key. Shown once; store it immediately.
+                    pattern: "^sk_[0-9a-f]{64}$"
+                  webhookSecret:
+                    type: string
+                    description: Present only if `webhookUrl` was provided.
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+
+  /admin/fee-wallets:
+    post:
+      tags: [admin]
+      summary: Register a fee wallet + store its private key in the SignerStore
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chainId, address, label, privateKey, family]
+              properties:
+                chainId: { type: integer }
+                address: { type: string }
+                label: { type: string, maxLength: 64 }
+                privateKey:
+                  type: string
+                  description: Hex or family-specific. Stored in the SignerStore at `{kind:"fee-wallet", family, label}`.
+                family:
+                  type: string
+                  enum: [evm, tron, solana]
+      responses:
+        "201":
+          description: Fee wallet registered
+        "400":
+          description: Invalid address OR family does not match the chain adapter
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /internal/cron/tick:
+    post:
+      tags: [internal]
+      summary: Trigger the full scheduled-jobs sweep
+      description: |
+        Used by Vercel Cron / Upstash QStash / external schedulers. Returns
+        per-job outcomes so a slow provider in one step doesn't mask failures
+        elsewhere.
+      security:
+        - CronSecret: []
+      responses:
+        "200":
+          description: Sweep completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  result:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        ok: { type: boolean }
+                        error: { type: string }
+        "401": { description: Missing or wrong Bearer token }
+        "404": { description: Cron endpoint not enabled (CRON_SECRET not set) }
+
+components:
+  securitySchemes:
+    MerchantApiKey:
+      type: http
+      scheme: bearer
+      description: |
+        Merchant API key returned once at `POST /admin/merchants`.
+        Also accepted as `X-API-Key: <key>`.
+    AdminKey:
+      type: http
+      scheme: bearer
+      description: Shared admin key from `ADMIN_KEY` env. Also accepted as `X-Admin-Key`.
+    AlchemySignature:
+      type: apiKey
+      in: header
+      name: X-Alchemy-Signature
+      description: HMAC-SHA256 hex of the raw body under `ALCHEMY_NOTIFY_SIGNING_KEY`.
+    CronSecret:
+      type: http
+      scheme: bearer
+      description: Shared secret from `CRON_SECRET` env.
+
+  headers:
+    X-Request-Id:
+      description: UUID correlation id. Accepts a caller-supplied value if it's a valid UUID; otherwise minted.
+      schema: { type: string, format: uuid }
+    X-RateLimit-Limit:
+      description: Window cap for this route's rate-limit scope
+      schema: { type: integer }
+    X-RateLimit-Remaining:
+      description: Requests left in the current window after this one
+      schema: { type: integer }
+    X-RateLimit-Reset:
+      description: Unix seconds when the window rolls
+      schema: { type: integer }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MerchantInactive:
+      description: Merchant is deactivated
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Entity not found (or not owned by this merchant)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: Request body failed schema validation
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests in the current window
+      headers:
+        Retry-After:
+          description: Seconds until the window rolls
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code]
+          properties:
+            code: { type: string, description: Stable machine-readable code }
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+              description: Optional per-code payload (e.g. Zod issues on VALIDATION)
+
+    CreateOrderInput:
+      type: object
+      description: |
+        Either `amountRaw` OR (`fiatAmount` + `fiatCurrency`) must be provided.
+      properties:
+        chainId: { type: integer }
+        token: { type: string, pattern: "^[A-Z0-9]+$" }
+        amountRaw:
+          type: string
+          pattern: "^\\d+$"
+          description: Raw token amount in smallest units.
+        fiatAmount:
+          type: string
+          pattern: "^\\d+(\\.\\d+)?$"
+        fiatCurrency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+        externalId:
+          type: string
+          maxLength: 256
+          description: Merchant's opaque reference (e.g. cart id)
+        metadata:
+          type: object
+          additionalProperties: true
+        expiresInMinutes:
+          type: integer
+          minimum: 1
+          maximum: 1440
+          default: 30
+      required: [chainId, token]
+
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        merchantId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [created, partial, detected, confirmed, expired, canceled]
+        chainId: { type: integer }
+        token: { type: string }
+        receiveAddress: { type: string }
+        addressIndex: { type: integer }
+        requiredAmountRaw: { type: string }
+        receivedAmountRaw: { type: string }
+        fiatAmount: { type: [string, "null"] }
+        fiatCurrency: { type: [string, "null"] }
+        quotedRate: { type: [string, "null"] }
+        externalId: { type: [string, "null"] }
+        metadata: { type: [object, "null"] }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    PublicOrder:
+      type: object
+      description: Same as Order but with merchant-private fields stripped
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string }
+        chainId: { type: integer }
+        token: { type: string }
+        receiveAddress: { type: string }
+        requiredAmountRaw: { type: string }
+        receivedAmountRaw: { type: string }
+        fiatAmount: { type: [string, "null"] }
+        fiatCurrency: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+
+    PlanPayoutInput:
+      type: object
+      required: [chainId, token, amountRaw, destinationAddress]
+      properties:
+        chainId: { type: integer }
+        token: { type: string }
+        amountRaw: { type: string, pattern: "^\\d+$" }
+        destinationAddress: { type: string, minLength: 1, maxLength: 128 }
+
+    Payout:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        merchantId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [planned, reserved, submitted, confirmed, failed, canceled]
+        chainId: { type: integer }
+        token: { type: string }
+        amountRaw: { type: string }
+        destinationAddress: { type: string }
+        sourceAddress: { type: [string, "null"] }
+        txHash: { type: [string, "null"] }
+        feeEstimateNative: { type: [string, "null"] }
+        lastError: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        submittedAt: { type: [string, "null"], format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+        updatedAt: { type: string, format: date-time }

@@ -24,7 +24,7 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
     .prepare(
       `SELECT chain_id, receive_address
          FROM orders
-        WHERE status IN ('created','pending','partial','detected','confirmed')
+        WHERE status IN ('created','partial','detected','confirmed')
           AND expires_at > ?`
     )
     .bind(deps.clock.now().getTime())

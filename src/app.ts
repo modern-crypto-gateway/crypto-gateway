@@ -4,6 +4,8 @@ import { confirmTransactions } from "./core/domain/payment.service.js";
 import { confirmPayouts, executeReservedPayouts } from "./core/domain/payout.service.js";
 import { pollPayments } from "./core/domain/poll-payments.js";
 import { registerWebhookSubscriber } from "./core/domain/webhook-subscriber.js";
+import { renderError } from "./http/middleware/error-handler.js";
+import { requestIdMiddleware, type RequestIdVariables } from "./http/middleware/request-id.js";
 import { adminRouter } from "./http/routes/admin.js";
 import { checkoutRouter } from "./http/routes/checkout.js";
 import { internalCronRouter } from "./http/routes/internal-cron.js";
@@ -21,13 +23,25 @@ export interface App {
 }
 
 export function buildApp(deps: AppDeps): App {
-  const app = new Hono();
+  const app = new Hono<{ Variables: RequestIdVariables }>();
 
   // Wire event-bus subscribers. Subscriptions stay active for the lifetime of
   // this buildApp call — one set per AppDeps is the contract.
   registerWebhookSubscriber(deps);
 
-  app.get("/health", (c) => c.json({ status: "ok", phase: 4 }));
+  // Request-id propagation sits at the root so every downstream route sees
+  // the id in the context and echoes it in the response header.
+  app.use("*", requestIdMiddleware());
+
+  // Global error handler — catches anything that escapes a route's own
+  // try/catch (or handlers that just `throw` directly). Pairs the error with
+  // the request id so operators can pivot from a log line back to a response.
+  app.onError((err, c) => {
+    const logger = deps.logger.child({ requestId: c.get("requestId") });
+    return renderError(c, err, logger);
+  });
+
+  app.get("/health", (c) => c.json({ status: "ok", phase: 8 }));
 
   app.route("/api/v1/orders", ordersRouter(deps));
   app.route("/api/v1/payouts", payoutsRouter(deps));

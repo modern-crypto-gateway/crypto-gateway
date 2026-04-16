@@ -6,16 +6,14 @@ import { MerchantIdSchema } from "./merchant.js";
 import { TokenSymbolSchema } from "./token.js";
 
 // Order lifecycle:
-//   created  -> awaiting first detection
-//   pending  -> at least one matching transfer seen, not yet confirmed
-//   partial  -> transfers seen sum to < required amount; timer still running
-//   detected -> exact-or-over amount seen, awaiting N confirmations
+//   created   -> awaiting first detection (or re-opened after all contributing txs reverted)
+//   partial   -> transfers seen sum to < required amount; timer still running
+//   detected  -> exact-or-over amount seen, awaiting N confirmations
 //   confirmed -> finalized; merchant webhook fired
 //   expired   -> expiry window elapsed without sufficient funds
 //   canceled  -> merchant canceled before confirmation
 export const OrderStatusSchema = z.enum([
   "created",
-  "pending",
   "partial",
   "detected",
   "confirmed",

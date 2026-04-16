@@ -8,6 +8,7 @@ import { TokenSymbolSchema } from "../types/token.js";
 import { findToken } from "../types/token-registry.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { rowToOrder, type OrderRow } from "./mappers.js";
+import { DomainError } from "../errors.js";
 
 // ---- Input validation ----
 
@@ -168,7 +169,7 @@ export async function expireOrder(deps: AppDeps, orderId: OrderId): Promise<Orde
     .prepare(
       `UPDATE orders
          SET status = 'expired', updated_at = ?
-       WHERE id = ? AND status IN ('created','pending','partial')
+       WHERE id = ? AND status IN ('created','partial')
        RETURNING *`
     )
     .bind(now, orderId)
@@ -193,9 +194,21 @@ export type OrderErrorCode =
   | "ADDRESS_ALLOCATION_FAILED"
   | "EXPIRE_NOT_ALLOWED";
 
-export class OrderError extends Error {
-  constructor(readonly code: OrderErrorCode, message: string) {
-    super(message);
+// HTTP status per code lives here (next to the codes themselves) rather than
+// in the route's handleError — routes shouldn't reverse-engineer semantics
+// from a code name.
+const ORDER_ERROR_HTTP_STATUS: Readonly<Record<OrderErrorCode, number>> = {
+  MERCHANT_NOT_FOUND: 404,
+  MERCHANT_INACTIVE: 403,
+  TOKEN_NOT_SUPPORTED: 400,
+  ADDRESS_ALLOCATION_FAILED: 500,
+  EXPIRE_NOT_ALLOWED: 409
+};
+
+export class OrderError extends DomainError {
+  declare readonly code: OrderErrorCode;
+  constructor(code: OrderErrorCode, message: string, details?: Record<string, unknown>) {
+    super(code, message, ORDER_ERROR_HTTP_STATUS[code], details);
     this.name = "OrderError";
   }
 }

@@ -3,6 +3,8 @@ import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
+import { consoleLogger } from "../adapters/logging/console.adapter.js";
+import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
 import { denoEnvSecrets } from "../adapters/secrets/deno-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
@@ -35,15 +37,33 @@ async function main(): Promise<void> {
     dbAuthToken !== undefined ? { url: databaseUrl, authToken: dbAuthToken } : { url: databaseUrl }
   );
 
+  const logger = consoleLogger({
+    format: "json",
+    minLevel: "info",
+    baseFields: { service: "crypto-gateway", runtime: "deno" }
+  });
+
+  const cache = memoryCacheAdapter();
+  const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
+
   const deps: AppDeps = {
     db,
-    cache: memoryCacheAdapter(),
-    jobs: promiseSetJobs(),
+    cache,
+    jobs: promiseSetJobs({
+      onError: (err, name) => logger.error("deferred job failed", { name, error: String(err) })
+    }),
     secrets,
     signerStore: memorySignerStore(),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: inlineFetchDispatcher(),
     events: createInMemoryEventBus(),
+    logger,
+    rateLimiter,
+    rateLimits: {
+      merchantPerMinute: Number(secrets.getOptional("RATE_LIMIT_MERCHANT_PER_MINUTE") ?? "1000"),
+      checkoutPerMinute: Number(secrets.getOptional("RATE_LIMIT_CHECKOUT_PER_MINUTE") ?? "60"),
+      webhookIngestPerMinute: Number(secrets.getOptional("RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE") ?? "300")
+    },
     chains: [devChainAdapter()],
     detectionStrategies: {},
     pushStrategies: {},

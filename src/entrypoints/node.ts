@@ -7,75 +7,87 @@ import { buildApp } from "../app.js";
 import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
 import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
+import { consoleLogger } from "../adapters/logging/console.adapter.js";
+import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { processEnvSecrets } from "../adapters/secrets/process-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
 import { noopWebhookDispatcher } from "../adapters/webhook-delivery/noop.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
+import { loadConfig, ConfigValidationError } from "../config/config.schema.js";
 import type { AppDeps } from "../core/app-deps.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
 
-// Production vs. dev behavior gate. Two things change in production:
-//   1. MASTER_SEED is strictly required; the dev fallback is removed.
-//   2. The default-merchant seed is skipped — production merchants are created
-//      through POST /admin/merchants, never auto-seeded.
-// `NODE_ENV` isn't a standard TypeScript convention but it IS the standard
-// runtime convention. We treat "production" strictly; anything else (including
-// unset) is dev.
-function isProduction(): boolean {
-  return process.env["NODE_ENV"] === "production";
-}
-
 async function main(): Promise<void> {
-  const production = isProduction();
-
-  // --- Boot-time secret validation -------------------------------------------
-  // Do this BEFORE wiring any adapter so a missing secret fails fast with a
-  // clear message rather than surfacing later as a viem derivation error.
-  if (production) {
-    const seed = process.env["MASTER_SEED"];
-    if (!seed || seed === "" || seed === "dev-seed") {
-      console.error(
-        "[boot] MASTER_SEED must be a real BIP39 mnemonic in production. " +
-          "Refusing to start with a missing or placeholder seed."
-      );
-      process.exit(1);
+  // Boot-time config validation. loadConfig throws a ConfigValidationError
+  // aggregating every missing or malformed field; catching it here lets us
+  // exit with a clear message instead of surfacing N individual failures
+  // scattered across later lazy lookups.
+  let config;
+  try {
+    config = loadConfig(process.env);
+  } catch (err) {
+    if (err instanceof ConfigValidationError) {
+      console.error(`[boot] ${err.message}`);
+    } else {
+      console.error("[boot] unexpected config error:", err);
     }
-  } else if (process.env["MASTER_SEED"] === undefined) {
-    // Dev convenience: accept a deliberately-weak default so `npm run dev:node`
-    // works without a .env file. Warn loudly so this is never mistaken for
-    // a real configuration.
+    process.exit(1);
+  }
+  const production = config.environment === "production";
+
+  const logger = consoleLogger({
+    format: production ? "json" : "pretty",
+    minLevel: production ? "info" : "debug",
+    baseFields: { service: "crypto-gateway", runtime: "node", env: config.environment }
+  });
+
+  // Dev convenience: if no MASTER_SEED was set and the config allowed it
+  // (loadConfig's refinement only enforces it in production), fall back to a
+  // deliberately-weak placeholder and warn. Derivation for real EVM/Tron/Solana
+  // adapters will fail with viem's own error until a real mnemonic is set.
+  if (!production && config.masterSeed === undefined) {
     process.env["MASTER_SEED"] = "dev-seed";
-    console.warn(
-      "[boot] WARNING: MASTER_SEED not set. Using the 'dev-seed' placeholder. " +
-        "Derivation will fail for real EVM/Tron adapters — set a real BIP39 " +
-        "mnemonic in .env before using anything beyond the dev chain adapter."
+    logger.warn(
+      "MASTER_SEED not set; using 'dev-seed' placeholder. Real EVM/Tron/Solana derivation will fail until a real BIP39 mnemonic is set."
     );
   }
 
   const secrets = processEnvSecrets();
-  const databaseUrl = secrets.getOptional("DATABASE_URL") ?? "file:./local.db";
-  const port = Number(secrets.getOptional("PORT") ?? "8787");
-
-  const dbAuthToken = secrets.getOptional("DATABASE_TOKEN");
+  const databaseUrl = config.databaseUrl ?? "file:./local.db";
+  const dbAuthToken = config.databaseToken;
   const db = libsqlAdapter(
     dbAuthToken !== undefined ? { url: databaseUrl, authToken: dbAuthToken } : { url: databaseUrl }
   );
 
   await applySchema(db);
   if (!production) {
-    await seedDefaultMerchantIfMissing(db);
+    await seedDefaultMerchantIfMissing(db, logger);
   }
+
+  const cache = memoryCacheAdapter();
+  // minTtlSeconds: 1 overrides the KV-shaped 60s floor — Node's memory cache
+  // has no TTL floor of its own, so sub-minute windows work correctly here.
+  const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
 
   const deps: AppDeps = {
     db,
-    cache: memoryCacheAdapter(),
-    jobs: promiseSetJobs(),
-    secrets: processEnvSecrets(),
+    cache,
+    jobs: promiseSetJobs({
+      onError: (err, name) => logger.error("deferred job failed", { name, error: String(err) })
+    }),
+    secrets,
     signerStore: memorySignerStore(),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: noopWebhookDispatcher(),
     events: createInMemoryEventBus(),
+    logger,
+    rateLimiter,
+    rateLimits: {
+      merchantPerMinute: config.rateLimitMerchantPerMinute,
+      checkoutPerMinute: config.rateLimitCheckoutPerMinute,
+      webhookIngestPerMinute: config.rateLimitWebhookIngestPerMinute
+    },
     chains: [devChainAdapter()],
     // Push-only for local dev by default: no detection strategies wired. Uncomment
     // and add an RPC poll strategy per chain when pointing the dev server at real
@@ -90,16 +102,14 @@ async function main(): Promise<void> {
   const app = buildApp(deps);
 
   const server = serve(
-    { fetch: app.fetch as (req: Request) => Response | Promise<Response>, port },
+    { fetch: app.fetch as (req: Request) => Response | Promise<Response>, port: config.port },
     (info) => {
-      console.warn(
-        `crypto-gateway (node, ${production ? "production" : "dev"}) listening on http://localhost:${info.port}`
-      );
+      logger.info("listening", { port: info.port, url: `http://localhost:${info.port}` });
     }
   );
 
   process.on("SIGTERM", async () => {
-    console.warn("SIGTERM received; draining jobs...");
+    logger.info("SIGTERM received; draining jobs");
     await deps.jobs.drain(10_000);
     server.close();
     process.exit(0);
@@ -116,7 +126,7 @@ async function applySchema(db: AppDeps["db"]): Promise<void> {
 
 // Dev-only helper. Guarded at the call site by `if (!production)`; this
 // function itself remains single-purpose so the dev-only behavior is obvious.
-async function seedDefaultMerchantIfMissing(db: AppDeps["db"]): Promise<void> {
+async function seedDefaultMerchantIfMissing(db: AppDeps["db"], logger: AppDeps["logger"]): Promise<void> {
   const existing = await db.prepare("SELECT id FROM merchants LIMIT 1").first<{ id: string }>();
   if (existing) return;
   const now = Date.now();
@@ -129,15 +139,15 @@ async function seedDefaultMerchantIfMissing(db: AppDeps["db"]): Promise<void> {
       "00000000-0000-0000-0000-000000000001",
       "Dev Merchant",
       // Placeholder api_key_hash — no known plaintext preimage. Even if this row
-      // leaked to prod (which the NODE_ENV=production guard prevents) nobody
-      // could authenticate as this merchant. Real merchants are created via
+      // leaked to prod (which the environment guard prevents) nobody could
+      // authenticate as this merchant. Real merchants are created via
       // POST /admin/merchants and return their plaintext key once.
       "d1f4b2a4a7e7c6d5c5c3a4e4c3d5e3f3c3e3e3c3d3f3a3e3c3d3e3f3c3e3e3c3",
       now,
       now
     )
     .run();
-  console.warn('[seed] dev-only: inserted default merchant "00000000-0000-0000-0000-000000000001"');
+  logger.warn("dev-only: seeded default merchant", { id: "00000000-0000-0000-0000-000000000001" });
 }
 
 void main();

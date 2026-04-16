@@ -11,6 +11,7 @@ import type { SignerScope } from "../types/signer.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { rowToPayout, type PayoutRow } from "./mappers.js";
 import { confirmationThreshold } from "./payment-config.js";
+import { DomainError } from "../errors.js";
 
 // PayoutService lifecycle:
 //
@@ -46,9 +47,18 @@ export type PayoutErrorCode =
   | "INVALID_DESTINATION"
   | "NO_FEE_WALLET_AVAILABLE";
 
-export class PayoutError extends Error {
-  constructor(readonly code: PayoutErrorCode, message: string) {
-    super(message);
+const PAYOUT_ERROR_HTTP_STATUS: Readonly<Record<PayoutErrorCode, number>> = {
+  MERCHANT_NOT_FOUND: 404,
+  MERCHANT_INACTIVE: 403,
+  TOKEN_NOT_SUPPORTED: 400,
+  INVALID_DESTINATION: 400,
+  NO_FEE_WALLET_AVAILABLE: 503
+};
+
+export class PayoutError extends DomainError {
+  declare readonly code: PayoutErrorCode;
+  constructor(code: PayoutErrorCode, message: string, details?: Record<string, unknown>) {
+    super(code, message, PAYOUT_ERROR_HTTP_STATUS[code], details);
     this.name = "PayoutError";
   }
 }

@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { AppDeps } from "../../core/app-deps.js";
 import { ingestDetectedTransfer } from "../../core/domain/payment.service.js";
 import { bytesToHex, hmacSha256 } from "../../adapters/crypto/subtle.js";
+import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
 
 // Routes under /webhooks/*. Each provider gets its own endpoint so the
 // signature scheme and payload shape can differ without shared coupling.
@@ -19,6 +20,20 @@ import { bytesToHex, hmacSha256 } from "../../adapters/crypto/subtle.js";
 
 export function webhooksIngestRouter(deps: AppDeps): Hono {
   const app = new Hono();
+
+  // Per-IP limit to stop an attacker from flooding the HMAC-verification path
+  // with bad signatures (the verify is cheap but not free). Legitimate
+  // providers originate from a narrow set of IPs; 300/min/IP is well above
+  // Alchemy's normal rate and still protects the surface.
+  app.use(
+    "*",
+    rateLimit(deps, {
+      scope: "webhook-ingest",
+      keyFn: (c) => getClientIp(c),
+      limit: deps.rateLimits.webhookIngestPerMinute,
+      windowSeconds: 60
+    })
+  );
 
   app.post("/alchemy", async (c) => {
     const strategy = deps.pushStrategies["alchemy-notify"];

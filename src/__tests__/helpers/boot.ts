@@ -10,7 +10,9 @@ import { staticPegPriceOracle } from "../../adapters/price-oracle/static-peg.ada
 import { memorySignerStore } from "../../adapters/signer-store/memory.adapter.js";
 import { capturingWebhookDispatcher, type CapturingDispatcher } from "../../adapters/webhook-delivery/noop.adapter.js";
 import { sha256Hex } from "../../adapters/crypto/subtle.js";
-import type { AppDeps } from "../../core/app-deps.js";
+import { bufferingLogger, type BufferingLogger } from "../../adapters/logging/console.adapter.js";
+import { cacheBackedRateLimiter } from "../../adapters/rate-limit/cache-backed.adapter.js";
+import type { AppDeps, RateLimitConfig } from "../../core/app-deps.js";
 import { createInMemoryEventBus } from "../../core/events/in-memory-bus.js";
 import type { SecretsProvider } from "../../core/ports/secrets.port.js";
 
@@ -38,6 +40,9 @@ export interface BootTestAppOptions {
     webhookUrl?: string;
     webhookSecret?: string;
   }>;
+  // Rate-limit overrides. Defaults are set high enough that existing integration
+  // tests never trip them; rate-limit-specific tests pass small numbers here.
+  rateLimits?: Partial<RateLimitConfig>;
 }
 
 export interface BootedTestApp {
@@ -49,6 +54,9 @@ export interface BootedTestApp {
   // Plaintext API keys for each seeded merchant, keyed by merchant id.
   // Tests pass these in the Authorization header.
   apiKeys: Readonly<Record<string, string>>;
+  // Buffering logger attached to deps — tests can inspect `logger.entries`
+  // to assert that a specific log line fired.
+  logger: BufferingLogger;
   // Close underlying resources (libSQL :memory: client).
   close: () => Promise<void>;
 }
@@ -153,16 +161,29 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
   };
 
   const capturingDispatcher = options.webhookDispatcher === undefined ? capturingWebhookDispatcher() : undefined;
+  const logger = bufferingLogger();
+  const cache = memoryCacheAdapter();
+  const rateLimits: RateLimitConfig = {
+    merchantPerMinute: options.rateLimits?.merchantPerMinute ?? 10_000,
+    checkoutPerMinute: options.rateLimits?.checkoutPerMinute ?? 10_000,
+    webhookIngestPerMinute: options.rateLimits?.webhookIngestPerMinute ?? 10_000
+  };
+  // The memory cache honors arbitrary TTLs (no 60s floor), so the limiter's
+  // windowing is exact in tests.
+  const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
 
   const deps: AppDeps = {
     db,
-    cache: memoryCacheAdapter(),
+    cache,
     jobs: promiseSetJobs(),
     secrets,
     signerStore: memorySignerStore(),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: options.webhookDispatcher ?? capturingDispatcher!,
     events: createInMemoryEventBus(),
+    logger,
+    rateLimiter,
+    rateLimits,
     chains: options.chains ?? [devChainAdapter()],
     detectionStrategies: options.detectionStrategies ?? {},
     pushStrategies: options.pushStrategies ?? {},
@@ -175,6 +196,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     app,
     deps,
     apiKeys,
+    logger,
     close: async () => {
       await deps.jobs.drain(1_000);
     }

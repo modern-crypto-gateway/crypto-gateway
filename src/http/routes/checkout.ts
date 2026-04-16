@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { AppDeps } from "../../core/app-deps.js";
 import { getOrder } from "../../core/domain/order.service.js";
 import type { OrderId } from "../../core/types/order.js";
+import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
 
 // Public checkout view. Anyone with an order id can fetch the details needed
 // to render a "send N TOKEN to ADDRESS" page / QR code. The order id itself is
@@ -14,6 +15,19 @@ import type { OrderId } from "../../core/types/order.js";
 
 export function checkoutRouter(deps: AppDeps): Hono {
   const app = new Hono();
+
+  // Per-IP limit on the public checkout surface. Abusive scanning of many
+  // order ids from one IP trips this; normal merchants serve their end users
+  // from distinct IPs.
+  app.use(
+    "*",
+    rateLimit(deps, {
+      scope: "checkout",
+      keyFn: (c) => getClientIp(c),
+      limit: deps.rateLimits.checkoutPerMinute,
+      windowSeconds: 60
+    })
+  );
 
   app.get("/:id", async (c) => {
     const id = c.req.param("id") as OrderId;

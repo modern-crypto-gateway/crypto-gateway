@@ -303,7 +303,6 @@ function orderEventFor(status: OrderStatus, order: Order, now: number): DomainEv
     case "canceled":
       return { type: "order.canceled", orderId: order.id, order, at };
     case "created":
-    case "pending":
       return { type: "order.created", orderId: order.id, order, at };
   }
 }

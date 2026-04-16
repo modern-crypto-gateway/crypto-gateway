@@ -2,6 +2,12 @@
 -- Dialect: SQLite (D1 + libSQL). CI will generate schema-pg.sql from this as Phase 8 lands.
 -- All amounts are TEXT (decimal strings) to avoid bigint serialization issues across adapters.
 -- All timestamps are INTEGER (epoch milliseconds) for portability.
+--
+-- FOREIGN KEY enforcement: D1 enables `PRAGMA foreign_keys = ON` by default.
+-- libSQL does NOT — the pragma is per-connection, not persisted. Running it
+-- here only affects the connection that applies this schema. Production libSQL
+-- deployments get referential integrity via application-level checks in
+-- order.service / payout.service (both verify the merchant exists before insert).
 
 CREATE TABLE IF NOT EXISTS merchants (
   id                  TEXT PRIMARY KEY,
@@ -19,7 +25,7 @@ CREATE INDEX IF NOT EXISTS idx_merchants_api_key_hash ON merchants(api_key_hash)
 CREATE TABLE IF NOT EXISTS orders (
   id                    TEXT PRIMARY KEY,
   merchant_id           TEXT NOT NULL REFERENCES merchants(id),
-  status                TEXT NOT NULL CHECK (status IN ('created','pending','partial','detected','confirmed','expired','canceled')),
+  status                TEXT NOT NULL CHECK (status IN ('created','partial','detected','confirmed','expired','canceled')),
 
   chain_id              INTEGER NOT NULL,
   token                 TEXT NOT NULL,

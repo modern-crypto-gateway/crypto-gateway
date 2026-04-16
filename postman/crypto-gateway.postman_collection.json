@@ -1,0 +1,218 @@
+{
+  "info": {
+    "name": "crypto-gateway",
+    "description": "Merchant + admin + checkout + ingest flows. Set the collection variables `baseUrl`, `merchantApiKey`, `adminKey`, `cronSecret`, and `alchemySigningKey` under the collection-level Variables tab before running requests.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "crypto-gateway"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8787", "type": "string" },
+    { "key": "merchantApiKey", "value": "sk_test_<fill-in>", "type": "string" },
+    { "key": "adminKey", "value": "<fill-in>", "type": "string" },
+    { "key": "cronSecret", "value": "<fill-in>", "type": "string" },
+    { "key": "alchemySigningKey", "value": "<fill-in>", "type": "string" },
+    { "key": "orderId", "value": "", "type": "string", "description": "Populated by the 'Create order' request's test script." },
+    { "key": "payoutId", "value": "", "type": "string", "description": "Populated by the 'Plan payout' request's test script." }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin",
+      "item": [
+        {
+          "name": "Create merchant",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/admin/merchants", "host": ["{{baseUrl}}"], "path": ["admin", "merchants"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Acme Corp\",\n  \"webhookUrl\": \"https://merchant.example.com/crypto-gateway/webhook\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.apiKey) {",
+                  "  pm.collectionVariables.set('merchantApiKey', body.apiKey);",
+                  "  console.log('Saved merchantApiKey into the collection variable.');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Register fee wallet",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/admin/fee-wallets", "host": ["{{baseUrl}}"], "path": ["admin", "fee-wallets"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 999,\n  \"address\": \"0xAABBCCDDEEFF00112233445566778899AABBCCDD\",\n  \"label\": \"hot-1\",\n  \"privateKey\": \"0x1111111111111111111111111111111111111111111111111111111111111111\",\n  \"family\": \"evm\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Orders (merchant)",
+      "item": [
+        {
+          "name": "Create order",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 999,\n  \"token\": \"DEV\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"cart-42\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.order && body.order.id) {",
+                  "  pm.collectionVariables.set('orderId', body.order.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get order",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "orders", "{{orderId}}"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }]
+          }
+        },
+        {
+          "name": "Expire order",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}/expire",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "orders", "{{orderId}}", "expire"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Payouts (merchant)",
+      "item": [
+        {
+          "name": "Plan payout",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 999,\n  \"token\": \"DEV\",\n  \"amountRaw\": \"500000\",\n  \"destinationAddress\": \"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.payout && body.payout.id) {",
+                  "  pm.collectionVariables.set('payoutId', body.payout.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get payout",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payouts/{{payoutId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payouts", "{{payoutId}}"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Checkout (public)",
+      "item": [
+        {
+          "name": "GET /checkout/:id",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/checkout/{{orderId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["checkout", "{{orderId}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Internal",
+      "item": [
+        {
+          "name": "Trigger cron sweep",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/internal/cron/tick",
+              "host": ["{{baseUrl}}"],
+              "path": ["internal", "cron", "tick"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{cronSecret}}" }]
+          }
+        }
+      ]
+    }
+  ]
+}

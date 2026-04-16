@@ -1,8 +1,9 @@
-import { Hono, type Context } from "hono";
-import { ZodError } from "zod";
+import { Hono } from "hono";
 import type { AppDeps } from "../../core/app-deps.js";
-import { createOrder, expireOrder, getOrder, OrderError } from "../../core/domain/order.service.js";
+import { createOrder, expireOrder, getOrder } from "../../core/domain/order.service.js";
 import type { Order, OrderId } from "../../core/types/order.js";
+import { renderError } from "../middleware/error-handler.js";
+import { rateLimit } from "../middleware/rate-limit.js";
 import { apiKeyAuth, type AuthedVariables } from "../middleware/api-key-auth.js";
 
 // Merchant-facing order routes. All endpoints require API-key authentication;
@@ -17,6 +18,18 @@ export function ordersRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables }
   const app = new Hono<{ Variables: AuthedVariables }>();
 
   app.use("*", apiKeyAuth(deps));
+  // Rate-limit per authenticated merchant. keyFn reads merchantId from the
+  // auth-middleware context; it can't return null here because auth above
+  // would have already rejected with 401.
+  app.use(
+    "*",
+    rateLimit(deps, {
+      scope: "merchant-api",
+      keyFn: (c) => (c.get("merchantId") as string | undefined) ?? null,
+      limit: deps.rateLimits.merchantPerMinute,
+      windowSeconds: 60
+    })
+  );
 
   app.post("/", async (c) => {
     const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
@@ -29,7 +42,7 @@ export function ordersRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables }
       const order = await createOrder(deps, input);
       return c.json({ order: serializeOrder(order) }, 201);
     } catch (err) {
-      return handleError(c, err);
+      return renderError(c, err, deps.logger);
     }
   });
 
@@ -52,7 +65,7 @@ export function ordersRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables }
       const order = await expireOrder(deps, id);
       return c.json({ order: serializeOrder(order) });
     } catch (err) {
-      return handleError(c, err);
+      return renderError(c, err, deps.logger);
     }
   });
 
@@ -71,23 +84,3 @@ function serializeOrder(order: Order): Record<string, unknown> {
   };
 }
 
-function handleError(c: Context, err: unknown): Response {
-  if (err instanceof ZodError) {
-    return c.json({ error: { code: "VALIDATION", message: "Invalid request", details: err.issues } }, 400);
-  }
-  if (err instanceof OrderError) {
-    const status =
-      err.code === "MERCHANT_NOT_FOUND"
-        ? 404
-        : err.code === "TOKEN_NOT_SUPPORTED"
-          ? 400
-          : err.code === "MERCHANT_INACTIVE"
-            ? 403
-            : err.code === "EXPIRE_NOT_ALLOWED"
-              ? 409
-              : 500;
-    return c.json({ error: { code: err.code, message: err.message } }, status);
-  }
-  console.error("[orders] unhandled error:", err);
-  return c.json({ error: { code: "INTERNAL", message: "Internal server error" } }, 500);
-}

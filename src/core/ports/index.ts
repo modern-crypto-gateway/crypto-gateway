@@ -7,3 +7,5 @@ export type { PriceOracle } from "./price-oracle.port.js";
 export type { DetectionStrategy } from "./detection.port.js";
 export type { WebhookDispatcher } from "./webhook-delivery.port.js";
 export type { SignerStore } from "./signer-store.port.js";
+export type { Logger, LogLevel, LogFields } from "./logger.port.js";
+export type { RateLimiter, RateLimitResult } from "./rate-limit.port.js";
