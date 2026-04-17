@@ -1,5 +1,5 @@
 // RateLimiter port. Intentionally minimal surface so a future Redis-INCR,
-// Cloudflare Durable Object, or in-memory backend can all slot in with the
+// Cloudflare ratelimits binding, or in-memory backend can all slot in with the
 // same contract. The port speaks buckets-per-key, not HTTP — the middleware
 // is responsible for mapping request shape to a key and consuming the result.
 
@@ -20,7 +20,7 @@ export interface RateLimiter {
   // Atomic semantics are advisory. Cache-backed implementations on eventually
   // consistent stores (CF KV) may over-admit by a handful of requests per
   // window under concurrent burst — that is acceptable for fairness limits,
-  // not for hard security gates. For strict caps use the future Durable
-  // Objects adapter.
+  // not for hard security gates. For strict caps on Workers, wire the
+  // `cloudflareRateLimiter` adapter with per-scope ratelimits bindings.
   consume(args: { key: string; limit: number; windowSeconds: number }): Promise<RateLimitResult>;
 }

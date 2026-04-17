@@ -9,7 +9,8 @@ import type { RateLimiter, RateLimitResult } from "../../core/ports/rate-limit.p
 // Consistency: cache `.get` + `.put` is NOT atomic. Under heavy concurrent
 // burst on eventually consistent stores (CF KV) this over-admits by up to the
 // concurrency level. In-memory and Redis backends (future) are tighter. For
-// strict single-digit-accurate limits, use the Durable Objects adapter (Phase 9).
+// strict single-digit-accurate limits on Workers, wire the Cloudflare
+// `ratelimits` binding via cloudflare.adapter.ts instead.
 
 export interface CacheBackedRateLimiterConfig {
   // Clock injection for tests. Defaults to `() => Date.now()`.

@@ -77,33 +77,25 @@
     }
   ],
 
-  // Durable Object namespace for strict rate-limiting. Optional but strongly
-  // recommended in production — the KV-backed limiter can over-admit by a
-  // handful of requests per window under concurrent burst (eventually
-  // consistent reads). The DO path serializes through a single-threaded
-  // instance per rate-limit key, giving honest atomic counters.
+  // Cloudflare built-in rate-limit bindings. One entry per scope — each
+  // binding is ONE (limit, period) pair enforced atomically at the edge,
+  // free, with no invocation cost on our side. Scopes map to the prefix
+  // used by the middleware (`rateLimit({ scope: "..." })` in routes).
   //
-  // Setup:
-  //   1. Leave the bindings block below and the `migrations` block in place.
-  //   2. Run `npx wrangler deploy -e dev` once — the first deploy creates
-  //      the DO class under the name "RATE_LIMITER_DO".
-  //   3. Subsequent deploys reuse it.
+  // namespace_id: any unique uint32 per binding within this account; the
+  // values below are arbitrary but stable — keep them in sync across envs
+  // so a rolling deploy doesn't flip buckets. `simple.limit` / `simple.period`
+  // should track the RATE_LIMIT_*_PER_MINUTE vars below (those feed the
+  // middleware headers; these enforce the actual cap).
   //
-  // To opt out, delete both the `durable_objects` block and the
-  // `migrations` block; the worker falls back to the KV-backed limiter.
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "RATE_LIMITER_DO",
-        "class_name": "RateLimiterDurableObject"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["RateLimiterDurableObject"]
-    }
+  // Any binding you omit falls back to the KV-backed limiter (the
+  // cacheBackedRateLimiter adapter), which has a documented over-admit
+  // risk under burst. Declare all four for strict production limits.
+  "ratelimits": [
+    { "name": "RATE_LIMIT_ADMIN",           "namespace_id": "4001", "simple": { "limit": 30,   "period": 60 } },
+    { "name": "RATE_LIMIT_CHECKOUT",        "namespace_id": "4002", "simple": { "limit": 60,   "period": 60 } },
+    { "name": "RATE_LIMIT_WEBHOOK_INGEST",  "namespace_id": "4003", "simple": { "limit": 300,  "period": 60 } },
+    { "name": "RATE_LIMIT_MERCHANT_API",    "namespace_id": "4004", "simple": { "limit": 1000, "period": 60 } }
   ],
 
   // Public env vars. Secrets (MASTER_SEED, ADMIN_KEY, CRON_SECRET,

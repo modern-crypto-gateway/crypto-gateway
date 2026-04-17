@@ -1,4 +1,4 @@
-import type { D1Database, DurableObjectNamespace, ExecutionContext, KVNamespace, ScheduledController } from "@cloudflare/workers-types";
+import type { D1Database, ExecutionContext, KVNamespace, RateLimit, ScheduledController } from "@cloudflare/workers-types";
 import { buildApp } from "../app.js";
 import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
@@ -21,8 +21,7 @@ import { consoleLogger } from "../adapters/logging/console.adapter.js";
 import { httpAlertSink } from "../adapters/logging/http-alert.adapter.js";
 import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
-import { durableObjectRateLimiter } from "../adapters/rate-limit/durable-object.adapter.js";
-export { RateLimiterDurableObject } from "../adapters/rate-limit/rate-limit-do.js";
+import { cloudflareRateLimiter } from "../adapters/rate-limit/cloudflare.adapter.js";
 import { workersEnvSecrets } from "../adapters/secrets/workers-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
@@ -44,9 +43,15 @@ export interface WorkerEnv {
   // Bindings declared in wrangler.jsonc
   DB: D1Database;
   KV: KVNamespace;
-  // Optional Durable Object namespace for strict rate-limiting. When present
-  // we prefer it over the KV-backed limiter; otherwise we fall back gracefully.
-  RATE_LIMITER_DO?: DurableObjectNamespace;
+  // Cloudflare built-in rate-limit bindings. Each (scope, limit, period) is
+  // declared in wrangler.jsonc. The adapter falls through to the cache-backed
+  // limiter for any scope whose binding is absent, so operators can roll
+  // these out one at a time. Scopes match the prefix used by rate-limit.ts
+  // (see `rateLimit({ scope: ... })` call sites).
+  RATE_LIMIT_ADMIN?: RateLimit;
+  RATE_LIMIT_CHECKOUT?: RateLimit;
+  RATE_LIMIT_WEBHOOK_INGEST?: RateLimit;
+  RATE_LIMIT_MERCHANT_API?: RateLimit;
 
   // Secrets (set via `wrangler secret put`)
   MASTER_SEED: string;
@@ -78,17 +83,28 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     ...(alertSink !== undefined ? { alertSink } : {})
   });
   const cache = cfKvAdapter(env.KV);
-  // Prefer the Durable Object rate limiter when a namespace is bound — it
-  // gives us atomic, honest INCR semantics that CF KV cannot. Fall back to
-  // the cache-backed limiter (with its documented over-admit risk) when the
-  // binding is absent so operators can still ship without the extra DO
-  // setup step. Flip over by adding the RATE_LIMITER_DO binding to
-  // wrangler.jsonc (see wrangler.jsonc.example for the block).
-  const rateLimiter = env.RATE_LIMITER_DO !== undefined
-    ? durableObjectRateLimiter(env.RATE_LIMITER_DO)
+  // Prefer the Cloudflare built-in ratelimits binding per scope when it's
+  // declared in wrangler.jsonc — that path is atomic at the edge, free, and
+  // serves the same correctness guarantee the old DO adapter was doing
+  // much more expensively. Any scope whose binding is absent falls through
+  // to the cache-backed limiter (documented over-admit under burst) so
+  // operators can roll the bindings out one at a time.
+  const cfBindings: Record<string, RateLimit | undefined> = {
+    ...(env.RATE_LIMIT_ADMIN !== undefined ? { admin: env.RATE_LIMIT_ADMIN } : {}),
+    ...(env.RATE_LIMIT_CHECKOUT !== undefined ? { checkout: env.RATE_LIMIT_CHECKOUT } : {}),
+    ...(env.RATE_LIMIT_WEBHOOK_INGEST !== undefined ? { "webhook-ingest": env.RATE_LIMIT_WEBHOOK_INGEST } : {}),
+    ...(env.RATE_LIMIT_MERCHANT_API !== undefined ? { "merchant-api": env.RATE_LIMIT_MERCHANT_API } : {})
+  };
+  const boundScopes = Object.keys(cfBindings);
+  const rateLimiter = boundScopes.length > 0
+    ? cloudflareRateLimiter({ bindings: cfBindings, fallback: cacheBackedRateLimiter(cache) })
     : cacheBackedRateLimiter(cache);
-  if (env.RATE_LIMITER_DO === undefined) {
-    logger.warn("RATE_LIMITER_DO binding not present; using cache-backed limiter (may over-admit under burst)");
+  if (boundScopes.length === 0) {
+    logger.warn("no RATE_LIMIT_* bindings present; using cache-backed limiter for all scopes (may over-admit under burst)");
+  } else if (boundScopes.length < 4) {
+    logger.info("partial CF rate-limit bindings; unbound scopes fall back to cache-backed", {
+      bound: boundScopes
+    });
   }
 
   // Same Alchemy-optional pattern as the Node entrypoint: dev adapter always,

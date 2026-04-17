@@ -10,8 +10,7 @@ file with no edits to core domain logic or HTTP routes.
 
 Status: pre-1.0. Feature-complete for the primary payment flow (detect → confirm
 → webhook → payout). Production hardening items (fee-wallet balance pre-checks,
-reorg recovery, Durable Objects–backed rate limiting) are tracked as known
-follow-ups.
+reorg recovery) are tracked as known follow-ups.
 
 ---
 
