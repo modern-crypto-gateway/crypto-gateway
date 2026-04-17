@@ -11,6 +11,7 @@ import type { SecretsCipher } from "./ports/secrets-cipher.port.ts";
 import type { SecretsProvider } from "./ports/secrets.port.ts";
 import type { SignerStore } from "./ports/signer-store.port.ts";
 import type { WebhookDispatcher } from "./ports/webhook-delivery.port.ts";
+import type { WebhookDeliveryStore } from "./ports/webhook-delivery-store.port.ts";
 import type { EventBus } from "./events/event-bus.port.ts";
 
 // The full set of injected ports that domain services and adapters receive.
@@ -31,6 +32,10 @@ export interface AppDeps {
   readonly signerStore: SignerStore;
   readonly priceOracle: PriceOracle;
   readonly webhookDispatcher: WebhookDispatcher;
+  // Outbox/dead-letter store for merchant webhooks. Every composed webhook is
+  // persisted here before dispatch; the scheduled-jobs sweeper retries any
+  // 'pending' row past its next_attempt_at. See webhook-subscriber.ts.
+  readonly webhookDeliveryStore: WebhookDeliveryStore;
   readonly events: EventBus;
   readonly logger: Logger;
   readonly rateLimiter: RateLimiter;

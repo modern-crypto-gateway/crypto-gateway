@@ -392,6 +392,51 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     return c.json({ stats }, 200);
   });
 
+  // Webhook delivery dead-letter surface. Operators list rows by status
+  // (usually 'dead') and replay individual ones once they've coordinated a
+  // fix with the merchant (TLS cert renewed, URL path changed, etc.).
+  app.get("/webhook-deliveries", async (c) => {
+    const statusParam = c.req.query("status") ?? "dead";
+    if (statusParam !== "pending" && statusParam !== "delivered" && statusParam !== "dead") {
+      return c.json(
+        { error: { code: "BAD_STATUS", message: "status must be one of: pending, delivered, dead" } },
+        400
+      );
+    }
+    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "50"), 1), 500);
+    const offset = Math.max(Number(c.req.query("offset") ?? "0"), 0);
+    const rows = await deps.webhookDeliveryStore.listByStatus({
+      status: statusParam,
+      limit,
+      offset
+    });
+    return c.json({ deliveries: rows }, 200);
+  });
+
+  app.post("/webhook-deliveries/:id/replay", async (c) => {
+    const id = c.req.param("id");
+    const now = deps.clock.now().getTime();
+    const { reset } = await deps.webhookDeliveryStore.resetForReplay({
+      id,
+      nextAttemptAt: now,
+      now
+    });
+    if (!reset) {
+      return c.json(
+        {
+          error: {
+            code: "NOT_DEAD",
+            message:
+              "Delivery row not found, or not in 'dead' status. Only dead rows can be replayed — pending rows are already queued for the sweeper."
+          }
+        },
+        404
+      );
+    }
+    deps.logger.info("webhook delivery replay queued", { deliveryId: id });
+    return c.json({ replayed: { id, nextAttemptAt: now } }, 200);
+  });
+
   // Runtime migration apply. Node/Deno already run migrations at boot — this
   // endpoint is the same set, exposed for (a) the ops panel's "reapply"
   // button and (b) restarting a Node worker after a hot-patch of the

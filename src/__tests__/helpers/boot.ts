@@ -10,6 +10,7 @@ import { promiseSetJobs } from "../../adapters/jobs/promise-set.adapter.js";
 import { staticPegPriceOracle } from "../../adapters/price-oracle/static-peg.adapter.js";
 import { memorySignerStore } from "../../adapters/signer-store/memory.adapter.js";
 import { capturingWebhookDispatcher, type CapturingDispatcher } from "../../adapters/webhook-delivery/noop.adapter.js";
+import { dbWebhookDeliveryStore } from "../../adapters/webhook-delivery/db-delivery-store.js";
 import { sha256Hex } from "../../adapters/crypto/subtle.js";
 import { bufferingLogger, type BufferingLogger } from "../../adapters/logging/console.adapter.js";
 import { cacheBackedRateLimiter } from "../../adapters/rate-limit/cache-backed.adapter.js";
@@ -216,6 +217,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     signerStore: memorySignerStore({ runtime: "test" }),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: options.webhookDispatcher ?? capturingDispatcher!,
+    webhookDeliveryStore: dbWebhookDeliveryStore(db),
     events: createInMemoryEventBus(),
     logger,
     rateLimiter,

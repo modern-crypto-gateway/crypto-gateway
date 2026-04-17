@@ -23,6 +23,7 @@ import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adap
 import { workersEnvSecrets } from "../adapters/secrets/workers-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
+import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import type { AppDeps } from "../core/app-deps.js";
 import { runScheduledJobs } from "../core/domain/scheduled-jobs.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
@@ -167,6 +168,7 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     webhookDispatcher: inlineFetchDispatcher({
       allowHttp: env["NODE_ENV"] === "development" || env["NODE_ENV"] === "test"
     }),
+    webhookDeliveryStore: dbWebhookDeliveryStore(db),
     events: createInMemoryEventBus(),
     logger,
     rateLimiter,

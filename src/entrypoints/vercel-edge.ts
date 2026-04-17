@@ -22,6 +22,7 @@ import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapte
 import { processEnvSecrets } from "../adapters/secrets/process-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
+import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import type { AppDeps } from "../core/app-deps.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
 import { parseFinalityOverridesEnv } from "../core/domain/payment-config.js";
@@ -154,6 +155,7 @@ async function getDeps(): Promise<AppDeps> {
         secrets.getOptional("NODE_ENV") === "development" ||
         secrets.getOptional("NODE_ENV") === "test"
     }),
+    webhookDeliveryStore: dbWebhookDeliveryStore(db),
     events: createInMemoryEventBus(),
     logger,
     rateLimiter,

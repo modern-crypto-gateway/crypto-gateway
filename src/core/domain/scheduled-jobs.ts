@@ -6,6 +6,7 @@ import {
   sweepStuckFeeWalletReservations
 } from "./payout.service.js";
 import { pollPayments } from "./poll-payments.js";
+import { sweepWebhookDeliveries } from "./webhook-subscriber.js";
 
 // Runs every scheduled job in sequence. Shared between the Workers `scheduled`
 // export, the Node cron runner, `Deno.cron`, and the Vercel Cron HTTP trigger —
@@ -23,6 +24,7 @@ export interface ScheduledJobsResult {
   executeReservedPayouts: JobOutcome;
   confirmPayouts: JobOutcome;
   sweepStuckFeeWalletReservations: JobOutcome;
+  sweepWebhookDeliveries: JobOutcome;
   // Present only when Alchemy is configured for this deployment
   // (`deps.alchemy` set). Absent otherwise — callers should not treat the
   // missing key as a failure.
@@ -37,7 +39,8 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     confirmTransactions: await run(() => confirmTransactions(deps)),
     executeReservedPayouts: await run(() => executeReservedPayouts(deps)),
     confirmPayouts: await run(() => confirmPayouts(deps)),
-    sweepStuckFeeWalletReservations: await run(() => sweepStuckFeeWalletReservations(deps))
+    sweepStuckFeeWalletReservations: await run(() => sweepStuckFeeWalletReservations(deps)),
+    sweepWebhookDeliveries: await run(() => sweepWebhookDeliveries(deps))
   };
   if (deps.alchemy !== undefined) {
     result.alchemySyncAddresses = await run(() => deps.alchemy!.syncAddresses());

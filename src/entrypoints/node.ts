@@ -15,6 +15,7 @@ import { processEnvSecrets } from "../adapters/secrets/process-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
+import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
@@ -201,6 +202,7 @@ async function main(): Promise<void> {
     webhookDispatcher: inlineFetchDispatcher({
       allowHttp: config.environment === "development" || config.environment === "test"
     }),
+    webhookDeliveryStore: dbWebhookDeliveryStore(db),
     events: createInMemoryEventBus(),
     logger,
     rateLimiter,
