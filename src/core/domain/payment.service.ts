@@ -3,7 +3,13 @@ import type { DomainEvent } from "../events/event-bus.port.js";
 import type { Order, OrderId, OrderStatus } from "../types/order.js";
 import { DetectedTransferSchema, type TransactionId, type TxStatus } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
-import { rowToOrder, rowToTransaction, type OrderRow, type TxRow } from "./mappers.js";
+import {
+  fetchOrderReceiveAddresses,
+  rowToOrder,
+  rowToTransaction,
+  type OrderRow,
+  type TxRow
+} from "./mappers.js";
 import { confirmationThreshold } from "./payment-config.js";
 
 // PaymentService: rules for how detected transfers become transactions, how
@@ -31,13 +37,22 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   const canonicalTo = chainAdapter.canonicalizeAddress(transfer.toAddress);
   const canonicalFrom = chainAdapter.canonicalizeAddress(transfer.fromAddress);
 
-  // Match to an order by (chain_id, receive_address). Transfers to addresses
-  // the gateway doesn't own still get recorded with order_id=NULL for later
-  // reconciliation (v1 rule — orphaned-transfer audit trail is load-bearing
-  // when operators investigate "customer paid, didn't get credit" tickets).
+  // Match to an order via the receive-addresses join table: family +
+  // address pair resolves across all chains in the family. This is how
+  // multi-family orders work — a USDC transfer on Polygon (chainId 137)
+  // matches an order with `family='evm', address='0xABC'` whether the
+  // order's primary chain was Ethereum or Arbitrum or any other EVM chain.
+  // Transfers to addresses the gateway doesn't own still get recorded
+  // with order_id=NULL (orphaned-transfer audit).
+  const family = chainAdapter.family;
   const orderRow = await deps.db
-    .prepare("SELECT * FROM orders WHERE chain_id = ? AND receive_address = ?")
-    .bind(transfer.chainId, canonicalTo)
+    .prepare(
+      `SELECT o.* FROM orders o
+         JOIN order_receive_addresses ora ON ora.order_id = o.id
+        WHERE ora.address = ? AND ora.family = ?
+        LIMIT 1`
+    )
+    .bind(canonicalTo, family)
     .first<OrderRow>();
 
   const orderId: string | null = orderRow ? orderRow.id : null;
@@ -271,13 +286,17 @@ async function recomputeOrderFromTransactions(
       .bind(after, total.toString(), after, now, now, orderRow.id)
       .run();
 
-    const updated = rowToOrder({
-      ...orderRow,
-      status: after,
-      received_amount_raw: total.toString(),
-      confirmed_at: after === "confirmed" ? now : orderRow.confirmed_at,
-      updated_at: now
-    });
+    const addresses = await fetchOrderReceiveAddresses(deps, orderRow.id);
+    const updated = rowToOrder(
+      {
+        ...orderRow,
+        status: after,
+        received_amount_raw: total.toString(),
+        confirmed_at: after === "confirmed" ? now : orderRow.confirmed_at,
+        updated_at: now
+      },
+      addresses
+    );
     await deps.events.publish(orderEventFor(after, updated, now));
   } else if (total.toString() !== orderRow.received_amount_raw) {
     await deps.db

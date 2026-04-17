@@ -244,6 +244,53 @@ for Solana) and **immediately removes it from the watch list** via
 mint/burn events on the zero address. Real HD-derived addresses come from
 the address pool (below).
 
+## Multi-family order acceptance
+
+An order can accept payment across multiple chain families. The merchant sets
+`acceptedFamilies: ["evm", "tron", "solana"]` (any subset) at creation and the
+order is allocated one receive address per family:
+
+```bash
+curl -X POST "$GATEWAY_URL/api/v1/orders" \
+  -H "Authorization: Bearer $MERCHANT_API_KEY" \
+  -d '{
+    "chainId": 1,
+    "token": "USDT",
+    "amountRaw": "1000000",
+    "acceptedFamilies": ["evm", "tron", "solana"]
+  }'
+```
+
+Response:
+
+```json
+{
+  "order": {
+    "id": "...",
+    "chainId": 1,
+    "receiveAddress": "0xABC…",
+    "acceptedFamilies": ["evm", "tron", "solana"],
+    "receiveAddresses": [
+      { "family": "evm",    "address": "0xABC…" },
+      { "family": "tron",   "address": "TXy…"  },
+      { "family": "solana", "address": "9JxS…" }
+    ],
+    ...
+  }
+}
+```
+
+Detection matches incoming transfers by `(family, address)` via the
+`order_receive_addresses` join, so a USDT transfer on **any** of the 7 EVM
+chains (Ethereum, Polygon, Base, Arbitrum, OP, Avalanche, BSC) against the
+`evm` entry matches this order — an EVM pubkey is identical across all EVM
+chains. Tron and Solana each get their own canonical address.
+
+Omitting `acceptedFamilies` defaults to `[familyOf(chainId)]` — single-family
+orders keep working without change. In A1.b, the **token** is still scoped
+per-chain; A2 introduces USD-pegged amounts and any-token acceptance within
+a family (e.g. pay $100 in USDC, USDT, or native ETH on any EVM chain).
+
 ## Address pool
 
 Incoming-payment addresses aren't HD-derived per-order anymore — they come

@@ -1,4 +1,6 @@
-import type { Order, OrderId, OrderStatus } from "../types/order.js";
+import type { AppDeps } from "../app-deps.js";
+import type { ChainFamily } from "../types/chain.js";
+import type { Order, OrderId, OrderReceiveAddress, OrderStatus } from "../types/order.js";
 import type { Payout, PayoutId, PayoutStatus } from "../types/payout.js";
 import type { Transaction, TransactionId, TxStatus } from "../types/transaction.js";
 
@@ -26,7 +28,13 @@ export interface OrderRow {
   updated_at: number;
 }
 
-export function rowToOrder(row: OrderRow): Order {
+// rowToOrder requires the order's receive addresses (from the join table)
+// because multi-family orders have more than one and the Order type encodes
+// that cleanly. Callers that already have the addresses in hand (createOrder
+// path) pass them; callers reading an existing order use `loadOrder` below
+// to bundle both queries.
+export function rowToOrder(row: OrderRow, receiveAddresses: readonly OrderReceiveAddress[]): Order {
+  const acceptedFamilies = Array.from(new Set(receiveAddresses.map((r) => r.family)));
   return {
     id: row.id as OrderId,
     merchantId: row.merchant_id as Order["merchantId"],
@@ -35,6 +43,8 @@ export function rowToOrder(row: OrderRow): Order {
     token: row.token,
     receiveAddress: row.receive_address,
     addressIndex: row.address_index,
+    acceptedFamilies,
+    receiveAddresses: [...receiveAddresses],
     requiredAmountRaw: row.required_amount_raw,
     receivedAmountRaw: row.received_amount_raw,
     fiatAmount: row.fiat_amount,
@@ -47,6 +57,37 @@ export function rowToOrder(row: OrderRow): Order {
     confirmedAt: row.confirmed_at === null ? null : new Date(row.confirmed_at),
     updatedAt: new Date(row.updated_at)
   };
+}
+
+// Fetch an order's per-family receive addresses from the join table.
+// Used by every order read path that needs a full Order object.
+export async function fetchOrderReceiveAddresses(
+  deps: AppDeps,
+  orderId: string
+): Promise<readonly OrderReceiveAddress[]> {
+  const rows = await deps.db
+    .prepare(
+      `SELECT family, address, pool_address_id FROM order_receive_addresses
+       WHERE order_id = ?
+       ORDER BY family ASC`
+    )
+    .bind(orderId)
+    .all<{ family: ChainFamily; address: string; pool_address_id: string }>();
+  return rows.results.map((r) => ({
+    family: r.family,
+    address: r.address as OrderReceiveAddress["address"],
+    poolAddressId: r.pool_address_id
+  }));
+}
+
+// Loads and hydrates a full Order by id (row + join). Returns null if the
+// order doesn't exist. Two queries — acceptable for single-order reads;
+// high-volume loops (pollPayments) should batch the join separately.
+export async function loadOrder(deps: AppDeps, orderId: string): Promise<Order | null> {
+  const row = await deps.db.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first<OrderRow>();
+  if (!row) return null;
+  const addresses = await fetchOrderReceiveAddresses(deps, orderId);
+  return rowToOrder(row, addresses);
 }
 
 export interface TxRow {

@@ -1,14 +1,17 @@
 import type { AppDeps } from "../app-deps.js";
-import type { ChainId } from "../types/chain.js";
+import type { ChainFamily, ChainId } from "../types/chain.js";
+import { findChainAdapter } from "./chain-lookup.js";
 import { ingestDetectedTransfer } from "./payment.service.js";
 
 // Cron-triggered orchestrator:
-//   1. Enumerate distinct (chain_id, receive_address) pairs for non-terminal orders
-//   2. For each chain with a registered DetectionStrategy.poll, invoke it
+//   1. Enumerate active per-family receive addresses across all non-terminal orders
+//   2. For each chainId with a registered DetectionStrategy.poll, select addresses
+//      whose family matches that chain's family and invoke the strategy
 //   3. Hand every returned DetectedTransfer to PaymentService.ingestDetectedTransfer
 //
-// Intentionally chain-agnostic — adding a new chain family changes this file
-// zero lines; the only change is an entry in `deps.detectionStrategies`.
+// Multi-family compatible: an order with acceptedFamilies=["evm","tron"]
+// gets its EVM address polled on every EVM chain that has a poll strategy,
+// and its Tron address polled on the Tron chain — all in a single tick.
 
 export interface PollPaymentsResult {
   chainsPolled: number;
@@ -19,25 +22,30 @@ export interface PollPaymentsResult {
 }
 
 export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
-  // Group active orders by chain so we do one strategy call per chain.
+  // Gather every family+address for orders that are still open. The join
+  // table is the authoritative source — `orders.receive_address` is just
+  // the primary-family denormalization for legacy single-chain reads.
   const rows = await deps.db
     .prepare(
-      `SELECT chain_id, receive_address
-         FROM orders
-        WHERE status IN ('created','partial','detected','confirmed')
-          AND expires_at > ?`
+      `SELECT DISTINCT ora.family, ora.address
+         FROM orders o
+         JOIN order_receive_addresses ora ON ora.order_id = o.id
+        WHERE o.status IN ('created','partial','detected','confirmed')
+          AND o.expires_at > ?`
     )
     .bind(deps.clock.now().getTime())
-    .all<{ chain_id: number; receive_address: string }>();
+    .all<{ family: ChainFamily; address: string }>();
 
-  const addressesByChain = new Map<number, string[]>();
+  // Group addresses by family once, up front. Each chainId's poll picks
+  // the addresses matching its family.
+  const addressesByFamily = new Map<ChainFamily, string[]>();
   for (const row of rows.results) {
-    let list = addressesByChain.get(row.chain_id);
+    let list = addressesByFamily.get(row.family);
     if (!list) {
       list = [];
-      addressesByChain.set(row.chain_id, list);
+      addressesByFamily.set(row.family, list);
     }
-    list.push(row.receive_address);
+    list.push(row.address);
   }
 
   let chainsPolled = 0;
@@ -46,14 +54,29 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
   let duplicates = 0;
   let addressesWatched = 0;
 
-  for (const [chainIdNumber, addresses] of addressesByChain) {
-    const chainId = chainIdNumber as ChainId;
-    const strategy = deps.detectionStrategies[chainIdNumber];
+  // Iterate each chain that has a registered poll strategy. For each,
+  // resolve its family via the adapter and pass the family-matching
+  // address set. A Tron chainId gets the Tron addresses; an EVM chainId
+  // gets the shared EVM address list (valid across every EVM chain).
+  for (const [chainIdKey, strategy] of Object.entries(deps.detectionStrategies)) {
+    const chainIdNumber = Number(chainIdKey);
     if (!strategy?.poll) continue;
+    // adapter tells us which family this chain belongs to
+    let family: ChainFamily;
+    try {
+      family = findChainAdapter(deps, chainIdNumber).family;
+    } catch {
+      // No adapter wired for this chain — skip. (A rare configuration
+      // drift where detectionStrategies references an unwired chainId.)
+      continue;
+    }
+    const addresses = addressesByFamily.get(family) ?? [];
+    if (addresses.length === 0) continue;
+
     chainsPolled += 1;
     addressesWatched += addresses.length;
 
-    const transfers = await strategy.poll(deps, chainId, addresses);
+    const transfers = await strategy.poll(deps, chainIdNumber as ChainId, addresses);
     transfersFound += transfers.length;
 
     for (const transfer of transfers) {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Brand } from "./branded.js";
-import { AddressSchema, ChainIdSchema } from "./chain.js";
+import { AddressSchema, ChainFamilySchema, ChainIdSchema } from "./chain.js";
 import { AmountRawSchema, FiatAmountSchema, FiatCurrencySchema } from "./money.js";
 import { MerchantIdSchema } from "./merchant.js";
 import { TokenSymbolSchema } from "./token.js";
@@ -25,17 +25,36 @@ export type OrderStatus = z.infer<typeof OrderStatusSchema>;
 export const OrderIdSchema = z.string().uuid();
 export type OrderId = Brand<z.infer<typeof OrderIdSchema>, "OrderId">;
 
+// Per-family receive-address entry on an order. Multi-family orders have
+// one row per accepted family (e.g. one EVM address + one Tron address).
+// Single-family orders (legacy path) have exactly one entry, denormalized
+// into the order's `chainId` + `receiveAddress` columns for back-compat.
+export const OrderReceiveAddressSchema = z.object({
+  family: ChainFamilySchema,
+  address: AddressSchema,
+  poolAddressId: z.string().uuid()
+});
+export type OrderReceiveAddress = z.infer<typeof OrderReceiveAddressSchema>;
+
 export const OrderSchema = z.object({
   id: OrderIdSchema,
   merchantId: MerchantIdSchema,
   status: OrderStatusSchema,
 
+  // Primary chain + receive address. For multi-family orders, this is the
+  // first family's values (for back-compat display). The authoritative
+  // address set lives in `receiveAddresses[]`.
   chainId: ChainIdSchema,
   token: TokenSymbolSchema,
-  // Receive address is an HD-derived address owned by the gateway. `addressIndex`
-  // is the derivation index; the private key is re-derived on demand, never stored.
   receiveAddress: AddressSchema,
   addressIndex: z.number().int().nonnegative(),
+
+  // Families this order accepts payment on. Defaults to
+  // `[familyOf(chainId)]` when the caller doesn't specify — preserves
+  // single-chain legacy semantics. Explicit `["evm","tron","solana"]`
+  // enables multi-family: one receive address per family, same order.
+  acceptedFamilies: z.array(ChainFamilySchema).min(1),
+  receiveAddresses: z.array(OrderReceiveAddressSchema).min(1),
 
   // Amount the merchant asked for, in the token's raw units.
   requiredAmountRaw: AmountRawSchema,

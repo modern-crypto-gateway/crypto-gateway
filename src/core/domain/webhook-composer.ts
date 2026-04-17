@@ -87,6 +87,11 @@ function serializeOrder(order: Order): Record<string, unknown> {
     chainId: order.chainId,
     token: order.token,
     receiveAddress: order.receiveAddress,
+    acceptedFamilies: order.acceptedFamilies,
+    receiveAddresses: order.receiveAddresses.map((r) => ({
+      family: r.family,
+      address: r.address
+    })),
     requiredAmountRaw: order.requiredAmountRaw,
     receivedAmountRaw: order.receivedAmountRaw,
     fiatAmount: order.fiatAmount,

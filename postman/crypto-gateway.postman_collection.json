@@ -453,6 +453,34 @@
               "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
             },
             {
+              "name": "Multi-family — USDT accepted on EVM + Tron + Solana",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"acceptedFamilies\": [\"evm\", \"tron\", \"solana\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Multi-family acceptance (A1.b). Order is allocated one pool address PER family; payer picks which chain to pay on and the gateway detects wherever it lands.\n\nResponse includes `receiveAddresses: [{family, address}, ...]` — render all three at checkout. `chainId` + `receiveAddress` echo the primary family (first in the list) for legacy clients.\n\nRequires the pool to be seeded for every family in `acceptedFamilies` (see `_Setup > 3a. Initialize address pool`). Missing chain adapters → `TOKEN_NOT_SUPPORTED`."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Multi-family — USDT accepted on EVM + Tron only",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"acceptedFamilies\": [\"evm\", \"tron\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "Subset of families. Two receive addresses returned — payer can pay USDT on any of the 7 EVM chains OR on Tron mainnet. Same order satisfies whichever chain gets the payment first."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+            },
+            {
               "name": "Fiat-quoted order (USD → USDC, amount inferred)",
               "request": {
                 "method": "POST",

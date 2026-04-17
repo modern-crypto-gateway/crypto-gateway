@@ -42,6 +42,15 @@ export function checkoutRouter(deps: AppDeps): Hono {
         chainId: order.chainId,
         token: order.token,
         receiveAddress: order.receiveAddress,
+        // Multi-family: one address per accepted family. The checkout UI
+        // renders all of them so the payer can choose which chain to pay on.
+        // Single-family orders have exactly one entry; UI can fall back to
+        // `receiveAddress` + `chainId` for simple cases.
+        acceptedFamilies: order.acceptedFamilies,
+        receiveAddresses: order.receiveAddresses.map((r) => ({
+          family: r.family,
+          address: r.address
+        })),
         requiredAmountRaw: order.requiredAmountRaw,
         receivedAmountRaw: order.receivedAmountRaw,
         fiatAmount: order.fiatAmount,
