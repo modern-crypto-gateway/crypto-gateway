@@ -24,6 +24,9 @@ function fakeClient(overrides: Partial<TronRpcBackend>): TronRpcBackend {
     async triggerSmartContract() {
       throw new Error("unexpected triggerSmartContract call");
     },
+    async createTransaction() {
+      throw new Error("unexpected createTransaction call");
+    },
     async broadcastTransaction() {
       throw new Error("unexpected broadcastTransaction call");
     }

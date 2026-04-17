@@ -200,10 +200,37 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       if (!token) {
         throw new Error(`Tron buildTransfer: unknown token ${args.token} on chain ${args.chainId}`);
       }
-      if (token.contractAddress === null) {
-        throw new Error("Tron buildTransfer: native TRX transfers not implemented in Phase 3c");
-      }
       const client = getClient(args.chainId);
+
+      if (token.contractAddress === null) {
+        // Native TRX — /wallet/createtransaction builds the unsigned tx directly.
+        // Amount is in sun; we pass the raw value as a number because TronGrid's
+        // JSON rejects strings here. BigInt -> Number is safe up to 9e15 sun
+        // (9 billion TRX), which is ~100x the total supply, so no overflow risk
+        // for any realistic payout.
+        const amountSun = Number(args.amountRaw);
+        if (!Number.isFinite(amountSun) || amountSun <= 0) {
+          throw new Error(`Tron buildTransfer: invalid TRX amount ${args.amountRaw}`);
+        }
+        const tx = await client.createTransaction({
+          owner_address: base58ToHex(args.fromAddress),
+          to_address: base58ToHex(args.toAddress),
+          amount: amountSun
+        });
+        if (tx.Error !== undefined) {
+          throw new Error(`Tron createtransaction failed: ${tx.Error}`);
+        }
+        return {
+          chainId: args.chainId as ChainId,
+          raw: {
+            txID: tx.txID,
+            raw_data_hex: tx.raw_data_hex,
+            raw_data: tx.raw_data,
+            fromAddress: args.fromAddress
+          },
+          summary: `TRON: native TRX transfer ${args.amountRaw} sun to ${args.toAddress}`
+        };
+      }
 
       // ABI-encoded parameter for `transfer(address,uint256)`:
       //   - 32 bytes: zero-padded core address (Tron addresses in calldata are

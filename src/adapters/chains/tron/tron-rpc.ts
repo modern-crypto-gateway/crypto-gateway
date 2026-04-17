@@ -64,6 +64,25 @@ export interface TriggerSmartContractParams {
   call_value: number;
 }
 
+// Native TRX transfer build response. TronGrid returns the fully-formed
+// unsigned transaction; shape matches triggerSmartContract's `transaction`
+// field so downstream sign+broadcast handles both identically.
+export interface TrongridCreateTransactionResponse {
+  raw_data: unknown;
+  raw_data_hex: string;
+  txID: string;
+  // Surfaced when the build itself rejects (e.g. bad hex inputs).
+  Error?: string;
+}
+
+export interface CreateTransactionParams {
+  // All three addresses are hex (21 bytes, 0x41-prefixed) per /wallet/* convention.
+  owner_address: string;
+  to_address: string;
+  // Amount in sun (1 TRX = 1_000_000 sun).
+  amount: number;
+}
+
 export interface TronRpcBackend {
   // Stable identifier for logs + metrics. "trongrid" | "alchemy-tron" | ...
   readonly name: string;
@@ -78,6 +97,7 @@ export interface TronRpcBackend {
   getTransactionInfo(txId: string): Promise<TrongridTxInfo | null>;
   getNowBlock(): Promise<TrongridBlock>;
   triggerSmartContract(params: TriggerSmartContractParams): Promise<TrongridTriggerSmartContractResponse>;
+  createTransaction(params: CreateTransactionParams): Promise<TrongridCreateTransactionResponse>;
   broadcastTransaction(params: {
     raw_data_hex: string;
     signature: readonly string[];
@@ -145,6 +165,12 @@ export function tronGridBackend(config: TronGridBackendConfig): TronRpcBackend {
         body: JSON.stringify(params)
       });
     },
+    async createTransaction(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/createtransaction", {
+        method: "POST",
+        body: JSON.stringify(params)
+      });
+    },
     async broadcastTransaction(params) {
       return base.request<TrongridBroadcastResponse>("/wallet/broadcasttransaction", {
         method: "POST",
@@ -196,6 +222,12 @@ export function alchemyTronBackend(config: AlchemyTronBackendConfig): TronRpcBac
     },
     async triggerSmartContract(params) {
       return base.request<TrongridTriggerSmartContractResponse>("/wallet/triggersmartcontract", {
+        method: "POST",
+        body: JSON.stringify(params)
+      });
+    },
+    async createTransaction(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/createtransaction", {
         method: "POST",
         body: JSON.stringify(params)
       });
@@ -274,6 +306,8 @@ export function tronCompositeClient(
     getNowBlock: () => tryEach("getNowBlock", (b) => b.getNowBlock()),
     triggerSmartContract: (params) =>
       tryEach("triggerSmartContract", (b) => b.triggerSmartContract(params)),
+    createTransaction: (params) =>
+      tryEach("createTransaction", (b) => b.createTransaction(params)),
     broadcastTransaction: (params) =>
       tryEach("broadcastTransaction", (b) => b.broadcastTransaction(params))
   };

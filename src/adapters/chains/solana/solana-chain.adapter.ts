@@ -21,6 +21,10 @@ import {
   encodeSignedTransaction
 } from "./solana-message.js";
 import {
+  buildSplTransferMessage,
+  deriveAssociatedTokenAccount
+} from "./solana-spl.js";
+import {
   solanaRpcClient,
   type SolanaRpcClient,
   type SolanaRpcConfig
@@ -208,21 +212,35 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       if (!token) {
         throw new Error(`Solana buildTransfer: unknown token ${args.token} on chain ${args.chainId}`);
       }
-      if (token.contractAddress !== null) {
-        // SPL tokens have a non-null contractAddress (the mint). Payouts for
-        // SPL are DEFERRED: they need Associated Token Account resolution
-        // (getOrCreate ATA for the destination), an SPL Token Program
-        // `TransferChecked` instruction encoding, and typically a ComputeBudget
-        // instruction prefix. Receive-side detection already works via the
-        // Alchemy Notify webhook path; only outbound sends are gated here.
-        throw new Error(
-          `Solana buildTransfer: SPL payouts for ${args.token} are not implemented ` +
-            "— receiving SPL works via Alchemy webhook; payouts are deferred."
-        );
-      }
 
       const client = getClient(args.chainId);
       const { blockhash } = await client.getLatestBlockhash();
+
+      if (token.contractAddress !== null) {
+        // SPL path. Derive both ATAs client-side and build a single tx that
+        // idempotently creates the destination ATA (no-op if it already
+        // exists) then does a TransferChecked from sender → recipient. We
+        // don't getAccountInfo the destination because CreateIdempotent is
+        // the whole point of that instruction — one fewer RPC round trip.
+        const senderAta = deriveAssociatedTokenAccount(args.fromAddress, token.contractAddress);
+        const recipientAta = deriveAssociatedTokenAccount(args.toAddress, token.contractAddress);
+        const message = buildSplTransferMessage({
+          senderOwner: args.fromAddress,
+          senderAssociatedTokenAccount: senderAta,
+          recipientOwner: args.toAddress,
+          recipientAssociatedTokenAccount: recipientAta,
+          mintAddress: token.contractAddress,
+          amount: BigInt(args.amountRaw),
+          decimals: token.decimals,
+          recentBlockhash: blockhash
+        });
+        return {
+          chainId: args.chainId as ChainId,
+          raw: { message, recentBlockhash: blockhash, fromAddress: args.fromAddress },
+          summary: `SOL: SPL ${args.token} transfer ${args.amountRaw} from ${args.fromAddress} to ${args.toAddress} (ATA=${recipientAta})`
+        };
+      }
+
       const message = buildNativeTransferMessage({
         sourceAddress: args.fromAddress,
         destinationAddress: args.toAddress,

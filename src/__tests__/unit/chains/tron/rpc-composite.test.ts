@@ -29,6 +29,11 @@ function stubBackend(name: string, overrides: Partial<TronRpcBackend>): TronRpcB
       (async () => {
         throw new Error(`${name}.triggerSmartContract: unexpected call`);
       }),
+    createTransaction:
+      overrides.createTransaction ??
+      (async () => {
+        throw new Error(`${name}.createTransaction: unexpected call`);
+      }),
     broadcastTransaction:
       overrides.broadcastTransaction ??
       (async () => {

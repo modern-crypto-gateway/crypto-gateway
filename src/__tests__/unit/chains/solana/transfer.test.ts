@@ -80,26 +80,40 @@ describe("solanaChainAdapter.buildTransfer (native SOL)", () => {
     expect(raw.message[3]).toBe(3);
   });
 
-  it("rejects SPL-token buildTransfer with a clear payouts-deferred message", async () => {
-    // SPL mints are now in the registry (webhook detection relies on them),
-    // so buildTransfer reaches the mint-is-non-null branch and fails with the
-    // deferred-payouts message — not the "unknown token" path. When SPL
-    // payouts ship this test becomes the one to update.
+  it("builds an SPL TransferChecked + idempotent ATA-create for a USDC payout", async () => {
+    // SPL path: the registry exposes USDC/USDT mints on chainId 900, so this
+    // flows through the contractAddress != null branch into the SPL builder.
+    // The resulting message must carry 8 accountKeys and two instructions
+    // (CreateIdempotent ATA + TransferChecked) in that order.
     const adapter = solanaChainAdapter({
       chainIds: [SOLANA_MAINNET_CHAIN_ID],
-      clients: { [SOLANA_MAINNET_CHAIN_ID]: fakeClient({}) }
+      clients: {
+        [SOLANA_MAINNET_CHAIN_ID]: fakeClient({
+          async getLatestBlockhash() {
+            return { blockhash: base58.encode(new Uint8Array(32).fill(9)), lastValidBlockHeight: 1 };
+          }
+        })
+      }
     });
     const from = "4LLm2rsDjYxSp3N5yXYBY4xA3mo7JLEhRaVA3yZJvZfV";
     const to = "6UQJxnM4fZMzWWLMb72Lhzk9hWV1tJmwSZH3AGHNzR9G";
-    await expect(
-      adapter.buildTransfer({
-        chainId: SOLANA_MAINNET_CHAIN_ID,
-        fromAddress: from,
-        toAddress: to,
-        token: "USDC",
-        amountRaw: "1"
-      })
-    ).rejects.toThrow(/SPL payouts.*not implemented|payouts are deferred/i);
+    const unsigned = await adapter.buildTransfer({
+      chainId: SOLANA_MAINNET_CHAIN_ID,
+      fromAddress: from,
+      toAddress: to,
+      token: "USDC",
+      amountRaw: "1000000"
+    });
+    const raw = unsigned.raw as { message: Uint8Array; fromAddress: string };
+    expect(raw.fromAddress).toBe(from);
+    // Header: 1 required signer, 0 readonly signed, 5 readonly unsigned.
+    expect(raw.message[0]).toBe(1);
+    expect(raw.message[1]).toBe(0);
+    expect(raw.message[2]).toBe(5);
+    // Then compact-u16 count=8 (sender owner, sender ATA, recipient ATA,
+    // mint, recipient owner, system, token, associated-token).
+    expect(raw.message[3]).toBe(8);
+    expect(unsigned.summary).toMatch(/SPL USDC transfer 1000000/);
   });
 });
 
