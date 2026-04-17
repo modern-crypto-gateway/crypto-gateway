@@ -60,7 +60,7 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   const invoiceId: string | null = invoiceRow ? invoiceRow.id : null;
 
   // Decide initial tx status using the reported confirmation count.
-  const threshold = confirmationThreshold(transfer.chainId);
+  const threshold = confirmationThreshold(transfer.chainId, deps.confirmationThresholds);
   const initialStatus: TxStatus = transfer.confirmations >= threshold ? "confirmed" : "detected";
   const now = deps.clock.now().getTime();
   const txId = globalThis.crypto.randomUUID();
@@ -239,7 +239,7 @@ export async function confirmTransactions(deps: AppDeps): Promise<ConfirmSweepRe
     const chainAdapter = findChainAdapter(deps, row.chain_id);
     const live = await chainAdapter.getConfirmationStatus(row.chain_id, row.tx_hash);
     const now = deps.clock.now().getTime();
-    const threshold = confirmationThreshold(row.chain_id);
+    const threshold = confirmationThreshold(row.chain_id, deps.confirmationThresholds);
 
     if (live.reverted) {
       await deps.db

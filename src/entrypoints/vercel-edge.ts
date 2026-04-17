@@ -24,6 +24,7 @@ import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import type { AppDeps } from "../core/app-deps.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
+import { parseFinalityOverridesEnv } from "../core/domain/payment-config.js";
 
 // Vercel Edge runtime entrypoint. The `runtime` export is how Vercel decides
 // this file runs on the Edge runtime (V8-based) rather than Node serverless.
@@ -170,7 +171,8 @@ async function getDeps(): Promise<AppDeps> {
     pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
-    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds)
+    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
+    confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES"))
   };
   cachedDeps = fresh;
   return fresh;

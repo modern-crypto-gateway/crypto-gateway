@@ -26,7 +26,14 @@ export default [
       parserOptions: {
         ecmaVersion: 2022,
         sourceType: "module",
-        project: false
+        // Type-aware rules (e.g. @typescript-eslint/no-floating-promises) need
+        // a live TS program. `projectService: true` lets the parser discover
+        // the nearest tsconfig per file, avoiding a hard-coded path and the
+        // duplicate build cost of parserOptions.project. Adds ~2s to a cold
+        // lint but catches unhandled async errors that the runtime would
+        // otherwise swallow.
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname
       }
     },
     plugins: {
@@ -78,6 +85,11 @@ export default [
       "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
       "@typescript-eslint/consistent-type-imports": ["error", { prefer: "type-imports", fixStyle: "inline-type-imports" }],
       "@typescript-eslint/no-explicit-any": "warn",
+      // Unhandled async errors are the most common production incident we've
+      // had to debug from logs — a silently-swallowed reject leaves no
+      // stacktrace. The rule accepts `void promise` or `.catch(...)` as
+      // explicit acknowledgments, so intentional fire-and-forget is easy.
+      "@typescript-eslint/no-floating-promises": "error",
       "no-console": ["warn", { allow: ["warn", "error"] }]
     }
   },

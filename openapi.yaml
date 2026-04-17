@@ -417,6 +417,117 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /admin/pool/initialize:
+    post:
+      tags: [admin]
+      summary: Seed or top up the address pool per family
+      description: |
+        Idempotent. Families already at or above `initialSize` return as
+        `already-sufficient` with zero additions. Families without a wired
+        chain adapter in deps.chains return as `skipped-no-adapter`. Safe to
+        call repeatedly and is the recovery path after a pool exhaustion.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        description: Empty body permitted; every field has a default.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                families:
+                  type: array
+                  minItems: 1
+                  items: { type: string, enum: [evm, tron, solana] }
+                  default: [evm, tron, solana]
+                initialSize:
+                  type: integer
+                  minimum: 1
+                  maximum: 500
+                  default: 5
+      responses:
+        "200":
+          description: Initialization outcomes per family
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        family: { type: string, enum: [evm, tron, solana] }
+                        status:
+                          type: string
+                          enum: [seeded, already-sufficient, skipped-no-adapter]
+                        added: { type: integer }
+        "400":
+          description: Malformed JSON (BAD_JSON) or invalid families/initialSize
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/pool/stats:
+    get:
+      tags: [admin]
+      summary: Per-family pool utilization snapshot
+      description: |
+        Operators watch this endpoint + an alert on available-count under a
+        threshold to catch "address supply running low" before POOL_EXHAUSTED
+        fires on a live invoice-create.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Pool statistics keyed by family
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        total: { type: integer }
+                        available: { type: integer }
+                        allocated: { type: integer }
+
+  /admin/migrate:
+    post:
+      tags: [admin]
+      summary: Apply any pending schema migrations
+      description: |
+        Runs the bundled migration set through the idempotent migration-runner.
+        Already-applied ids are skipped. On Workers/Vercel-Edge (no filesystem
+        at runtime) this endpoint returns 501 — operators use `wrangler d1
+        migrations apply` or the Turso migration CLI instead.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Migration sweep result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applied:
+                    type: array
+                    items: { type: string }
+                  skipped:
+                    type: array
+                    items: { type: string }
+        "501":
+          description: No bundled migration set on this runtime (MIGRATIONS_NOT_BUNDLED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /internal/cron/tick:
     post:
       tags: [internal]

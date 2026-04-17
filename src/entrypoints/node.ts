@@ -33,6 +33,7 @@ import type { ChainAdapter } from "../core/ports/chain.port.js";
 import type { DetectionStrategy } from "../core/ports/detection.port.js";
 import type { AppDeps } from "../core/app-deps.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
+import { parseFinalityOverridesEnv } from "../core/domain/payment-config.js";
 
 async function main(): Promise<void> {
   // Boot-time config validation. loadConfig throws a ConfigValidationError
@@ -222,7 +223,8 @@ async function main(): Promise<void> {
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
-    migrations
+    migrations,
+    confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES"))
   };
 
   const app = buildApp(deps);

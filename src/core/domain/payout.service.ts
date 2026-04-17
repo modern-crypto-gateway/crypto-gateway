@@ -272,7 +272,7 @@ export async function confirmPayouts(deps: AppDeps): Promise<ConfirmPayoutsResul
     const chainAdapter = findChainAdapter(deps, row.chain_id);
     const status = await chainAdapter.getConfirmationStatus(row.chain_id, row.tx_hash);
     const now = deps.clock.now().getTime();
-    const threshold = confirmationThreshold(row.chain_id);
+    const threshold = confirmationThreshold(row.chain_id, deps.confirmationThresholds);
 
     if (status.reverted) {
       // Batched with releaseFeeWallet so the two writes commit together.

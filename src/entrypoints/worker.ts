@@ -26,6 +26,7 @@ import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch
 import type { AppDeps } from "../core/app-deps.js";
 import { runScheduledJobs } from "../core/domain/scheduled-jobs.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
+import { parseFinalityOverridesEnv } from "../core/domain/payment-config.js";
 
 // Cloudflare Workers entrypoint. Exports { fetch, scheduled } as required by
 // the Workers runtime. Each invocation constructs a fresh AppDeps using the
@@ -180,7 +181,10 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
-    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds)
+    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
+    confirmationThresholds: parseFinalityOverridesEnv(
+      typeof env["FINALITY_OVERRIDES"] === "string" ? env["FINALITY_OVERRIDES"] : undefined
+    )
   };
 }
 

@@ -79,6 +79,12 @@ export interface AppDeps {
   // where migrations ship via `wrangler d1 migrations apply` / the Turso
   // migration CLI — the endpoint returns 501 when this field is missing.
   readonly migrations?: readonly MigrationEntry[];
+
+  // Per-chain confirmation-threshold overrides. Takes precedence over the
+  // shipped `DEFAULT_CONFIRMATION_THRESHOLDS` — populated from the
+  // FINALITY_OVERRIDES env var (e.g. "1:20,137:64"). Empty / undefined means
+  // fall back to the defaults.
+  readonly confirmationThresholds?: Readonly<Record<number, number>>;
 }
 
 // Mirrors `adapters/db/migration-runner.ts Migration` — duplicated here so

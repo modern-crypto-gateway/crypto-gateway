@@ -27,6 +27,7 @@ import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch
 import type { AppDeps } from "../core/app-deps.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
 import { runScheduledJobs } from "../core/domain/scheduled-jobs.js";
+import { parseFinalityOverridesEnv } from "../core/domain/payment-config.js";
 
 // Local Deno type declaration. We avoid adding a global shim (which would
 // pollute every other file's type scope) and instead declare just the Deno
@@ -184,15 +185,19 @@ async function main(): Promise<void> {
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
-    migrations
+    migrations,
+    confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES"))
   };
 
   const app = buildApp(deps);
 
   // Deno.cron is stable (Deno 1.38+) and native on Deno Deploy. Every minute
   // runs the full scheduled-jobs sequence. Named after the cadence so Deno
-  // Deploy's observability panels are self-explanatory.
-  Deno.cron("scheduled-jobs-1m", "* * * * *", async () => {
+  // Deploy's observability panels are self-explanatory. `void` because the
+  // registration promise resolves once the cron is queued with the runtime;
+  // subsequent tick failures surface via the handler's own error path, not
+  // this call's return value.
+  void Deno.cron("scheduled-jobs-1m", "* * * * *", async () => {
     await runScheduledJobs(deps);
   });
 

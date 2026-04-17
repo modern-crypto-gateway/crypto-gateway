@@ -18,7 +18,9 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
   app.use(
     "*",
     rateLimit(deps, {
-      scope: "merchant-api",
+      // See invoices.ts — separate scope per surface so invoices traffic
+      // doesn't drain a merchant's payouts quota.
+      scope: "merchant-api:payouts",
       keyFn: (c) => (c.get("merchantId") as string | undefined) ?? null,
       limit: deps.rateLimits.merchantPerMinute,
       windowSeconds: 60

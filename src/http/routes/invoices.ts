@@ -24,7 +24,12 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
   app.use(
     "*",
     rateLimit(deps, {
-      scope: "merchant-api",
+      // Per-surface scope: invoices and payouts each get their own
+      // per-merchant bucket. Previously both surfaces shared
+      // `merchant-api:<id>`, so a burst of /invoices calls could starve the
+      // merchant's /payouts quota (and vice-versa). Separate scopes keep
+      // each surface independently limited at `merchantPerMinute`.
+      scope: "merchant-api:invoices",
       keyFn: (c) => (c.get("merchantId") as string | undefined) ?? null,
       limit: deps.rateLimits.merchantPerMinute,
       windowSeconds: 60
