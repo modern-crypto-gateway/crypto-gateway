@@ -1,5 +1,5 @@
 import type { AppDeps } from "../app-deps.js";
-import { confirmTransactions } from "./payment.service.js";
+import { confirmTransactions, recheckConfirmedTransactionsForReorg } from "./payment.service.js";
 import {
   confirmPayouts,
   executeReservedPayouts,
@@ -21,6 +21,7 @@ import { sweepWebhookDeliveries } from "./webhook-subscriber.js";
 export interface ScheduledJobsResult {
   pollPayments: JobOutcome;
   confirmTransactions: JobOutcome;
+  recheckConfirmedForReorg: JobOutcome;
   executeReservedPayouts: JobOutcome;
   confirmPayouts: JobOutcome;
   sweepStuckFeeWalletReservations: JobOutcome;
@@ -37,6 +38,9 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
   const result: ScheduledJobsResult = {
     pollPayments: await run(() => pollPayments(deps)),
     confirmTransactions: await run(() => confirmTransactions(deps)),
+    // Reorg safety net — runs after confirmTransactions so a tx confirmed
+    // this tick and reorged out next tick still gets caught promptly.
+    recheckConfirmedForReorg: await run(() => recheckConfirmedTransactionsForReorg(deps)),
     executeReservedPayouts: await run(() => executeReservedPayouts(deps)),
     confirmPayouts: await run(() => confirmPayouts(deps)),
     sweepStuckFeeWalletReservations: await run(() => sweepStuckFeeWalletReservations(deps)),

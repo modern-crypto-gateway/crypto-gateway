@@ -1,6 +1,7 @@
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
 import type { ChainFamily } from "../types/chain.js";
+import type { ChainAdapter } from "../ports/chain.port.js";
 import type { Invoice, InvoiceId, InvoiceStatus } from "../types/invoice.js";
 import { DetectedTransferSchema, type TransactionId, type TxStatus } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
@@ -19,8 +20,14 @@ import { addUsd, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rat
 // through the state machine. Chain-agnostic — every family calls into the same
 // logic via the ChainAdapter port.
 
-// Terminal states: once an invoice lands here, no further transfers update it.
-const INVOICE_TERMINAL_STATES: ReadonlySet<InvoiceStatus> = new Set<InvoiceStatus>(["confirmed", "expired", "canceled"]);
+// Administratively terminal: these are merchant / operator decisions that
+// no chain event can reverse. `confirmed` is NOT here on purpose — a
+// confirmed invoice can still demote on deep reorg when its contributing
+// transactions orphan out, and the recompute path has to observe that.
+// Historically `confirmed` was treated as terminal, which silently held the
+// merchant-visible status at `confirmed` even after the underlying payment
+// evaporated on-chain. Audit finding C6 fixed that by narrowing the set.
+const ADMIN_TERMINAL_STATES: ReadonlySet<InvoiceStatus> = new Set<InvoiceStatus>(["expired", "canceled"]);
 
 // ---- Ingest a detected transfer ----
 
@@ -310,6 +317,125 @@ export async function confirmTransactions(deps: AppDeps): Promise<ConfirmSweepRe
   return { checked: pending.results.length, confirmed, reverted, promotedInvoices };
 }
 
+// ---- Reorg re-check sweep ----
+
+// Default reorg-recheck window: 24 hours. Any tx confirmed more recently than
+// this gets re-verified against the chain on every sweep; older txs are
+// trusted as finalized. Polygon's 256-confirmation threshold already handles
+// its known deep-reorg risk, and Ethereum / L2s rarely reorg past ~15 blocks
+// — 24h is a very conservative upper bound.
+const DEFAULT_REORG_RECHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// Per-sweep cap. At 1 tick per minute and 200 rows per tick the reorg
+// re-check can inspect 12k confirmed txs per hour, enough to cover the
+// busiest realistic load and still leave RPC budget for live detection.
+const REORG_RECHECK_BATCH_SIZE = 200;
+
+export interface ReorgRecheckResult {
+  checked: number;
+  demoted: number;
+  invoicesTouched: number;
+}
+
+// Re-queries the chain for every confirmed tx within the reorg window. A tx
+// whose on-chain state has flipped to reverted, or that is no longer known
+// to the chain at all, is moved to 'orphaned' and its invoice is recomputed
+// — which may demote a previously-confirmed invoice back to partial /
+// detected / created.
+//
+// A tx whose confirmation count merely dropped (but is still positive and
+// non-reverted) is NOT orphaned: adapters sometimes transiently report a
+// lower count during RPC failover, and a real reorg that displaced the tx
+// entirely surfaces as `reverted=true` or `blockNumber=null` next tick.
+export async function recheckConfirmedTransactionsForReorg(
+  deps: AppDeps,
+  opts: { windowMs?: number; limit?: number } = {}
+): Promise<ReorgRecheckResult> {
+  const windowMs = opts.windowMs ?? DEFAULT_REORG_RECHECK_WINDOW_MS;
+  const limit = opts.limit ?? REORG_RECHECK_BATCH_SIZE;
+  const now = deps.clock.now().getTime();
+  const cutoff = now - windowMs;
+
+  const confirmedRows = await deps.db
+    .prepare(
+      `SELECT * FROM transactions
+        WHERE status = 'confirmed'
+          AND confirmed_at IS NOT NULL
+          AND confirmed_at >= ?
+        ORDER BY confirmed_at DESC
+        LIMIT ?`
+    )
+    .bind(cutoff, limit)
+    .all<TxRow>();
+
+  let demoted = 0;
+  const touchedInvoiceIds = new Set<string>();
+
+  for (const row of confirmedRows.results) {
+    const chainAdapter = findChainAdapter(deps, row.chain_id);
+    let live: Awaited<ReturnType<ChainAdapter["getConfirmationStatus"]>>;
+    try {
+      live = await chainAdapter.getConfirmationStatus(row.chain_id, row.tx_hash);
+    } catch (err) {
+      // Transient RPC errors must not demote — only explicit
+      // `reverted=true` or "tx absent from chain" does. Skip and let the
+      // next tick retry.
+      deps.logger.warn("reorg recheck: getConfirmationStatus failed", {
+        txId: row.id,
+        chainId: row.chain_id,
+        txHash: row.tx_hash,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      continue;
+    }
+
+    const absent = live.blockNumber === null && live.confirmations === 0 && !live.reverted;
+    if (!live.reverted && !absent) continue;
+
+    await deps.db
+      .prepare(
+        "UPDATE transactions SET status = 'orphaned', confirmations = ?, block_number = ? WHERE id = ?"
+      )
+      .bind(live.confirmations, live.blockNumber, row.id)
+      .run();
+    const tx = rowToTransaction({
+      ...row,
+      status: "orphaned",
+      confirmations: live.confirmations,
+      block_number: live.blockNumber
+    });
+    deps.logger.error("confirmed tx orphaned by reorg", {
+      txId: row.id,
+      invoiceId: row.invoice_id,
+      chainId: row.chain_id,
+      txHash: row.tx_hash,
+      reverted: live.reverted,
+      absent
+    });
+    await deps.events.publish({ type: "tx.orphaned", txId: tx.id, tx, at: new Date(now) });
+    demoted += 1;
+    if (row.invoice_id !== null) touchedInvoiceIds.add(row.invoice_id);
+  }
+
+  if (touchedInvoiceIds.size > 0) {
+    const ids = [...touchedInvoiceIds];
+    const placeholders = ids.map(() => "?").join(",");
+    const invoiceRows = await deps.db
+      .prepare(`SELECT * FROM invoices WHERE id IN (${placeholders})`)
+      .bind(...ids)
+      .all<InvoiceRow>();
+    for (const invoiceRow of invoiceRows.results) {
+      await recomputeInvoiceFromTransactions(deps, invoiceRow, deps.clock.now().getTime());
+    }
+  }
+
+  return {
+    checked: confirmedRows.results.length,
+    demoted,
+    invoicesTouched: touchedInvoiceIds.size
+  };
+}
+
 // ---- Internal: recompute invoice state from its contributing transactions ----
 
 async function recomputeInvoiceFromTransactions(
@@ -318,9 +444,11 @@ async function recomputeInvoiceFromTransactions(
   now: number
 ): Promise<InvoiceStatus> {
   const before = invoiceRow.status as InvoiceStatus;
-  if (INVOICE_TERMINAL_STATES.has(before)) {
-    // Terminal invoices are frozen. Late transfers still get inserted into
-    // `transactions` (audit), but they don't change the invoice state.
+  if (ADMIN_TERMINAL_STATES.has(before)) {
+    // `expired` / `canceled` are frozen. Late transfers still get inserted
+    // into `transactions` (audit), but they don't change the invoice state.
+    // `confirmed` / `overpaid` invoices fall through — if a reorg orphaned a
+    // contributing tx they need to demote.
     return before;
   }
 
@@ -365,12 +493,19 @@ async function recomputeInvoiceFromTransactions(
 
   // Persist: always update received_amount_raw; update status only when changed.
   if (after !== before) {
+    // Preserve the first-confirm timestamp across reorg round-trips. When a
+    // confirmed invoice demotes (reorg) and later re-confirms, keeping the
+    // original confirmed_at makes "time-to-confirm" dashboards honest. The
+    // USD path already did this; the legacy path didn't, which is C6 territory.
     await deps.db
       .prepare(
         `UPDATE invoices
             SET status = ?,
                 received_amount_raw = ?,
-                confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END,
+                confirmed_at = CASE
+                  WHEN ? = 'confirmed' AND confirmed_at IS NULL THEN ?
+                  ELSE confirmed_at
+                END,
                 updated_at = ?
           WHERE id = ?`
       )
@@ -383,11 +518,38 @@ async function recomputeInvoiceFromTransactions(
         ...invoiceRow,
         status: after,
         received_amount_raw: total.toString(),
-        confirmed_at: after === "confirmed" ? now : invoiceRow.confirmed_at,
+        confirmed_at:
+          after === "confirmed" && invoiceRow.confirmed_at === null ? now : invoiceRow.confirmed_at,
         updated_at: now
       },
       addresses
     );
+    // Reorg demotion (confirmed -> anything lower) is an operator-visible
+    // event: the merchant has already been told the payment confirmed, and
+    // downstream systems (payout, fulfillment) may have acted on it. Log at
+    // error level so alerting picks it up; the webhook fires too so the
+    // merchant can reconcile.
+    //
+    // NOTE: the address-pool release handler (pool.service.ts) already fired
+    // on `invoice.confirmed`, so the receive address for this invoice may
+    // have been marked available and potentially reallocated to a new
+    // invoice. Operators seeing this log should manually verify that any
+    // payment observed against the demoted invoice's receive address
+    // genuinely belongs to this invoice and not a newer one that inherited
+    // the slot. A dedicated `invoice.demoted` event + automatic pool
+    // re-acquire is a known follow-up; for now `poolReallocationRisk: true`
+    // in the fields tags this log line for alert routing.
+    if (before === "confirmed" && after !== "confirmed") {
+      deps.logger.error("invoice demoted after confirmation (reorg)", {
+        invoiceId: invoiceRow.id,
+        merchantId: invoiceRow.merchant_id,
+        before,
+        after,
+        receivedAmountRaw: total.toString(),
+        requiredAmountRaw: invoiceRow.required_amount_raw,
+        poolReallocationRisk: true
+      });
+    }
     await deps.events.publish(invoiceEventFor(after, updated, now));
   } else if (total.toString() !== invoiceRow.received_amount_raw) {
     await deps.db
@@ -479,6 +641,27 @@ async function recomputeUsdInvoice(
       },
       addresses
     );
+    // Reorg demotion on USD-path invoices: confirmed / overpaid are positive
+    // terminal-ish outcomes the merchant has been notified about. A
+    // transition to a lower status (partial / detected / created) means the
+    // chain walked back our happy-path event — surface loudly.
+    if (
+      (before === "confirmed" || before === "overpaid") &&
+      after !== "confirmed" &&
+      after !== "overpaid"
+    ) {
+      deps.logger.error("USD invoice demoted after confirmation (reorg)", {
+        invoiceId: invoiceRow.id,
+        merchantId: invoiceRow.merchant_id,
+        before,
+        after,
+        paidUsd,
+        amountUsd,
+        // See note in non-USD recompute path: pool may have released this
+        // invoice's receive address on the original confirmation.
+        poolReallocationRisk: true
+      });
+    }
     await deps.events.publish(invoiceEventFor(after, updated, now));
   }
 

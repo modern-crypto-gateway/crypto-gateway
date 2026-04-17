@@ -12,6 +12,13 @@ export interface ConsoleLoggerConfig {
   now?: () => Date;
   // Underlying sink. Defaults to console.{debug,error}. Swap in a buffer for tests.
   sink?: (level: LogLevel, line: string) => void;
+  // Optional fan-out sink for critical log lines. Called in addition to `sink`
+  // for any log at or above `alertMinLevel`. Fire-and-forget from the logger's
+  // point of view — the adapter is responsible for its own retry/error
+  // handling. A throw here must not propagate to the calling domain code.
+  alertSink?: (level: LogLevel, line: string, fields: LogFields) => void;
+  // Minimum level routed to `alertSink`. Default "error" — page-worthy only.
+  alertMinLevel?: LogLevel;
 }
 
 const LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -59,6 +66,8 @@ export function consoleLogger(config: ConsoleLoggerConfig = {}): Logger {
         console.warn(line);
       }
     });
+  const alertSink = config.alertSink;
+  const alertMinOrder = LEVEL_ORDER[config.alertMinLevel ?? "error"];
 
   return makeLogger(baseFields);
 
@@ -70,7 +79,17 @@ export function consoleLogger(config: ConsoleLoggerConfig = {}): Logger {
       const line = format === "json"
         ? JSON.stringify({ ts: timestamp, level, msg: message, ...merged })
         : formatPretty(timestamp, level, message, merged);
-      sink(level, redactSecrets(line));
+      const redacted = redactSecrets(line);
+      sink(level, redacted);
+      if (alertSink !== undefined && LEVEL_ORDER[level] >= alertMinOrder) {
+        // Swallow sink exceptions — an alert channel failing must never break
+        // the caller's normal logging path.
+        try {
+          alertSink(level, redacted, { ts: timestamp, msg: message, ...merged });
+        } catch {
+          // intentionally ignored
+        }
+      }
     };
 
     return {

@@ -19,8 +19,9 @@ import { applyMigrations } from "../adapters/db/migration-runner.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
+import { httpAlertSink } from "../adapters/logging/http-alert.adapter.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
-import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
+import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { denoEnvSecrets } from "../adapters/secrets/deno-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
@@ -54,10 +55,19 @@ async function main(): Promise<void> {
     dbAuthToken !== undefined ? { url: databaseUrl, authToken: dbAuthToken } : { url: databaseUrl }
   );
 
+  const alertWebhookUrl = secrets.getOptional("ALERT_WEBHOOK_URL");
+  const alertAuthHeader = secrets.getOptional("ALERT_WEBHOOK_AUTH_HEADER");
+  const alertSink = alertWebhookUrl !== undefined
+    ? httpAlertSink({
+        url: alertWebhookUrl,
+        ...(alertAuthHeader !== undefined ? { headers: { authorization: alertAuthHeader } } : {})
+      })
+    : undefined;
   const logger = consoleLogger({
     format: "json",
     minLevel: "info",
-    baseFields: { service: "crypto-gateway", runtime: "deno" }
+    baseFields: { service: "crypto-gateway", runtime: "deno" },
+    ...(alertSink !== undefined ? { alertSink } : {})
   });
 
   // Apply migrations at boot. Deno supports node:fs + node:url natively, so
@@ -162,7 +172,25 @@ async function main(): Promise<void> {
       ...(secrets.getOptional("NODE_ENV") !== undefined ? { environment: secrets.getOptional("NODE_ENV")! } : {}),
       logger
     }),
-    priceOracle: staticPegPriceOracle(),
+    priceOracle: selectPriceOracle({
+      ...(secrets.getOptional("PRICE_ADAPTER") === "coingecko" ||
+      secrets.getOptional("PRICE_ADAPTER") === "static-peg" ||
+      secrets.getOptional("PRICE_ADAPTER") === "alchemy"
+        ? { priceAdapter: secrets.getOptional("PRICE_ADAPTER") as "coingecko" | "static-peg" | "alchemy" }
+        : {}),
+      ...(secrets.getOptional("COINGECKO_API_KEY") !== undefined
+        ? { coingeckoApiKey: secrets.getOptional("COINGECKO_API_KEY")! }
+        : {}),
+      coingeckoPlan: secrets.getOptional("COINGECKO_PLAN") === "pro" ? "pro" : "demo",
+      ...(secrets.getOptional("COINCAP_API_KEY") !== undefined
+        ? { coincapApiKey: secrets.getOptional("COINCAP_API_KEY")! }
+        : {}),
+      ...(secrets.getOptional("DISABLE_COINGECKO") === "1" ? { disableCoingecko: true } : {}),
+      ...(secrets.getOptional("DISABLE_COINCAP") === "1" ? { disableCoincap: true } : {}),
+      ...(secrets.getOptional("DISABLE_BINANCE") === "1" ? { disableBinance: true } : {}),
+      cache,
+      logger
+    }),
     webhookDispatcher: inlineFetchDispatcher({
       allowHttp:
         secrets.getOptional("NODE_ENV") === "development" ||

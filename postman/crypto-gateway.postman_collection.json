@@ -675,6 +675,74 @@
       ]
     },
     {
+      "name": "Admin / Webhook deliveries",
+      "description": "Operator-only dead-letter queue for outbound webhook deliveries. Use these when a merchant webhook has been failing and you've coordinated a fix.",
+      "item": [
+        {
+          "name": "List dead deliveries",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/webhook-deliveries?status=dead&limit=50&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "webhook-deliveries"],
+              "query": [
+                { "key": "status", "value": "dead", "description": "pending | delivered | dead" },
+                { "key": "limit", "value": "50" },
+                { "key": "offset", "value": "0" }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Returns a page of webhook delivery rows filtered by status. Default `status=dead` surfaces rows that exhausted the retry schedule (5 outer attempts × up to 4 inline HTTP attempts each) and require operator intervention before the merchant sees the event."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('has deliveries array', () => pm.expect(body.deliveries).to.be.an('array'));",
+                  "const first = (body.deliveries || [])[0];",
+                  "if (first && first.id) {",
+                  "  pm.environment.set('deadDeliveryId', first.id);",
+                  "  console.log('saved deadDeliveryId =', first.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Replay a dead delivery",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/webhook-deliveries/{{deadDeliveryId}}/replay",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "webhook-deliveries", "{{deadDeliveryId}}", "replay"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Resets a row from `dead` to `pending` with `next_attempt_at = now`, so the next scheduled-jobs sweep re-dispatches it. Returns 404 with code `NOT_DEAD` if the row is not in dead status — pending rows are already queued and delivered rows don't need replay.\n\nSet `deadDeliveryId` from the List-dead-deliveries test script, or paste a specific id."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('replayed echoes id', () => pm.expect(body.replayed).to.have.property('id'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "Internal",
       "description": "Endpoints the gateway operator hits directly — not the merchant surface, not public.",
       "item": [

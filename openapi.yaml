@@ -497,6 +497,95 @@ paths:
                         available: { type: integer }
                         allocated: { type: integer }
 
+  /admin/webhook-deliveries:
+    get:
+      tags: [admin]
+      summary: List webhook deliveries by status
+      description: |
+        Operator view of the outbox. Use `status=dead` (default) to surface
+        deliveries that exhausted the retry schedule and need manual
+        intervention (merchant-side fix, then POST the replay endpoint).
+        `pending` shows rows still queued for retry; `delivered` shows
+        successful deliveries (mostly useful for audit).
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [pending, delivered, dead], default: dead }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Page of delivery rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        merchantId: { type: string }
+                        eventType: { type: string }
+                        status: { type: string, enum: [pending, delivered, dead] }
+                        attempts: { type: integer }
+                        lastStatusCode: { type: integer, nullable: true }
+                        lastError: { type: string, nullable: true }
+                        nextAttemptAt: { type: integer, nullable: true, description: "Epoch ms" }
+                        deliveredAt: { type: integer, nullable: true, description: "Epoch ms" }
+                        createdAt: { type: integer, description: "Epoch ms" }
+                        updatedAt: { type: integer, description: "Epoch ms" }
+        "400":
+          description: Unknown status value (BAD_STATUS)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/webhook-deliveries/{id}/replay:
+    post:
+      tags: [admin]
+      summary: Replay a dead webhook delivery
+      description: |
+        Resets a delivery from `dead` back to `pending` with `next_attempt_at`
+        set to now, so the next scheduled-jobs sweep re-drives it. Only rows
+        in `dead` status are replayable — `pending` rows are already queued
+        and `delivered` rows have already succeeded. Intended for when the
+        merchant has fixed the underlying cause of permanent failure (TLS
+        cert, URL change, etc.) and you want to push the event through.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Row reset to pending and queued for retry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  replayed:
+                    type: object
+                    properties:
+                      id: { type: string }
+                      nextAttemptAt: { type: integer, description: "Epoch ms" }
+        "404":
+          description: Delivery not found or not in dead status (NOT_DEAD)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /admin/migrate:
     post:
       tags: [admin]

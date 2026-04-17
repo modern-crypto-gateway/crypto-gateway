@@ -36,6 +36,21 @@ export const AppConfigSchema = z
 
     // Provider secrets.
     alchemyApiKey: z.string().optional(),
+    // CoinGecko API key. Optional — the free tier is keyless but heavily
+    // rate-limited; demo/pro keys raise that ceiling. `coingeckoPlan` selects
+    // which header the adapter sends.
+    coingeckoApiKey: z.string().optional(),
+    coingeckoPlan: z.enum(["demo", "pro"]).default("demo"),
+    // CoinCap (Messari) API key. Optional — v2 /assets is keyless in
+    // practice; set this to raise the per-minute budget under load.
+    coincapApiKey: z.string().optional(),
+    // Per-provider opt-outs. Set to "1" to remove that source from the
+    // fallback chain — useful when a jurisdiction prohibits hitting a
+    // specific provider or when an operator wants deterministic-per-source
+    // behavior during incident response.
+    disableCoingecko: z.coerce.boolean().optional(),
+    disableCoincap: z.coerce.boolean().optional(),
+    disableBinance: z.coerce.boolean().optional(),
     // Comma-separated chain-id override for which chains to wire via Alchemy
     // when `alchemyApiKey` is set. Absent = default mainnet set (ETH / OP /
     // Polygon / Base / Arbitrum). Useful for narrowing to a subset, or for
@@ -88,6 +103,14 @@ export const AppConfigSchema = z
     rateLimitMerchantPerMinute: z.coerce.number().int().min(1).default(1000),
     rateLimitCheckoutPerMinute: z.coerce.number().int().min(1).default(60),
     rateLimitWebhookIngestPerMinute: z.coerce.number().int().min(1).default(300),
+
+    // Ops alerting: when set, error-level log lines are fan-out POSTed to this
+    // URL (Slack/Discord/PagerDuty-compatible JSON body). Normal logs still
+    // flow to stdout/stderr; this is the page-the-oncall channel only.
+    alertWebhookUrl: z.string().url().optional(),
+    // Optional Authorization header value to include on alert POSTs. Useful
+    // for PagerDuty ("Token token=...") or self-hosted collectors.
+    alertWebhookAuthHeader: z.string().optional(),
 
     // Comma-separated list of which forwarded-IP headers to trust when
     // extracting the client IP for rate limiting. Order matters: the first
@@ -175,6 +198,12 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     secretsEncryptionKey: env["SECRETS_ENCRYPTION_KEY"],
     alchemyApiKey: env["ALCHEMY_API_KEY"],
     alchemyChains: env["ALCHEMY_CHAINS"],
+    coingeckoApiKey: env["COINGECKO_API_KEY"],
+    coingeckoPlan: env["COINGECKO_PLAN"],
+    coincapApiKey: env["COINCAP_API_KEY"],
+    disableCoingecko: env["DISABLE_COINGECKO"],
+    disableCoincap: env["DISABLE_COINCAP"],
+    disableBinance: env["DISABLE_BINANCE"],
     trongridApiKey: env["TRONGRID_API_KEY"],
     tronNetwork: env["TRON_NETWORK"],
     tronPollIntervalMs: env["TRON_POLL_INTERVAL_MS"],
@@ -187,7 +216,9 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     rateLimitMerchantPerMinute: env["RATE_LIMIT_MERCHANT_PER_MINUTE"],
     rateLimitCheckoutPerMinute: env["RATE_LIMIT_CHECKOUT_PER_MINUTE"],
     rateLimitWebhookIngestPerMinute: env["RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE"],
-    trustedIpHeaders: env["TRUSTED_IP_HEADERS"]
+    trustedIpHeaders: env["TRUSTED_IP_HEADERS"],
+    alertWebhookUrl: env["ALERT_WEBHOOK_URL"],
+    alertWebhookAuthHeader: env["ALERT_WEBHOOK_AUTH_HEADER"]
   };
   // Treat empty strings as absent so Zod's optional() path matches user intent.
   const normalized: Record<string, unknown> = {};

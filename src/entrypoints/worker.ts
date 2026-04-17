@@ -18,7 +18,8 @@ import { d1Adapter } from "../adapters/db/d1.adapter.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { waitUntilJobs } from "../adapters/jobs/wait-until.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
-import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
+import { httpAlertSink } from "../adapters/logging/http-alert.adapter.js";
+import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { workersEnvSecrets } from "../adapters/secrets/workers-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
@@ -53,10 +54,23 @@ export interface WorkerEnv {
 }
 
 async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> {
+  const alertWebhookUrl = typeof env["ALERT_WEBHOOK_URL"] === "string" && env["ALERT_WEBHOOK_URL"].length > 0
+    ? env["ALERT_WEBHOOK_URL"]
+    : undefined;
+  const alertAuthHeader = typeof env["ALERT_WEBHOOK_AUTH_HEADER"] === "string" && env["ALERT_WEBHOOK_AUTH_HEADER"].length > 0
+    ? env["ALERT_WEBHOOK_AUTH_HEADER"]
+    : undefined;
+  const alertSink = alertWebhookUrl !== undefined
+    ? httpAlertSink({
+        url: alertWebhookUrl,
+        ...(alertAuthHeader !== undefined ? { headers: { authorization: alertAuthHeader } } : {})
+      })
+    : undefined;
   const logger = consoleLogger({
     format: "json",
     minLevel: "info",
-    baseFields: { service: "crypto-gateway", runtime: "workers" }
+    baseFields: { service: "crypto-gateway", runtime: "workers" },
+    ...(alertSink !== undefined ? { alertSink } : {})
   });
   const cache = cfKvAdapter(env.KV);
   // CF KV enforces a 60s TTL floor already, so the limiter's 60s+1 setting lands
@@ -164,7 +178,23 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
       ...(typeof env["NODE_ENV"] === "string" ? { environment: env["NODE_ENV"] } : {}),
       logger
     }),
-    priceOracle: staticPegPriceOracle(),
+    priceOracle: selectPriceOracle({
+      ...(env["PRICE_ADAPTER"] === "coingecko" || env["PRICE_ADAPTER"] === "static-peg" || env["PRICE_ADAPTER"] === "alchemy"
+        ? { priceAdapter: env["PRICE_ADAPTER"] as "coingecko" | "static-peg" | "alchemy" }
+        : {}),
+      ...(typeof env["COINGECKO_API_KEY"] === "string" && env["COINGECKO_API_KEY"].length > 0
+        ? { coingeckoApiKey: env["COINGECKO_API_KEY"] }
+        : {}),
+      coingeckoPlan: env["COINGECKO_PLAN"] === "pro" ? "pro" : "demo",
+      ...(typeof env["COINCAP_API_KEY"] === "string" && env["COINCAP_API_KEY"].length > 0
+        ? { coincapApiKey: env["COINCAP_API_KEY"] }
+        : {}),
+      ...(env["DISABLE_COINGECKO"] === "1" ? { disableCoingecko: true } : {}),
+      ...(env["DISABLE_COINCAP"] === "1" ? { disableCoincap: true } : {}),
+      ...(env["DISABLE_BINANCE"] === "1" ? { disableBinance: true } : {}),
+      cache,
+      logger
+    }),
     webhookDispatcher: inlineFetchDispatcher({
       allowHttp: env["NODE_ENV"] === "development" || env["NODE_ENV"] === "test"
     }),

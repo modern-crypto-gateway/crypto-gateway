@@ -10,10 +10,11 @@ import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.
 import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
+import { httpAlertSink } from "../adapters/logging/http-alert.adapter.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { processEnvSecrets } from "../adapters/secrets/process-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
-import { staticPegPriceOracle } from "../adapters/price-oracle/static-peg.adapter.js";
+import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
@@ -54,10 +55,19 @@ async function main(): Promise<void> {
   }
   const production = config.environment === "production";
 
+  const alertSink = config.alertWebhookUrl !== undefined
+    ? httpAlertSink({
+        url: config.alertWebhookUrl,
+        ...(config.alertWebhookAuthHeader !== undefined
+          ? { headers: { authorization: config.alertWebhookAuthHeader } }
+          : {})
+      })
+    : undefined;
   const logger = consoleLogger({
     format: production ? "json" : "pretty",
     minLevel: production ? "info" : "debug",
-    baseFields: { service: "crypto-gateway", runtime: "node", env: config.environment }
+    baseFields: { service: "crypto-gateway", runtime: "node", env: config.environment },
+    ...(alertSink !== undefined ? { alertSink } : {})
   });
 
   // Dev convenience: if no MASTER_SEED was set and the config allowed it
@@ -198,7 +208,17 @@ async function main(): Promise<void> {
       environment: config.environment,
       logger
     }),
-    priceOracle: staticPegPriceOracle(),
+    priceOracle: selectPriceOracle({
+      ...(config.priceAdapter !== undefined ? { priceAdapter: config.priceAdapter } : {}),
+      ...(config.coingeckoApiKey !== undefined ? { coingeckoApiKey: config.coingeckoApiKey } : {}),
+      coingeckoPlan: config.coingeckoPlan,
+      ...(config.coincapApiKey !== undefined ? { coincapApiKey: config.coincapApiKey } : {}),
+      ...(config.disableCoingecko !== undefined ? { disableCoingecko: config.disableCoingecko } : {}),
+      ...(config.disableCoincap !== undefined ? { disableCoincap: config.disableCoincap } : {}),
+      ...(config.disableBinance !== undefined ? { disableBinance: config.disableBinance } : {}),
+      cache,
+      logger
+    }),
     webhookDispatcher: inlineFetchDispatcher({
       allowHttp: config.environment === "development" || config.environment === "test"
     }),
