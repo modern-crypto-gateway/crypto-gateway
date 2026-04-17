@@ -199,7 +199,11 @@ async function main(): Promise<void> {
     rateLimits: {
       merchantPerMinute: config.rateLimitMerchantPerMinute,
       checkoutPerMinute: config.rateLimitCheckoutPerMinute,
-      webhookIngestPerMinute: config.rateLimitWebhookIngestPerMinute
+      webhookIngestPerMinute: config.rateLimitWebhookIngestPerMinute,
+      trustedIpHeaders: config.trustedIpHeaders
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => s.length > 0)
     },
     chains,
     detectionStrategies,

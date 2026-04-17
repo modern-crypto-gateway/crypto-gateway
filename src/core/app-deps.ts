@@ -83,4 +83,9 @@ export interface RateLimitConfig {
   checkoutPerMinute: number;
   // Per-IP cap on the webhook ingest endpoints (Alchemy, etc.).
   webhookIngestPerMinute: number;
+  // Headers consulted (in order) by `getClientIp`. Anything not in this list
+  // is ignored — an attacker can't spoof their rate-limit bucket key by
+  // sending unsolicited X-Forwarded-For. Empty list = bucket all under
+  // "anonymous". Defaults to ["cf-connecting-ip"] from config.
+  readonly trustedIpHeaders: readonly string[];
 }

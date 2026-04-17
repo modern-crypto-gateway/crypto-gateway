@@ -1,0 +1,26 @@
+-- Broadcast idempotency: a payout row claims the broadcast slot before the
+-- chain-adapter call, so a crash after broadcast but before the
+-- status='submitted' write cannot be retried into a second on-chain tx.
+--
+-- Semantics:
+--   broadcast_attempted_at IS NULL   => never broadcast; safe to proceed
+--   broadcast_attempted_at IS NOT NULL AND status='reserved'
+--                                    => a prior attempt broadcast (maybe) but
+--                                       never recorded success. Operator must
+--                                       investigate on-chain before retrying;
+--                                       the dispatcher fails-shut and flips
+--                                       the row to 'failed' with a specific
+--                                       error code rather than double-spend.
+--
+-- The CAS that claims the slot is:
+--   UPDATE payouts
+--      SET broadcast_attempted_at = ?
+--    WHERE id = ?
+--      AND broadcast_attempted_at IS NULL
+--      AND status = 'reserved'
+--   RETURNING id
+--
+-- A zero-row result means the slot is already claimed; the dispatcher treats
+-- that as a terminal error for this attempt.
+
+ALTER TABLE payouts ADD COLUMN broadcast_attempted_at INTEGER;

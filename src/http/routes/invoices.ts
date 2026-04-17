@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { AppDeps } from "../../core/app-deps.js";
 import { createInvoice, expireInvoice, getInvoice } from "../../core/domain/invoice.service.js";
-import type { Invoice, InvoiceId } from "../../core/types/invoice.js";
+import { InvoiceIdSchema, type Invoice, type InvoiceId } from "../../core/types/invoice.js";
 import { renderError } from "../middleware/error-handler.js";
 import { rateLimit } from "../middleware/rate-limit.js";
 import { apiKeyAuth, type AuthedVariables } from "../middleware/api-key-auth.js";
@@ -47,7 +47,12 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
   });
 
   app.get("/:id", async (c) => {
-    const id = c.req.param("id") as InvoiceId;
+    const id = parseInvoiceIdParam(c.req.param("id"));
+    if (id === null) {
+      // Unknown id shape -> 404, same as "doesn't exist", so an attacker can't
+      // distinguish malformed vs missing ids and enumerate the keyspace.
+      return c.json({ error: { code: "NOT_FOUND" } }, 404);
+    }
     const invoice = await getInvoice(deps, id);
     if (!invoice || invoice.merchantId !== c.get("merchantId")) {
       return c.json({ error: { code: "NOT_FOUND", message: `Invoice ${id} not found` } }, 404);
@@ -56,7 +61,10 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
   });
 
   app.post("/:id/expire", async (c) => {
-    const id = c.req.param("id") as InvoiceId;
+    const id = parseInvoiceIdParam(c.req.param("id"));
+    if (id === null) {
+      return c.json({ error: { code: "NOT_FOUND" } }, 404);
+    }
     const existing = await getInvoice(deps, id);
     if (!existing || existing.merchantId !== c.get("merchantId")) {
       return c.json({ error: { code: "NOT_FOUND", message: `Invoice ${id} not found` } }, 404);
@@ -70,6 +78,15 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
   });
 
   return app;
+}
+
+// Validate that the path-param id is a UUID before it ever touches the DB.
+// Stops malformed inputs from wasting a SELECT round-trip and forces every id
+// that reaches `getInvoice` to be shape-correct.
+function parseInvoiceIdParam(raw: string | undefined): InvoiceId | null {
+  if (raw === undefined) return null;
+  const parsed = InvoiceIdSchema.safeParse(raw);
+  return parsed.success ? (parsed.data as InvoiceId) : null;
 }
 
 // Dates serialize as ISO strings. No other transforms — the `Invoice` shape is

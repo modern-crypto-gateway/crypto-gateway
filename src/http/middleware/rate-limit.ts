@@ -68,21 +68,29 @@ export function rateLimit(deps: AppDeps, opts: RateLimitOptions): MiddlewareHand
   };
 }
 
-// Best-effort client IP extraction. Checks headers common across Cloudflare,
-// Vercel, AWS ALB, and generic reverse proxies. Falls back to "anonymous"
-// which buckets unknown clients together — mildly unfair for shared NAT but
-// safe for a public checkout/webhook endpoint that expects a proxy.
-export function getClientIp(c: Context): string {
-  const cf = c.req.header("cf-connecting-ip");
-  if (cf !== undefined && cf.length > 0) return cf;
-  const xff = c.req.header("x-forwarded-for");
-  if (xff !== undefined && xff.length > 0) {
-    // XFF is a comma-separated chain "client, proxy1, proxy2"; the leftmost
-    // is the originating client (trust depends on upstream proxy hygiene).
-    const first = xff.split(",")[0]?.trim();
-    if (first) return first;
+// Client-IP extraction for rate-limit bucketing. ONLY consults headers the
+// operator has explicitly allow-listed via `deps.rateLimits.trustedIpHeaders`
+// — a request that arrives with, say, an unsolicited `x-forwarded-for` header
+// through a runtime that doesn't terminate a trusted proxy is ignored and
+// buckets under "anonymous". This is the fix for the classic XFF-spoof
+// quota-drain: an attacker can't impersonate a victim's IP just by setting
+// the header.
+//
+// Headers are consulted in the configured order; first non-empty wins.
+// XFF-style comma chains are split and only the leftmost (originating client)
+// entry is used — trustworthy ONLY when the upstream proxy you terminate at
+// strips any client-supplied XFF before forwarding. Configure accordingly.
+//
+// Falling back to "anonymous" buckets unknown clients together — slightly
+// unfair for shared NAT but safe for a public checkout/webhook endpoint
+// whose normal callers are expected to arrive through a trusted proxy.
+export function getClientIp(c: Context, trustedHeaders: readonly string[] = []): string {
+  for (const headerName of trustedHeaders) {
+    const value = c.req.header(headerName);
+    if (value === undefined || value.length === 0) continue;
+    // Comma-separated chains (XFF shape) take the leftmost entry.
+    const first = value.split(",")[0]?.trim();
+    if (first && first.length > 0) return first;
   }
-  const real = c.req.header("x-real-ip");
-  if (real !== undefined && real.length > 0) return real;
   return "anonymous";
 }

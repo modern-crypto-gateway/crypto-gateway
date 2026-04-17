@@ -166,7 +166,8 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     rateLimits: {
       merchantPerMinute: envNumber(env, "RATE_LIMIT_MERCHANT_PER_MINUTE", 1000),
       checkoutPerMinute: envNumber(env, "RATE_LIMIT_CHECKOUT_PER_MINUTE", 60),
-      webhookIngestPerMinute: envNumber(env, "RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE", 300)
+      webhookIngestPerMinute: envNumber(env, "RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE", 300),
+      trustedIpHeaders: parseTrustedIpHeaders(env["TRUSTED_IP_HEADERS"], ["cf-connecting-ip"])
     },
     chains,
     detectionStrategies,
@@ -184,6 +185,15 @@ function envNumber(env: WorkerEnv, key: string, fallback: number): number {
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
   return fallback;
+}
+
+function parseTrustedIpHeaders(raw: unknown, fallback: readonly string[]): readonly string[] {
+  if (typeof raw !== "string") return fallback;
+  const parsed = raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0);
+  return parsed.length > 0 ? parsed : fallback;
 }
 
 export default {

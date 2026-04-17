@@ -243,17 +243,36 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       }
       const results = await bootstrapAlchemyWebhooks(bootstrapArgs);
 
-      // Surface a note for any `created` row whose persistence failed — the
-      // operator needs to manually paste that row into the registry or
-      // delete-and-recreate. `persisted=true` rows need no action: the inbound
-      // ingest route will resolve the signing key from the DB.
+      // Surface any `created` row whose persistence failed — the operator
+      // needs to manually paste that row into the registry or delete-and-
+      // recreate. `persisted=true` rows need no action: the inbound ingest
+      // route will resolve the signing key from the DB.
+      //
+      // Hard-fail the response with 500 if any row failed to persist, so
+      // operators/CI notice the orphan in Alchemy rather than assuming a 2xx
+      // means "all wired". The response body still carries the signingKey so
+      // the operator can re-register via POST /alchemy-webhooks/signing-keys.
       const needsManualAction = results.filter(
         (r) => r.status === "created" && r.persisted === false
       );
       if (needsManualAction.length > 0) {
-        deps.logger.warn(
+        deps.logger.error(
           "alchemy: webhook created but registry write failed; signingKey returned in response only",
-          { chainIds: needsManualAction.map((r) => r.chainId) }
+          {
+            chainIds: needsManualAction.map((r) => r.chainId),
+            webhookIds: needsManualAction.map((r) => r.webhookId)
+          }
+        );
+        return c.json(
+          {
+            error: {
+              code: "BOOTSTRAP_PARTIAL_FAILURE",
+              message:
+                "One or more webhooks were created in Alchemy but could not be persisted to the registry. Register each orphaned webhook's signingKey via POST /admin/alchemy-webhooks/signing-keys using the values in `results`."
+            },
+            results
+          },
+          500
         );
       }
 

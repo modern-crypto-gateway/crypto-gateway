@@ -87,7 +87,22 @@ export const AppConfigSchema = z
     // don't trip them; tune down in production via env vars.
     rateLimitMerchantPerMinute: z.coerce.number().int().min(1).default(1000),
     rateLimitCheckoutPerMinute: z.coerce.number().int().min(1).default(60),
-    rateLimitWebhookIngestPerMinute: z.coerce.number().int().min(1).default(300)
+    rateLimitWebhookIngestPerMinute: z.coerce.number().int().min(1).default(300),
+
+    // Comma-separated list of which forwarded-IP headers to trust when
+    // extracting the client IP for rate limiting. Order matters: the first
+    // match wins. Anything not in this list is ignored — an attacker can't
+    // spoof their bucket key by sending unsolicited X-Forwarded-For headers.
+    //
+    // Recommended values per runtime:
+    //   - Cloudflare Workers : "cf-connecting-ip"
+    //   - Vercel             : "x-vercel-forwarded-for,x-real-ip"
+    //   - AWS ALB            : "x-forwarded-for"  (only if you terminate at the ALB)
+    //   - Bare Node          : ""  (empty = trust nothing; bucket all under "anonymous")
+    //
+    // Default: cf-connecting-ip only. Production deployments behind other
+    // proxies must override this explicitly.
+    trustedIpHeaders: z.string().default("cf-connecting-ip")
   })
   // Production-grade guards also apply to `staging` so a pre-prod deploy can't
   // quietly run with placeholder secrets. Only `development` and `test` are
@@ -171,7 +186,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     redisUrl: env["REDIS_URL"],
     rateLimitMerchantPerMinute: env["RATE_LIMIT_MERCHANT_PER_MINUTE"],
     rateLimitCheckoutPerMinute: env["RATE_LIMIT_CHECKOUT_PER_MINUTE"],
-    rateLimitWebhookIngestPerMinute: env["RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE"]
+    rateLimitWebhookIngestPerMinute: env["RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE"],
+    trustedIpHeaders: env["TRUSTED_IP_HEADERS"]
   };
   // Treat empty strings as absent so Zod's optional() path matches user intent.
   const normalized: Record<string, unknown> = {};

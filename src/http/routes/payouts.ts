@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { AppDeps } from "../../core/app-deps.js";
 import { getPayout, planPayout } from "../../core/domain/payout.service.js";
-import type { Payout, PayoutId } from "../../core/types/payout.js";
+import { PayoutIdSchema, type Payout, type PayoutId } from "../../core/types/payout.js";
 import { renderError } from "../middleware/error-handler.js";
 import { rateLimit } from "../middleware/rate-limit.js";
 import { apiKeyAuth, type AuthedVariables } from "../middleware/api-key-auth.js";
@@ -40,7 +40,12 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
   });
 
   app.get("/:id", async (c) => {
-    const id = c.req.param("id") as PayoutId;
+    const id = parsePayoutIdParam(c.req.param("id"));
+    if (id === null) {
+      // Malformed ids get the same 404 as missing ids so an attacker can't
+      // enumerate by shape.
+      return c.json({ error: { code: "NOT_FOUND" } }, 404);
+    }
     const payout = await getPayout(deps, id);
     // 404 on cross-merchant access: don't leak which ids exist.
     if (!payout || payout.merchantId !== c.get("merchantId")) {
@@ -50,6 +55,12 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
   });
 
   return app;
+}
+
+function parsePayoutIdParam(raw: string | undefined): PayoutId | null {
+  if (raw === undefined) return null;
+  const parsed = PayoutIdSchema.safeParse(raw);
+  return parsed.success ? (parsed.data as PayoutId) : null;
 }
 
 function serializePayout(payout: Payout): Record<string, unknown> {

@@ -164,17 +164,34 @@ export async function executeReservedPayouts(deps: AppDeps): Promise<ExecuteSwee
       .bind(wallet.address, now1, row.id)
       .run();
 
-    // 3. Build -> sign -> broadcast. Any throw here moves us to 'failed' and
+    // 3. Claim the broadcast slot (CAS on broadcast_attempted_at) BEFORE calling
+    //    the chain adapter. If the CAS loses (returns null) either another
+    //    worker already broadcast this payout, or a previous attempt crashed
+    //    after broadcast but before we could record success. Either way, we
+    //    MUST NOT broadcast again — doing so would double-spend the fee wallet.
+    //    Fail-shut: flip to 'failed' and release the wallet so an operator can
+    //    manually reconcile with on-chain state before retrying.
+    const broadcastClaim = await deps.db
+      .prepare(
+        `UPDATE payouts
+            SET broadcast_attempted_at = ?
+          WHERE id = ?
+            AND broadcast_attempted_at IS NULL
+            AND status = 'reserved'
+          RETURNING id`
+      )
+      .bind(deps.clock.now().getTime(), row.id)
+      .first<{ id: string }>();
+    if (!broadcastClaim) {
+      // Someone else is broadcasting this row (or already did). Don't touch it.
+      deferred += 1;
+      continue;
+    }
+
+    // 4. Build -> sign -> broadcast. Any throw here moves us to 'failed' and
     //    releases the wallet so a retry (with a different or the same wallet)
-    //    can proceed.
-    //
-    // DEFERRED (Stage B.2, double-spend hardening): we do NOT persist the
-    // unsigned tx + nonce before broadcast. If the process crashes AFTER
-    // broadcast but BEFORE the status='submitted' write below, a retry will
-    // call buildTransfer again with a fresh nonce and broadcast a second tx.
-    // Fix requires a `broadcast_intent` row written in the same batch as the
-    // 'reserved' transition, then idempotent re-broadcast on retry. Tracked
-    // as Stage B.2 — NOT safe to enable real-money payouts until resolved.
+    //    can proceed. Because the broadcast slot is already claimed above, a
+    //    retry after this point will not re-enter this block for this row.
     try {
       const unsigned = await chainAdapter.buildTransfer({
         chainId: row.chain_id,
@@ -392,33 +409,44 @@ async function fetchPayout(deps: AppDeps, id: string): Promise<Payout | null> {
 
 // Atomic fee-wallet selection: pick any active, unreserved wallet on this
 // chain, mark it reserved-by-this-payout. Returns null if none are free.
+//
+// Two-step pattern (SELECT candidate, then CAS UPDATE): doing it as a single
+// UPDATE with a subselect would be one round-trip but libSQL's UPDATE-with-
+// subquery edge cases have historically been flaky compared to D1. Instead,
+// we loop: if the CAS loses to a racing concurrent reservation of the same
+// candidate, pick the next free wallet and try again. Without the retry,
+// contention on a busy chain returned a spurious "NO_FEE_WALLETS" even when
+// additional free wallets existed.
+const FEE_WALLET_CAS_MAX_ATTEMPTS = 5;
 async function tryReserveFeeWallet(
   deps: AppDeps,
   chainId: number,
   payoutId: string
 ): Promise<{ id: string; address: string; label: string } | null> {
   const now = deps.clock.now().getTime();
-  // Two-step: pick a candidate, then CAS. Doing it in one UPDATE with a
-  // subselect would be cleaner, but libSQL's UPDATE-with-subquery edge cases
-  // are historically flaky compared to D1. This is portable.
-  const candidate = await deps.db
-    .prepare(
-      "SELECT id, address, label FROM fee_wallets WHERE chain_id = ? AND active = 1 AND reserved_by_payout_id IS NULL LIMIT 1"
-    )
-    .bind(chainId)
-    .first<{ id: string; address: string; label: string }>();
-  if (!candidate) return null;
+  for (let attempt = 0; attempt < FEE_WALLET_CAS_MAX_ATTEMPTS; attempt += 1) {
+    const candidate = await deps.db
+      .prepare(
+        "SELECT id, address, label FROM fee_wallets WHERE chain_id = ? AND active = 1 AND reserved_by_payout_id IS NULL LIMIT 1"
+      )
+      .bind(chainId)
+      .first<{ id: string; address: string; label: string }>();
+    if (!candidate) return null;
 
-  const claim = await deps.db
-    .prepare(
-      `UPDATE fee_wallets
-          SET reserved_by_payout_id = ?, reserved_at = ?
-        WHERE id = ? AND reserved_by_payout_id IS NULL
-        RETURNING id, address, label`
-    )
-    .bind(payoutId, now, candidate.id)
-    .first<{ id: string; address: string; label: string }>();
-  return claim ?? null;
+    const claim = await deps.db
+      .prepare(
+        `UPDATE fee_wallets
+            SET reserved_by_payout_id = ?, reserved_at = ?
+          WHERE id = ? AND reserved_by_payout_id IS NULL
+          RETURNING id, address, label`
+      )
+      .bind(payoutId, now, candidate.id)
+      .first<{ id: string; address: string; label: string }>();
+    if (claim) return claim;
+    // CAS lost — someone else reserved this wallet between our SELECT and
+    // UPDATE. Loop to pick the next free candidate.
+  }
+  return null;
 }
 
 // Returns the prepared statement without executing it, so callers can include

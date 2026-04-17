@@ -9,6 +9,7 @@ import { dbAlchemySubscriptionStore } from "./adapters/detection/alchemy-subscri
 import { registerAlchemySubscriptionTracker } from "./adapters/detection/alchemy-subscription-tracker.js";
 import { renderError } from "./http/middleware/error-handler.js";
 import { requestIdMiddleware, type RequestIdVariables } from "./http/middleware/request-id.js";
+import { securityHeaders } from "./http/middleware/security-headers.js";
 import { adminRouter } from "./http/routes/admin.js";
 import { checkoutRouter } from "./http/routes/checkout.js";
 import { internalCronRouter } from "./http/routes/internal-cron.js";
@@ -48,6 +49,10 @@ export function buildApp(deps: AppDeps): App {
       alchemyChainsByFamily: deps.alchemySubscribableChainsByFamily ?? {}
     });
   }
+
+  // Security headers sit above everything else so error responses and 404s
+  // get them too. Header-only — adds no per-request work beyond Map writes.
+  app.use("*", securityHeaders());
 
   // Request-id propagation sits at the root so every downstream route sees
   // the id in the context and echoes it in the response header.

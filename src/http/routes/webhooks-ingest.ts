@@ -29,6 +29,16 @@ import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
 // opening a JSON-parse DoS vector.
 const MAX_WEBHOOK_BODY_BYTES = 64 * 1024;
 
+// Replay-window: reject payloads whose `createdAt` is older than this. Alchemy
+// retries on non-2xx for ~5 attempts over a few minutes, so 10 minutes is a
+// generous freshness window that still defangs captured-and-replayed payloads.
+const MAX_PAYLOAD_AGE_MS = 10 * 60 * 1000;
+
+// Dedup TTL for a seen payload `id`. Must be ≥ MAX_PAYLOAD_AGE_MS so a payload
+// that's still inside the freshness window can't be replayed by an attacker who
+// times their replay just outside the dedup TTL but inside the freshness check.
+const REPLAY_CACHE_TTL_SECONDS = 24 * 60 * 60;
+
 export function webhooksIngestRouter(deps: AppDeps): Hono {
   const app = new Hono();
 
@@ -40,7 +50,7 @@ export function webhooksIngestRouter(deps: AppDeps): Hono {
     "*",
     rateLimit(deps, {
       scope: "webhook-ingest",
-      keyFn: (c) => getClientIp(c),
+      keyFn: (c) => getClientIp(c, deps.rateLimits.trustedIpHeaders),
       limit: deps.rateLimits.webhookIngestPerMinute,
       windowSeconds: 60
     })
@@ -52,6 +62,15 @@ export function webhooksIngestRouter(deps: AppDeps): Hono {
       // Provider not configured for this deployment. 404 rather than 401 so
       // operators can tell "nothing here" from "bad signature".
       return c.json({ error: { code: "NOT_CONFIGURED", message: "Alchemy ingest not enabled" } }, 404);
+    }
+
+    // Pre-parse Content-Length guard so we 413 BEFORE buffering a large
+    // body into memory. The post-read length check below is the authoritative
+    // check (a malicious peer can lie about Content-Length), but rejecting at
+    // the header level is much cheaper and covers honest oversize requests.
+    const declaredLength = Number(c.req.header("content-length") ?? "0");
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_WEBHOOK_BODY_BYTES) {
+      return c.json({ error: { code: "PAYLOAD_TOO_LARGE" } }, 413);
     }
 
     const rawBody = await c.req.text();
@@ -68,11 +87,57 @@ export function webhooksIngestRouter(deps: AppDeps): Hono {
     // per-chain signing-key lookup. An attacker can't forge a valid HMAC
     // without our key, so the dispatch after verify is still gated — parsing
     // unverified JSON is safe as long as the body size is bounded (above).
-    let payload: { webhookId?: string } & Record<string, unknown>;
+    let payload: { webhookId?: string; id?: string; createdAt?: string } & Record<string, unknown>;
     try {
       payload = JSON.parse(rawBody);
     } catch {
       return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+
+    // Replay defense, pre-HMAC: an attacker who captures a previously-valid
+    // payload can re-POST it with the original signature and have it verify
+    // every time. Two complementary checks:
+    //
+    //   1. Freshness: reject anything whose `createdAt` is outside the replay
+    //      window. Caps how stale a captured payload can be when reused.
+    //   2. Nonce: cache `id` for ≥ the freshness window. The first POST
+    //      processes; subsequent POSTs with the same id 200 with seen=true.
+    //
+    // Both checks happen pre-HMAC so they protect the verify path itself
+    // from being a probing oracle. Payloads that lack `id`/`createdAt` skip
+    // the corresponding check (forward-compat with payload schema changes).
+    const nowMs = deps.clock.now().getTime();
+    if (typeof payload.createdAt === "string") {
+      const createdMs = Date.parse(payload.createdAt);
+      if (Number.isFinite(createdMs) && nowMs - createdMs > MAX_PAYLOAD_AGE_MS) {
+        deps.logger.warn("webhook payload rejected: stale createdAt", {
+          webhookId: payload.webhookId,
+          payloadId: payload.id,
+          ageMs: nowMs - createdMs
+        });
+        return c.json({ error: { code: "STALE_PAYLOAD" } }, 401);
+      }
+    }
+    if (typeof payload.id === "string" && payload.id.length > 0) {
+      // putIfAbsent returns false on contention (someone already saw this id).
+      // Backend semantics: memory = strict, KV = eventually consistent so a
+      // racing duplicate inside the KV propagation window may slip through;
+      // the downstream INSERT into `transactions` then trips its UNIQUE
+      // constraint and ingestDetectedTransfer treats it as a no-op.
+      const acquired = await deps.cache.putIfAbsent(
+        `webhook:alchemy:seen:${payload.id}`,
+        "1",
+        { ttlSeconds: REPLAY_CACHE_TTL_SECONDS }
+      );
+      if (!acquired) {
+        deps.logger.info("webhook payload deduped (already seen)", {
+          webhookId: payload.webhookId,
+          payloadId: payload.id
+        });
+        // 200 so the provider doesn't spin up a retry loop on a payload we've
+        // already accepted. `received: true, deduped: true` is the contract.
+        return c.json({ received: true, deduped: true }, 200);
+      }
     }
 
     // Resolve the signing key via the DB registry keyed on webhookId. The DB

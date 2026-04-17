@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { AppDeps } from "../../core/app-deps.js";
 import { getInvoice } from "../../core/domain/invoice.service.js";
 import { payableAmountRaw, tokenDecimalsFor } from "../../core/domain/rate-window.js";
-import type { Invoice, InvoiceId } from "../../core/types/invoice.js";
+import { InvoiceIdSchema, type Invoice, type InvoiceId } from "../../core/types/invoice.js";
 import type { ChainFamily } from "../../core/types/chain.js";
 import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
 import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
@@ -63,14 +63,21 @@ export function checkoutRouter(deps: AppDeps): Hono {
     "*",
     rateLimit(deps, {
       scope: "checkout",
-      keyFn: (c) => getClientIp(c),
+      keyFn: (c) => getClientIp(c, deps.rateLimits.trustedIpHeaders),
       limit: deps.rateLimits.checkoutPerMinute,
       windowSeconds: 60
     })
   );
 
   app.get("/:id", async (c) => {
-    const id = c.req.param("id") as InvoiceId;
+    const raw = c.req.param("id");
+    // Public endpoint: validate the UUID shape before a DB hit so bots
+    // scanning the checkout surface with garbage ids can't waste round-trips.
+    const parsed = InvoiceIdSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: { code: "NOT_FOUND", message: "Invoice not found" } }, 404);
+    }
+    const id = parsed.data as InvoiceId;
     const invoice = await getInvoice(deps, id);
     if (!invoice) {
       return c.json({ error: { code: "NOT_FOUND", message: `Invoice ${id} not found` } }, 404);
