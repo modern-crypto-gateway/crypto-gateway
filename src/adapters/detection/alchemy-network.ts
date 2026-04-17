@@ -1,3 +1,7 @@
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { sha256 as sha256Bytes } from "@noble/hashes/sha2.js";
+import { base58 } from "@scure/base";
+
 // chainId <-> Alchemy Notify network name. Two consumers:
 //   - alchemy-notify.adapter.ts   — map inbound network name -> chainId when parsing webhook payloads
 //   - alchemy-admin-client.ts     — map our chainId -> network name when creating webhooks
@@ -38,3 +42,47 @@ export const ALCHEMY_NETWORK_BY_CHAIN_ID: Readonly<Record<number, string>> = {
 export const CHAIN_ID_BY_ALCHEMY_NETWORK: Readonly<Record<string, number>> = Object.freeze(
   Object.fromEntries(Object.entries(ALCHEMY_NETWORK_BY_CHAIN_ID).map(([id, name]) => [name, Number(id)]))
 );
+
+// Chain family per Alchemy-served chainId. Used by bootstrap to pick the
+// right address format when seeding a webhook (EVM wants hex, Solana wants
+// base58 — passing the wrong format triggers a ValidationError from
+// Alchemy's create-webhook endpoint).
+export type AlchemyChainFamily = "evm" | "solana";
+export const ALCHEMY_FAMILY_BY_CHAIN_ID: Readonly<Record<number, AlchemyChainFamily>> = {
+  1: "evm", 10: "evm", 56: "evm", 137: "evm", 8453: "evm", 42161: "evm", 43114: "evm",
+  11155111: "evm", 11155420: "evm", 80002: "evm", 84532: "evm", 421614: "evm",
+  43113: "evm", 97: "evm",
+  900: "solana", 901: "solana"
+};
+
+// Placeholder addresses we use to satisfy Alchemy's "≥1 address at webhook
+// creation" rule. Bootstrap removes the placeholder from the watch list
+// immediately after create so we don't drown in mint/burn events — real
+// receive addresses get added via the subscription-sync sweep as orders
+// are placed.
+//
+// EVM zero address sees ENORMOUS volume on mainnet (every ERC-20 mint/burn
+// routes through it — USDC/USDT alone produce thousands of Transfer events
+// per day). Watching it would effectively DoS the gateway.
+//
+// Solana is trickier: Alchemy blocks known PROGRAM addresses in
+// create-webhook validation (System Program `11111…11` returns 400 "the
+// program address is not supported"), and many well-known vanity addresses
+// are either program accounts, mints, or on allowlists we don't control.
+// The safest seed is a valid on-curve ed25519 pubkey derived from a
+// namespaced string constant — it's indistinguishable from any user
+// wallet from Alchemy's perspective, it's deterministic (same value every
+// deployment so no surprises), and we remove it immediately post-create so
+// whether it ever sees activity is irrelevant.
+export const ALCHEMY_PLACEHOLDER_ADDRESS_BY_FAMILY: Readonly<Record<AlchemyChainFamily, string>> = {
+  evm: "0x0000000000000000000000000000000000000000",
+  solana: computeSolanaPlaceholder()
+};
+
+function computeSolanaPlaceholder(): string {
+  // sha256(namespace-string) → ed25519 private key → on-curve pubkey.
+  // The resulting address is a stable constant across deployments.
+  const seed = sha256Bytes(new TextEncoder().encode("crypto-gateway-bootstrap-placeholder-v1"));
+  const pubkey = ed25519.getPublicKey(seed);
+  return base58.encode(pubkey);
+}

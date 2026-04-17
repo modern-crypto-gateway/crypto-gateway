@@ -234,6 +234,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         chainIds,
         registryStore,
         secretsCipher: deps.secretsCipher,
+        logger: deps.logger,
         now: () => deps.clock.now().getTime()
       };
       if (Object.keys(seedAddressByChainId).length > 0) {

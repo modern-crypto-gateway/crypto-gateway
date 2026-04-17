@@ -92,11 +92,10 @@ function fakeClient(overrides: {
       (async () => {
         throw new Error("unexpected createWebhook call");
       }),
-    updateWebhookAddresses:
-      overrides.updateWebhookAddresses ??
-      (async () => {
-        throw new Error("unexpected updateWebhookAddresses call");
-      })
+    // Bootstrap always calls this to remove the placeholder seed post-create
+    // (or to self-heal an existing webhook). Default to a silent no-op so
+    // tests that don't care about the remove path aren't forced to stub it.
+    updateWebhookAddresses: overrides.updateWebhookAddresses ?? (async () => undefined)
   };
 }
 
@@ -152,7 +151,10 @@ describe("bootstrapAlchemyWebhooks", () => {
     expect(results[0]).toEqual<BootstrapPerChainResult>({
       chainId: 1,
       status: "existing",
-      webhookId: "wh_existing"
+      webhookId: "wh_existing",
+      // Self-heal: bootstrap removes the placeholder off an existing webhook's
+      // watch list (idempotent — Alchemy no-ops if it isn't there).
+      placeholderRemoved: true
     });
   });
 

@@ -41,6 +41,11 @@ export interface CreateWebhookArgs {
   // Initial address list. Alchemy requires at least one address at create time;
   // supply a placeholder if you plan to add real addresses later via update.
   addresses: readonly string[];
+  // Optional human-readable name shown in the Alchemy dashboard. When omitted
+  // Alchemy auto-generates one like "Webhook #12" — fine for a single-chain
+  // op, unreadable when you've got 7. Bootstrap passes e.g.
+  // "crypto-gateway evm-1" so chains are identifiable at a glance.
+  name?: string;
 }
 
 export interface UpdateWebhookAddressesArgs {
@@ -114,14 +119,21 @@ export function alchemyAdminClient(config: AlchemyAdminClientConfig): AlchemyAdm
       if (args.addresses.length === 0) {
         throw new Error("Alchemy createWebhook requires at least one address");
       }
+      const createBody: Record<string, unknown> = {
+        network,
+        webhook_type: "ADDRESS_ACTIVITY",
+        webhook_url: args.webhookUrl,
+        addresses: args.addresses
+      };
+      if (args.name !== undefined && args.name.length > 0) {
+        // Alchemy's dashboard displays this; the API silently ignores unknown
+        // fields on versions where it isn't supported, so sending it is safe
+        // either way.
+        createBody["name"] = args.name;
+      }
       const body = await request<{ data: AlchemyWebhookSummary }>("/create-webhook", {
         method: "POST",
-        body: JSON.stringify({
-          network,
-          webhook_type: "ADDRESS_ACTIVITY",
-          webhook_url: args.webhookUrl,
-          addresses: args.addresses
-        })
+        body: JSON.stringify(createBody)
       });
       return body.data;
     },

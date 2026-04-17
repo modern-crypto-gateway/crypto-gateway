@@ -29,11 +29,11 @@ function fakeClient(overrides: {
       (async () => {
         throw new Error("unexpected createWebhook call");
       }),
-    updateWebhookAddresses:
-      overrides.updateWebhookAddresses ??
-      (async () => {
-        throw new Error("unexpected updateWebhookAddresses call");
-      })
+    // Bootstrap calls this after every create+existing (removes the seed
+    // placeholder). Default is a silent no-op so tests that don't care about
+    // the remove path don't have to stub it. Override when you want to
+    // assert the call happened.
+    updateWebhookAddresses: overrides.updateWebhookAddresses ?? (async () => undefined)
   };
 }
 
@@ -306,5 +306,192 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     expect(body.results).toHaveLength(2);
     expect(body.results[0]).toMatchObject({ chainId: 99999, status: "unsupported" });
     expect(body.results[1]).toMatchObject({ chainId: 1, status: "created" });
+  });
+
+  it("uses per-family placeholder seed: base58 all-zeros for Solana (chain 900)", async () => {
+    // Regression guard: passing the EVM zero address to Solana's create-webhook
+    // produces `"Must be a valid solana address, base58..."` — the exact error
+    // that blew up in prod. Bootstrap must route by family.
+    const createCalls: Array<{ chainId: number; addresses: readonly string[]; name?: string }> = [];
+    const app = mountAdminWith(booted, () =>
+      fakeClient({
+        listWebhooks: async () => [],
+        createWebhook: async (args) => {
+          const entry: { chainId: number; addresses: readonly string[]; name?: string } = {
+            chainId: args.chainId,
+            addresses: args.addresses
+          };
+          if (args.name !== undefined) entry.name = args.name;
+          createCalls.push(entry);
+          return {
+            id: `wh_${args.chainId}`,
+            network: args.chainId === 900 ? "SOLANA_MAINNET" : "ETH_MAINNET",
+            webhook_type: "ADDRESS_ACTIVITY",
+            webhook_url: args.webhookUrl,
+            is_active: true,
+            signing_key: `whsec_${args.chainId}`
+          };
+        }
+      })
+    );
+    const res = await app.fetch(
+      new Request("http://test.local/admin/bootstrap/alchemy-webhooks", {
+        method: "POST",
+        headers: authHeader(),
+        body: JSON.stringify({ chainIds: [1, 900] })
+      })
+    );
+    expect(res.status).toBe(200);
+    const evm = createCalls.find((c) => c.chainId === 1);
+    const sol = createCalls.find((c) => c.chainId === 900);
+    expect(evm?.addresses).toEqual(["0x0000000000000000000000000000000000000000"]);
+    // Solana placeholder is a deterministically-derived ed25519 pubkey.
+    // Exact value is validated separately; here we just check it's a valid
+    // base58 Solana address (32-44 chars, no 0OIl) and NOT a program address
+    // (Alchemy blocklists those).
+    const solSeed = sol?.addresses[0] ?? "";
+    expect(solSeed).toMatch(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+    expect(solSeed).not.toBe("11111111111111111111111111111111");
+    // Names are passed so the dashboard doesn't show unlabelled rows.
+    expect(evm?.name).toBe("crypto-gateway evm-1");
+    expect(sol?.name).toBe("crypto-gateway solana-900");
+  });
+
+  it("removes the placeholder from the watch list immediately after create (no mint/burn flood)", async () => {
+    const removeCalls: Array<{ webhookId: string; addressesToRemove?: readonly string[] }> = [];
+    const app = mountAdminWith(booted, () =>
+      fakeClient({
+        listWebhooks: async () => [],
+        createWebhook: async (args) => ({
+          id: `wh_${args.chainId}`,
+          network: "ETH_MAINNET",
+          webhook_type: "ADDRESS_ACTIVITY",
+          webhook_url: args.webhookUrl,
+          is_active: true,
+          signing_key: `whsec_${args.chainId}`
+        }),
+        updateWebhookAddresses: async (args) => {
+          removeCalls.push({
+            webhookId: args.webhookId,
+            ...(args.addressesToRemove !== undefined ? { addressesToRemove: args.addressesToRemove } : {})
+          });
+        }
+      })
+    );
+    await app.fetch(
+      new Request("http://test.local/admin/bootstrap/alchemy-webhooks", {
+        method: "POST",
+        headers: authHeader(),
+        body: JSON.stringify({ chainIds: [1] })
+      })
+    );
+    expect(removeCalls).toHaveLength(1);
+    expect(removeCalls[0]?.webhookId).toBe("wh_1");
+    expect(removeCalls[0]?.addressesToRemove).toEqual([
+      "0x0000000000000000000000000000000000000000"
+    ]);
+  });
+
+  it("preserves operator-supplied seedAddressByChainId (keeps it watched, no remove call)", async () => {
+    const operatorSeed = "0xABCDabcdABCDabcdABCDabcdABCDabcdABCDabcd";
+    let removeCalls = 0;
+    const app = mountAdminWith(booted, () =>
+      fakeClient({
+        listWebhooks: async () => [],
+        createWebhook: async (args) => ({
+          id: `wh_${args.chainId}`,
+          network: "ETH_MAINNET",
+          webhook_type: "ADDRESS_ACTIVITY",
+          webhook_url: args.webhookUrl,
+          is_active: true,
+          signing_key: `whsec_${args.chainId}`
+        }),
+        updateWebhookAddresses: async () => {
+          removeCalls += 1;
+        }
+      })
+    );
+    await app.fetch(
+      new Request("http://test.local/admin/bootstrap/alchemy-webhooks", {
+        method: "POST",
+        headers: authHeader(),
+        body: JSON.stringify({
+          chainIds: [1],
+          seedAddressByChainId: { "1": operatorSeed }
+        })
+      })
+    );
+    // Operator asked for this address to be watched — keep it.
+    expect(removeCalls).toBe(0);
+  });
+
+  it("self-heals: removes the placeholder from EXISTING webhooks so re-running bootstrap cleans up an earlier bad seed", async () => {
+    const removeCalls: Array<{ webhookId: string; addressesToRemove?: readonly string[] }> = [];
+    const app = mountAdminWith(booted, () =>
+      fakeClient({
+        listWebhooks: async () => [
+          {
+            id: "wh_preexisting",
+            network: "ETH_MAINNET",
+            webhook_type: "ADDRESS_ACTIVITY",
+            webhook_url: "https://gateway.example.com/webhooks/alchemy",
+            is_active: true
+          }
+        ],
+        updateWebhookAddresses: async (args) => {
+          removeCalls.push({
+            webhookId: args.webhookId,
+            ...(args.addressesToRemove !== undefined ? { addressesToRemove: args.addressesToRemove } : {})
+          });
+        }
+      })
+    );
+    const res = await app.fetch(
+      new Request("http://test.local/admin/bootstrap/alchemy-webhooks", {
+        method: "POST",
+        headers: authHeader(),
+        body: JSON.stringify({ chainIds: [1] })
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { results: Array<{ status: string; placeholderRemoved?: boolean }> };
+    expect(body.results[0]?.status).toBe("existing");
+    expect(body.results[0]?.placeholderRemoved).toBe(true);
+    expect(removeCalls).toEqual([
+      {
+        webhookId: "wh_preexisting",
+        addressesToRemove: ["0x0000000000000000000000000000000000000000"]
+      }
+    ]);
+  });
+
+  it("does NOT fail bootstrap if the placeholder-remove call errors (best-effort cleanup)", async () => {
+    const app = mountAdminWith(booted, () =>
+      fakeClient({
+        listWebhooks: async () => [],
+        createWebhook: async (args) => ({
+          id: `wh_${args.chainId}`,
+          network: "ETH_MAINNET",
+          webhook_type: "ADDRESS_ACTIVITY",
+          webhook_url: args.webhookUrl,
+          is_active: true,
+          signing_key: `whsec_${args.chainId}`
+        }),
+        updateWebhookAddresses: async () => {
+          throw new Error("Alchemy transient 503");
+        }
+      })
+    );
+    const res = await app.fetch(
+      new Request("http://test.local/admin/bootstrap/alchemy-webhooks", {
+        method: "POST",
+        headers: authHeader(),
+        body: JSON.stringify({ chainIds: [1] })
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { results: Array<{ status: string; placeholderRemoved?: boolean }> };
+    expect(body.results[0]?.status).toBe("created");
+    expect(body.results[0]?.placeholderRemoved).toBe(false);
   });
 });
