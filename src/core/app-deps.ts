@@ -108,6 +108,12 @@ export interface RateLimitConfig {
   checkoutPerMinute: number;
   // Per-IP cap on the webhook ingest endpoints (Alchemy, etc.).
   webhookIngestPerMinute: number;
+  // Per-IP cap on /admin/*. Admin routes are protected by ADMIN_KEY but an
+  // attacker with a leaked/guessed key (or a misbehaving operator tool)
+  // should still hit a throttle before exhausting D1/libsql write capacity.
+  // Bucketed by client IP so one compromised key from one box does not
+  // starve another operator's legitimate tooling.
+  adminPerMinute: number;
   // Headers consulted (in order) by `getClientIp`. Anything not in this list
   // is ignored — an attacker can't spoof their rate-limit bucket key by
   // sending unsolicited X-Forwarded-For. Empty list = bucket all under

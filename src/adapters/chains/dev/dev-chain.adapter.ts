@@ -96,6 +96,13 @@ export function devChainAdapter(config: DevChainConfig = {}): ChainAdapter {
 
     async estimateGasForTransfer(_args: EstimateArgs): Promise<AmountRaw> {
       return "21000" as AmountRaw;
+    },
+
+    async getBalance(_args): Promise<AmountRaw> {
+      // Dev adapter doesn't model balances. Return a large number so the
+      // payout executor's pre-flight check always passes and the test can
+      // focus on the state machine without fixture balance bookkeeping.
+      return "1000000000000000000000" as AmountRaw;
     }
   };
 }

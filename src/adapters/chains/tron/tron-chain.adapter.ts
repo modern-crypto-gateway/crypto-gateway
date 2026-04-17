@@ -281,6 +281,17 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       return "TRX" as TokenSymbol;
     },
 
+    async getBalance(_args): Promise<AmountRaw> {
+      // Tron balance lookups aren't wired through the RPC backend yet (no
+      // triggerConstantContract method), so payout.service falls back to its
+      // graceful-degrade path and broadcasts without the token pre-check. The
+      // energy-consumption guard in buildTransfer still prevents silent fee
+      // burns on malformed TRC-20 contracts, and Tron's triggerSmartContract
+      // itself does a dry-run that reverts on insufficient balance, so this
+      // is not "no protection" — just "no extra belt-and-braces".
+      throw new Error("Tron getBalance not implemented");
+    },
+
     async estimateGasForTransfer(args: EstimateArgs): Promise<AmountRaw> {
       // TronGrid's triggersmartcontract returns `energy_used` for the simulated
       // call. We invoke a dry-run build and read that field. For a simple TRC-20

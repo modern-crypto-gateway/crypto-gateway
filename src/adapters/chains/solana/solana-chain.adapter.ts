@@ -270,6 +270,17 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       // the fee is a fixed 5000 lamports. For SPL transfers the signer count
       // is still 1 (the fee payer) so the base fee is the same.
       return SIGNATURE_FEE_LAMPORTS.toString() as AmountRaw;
+    },
+
+    async getBalance(_args): Promise<AmountRaw> {
+      // Solana balance lookups aren't wired through the RPC client (no
+      // getBalance / getTokenAccountsByOwner method). SPL payouts are also
+      // not implemented (buildTransfer throws above), so the only payouts
+      // that would reach here are native SOL — which the payout executor
+      // handles with its graceful-degrade path: it broadcasts and lets the
+      // chain's preflight simulation reject insufficient-balance txs before
+      // they land. Adding a balance pre-check here is a follow-up.
+      throw new Error("Solana getBalance not implemented");
     }
   };
 }

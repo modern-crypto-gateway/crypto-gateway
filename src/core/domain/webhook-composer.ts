@@ -35,6 +35,7 @@ export type WebhookEventName =
   | "invoice.overpaid"
   | "invoice.expired"
   | "invoice.canceled"
+  | "invoice.demoted"
   | "invoice.payment_received"
   | "payout.submitted"
   | "payout.confirmed"
@@ -56,6 +57,27 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
           data: serializeInvoice(event.invoice)
         },
         idempotencyKey: `${event.type}:${event.invoice.id}:${event.invoice.status}`
+      };
+
+    case "invoice.demoted":
+      // Reorg un-confirmation. Keyed by (invoiceId, previousStatus, newStatus)
+      // so distinct reorg events from the same invoice are not deduped. Pool
+      // re-acquire counts travel alongside the invoice body so merchants
+      // can surface "address potentially reused by invoice X" alerts if
+      // `poolCollided > 0`.
+      return {
+        merchantId: event.invoice.merchantId,
+        payload: {
+          event: event.type,
+          timestamp: event.at.toISOString(),
+          data: {
+            invoice: serializeInvoice(event.invoice),
+            previousStatus: event.previousStatus,
+            poolReacquired: event.poolReacquired,
+            poolCollided: event.poolCollided
+          }
+        },
+        idempotencyKey: `${event.type}:${event.invoice.id}:${event.previousStatus}:${event.invoice.status}`
       };
 
     case "invoice.payment_received":

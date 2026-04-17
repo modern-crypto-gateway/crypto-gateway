@@ -202,6 +202,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     merchantPerMinute: options.rateLimits?.merchantPerMinute ?? 10_000,
     checkoutPerMinute: options.rateLimits?.checkoutPerMinute ?? 10_000,
     webhookIngestPerMinute: options.rateLimits?.webhookIngestPerMinute ?? 10_000,
+    adminPerMinute: options.rateLimits?.adminPerMinute ?? 10_000,
     trustedIpHeaders: options.rateLimits?.trustedIpHeaders ?? ["x-forwarded-for"]
   };
   // The memory cache honors arbitrary TTLs (no 60s floor), so the limiter's

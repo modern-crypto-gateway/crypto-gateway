@@ -1,5 +1,5 @@
 import type { ChainFamily } from "../types/chain.js";
-import type { Invoice, InvoiceId } from "../types/invoice.js";
+import type { Invoice, InvoiceId, InvoiceStatus } from "../types/invoice.js";
 import type { Payout, PayoutId } from "../types/payout.js";
 import type { Transaction, TransactionId } from "../types/transaction.js";
 
@@ -19,6 +19,24 @@ export type DomainEvent =
   | { type: "invoice.overpaid"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
   | { type: "invoice.expired"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
   | { type: "invoice.canceled"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  // Reorg un-confirmation. Fired BEFORE the normal status-transition event
+  // when a previously confirmed (or overpaid) invoice is demoted back to
+  // a lower status because the chain rolled back the underlying
+  // transaction(s). `previousStatus` is the pre-demotion status
+  // ('confirmed' or 'overpaid'); `invoice.status` carries the new one.
+  // `poolReacquired` / `poolCollided` report whether the receive addresses
+  // were successfully re-claimed from the pool — `collided > 0` means a
+  // new invoice had already grabbed the slot and manual reconciliation
+  // is needed.
+  | {
+      type: "invoice.demoted";
+      invoiceId: InvoiceId;
+      invoice: Invoice;
+      previousStatus: InvoiceStatus;
+      poolReacquired: number;
+      poolCollided: number;
+      at: Date;
+    }
   // Fires on EVERY confirmed inbound transfer that contributes to an invoice,
   // separate from the invoice-status transition events above. Gives merchants
   // audit-grade per-payment visibility — they can render "USDC 30.00 on

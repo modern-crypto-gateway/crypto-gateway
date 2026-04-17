@@ -104,6 +104,7 @@ export const AppConfigSchema = z
     rateLimitMerchantPerMinute: z.coerce.number().int().min(1).default(1000),
     rateLimitCheckoutPerMinute: z.coerce.number().int().min(1).default(60),
     rateLimitWebhookIngestPerMinute: z.coerce.number().int().min(1).default(300),
+    rateLimitAdminPerMinute: z.coerce.number().int().min(1).default(30),
 
     // Ops alerting: when set, error-level log lines are fan-out POSTed to this
     // URL (Slack/Discord/PagerDuty-compatible JSON body). Normal logs still
@@ -218,6 +219,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     rateLimitMerchantPerMinute: env["RATE_LIMIT_MERCHANT_PER_MINUTE"],
     rateLimitCheckoutPerMinute: env["RATE_LIMIT_CHECKOUT_PER_MINUTE"],
     rateLimitWebhookIngestPerMinute: env["RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE"],
+    rateLimitAdminPerMinute: env["RATE_LIMIT_ADMIN_PER_MINUTE"],
     trustedIpHeaders: env["TRUSTED_IP_HEADERS"],
     alertWebhookUrl: env["ALERT_WEBHOOK_URL"],
     alertWebhookAuthHeader: env["ALERT_WEBHOOK_AUTH_HEADER"]

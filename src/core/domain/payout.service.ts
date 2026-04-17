@@ -1,11 +1,11 @@
 import { z } from "zod";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
-import { ChainIdSchema } from "../types/chain.js";
+import { ChainIdSchema, type Address, type ChainId } from "../types/chain.js";
 import { MerchantIdSchema } from "../types/merchant.js";
 import { AmountRawSchema } from "../types/money.js";
 import type { Payout, PayoutId } from "../types/payout.js";
-import { TokenSymbolSchema } from "../types/token.js";
+import { TokenSymbolSchema, type TokenSymbol } from "../types/token.js";
 import { findToken } from "../types/token-registry.js";
 import type { SignerScope } from "../types/signer.js";
 import { findChainAdapter } from "./chain-lookup.js";
@@ -137,11 +137,23 @@ export interface ExecuteSweepResult {
   deferred: number; // no available fee wallet; left in 'planned'
 }
 
+export interface ExecuteReservedPayoutsOptions {
+  // Caps the rows fetched per tick. Bounding the batch keeps a long queue
+  // from pushing runScheduledJobs past Workers' 30s CPU limit — partial
+  // progress is safe because the cron re-runs frequently.
+  maxBatch?: number;
+}
+
 // Cron-triggered: promote planned payouts to submitted by CAS-reserving a fee
 // wallet, building + signing + broadcasting the transfer.
-export async function executeReservedPayouts(deps: AppDeps): Promise<ExecuteSweepResult> {
+export async function executeReservedPayouts(
+  deps: AppDeps,
+  opts: ExecuteReservedPayoutsOptions = {}
+): Promise<ExecuteSweepResult> {
+  const limit = opts.maxBatch ?? 200;
   const planned = await deps.db
-    .prepare("SELECT * FROM payouts WHERE status = 'planned' ORDER BY created_at ASC")
+    .prepare("SELECT * FROM payouts WHERE status = 'planned' ORDER BY created_at ASC LIMIT ?")
+    .bind(limit)
     .all<PayoutRow>();
 
   let submitted = 0;
@@ -188,7 +200,67 @@ export async function executeReservedPayouts(deps: AppDeps): Promise<ExecuteSwee
       continue;
     }
 
-    // 4. Build -> sign -> broadcast. Any throw here moves us to 'failed' and
+    // 4. Balance pre-flight. Before we burn energy/gas on a tx that will
+    //    revert on-chain, ask the adapter what the fee wallet actually holds
+    //    and bail early if it's short. Adapters that haven't implemented
+    //    getBalance (Tron, Solana) throw — we catch and continue under the
+    //    "broadcast and let the chain decide" fallback so we don't break
+    //    existing flows while the coverage gap is closed iteratively.
+    try {
+      const walletBalance = await chainAdapter.getBalance({
+        chainId: row.chain_id as ChainId,
+        address: wallet.address as Address,
+        token: row.token as TokenSymbol
+      });
+      if (BigInt(walletBalance) < BigInt(row.amount_raw)) {
+        throw new Error(
+          `Insufficient ${row.token} balance on fee wallet ${wallet.address}: ` +
+            `have ${walletBalance}, need ${row.amount_raw}`
+        );
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Distinguish "adapter can't check" (benign) from "adapter says no"
+      // (hard fail). The "not implemented" path logs once and proceeds.
+      if (message.includes("not implemented")) {
+        deps.logger.debug("balance pre-check skipped (adapter not implemented)", {
+          payoutId: row.id,
+          chainId: row.chain_id
+        });
+      } else if (message.startsWith("Insufficient ")) {
+        // Hard fail — fee wallet short. Mark failed + release the wallet so
+        // the operator can top it up and the payout gets re-planned manually
+        // (we don't auto-retry a known-bad wallet).
+        const now2 = deps.clock.now().getTime();
+        await deps.db.batch([
+          deps.db
+            .prepare("UPDATE payouts SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?")
+            .bind(message.slice(0, 2048), now2, row.id),
+          releaseFeeWalletStmt(deps, row.id)
+        ]);
+        const updated = await fetchPayout(deps, row.id);
+        if (updated) {
+          await deps.events.publish({
+            type: "payout.failed",
+            payoutId: updated.id,
+            payout: updated,
+            at: new Date(now2)
+          });
+        }
+        failed += 1;
+        continue;
+      } else {
+        // Transient RPC error reading balance. Log, proceed to broadcast —
+        // the chain's own simulation/preflight is our backstop.
+        deps.logger.warn("balance pre-check failed; proceeding to broadcast", {
+          payoutId: row.id,
+          chainId: row.chain_id,
+          error: message
+        });
+      }
+    }
+
+    // 5. Build -> sign -> broadcast. Any throw here moves us to 'failed' and
     //    releases the wallet so a retry (with a different or the same wallet)
     //    can proceed. Because the broadcast slot is already claimed above, a
     //    retry after this point will not re-enter this block for this row.
@@ -258,11 +330,21 @@ export interface ConfirmPayoutsResult {
   failed: number;
 }
 
+export interface ConfirmPayoutsOptions {
+  // See ExecuteReservedPayoutsOptions.maxBatch — same rationale.
+  maxBatch?: number;
+}
+
 // Cron-triggered: move submitted payouts to confirmed or failed based on the
 // chain's current view of their tx hash. Releases the fee wallet on terminal states.
-export async function confirmPayouts(deps: AppDeps): Promise<ConfirmPayoutsResult> {
+export async function confirmPayouts(
+  deps: AppDeps,
+  opts: ConfirmPayoutsOptions = {}
+): Promise<ConfirmPayoutsResult> {
+  const limit = opts.maxBatch ?? 200;
   const submitted = await deps.db
-    .prepare("SELECT * FROM payouts WHERE status = 'submitted'")
+    .prepare("SELECT * FROM payouts WHERE status = 'submitted' ORDER BY submitted_at ASC LIMIT ?")
+    .bind(limit)
     .all<PayoutRow>();
 
   let confirmed = 0;

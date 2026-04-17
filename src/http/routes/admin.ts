@@ -18,6 +18,7 @@ import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
 import { applyMigrations } from "../../adapters/db/migration-runner.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
+import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
 
 // Operator-only surface. All routes require the shared admin key; the rest of
 // the gateway authenticates merchants via their own API key. Keep this
@@ -83,6 +84,19 @@ export interface AdminRouterOptions {
 
 export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono {
   const app = new Hono();
+  // Rate-limit BEFORE auth: a caller hammering the surface with wrong keys
+  // shouldn't be able to exhaust D1 writes or crowd out a legitimate operator.
+  // Bucketed by client IP (trusted headers only — same rule as the rest of
+  // the gateway) so the limit is per box, not per connection.
+  app.use(
+    "*",
+    rateLimit(deps, {
+      scope: "admin",
+      keyFn: (c) => getClientIp(c, deps.rateLimits.trustedIpHeaders),
+      limit: deps.rateLimits.adminPerMinute,
+      windowSeconds: 60
+    })
+  );
   app.use("*", adminAuth(deps));
   const clientFactory =
     opts.alchemyAdminClientFactory ?? ((authToken) => alchemyAdminClient({ authToken }));

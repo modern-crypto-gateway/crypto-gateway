@@ -139,7 +139,16 @@ async function main(): Promise<void> {
     activeAlchemyChainIds.push(solanaWiring.chainId);
   }
 
+  // SECRETS_ENCRYPTION_KEY is REQUIRED in production / staging.
   const secretsEncryptionKey = secrets.getOptional("SECRETS_ENCRYPTION_KEY");
+  const nodeEnv = secrets.getOptional("NODE_ENV");
+  const isProdLike = nodeEnv === "production" || nodeEnv === "staging";
+  if (isProdLike && secretsEncryptionKey === undefined) {
+    throw new Error(
+      "SECRETS_ENCRYPTION_KEY is required when NODE_ENV=production or staging. " +
+        "Generate one with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+    );
+  }
   const secretsCipher = secretsEncryptionKey !== undefined
     ? await makeSecretsCipher(secretsEncryptionKey)
     : await devCipher();
@@ -206,6 +215,7 @@ async function main(): Promise<void> {
       merchantPerMinute: Number(secrets.getOptional("RATE_LIMIT_MERCHANT_PER_MINUTE") ?? "1000"),
       checkoutPerMinute: Number(secrets.getOptional("RATE_LIMIT_CHECKOUT_PER_MINUTE") ?? "60"),
       webhookIngestPerMinute: Number(secrets.getOptional("RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE") ?? "300"),
+      adminPerMinute: Number(secrets.getOptional("RATE_LIMIT_ADMIN_PER_MINUTE") ?? "30"),
       trustedIpHeaders: (secrets.getOptional("TRUSTED_IP_HEADERS") ?? "x-forwarded-for")
         .split(",")
         .map((s) => s.trim().toLowerCase())

@@ -30,6 +30,7 @@ const OUTBOUND_EVENT_TYPES = [
   "invoice.overpaid",
   "invoice.expired",
   "invoice.canceled",
+  "invoice.demoted",
   "invoice.payment_received",
   "payout.submitted",
   "payout.confirmed",

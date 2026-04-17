@@ -77,6 +77,35 @@
     }
   ],
 
+  // Durable Object namespace for strict rate-limiting. Optional but strongly
+  // recommended in production — the KV-backed limiter can over-admit by a
+  // handful of requests per window under concurrent burst (eventually
+  // consistent reads). The DO path serializes through a single-threaded
+  // instance per rate-limit key, giving honest atomic counters.
+  //
+  // Setup:
+  //   1. Leave the bindings block below and the `migrations` block in place.
+  //   2. Run `npx wrangler deploy -e dev` once — the first deploy creates
+  //      the DO class under the name "RATE_LIMITER_DO".
+  //   3. Subsequent deploys reuse it.
+  //
+  // To opt out, delete both the `durable_objects` block and the
+  // `migrations` block; the worker falls back to the KV-backed limiter.
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RATE_LIMITER_DO",
+        "class_name": "RateLimiterDurableObject"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RateLimiterDurableObject"]
+    }
+  ],
+
   // Public env vars. Secrets (MASTER_SEED, ADMIN_KEY, CRON_SECRET,
   // ALCHEMY_NOTIFY_TOKEN, SECRETS_ENCRYPTION_KEY, ...) are set via
   // `wrangler secret put <NAME>` and do NOT go here.

@@ -165,6 +165,56 @@ export async function releaseFromInvoice(deps: AppDeps, invoiceId: string): Prom
     .run();
 }
 
+// Re-claim the pool addresses previously held by `invoiceId` after a reorg
+// demotion (confirmed → partial/detected/etc). For each address we try to
+// atomically flip an 'available' pool row back to 'allocated' for this
+// invoice. Returns counts so the caller can log the outcome:
+//
+//   reacquired: rows we successfully re-claimed (safe — no collision).
+//   collided:   rows now allocated to a DIFFERENT invoice (the dangerous
+//               case; a new invoice grabbed the slot before we could
+//               re-claim it. Operator action required to avoid crediting
+//               the wrong invoice.).
+//
+// No-op for addresses that are still held by this invoice (idempotent).
+export async function reacquireForInvoice(
+  deps: AppDeps,
+  invoiceId: string,
+  addresses: readonly string[]
+): Promise<{ reacquired: number; collided: number }> {
+  if (addresses.length === 0) return { reacquired: 0, collided: 0 };
+  const now = deps.clock.now().getTime();
+  let reacquired = 0;
+  let collided = 0;
+  for (const address of addresses) {
+    const upd = await deps.db
+      .prepare(
+        `UPDATE address_pool
+           SET status = 'allocated',
+               allocated_to_invoice_id = ?,
+               allocated_at = ?
+         WHERE address = ? AND status = 'available'`
+      )
+      .bind(invoiceId, now, address)
+      .run();
+    const changes = upd.meta.changes ?? 0;
+    if (changes > 0) {
+      reacquired += 1;
+      continue;
+    }
+    // Nothing changed — either this invoice already holds the row (safe) or
+    // a different invoice does (collision). One extra SELECT to tell them
+    // apart. The cost is per-reorg-demotion, which is rare.
+    const row = await deps.db
+      .prepare("SELECT allocated_to_invoice_id FROM address_pool WHERE address = ?")
+      .bind(address)
+      .first<{ allocated_to_invoice_id: string | null }>();
+    const held = row?.allocated_to_invoice_id ?? null;
+    if (held !== null && held !== invoiceId) collided += 1;
+  }
+  return { reacquired, collided };
+}
+
 // Derive `count` new addresses for `family`, insert as 'available', emit
 // pool.address.created per row. Idempotent under contention via the cache
 // mutex — if another refill is mid-flight, this call is a no-op and returns 0.

@@ -296,6 +296,25 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         data
       });
       return gas.toString() as AmountRaw;
+    },
+
+    async getBalance(args): Promise<AmountRaw> {
+      const client = getClient(args.chainId);
+      const token = findToken(args.chainId as ChainId, args.token);
+      if (!token) {
+        throw new Error(`EVM getBalance: unknown token ${args.token} on chain ${args.chainId}`);
+      }
+      if (token.contractAddress === null) {
+        const balance = await client.getBalance({ address: args.address as Hex });
+        return balance.toString() as AmountRaw;
+      }
+      const balance = (await client.readContract({
+        address: token.contractAddress as unknown as Hex,
+        abi: ERC20_ABI,
+        functionName: "balanceOf",
+        args: [args.address as Hex]
+      })) as bigint;
+      return balance.toString() as AmountRaw;
     }
   };
 }

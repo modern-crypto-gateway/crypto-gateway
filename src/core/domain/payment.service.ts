@@ -13,6 +13,7 @@ import {
   type TxRow
 } from "./mappers.js";
 import { confirmationThreshold } from "./payment-config.js";
+import { reacquireForInvoice } from "./pool.service.js";
 import { addUsd, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
 
 // PaymentService: rules for how detected transfers become transactions, how
@@ -233,9 +234,23 @@ export interface ConfirmSweepResult {
   promotedInvoices: number;
 }
 
-export async function confirmTransactions(deps: AppDeps): Promise<ConfirmSweepResult> {
+export interface ConfirmTransactionsOptions {
+  // Caps the rows fetched per tick. On Workers the whole runScheduledJobs
+  // call shares a 30s CPU budget, so sweeps that each dispatch an RPC per
+  // row must bound their batch or risk killing the entire tick mid-flight.
+  // The cron runs frequently enough that partial progress is fine — the
+  // remainder gets picked up next tick. Default 200 leaves ~150ms/row at 30s.
+  maxBatch?: number;
+}
+
+export async function confirmTransactions(
+  deps: AppDeps,
+  opts: ConfirmTransactionsOptions = {}
+): Promise<ConfirmSweepResult> {
+  const limit = opts.maxBatch ?? 200;
   const pending = await deps.db
-    .prepare("SELECT * FROM transactions WHERE status = 'detected'")
+    .prepare("SELECT * FROM transactions WHERE status = 'detected' ORDER BY detected_at ASC LIMIT ?")
+    .bind(limit)
     .all<TxRow>();
 
   let confirmed = 0;
@@ -526,20 +541,32 @@ async function recomputeInvoiceFromTransactions(
     );
     // Reorg demotion (confirmed -> anything lower) is an operator-visible
     // event: the merchant has already been told the payment confirmed, and
-    // downstream systems (payout, fulfillment) may have acted on it. Log at
-    // error level so alerting picks it up; the webhook fires too so the
-    // merchant can reconcile.
+    // downstream systems (payout, fulfillment) may have acted on it.
     //
-    // NOTE: the address-pool release handler (pool.service.ts) already fired
-    // on `invoice.confirmed`, so the receive address for this invoice may
-    // have been marked available and potentially reallocated to a new
-    // invoice. Operators seeing this log should manually verify that any
-    // payment observed against the demoted invoice's receive address
-    // genuinely belongs to this invoice and not a newer one that inherited
-    // the slot. A dedicated `invoice.demoted` event + automatic pool
-    // re-acquire is a known follow-up; for now `poolReallocationRisk: true`
-    // in the fields tags this log line for alert routing.
+    // Two things happen, in order:
+    //   1. Try to re-claim the pool addresses this invoice used. They were
+    //      released on `invoice.confirmed`; a newer invoice may have taken
+    //      the slot. `reacquireForInvoice` reports the outcome so we log
+    //      (and publish) whether any collision happened.
+    //   2. Publish `invoice.demoted` BEFORE the normal status-transition
+    //      event so subscribers see the reorg flag first.
     if (before === "confirmed" && after !== "confirmed") {
+      let poolReacquired = 0;
+      let poolCollided = 0;
+      try {
+        const outcome = await reacquireForInvoice(
+          deps,
+          invoiceRow.id,
+          addresses.map((a) => a.address)
+        );
+        poolReacquired = outcome.reacquired;
+        poolCollided = outcome.collided;
+      } catch (err) {
+        deps.logger.error("pool re-acquire failed on demotion", {
+          invoiceId: invoiceRow.id,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
       deps.logger.error("invoice demoted after confirmation (reorg)", {
         invoiceId: invoiceRow.id,
         merchantId: invoiceRow.merchant_id,
@@ -547,7 +574,18 @@ async function recomputeInvoiceFromTransactions(
         after,
         receivedAmountRaw: total.toString(),
         requiredAmountRaw: invoiceRow.required_amount_raw,
-        poolReallocationRisk: true
+        poolReacquired,
+        poolCollided,
+        poolReallocationRisk: poolCollided > 0
+      });
+      await deps.events.publish({
+        type: "invoice.demoted",
+        invoiceId: updated.id,
+        invoice: updated,
+        previousStatus: before,
+        poolReacquired,
+        poolCollided,
+        at: new Date(now)
       });
     }
     await deps.events.publish(invoiceEventFor(after, updated, now));
@@ -644,12 +682,29 @@ async function recomputeUsdInvoice(
     // Reorg demotion on USD-path invoices: confirmed / overpaid are positive
     // terminal-ish outcomes the merchant has been notified about. A
     // transition to a lower status (partial / detected / created) means the
-    // chain walked back our happy-path event — surface loudly.
+    // chain walked back our happy-path event. Same re-acquire + demoted-
+    // event flow as the non-USD path.
     if (
       (before === "confirmed" || before === "overpaid") &&
       after !== "confirmed" &&
       after !== "overpaid"
     ) {
+      let poolReacquired = 0;
+      let poolCollided = 0;
+      try {
+        const outcome = await reacquireForInvoice(
+          deps,
+          invoiceRow.id,
+          addresses.map((a) => a.address)
+        );
+        poolReacquired = outcome.reacquired;
+        poolCollided = outcome.collided;
+      } catch (err) {
+        deps.logger.error("pool re-acquire failed on demotion", {
+          invoiceId: invoiceRow.id,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
       deps.logger.error("USD invoice demoted after confirmation (reorg)", {
         invoiceId: invoiceRow.id,
         merchantId: invoiceRow.merchant_id,
@@ -657,9 +712,18 @@ async function recomputeUsdInvoice(
         after,
         paidUsd,
         amountUsd,
-        // See note in non-USD recompute path: pool may have released this
-        // invoice's receive address on the original confirmation.
-        poolReallocationRisk: true
+        poolReacquired,
+        poolCollided,
+        poolReallocationRisk: poolCollided > 0
+      });
+      await deps.events.publish({
+        type: "invoice.demoted",
+        invoiceId: updated.id,
+        invoice: updated,
+        previousStatus: before,
+        poolReacquired,
+        poolCollided,
+        at: new Date(now)
       });
     }
     await deps.events.publish(invoiceEventFor(after, updated, now));

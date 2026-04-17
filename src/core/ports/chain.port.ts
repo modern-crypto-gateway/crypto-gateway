@@ -59,4 +59,19 @@ export interface ChainAdapter {
   // Raw native units (wei / sun / lamports). Used by source-selection to verify
   // the chosen fee wallet has enough native gas before reserving it.
   estimateGasForTransfer(args: EstimateArgs): Promise<AmountRaw>;
+
+  // Returns the on-chain balance of `token` held by `address` on `chainId`,
+  // in raw units (wei / sun / lamports / token-atomic). Used by the payout
+  // executor for a pre-flight check before broadcasting — spares us burning
+  // gas on transfers that will revert for insufficient balance.
+  //
+  // Implementations SHOULD NOT throw on a missing account: return "0" so the
+  // caller can decide whether that's a hard failure. They MAY throw on
+  // network errors; the caller treats that as "can't verify, broadcast anyway
+  // and let the chain decide" to avoid trading correctness for liveness.
+  getBalance(args: {
+    chainId: ChainId;
+    address: Address;
+    token: TokenSymbol;
+  }): Promise<AmountRaw>;
 }

@@ -232,6 +232,7 @@ async function main(): Promise<void> {
       merchantPerMinute: config.rateLimitMerchantPerMinute,
       checkoutPerMinute: config.rateLimitCheckoutPerMinute,
       webhookIngestPerMinute: config.rateLimitWebhookIngestPerMinute,
+      adminPerMinute: config.rateLimitAdminPerMinute,
       trustedIpHeaders: config.trustedIpHeaders
         .split(",")
         .map((s) => s.trim().toLowerCase())

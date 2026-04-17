@@ -17,6 +17,12 @@ import { sweepWebhookDeliveries } from "./webhook-subscriber.js";
 // detections are ingested, and payout submissions only after that. Any single
 // job failing logs + continues; the runner catches and reports per-job so one
 // slow/failing RPC can't deny-of-service the others.
+//
+// CPU budget on Workers: the whole sequence must fit in 30s CPU. Each sweep
+// function caps its batch (`maxBatch` option) so a backlog can't blow past
+// the limit — partial progress is safe because the cron re-invokes
+// frequently. Tune via scheduled-jobs callers if your tick rate or per-row
+// cost differs from the defaults (200 payouts / 200 txs / 100 webhooks).
 
 export interface ScheduledJobsResult {
   pollPayments: JobOutcome;

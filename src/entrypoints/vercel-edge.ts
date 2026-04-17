@@ -126,7 +126,18 @@ async function getDeps(): Promise<AppDeps> {
     activeAlchemyChainIds.push(solanaWiring.chainId);
   }
 
+  // SECRETS_ENCRYPTION_KEY is REQUIRED in production / staging. Falling
+  // through to devCipher would encrypt every secret with a publicly-known
+  // zero key; refuse to boot instead.
   const secretsEncryptionKey = secrets.getOptional("SECRETS_ENCRYPTION_KEY");
+  const nodeEnv = secrets.getOptional("NODE_ENV");
+  const isProdLike = nodeEnv === "production" || nodeEnv === "staging";
+  if (isProdLike && secretsEncryptionKey === undefined) {
+    throw new Error(
+      "SECRETS_ENCRYPTION_KEY is required when NODE_ENV=production or staging. " +
+        "Generate one with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+    );
+  }
   const secretsCipher = secretsEncryptionKey !== undefined
     ? await makeSecretsCipher(secretsEncryptionKey)
     : await devCipher();
@@ -193,6 +204,7 @@ async function getDeps(): Promise<AppDeps> {
       merchantPerMinute: Number(secrets.getOptional("RATE_LIMIT_MERCHANT_PER_MINUTE") ?? "1000"),
       checkoutPerMinute: Number(secrets.getOptional("RATE_LIMIT_CHECKOUT_PER_MINUTE") ?? "60"),
       webhookIngestPerMinute: Number(secrets.getOptional("RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE") ?? "300"),
+      adminPerMinute: Number(secrets.getOptional("RATE_LIMIT_ADMIN_PER_MINUTE") ?? "30"),
       trustedIpHeaders: (secrets.getOptional("TRUSTED_IP_HEADERS") ?? "x-vercel-forwarded-for,x-real-ip")
         .split(",")
         .map((s) => s.trim().toLowerCase())
@@ -210,9 +222,63 @@ async function getDeps(): Promise<AppDeps> {
   return fresh;
 }
 
+// Best-effort boot-error reporter. If getDeps throws (missing
+// SECRETS_ENCRYPTION_KEY in prod, bad DATABASE_URL, etc.) we log to
+// console.error and fan out a POST to ALERT_WEBHOOK_URL so ops see the
+// failure rather than discovering via a 500 from a paying merchant.
+async function reportBootFailure(err: unknown): Promise<void> {
+  const message = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? err.stack : undefined;
+  const payload = {
+    ts: new Date().toISOString(),
+    level: "fatal",
+    msg: "vercel-edge boot failed",
+    service: "crypto-gateway",
+    runtime: "vercel-edge",
+    error: message,
+    ...(stack !== undefined ? { stack } : {})
+  };
+  console.error(JSON.stringify(payload));
+
+  // processEnvSecrets() is a pure wrapper over process.env — safe to call here
+  // even though getDeps() just failed. We need env access without pulling in
+  // the deps graph whose construction just errored.
+  const bootSecrets = processEnvSecrets();
+  const alertUrl = bootSecrets.getOptional("ALERT_WEBHOOK_URL");
+  if (alertUrl === undefined || alertUrl.length === 0) return;
+  const authHeader = bootSecrets.getOptional("ALERT_WEBHOOK_AUTH_HEADER");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    await fetch(alertUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(authHeader !== undefined ? { authorization: authHeader } : {})
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+  } catch {
+    // fire-and-forget — already logged to console.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Vercel Edge invokes the default export with (Request) and expects Response
 // (or Promise<Response>). Hono's `.fetch` matches that signature exactly.
 export default async function handler(req: Request): Promise<Response> {
-  const app = buildApp(await getDeps());
+  let deps: AppDeps;
+  try {
+    deps = await getDeps();
+  } catch (err) {
+    await reportBootFailure(err);
+    return new Response(
+      JSON.stringify({ error: "service misconfigured", detail: "see server logs" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+  const app = buildApp(deps);
   return app.fetch(req) as Promise<Response>;
 }

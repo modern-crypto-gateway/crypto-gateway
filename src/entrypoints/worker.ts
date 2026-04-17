@@ -1,4 +1,4 @@
-import type { D1Database, ExecutionContext, KVNamespace, ScheduledController } from "@cloudflare/workers-types";
+import type { D1Database, DurableObjectNamespace, ExecutionContext, KVNamespace, ScheduledController } from "@cloudflare/workers-types";
 import { buildApp } from "../app.js";
 import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
@@ -21,6 +21,8 @@ import { consoleLogger } from "../adapters/logging/console.adapter.js";
 import { httpAlertSink } from "../adapters/logging/http-alert.adapter.js";
 import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
+import { durableObjectRateLimiter } from "../adapters/rate-limit/durable-object.adapter.js";
+export { RateLimiterDurableObject } from "../adapters/rate-limit/rate-limit-do.js";
 import { workersEnvSecrets } from "../adapters/secrets/workers-env.js";
 import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
@@ -42,6 +44,9 @@ export interface WorkerEnv {
   // Bindings declared in wrangler.jsonc
   DB: D1Database;
   KV: KVNamespace;
+  // Optional Durable Object namespace for strict rate-limiting. When present
+  // we prefer it over the KV-backed limiter; otherwise we fall back gracefully.
+  RATE_LIMITER_DO?: DurableObjectNamespace;
 
   // Secrets (set via `wrangler secret put`)
   MASTER_SEED: string;
@@ -73,9 +78,18 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     ...(alertSink !== undefined ? { alertSink } : {})
   });
   const cache = cfKvAdapter(env.KV);
-  // CF KV enforces a 60s TTL floor already, so the limiter's 60s+1 setting lands
-  // at 60 anyway. Fixed-window bucketing still rolls correctly per minute.
-  const rateLimiter = cacheBackedRateLimiter(cache);
+  // Prefer the Durable Object rate limiter when a namespace is bound — it
+  // gives us atomic, honest INCR semantics that CF KV cannot. Fall back to
+  // the cache-backed limiter (with its documented over-admit risk) when the
+  // binding is absent so operators can still ship without the extra DO
+  // setup step. Flip over by adding the RATE_LIMITER_DO binding to
+  // wrangler.jsonc (see wrangler.jsonc.example for the block).
+  const rateLimiter = env.RATE_LIMITER_DO !== undefined
+    ? durableObjectRateLimiter(env.RATE_LIMITER_DO)
+    : cacheBackedRateLimiter(cache);
+  if (env.RATE_LIMITER_DO === undefined) {
+    logger.warn("RATE_LIMITER_DO binding not present; using cache-backed limiter (may over-admit under burst)");
+  }
 
   // Same Alchemy-optional pattern as the Node entrypoint: dev adapter always,
   // real EVM + RPC-poll detection when ALCHEMY_API_KEY is set.
@@ -138,11 +152,20 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     activeAlchemyChainIds.push(solanaWiring.chainId);
   }
 
-  // Secrets-at-rest cipher. SECRETS_ENCRYPTION_KEY is required in
-  // production — prod Workers don't run loadConfig (D1/KV-driven boot, not
-  // an env-schema); the admin routes fail fast if a ciphertext can't be
-  // produced, so misconfiguration is visible at first merchant creation.
+  // Secrets-at-rest cipher. SECRETS_ENCRYPTION_KEY is REQUIRED in
+  // production / staging — Workers don't run loadConfig the way node.ts
+  // does, so we enforce the same guard here at cipher construction.
+  // Falling through to devCipher in prod would encrypt every secret with
+  // a publicly-known zero key; refuse to boot instead.
   const secretsEncryptionKey = typeof env["SECRETS_ENCRYPTION_KEY"] === "string" ? env["SECRETS_ENCRYPTION_KEY"] : undefined;
+  const nodeEnv = typeof env["NODE_ENV"] === "string" ? env["NODE_ENV"] : undefined;
+  const isProdLike = nodeEnv === "production" || nodeEnv === "staging";
+  if (isProdLike && (secretsEncryptionKey === undefined || secretsEncryptionKey.length === 0)) {
+    throw new Error(
+      "SECRETS_ENCRYPTION_KEY is required when NODE_ENV=production or staging. " +
+        "Generate one with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+    );
+  }
   const secretsCipher = secretsEncryptionKey !== undefined && secretsEncryptionKey.length > 0
     ? await makeSecretsCipher(secretsEncryptionKey)
     : await devCipher();
@@ -208,6 +231,7 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
       merchantPerMinute: envNumber(env, "RATE_LIMIT_MERCHANT_PER_MINUTE", 1000),
       checkoutPerMinute: envNumber(env, "RATE_LIMIT_CHECKOUT_PER_MINUTE", 60),
       webhookIngestPerMinute: envNumber(env, "RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE", 300),
+      adminPerMinute: envNumber(env, "RATE_LIMIT_ADMIN_PER_MINUTE", 30),
       trustedIpHeaders: parseTrustedIpHeaders(env["TRUSTED_IP_HEADERS"], ["cf-connecting-ip"])
     },
     chains,
@@ -240,9 +264,61 @@ function parseTrustedIpHeaders(raw: unknown, fallback: readonly string[]): reado
   return parsed.length > 0 ? parsed : fallback;
 }
 
+// Boot-error handler shared by fetch + scheduled. Any failure inside depsFor
+// (missing SECRETS_ENCRYPTION_KEY in prod, D1 binding missing, bad env) would
+// otherwise surface as an opaque 500 — log with structured fields and
+// best-effort POST to ALERT_WEBHOOK_URL if it's set, so ops know cold-boot
+// failed rather than discovering via a paging merchant.
+async function reportBootFailure(err: unknown, env: WorkerEnv): Promise<void> {
+  const message = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? err.stack : undefined;
+  const payload = {
+    ts: new Date().toISOString(),
+    level: "fatal",
+    msg: "worker boot failed",
+    service: "crypto-gateway",
+    runtime: "workers",
+    error: message,
+    ...(stack !== undefined ? { stack } : {})
+  };
+  // Log to the Workers runtime first — that always works.
+  console.error(JSON.stringify(payload));
+
+  const alertUrl = typeof env["ALERT_WEBHOOK_URL"] === "string" ? env["ALERT_WEBHOOK_URL"] : undefined;
+  if (alertUrl === undefined || alertUrl.length === 0) return;
+  const authHeader = typeof env["ALERT_WEBHOOK_AUTH_HEADER"] === "string" ? env["ALERT_WEBHOOK_AUTH_HEADER"] : undefined;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    await fetch(alertUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(authHeader !== undefined ? { authorization: authHeader } : {})
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+  } catch {
+    // fire-and-forget — already logged to console.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export default {
   async fetch(request: Request, env: WorkerEnv, ctx: ExecutionContext): Promise<Response> {
-    const app = buildApp(await depsFor(env, ctx));
+    let deps: AppDeps;
+    try {
+      deps = await depsFor(env, ctx);
+    } catch (err) {
+      await reportBootFailure(err, env);
+      return new Response(
+        JSON.stringify({ error: "service misconfigured", detail: "see server logs" }),
+        { status: 500, headers: { "content-type": "application/json" } }
+      );
+    }
+    const app = buildApp(deps);
     return app.fetch(request) as Promise<Response>;
   },
 
@@ -252,7 +328,13 @@ export default {
     // set — including `alchemy.syncAddresses` when configured. runScheduledJobs
     // catches per-step errors and returns outcomes; we surface them via logger
     // so the Workers runtime sees them.
-    const deps = await depsFor(env, ctx);
+    let deps: AppDeps;
+    try {
+      deps = await depsFor(env, ctx);
+    } catch (err) {
+      await reportBootFailure(err, env);
+      return;
+    }
     const result = await runScheduledJobs(deps);
     for (const [name, outcome] of Object.entries(result)) {
       if (outcome && !outcome.ok) {
