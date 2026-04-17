@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { custom } from "viem";
+import { invoices } from "../../db/schema.js";
 import { evmChainAdapter } from "../../adapters/chains/evm/evm-chain.adapter.js";
 import { solanaChainAdapter, SOLANA_MAINNET_CHAIN_ID } from "../../adapters/chains/solana/solana-chain.adapter.js";
 import { tronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../adapters/chains/tron/tron-chain.adapter.js";
@@ -111,23 +113,22 @@ describe("POST /api/v1/invoices — USD-pegged path (A2.a)", () => {
       })
     );
     const { invoice } = (await res.json()) as { invoice: { id: string } };
-    const row = await booted.deps.db
-      .prepare(
-        "SELECT amount_usd, paid_usd, overpaid_usd, rate_window_expires_at, rates_json FROM invoices WHERE id = ?"
-      )
-      .bind(invoice.id)
-      .first<{
-        amount_usd: string;
-        paid_usd: string;
-        overpaid_usd: string;
-        rate_window_expires_at: number;
-        rates_json: string;
-      }>();
+    const [row] = await booted.deps.db
+      .select({
+        amount_usd: invoices.amountUsd,
+        paid_usd: invoices.paidUsd,
+        overpaid_usd: invoices.overpaidUsd,
+        rate_window_expires_at: invoices.rateWindowExpiresAt,
+        rates_json: invoices.ratesJson
+      })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     expect(row?.amount_usd).toBe("49.99");
     expect(row?.paid_usd).toBe("0");
     expect(row?.overpaid_usd).toBe("0");
     expect(row?.rate_window_expires_at).toBeGreaterThan(Date.now());
-    const parsed = JSON.parse(row!.rates_json) as Record<string, string>;
+    const parsed = JSON.parse(row!.rates_json!) as Record<string, string>;
     expect(parsed["USDC"]).toBe("1");
     expect(parsed["ETH"]).toBe("2500");
   });

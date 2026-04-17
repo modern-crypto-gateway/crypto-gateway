@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { and, asc, eq, sql } from "drizzle-orm";
+import { addressPool } from "../../db/schema.js";
 import {
   allocateForInvoice,
   getStats,
@@ -80,10 +82,15 @@ describe("pool.service — allocate + release", () => {
     const allocated = await allocateForInvoice(booted.deps, "invoice-1", "evm");
     await releaseFromInvoice(booted.deps, "invoice-1");
 
-    const row = await booted.deps.db
-      .prepare("SELECT status, allocated_to_invoice_id, total_allocations FROM address_pool WHERE id = ?")
-      .bind(allocated.id)
-      .first<{ status: string; allocated_to_invoice_id: string | null; total_allocations: number }>();
+    const [row] = await booted.deps.db
+      .select({
+        status: addressPool.status,
+        allocated_to_invoice_id: addressPool.allocatedToInvoiceId,
+        total_allocations: addressPool.totalAllocations
+      })
+      .from(addressPool)
+      .where(eq(addressPool.id, allocated.id))
+      .limit(1);
     expect(row?.status).toBe("available");
     expect(row?.allocated_to_invoice_id).toBeNull();
     expect(row?.total_allocations).toBe(1);
@@ -125,25 +132,28 @@ describe("pool.service — allocate + release", () => {
     // (not actually a separate family here since test only has evm, but the
     // release-by-invoiceId behavior is family-agnostic). SQLite doesn't
     // support UPDATE...LIMIT — subquery picks the next available id.
+    const candidateIds = booted.deps.db
+      .select({ id: addressPool.id })
+      .from(addressPool)
+      .where(and(eq(addressPool.family, "evm"), eq(addressPool.status, "available")))
+      .limit(1);
     await booted.deps.db
-      .prepare(
-        `UPDATE address_pool SET status = 'allocated', allocated_to_invoice_id = ?, allocated_at = ?
-         WHERE id = (SELECT id FROM address_pool WHERE family = 'evm' AND status = 'available' LIMIT 1)`
-      )
-      .bind("multi-invoice", Date.now())
-      .run();
+      .update(addressPool)
+      .set({ status: "allocated", allocatedToInvoiceId: "multi-invoice", allocatedAt: Date.now() })
+      .where(sql`${addressPool.id} = (${candidateIds})`);
 
     await releaseFromInvoice(booted.deps, "multi-invoice");
-    const rows = await booted.deps.db
-      .prepare("SELECT COUNT(*) AS cnt FROM address_pool WHERE allocated_to_invoice_id = ?")
-      .bind("multi-invoice")
-      .first<{ cnt: number }>();
-    expect(rows?.cnt).toBe(0);
+    const [rows] = await booted.deps.db
+      .select({ cnt: sql<number>`COUNT(*)` })
+      .from(addressPool)
+      .where(eq(addressPool.allocatedToInvoiceId, "multi-invoice"));
+    expect(Number(rows?.cnt)).toBe(0);
     // The explicitly-allocated row `a` is also released.
-    const aRow = await booted.deps.db
-      .prepare("SELECT status FROM address_pool WHERE id = ?")
-      .bind(a.id)
-      .first<{ status: string }>();
+    const [aRow] = await booted.deps.db
+      .select({ status: addressPool.status })
+      .from(addressPool)
+      .where(eq(addressPool.id, a.id))
+      .limit(1);
     expect(aRow?.status).toBe("available");
   });
 });
@@ -160,18 +170,22 @@ describe("pool.service — refill", () => {
   it("inserts N new rows with monotonically increasing address_index", async () => {
     await refillFamily(booted.deps, "evm", 3);
     const rows = await booted.deps.db
-      .prepare("SELECT address_index FROM address_pool WHERE family = 'evm' ORDER BY address_index ASC")
-      .all<{ address_index: number }>();
-    expect(rows.results.map((r) => r.address_index)).toEqual([0, 1, 2]);
+      .select({ address_index: addressPool.addressIndex })
+      .from(addressPool)
+      .where(eq(addressPool.family, "evm"))
+      .orderBy(asc(addressPool.addressIndex));
+    expect(rows.map((r) => r.address_index)).toEqual([0, 1, 2]);
   });
 
   it("continues indexing from MAX on subsequent refills (no gaps, no duplicates)", async () => {
     await refillFamily(booted.deps, "evm", 2);
     await refillFamily(booted.deps, "evm", 3);
     const rows = await booted.deps.db
-      .prepare("SELECT address_index FROM address_pool WHERE family = 'evm' ORDER BY address_index ASC")
-      .all<{ address_index: number }>();
-    expect(rows.results.map((r) => r.address_index)).toEqual([0, 1, 2, 3, 4]);
+      .select({ address_index: addressPool.addressIndex })
+      .from(addressPool)
+      .where(eq(addressPool.family, "evm"))
+      .orderBy(asc(addressPool.addressIndex));
+    expect(rows.map((r) => r.address_index)).toEqual([0, 1, 2, 3, 4]);
   });
 
   it("no-ops while the per-family refill mutex is held", async () => {
@@ -180,9 +194,10 @@ describe("pool.service — refill", () => {
     await booted.deps.cache.put("pool:refill-lock:evm", "1", { ttlSeconds: 60 });
     const added = await refillFamily(booted.deps, "evm", 3);
     expect(added).toBe(0);
-    const rows = await booted.deps.db
-      .prepare("SELECT COUNT(*) AS cnt FROM address_pool WHERE family = 'evm'")
-      .first<{ cnt: number }>();
-    expect(rows?.cnt).toBe(0);
+    const [rows] = await booted.deps.db
+      .select({ cnt: sql<number>`COUNT(*)` })
+      .from(addressPool)
+      .where(eq(addressPool.family, "evm"));
+    expect(Number(rows?.cnt)).toBe(0);
   });
 });

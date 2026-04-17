@@ -1,6 +1,8 @@
 import type { Context, MiddlewareHandler } from "hono";
+import { eq } from "drizzle-orm";
 import type { AppDeps } from "../../core/app-deps.js";
 import { sha256Hex } from "../../adapters/crypto/subtle.js";
+import { merchants } from "../../db/schema.js";
 
 // Merchant API-key authentication.
 //
@@ -27,10 +29,11 @@ export function apiKeyAuth(deps: AppDeps): MiddlewareHandler<{ Variables: Authed
     }
 
     const hash = await sha256Hex(key);
-    const merchant = await deps.db
-      .prepare("SELECT id, active FROM merchants WHERE api_key_hash = ?")
-      .bind(hash)
-      .first<{ id: string; active: number }>();
+    const [merchant] = await deps.db
+      .select({ id: merchants.id, active: merchants.active })
+      .from(merchants)
+      .where(eq(merchants.apiKeyHash, hash))
+      .limit(1);
 
     if (!merchant || merchant.active !== 1) {
       return c.json({ error: { code: "UNAUTHORIZED" } }, 401);

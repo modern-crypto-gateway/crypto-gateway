@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { asc, eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { alchemyWebhookRegistry } from "../../db/schema.js";
 import type {
   AlchemyAdminClient,
   AlchemyWebhookSummary
@@ -144,20 +146,25 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
     // route can resolve signing keys by webhookId.
     expect(body.results.every((r) => r.persisted === true)).toBe(true);
     const rows = await booted.deps.db
-      .prepare("SELECT chain_id, webhook_id, signing_key_ciphertext FROM alchemy_webhook_registry ORDER BY chain_id")
-      .all<{ chain_id: number; webhook_id: string; signing_key_ciphertext: string }>();
-    expect(rows.results.map((r) => ({ chain_id: r.chain_id, webhook_id: r.webhook_id }))).toEqual([
+      .select({
+        chain_id: alchemyWebhookRegistry.chainId,
+        webhook_id: alchemyWebhookRegistry.webhookId,
+        signing_key_ciphertext: alchemyWebhookRegistry.signingKeyCiphertext
+      })
+      .from(alchemyWebhookRegistry)
+      .orderBy(asc(alchemyWebhookRegistry.chainId));
+    expect(rows.map((r) => ({ chain_id: r.chain_id, webhook_id: r.webhook_id }))).toEqual([
       { chain_id: 1, webhook_id: "wh_1" },
       { chain_id: 137, webhook_id: "wh_137" }
     ]);
     // Stored signing keys are ciphertext, not plaintext — the security fix.
-    for (const r of rows.results) {
+    for (const r of rows) {
       expect(r.signing_key_ciphertext).toMatch(/^v1:/);
       expect(r.signing_key_ciphertext).not.toContain("whsec_");
     }
     // Round-trip: decrypted ciphertext matches what Alchemy returned.
-    const decrypted1 = await booted.deps.secretsCipher.decrypt(rows.results[0]!.signing_key_ciphertext);
-    const decrypted137 = await booted.deps.secretsCipher.decrypt(rows.results[1]!.signing_key_ciphertext);
+    const decrypted1 = await booted.deps.secretsCipher.decrypt(rows[0]!.signing_key_ciphertext);
+    const decrypted137 = await booted.deps.secretsCipher.decrypt(rows[1]!.signing_key_ciphertext);
     expect(decrypted1).toBe("whsec_1");
     expect(decrypted137).toBe("whsec_137");
   });
@@ -196,9 +203,14 @@ describe("POST /admin/bootstrap/alchemy-webhooks", () => {
       })
     );
 
-    const row = await booted.deps.db
-      .prepare("SELECT webhook_id, signing_key_ciphertext FROM alchemy_webhook_registry WHERE chain_id = 1")
-      .first<{ webhook_id: string; signing_key_ciphertext: string }>();
+    const [row] = await booted.deps.db
+      .select({
+        webhook_id: alchemyWebhookRegistry.webhookId,
+        signing_key_ciphertext: alchemyWebhookRegistry.signingKeyCiphertext
+      })
+      .from(alchemyWebhookRegistry)
+      .where(eq(alchemyWebhookRegistry.chainId, 1))
+      .limit(1);
     expect(row?.webhook_id).toBe("wh_1_v2");
     // Ciphertext rotated too — decrypting yields the new plaintext from v2.
     const decrypted = await booted.deps.secretsCipher.decrypt(row!.signing_key_ciphertext);

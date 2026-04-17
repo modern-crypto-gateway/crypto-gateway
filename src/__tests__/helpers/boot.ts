@@ -1,9 +1,11 @@
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+import { migrate } from "drizzle-orm/libsql/migrator";
 import { buildApp, type App } from "../../app.js";
 import { memoryCacheAdapter } from "../../adapters/cache/memory.adapter.js";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
-import { libsqlAdapter } from "../../adapters/db/libsql.adapter.js";
-import { loadMigrationsFromDir } from "../../adapters/db/fs-migration-loader.js";
-import { applyMigrations } from "../../adapters/db/migration-runner.js";
+import { createDb, createLibsqlClient } from "../../db/client.js";
+import { merchants as merchantsTable } from "../../db/schema.js";
 import { devCipher } from "../../adapters/crypto/secrets-cipher.js";
 import { initializePool } from "../../core/domain/pool.service.js";
 import { promiseSetJobs } from "../../adapters/jobs/promise-set.adapter.js";
@@ -130,11 +132,19 @@ export async function createInvoiceViaApi(
 // exercise HTTP routes via `app.fetch(new Request(...))` against this bundle.
 
 export async function bootTestApp(options: BootTestAppOptions = {}): Promise<BootedTestApp> {
-  const db = libsqlAdapter({ url: ":memory:" });
+  const libsqlClient = createLibsqlClient({ url: ":memory:" });
+  const db = createDb(libsqlClient);
 
   // src/__tests__/helpers/boot.ts  ->  repo root is three dirs up.
-  const migrationsDir = new URL("../../../migrations/", import.meta.url);
-  await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
+  const migrationsFolder = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "..",
+    "drizzle",
+    "migrations"
+  );
+  await migrate(db, { migrationsFolder });
 
   const secretsCipher = await devCipher();
 
@@ -154,22 +164,16 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     const webhookSecretCiphertext = m.webhookSecret !== undefined
       ? await secretsCipher.encrypt(m.webhookSecret)
       : null;
-    await db
-      .prepare(
-        `INSERT INTO merchants (id, name, api_key_hash, webhook_url, webhook_secret_ciphertext, active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        m.id,
-        m.name ?? "Test Merchant",
-        apiKeyHash,
-        m.webhookUrl ?? null,
-        webhookSecretCiphertext,
-        m.active === false ? 0 : 1,
-        seedNow,
-        seedNow
-      )
-      .run();
+    await db.insert(merchantsTable).values({
+      id: m.id,
+      name: m.name ?? "Test Merchant",
+      apiKeyHash,
+      webhookUrl: m.webhookUrl ?? null,
+      webhookSecretCiphertext,
+      active: m.active === false ? 0 : 1,
+      createdAt: seedNow,
+      updatedAt: seedNow
+    });
   }
 
   const secretsOverrides: Record<string, string> = {
@@ -257,6 +261,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     logger,
     close: async () => {
       await deps.jobs.drain(1_000);
+      libsqlClient.close();
     }
   };
   if (capturingDispatcher !== undefined) booted.webhookDispatcher = capturingDispatcher;

@@ -13,9 +13,8 @@ import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-s
 import { readAlchemyNotifyToken } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
-import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
-import { loadMigrationsFromDir } from "../adapters/db/fs-migration-loader.js";
-import { applyMigrations } from "../adapters/db/migration-runner.js";
+import { migrate } from "drizzle-orm/libsql/migrator";
+import { createDb, createLibsqlClient } from "../db/client.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
@@ -47,13 +46,18 @@ declare const Deno: {
 
 async function main(): Promise<void> {
   const secrets = denoEnvSecrets();
-  const databaseUrl = secrets.getOptional("DATABASE_URL") ?? "file:./local.db";
+  // TURSO_URL is the canonical post-Turso-pivot name; DATABASE_URL remains an
+  // alias for one release cycle so existing local .env files keep working.
+  const databaseUrl =
+    secrets.getOptional("TURSO_URL") ?? secrets.getOptional("DATABASE_URL") ?? "file:./local.db";
   const port = Number(secrets.getOptional("PORT") ?? "8787");
-  const dbAuthToken = secrets.getOptional("DATABASE_TOKEN");
+  const dbAuthToken =
+    secrets.getOptional("TURSO_AUTH_TOKEN") ?? secrets.getOptional("DATABASE_TOKEN");
 
-  const db = libsqlAdapter(
+  const libsqlClient = createLibsqlClient(
     dbAuthToken !== undefined ? { url: databaseUrl, authToken: dbAuthToken } : { url: databaseUrl }
   );
+  const db = createDb(libsqlClient);
 
   const alertWebhookUrl = secrets.getOptional("ALERT_WEBHOOK_URL");
   const alertAuthHeader = secrets.getOptional("ALERT_WEBHOOK_AUTH_HEADER");
@@ -70,14 +74,17 @@ async function main(): Promise<void> {
     ...(alertSink !== undefined ? { alertSink } : {})
   });
 
-  // Apply migrations at boot. Deno supports node:fs + node:url natively, so
-  // the shared fs loader works here too. Must run before any route handler.
-  const migrationsDir = new URL("../../migrations/", import.meta.url);
-  const migrations = loadMigrationsFromDir(migrationsDir);
-  const migrationResult = await applyMigrations(db, migrations);
-  if (migrationResult.applied.length > 0) {
-    logger.info("migrations applied", { applied: migrationResult.applied });
-  }
+  // Apply Drizzle migrations at boot. Deno supports Drizzle's libsql migrator
+  // because it has filesystem access + node:fs/node:path compat. The migrator
+  // is idempotent: it reads `meta/_journal.json` and applies only new entries.
+  const migrationsFolderUrl = new URL("../../drizzle/migrations/", import.meta.url);
+  // `URL.pathname` on Windows (`file:///C:/...`) returns `/C:/...` with a
+  // leading slash; libsql migrator's fs.readdir rejects that shape. Strip
+  // only when `import.meta.url` is a file: URL and the path looks Windows-y.
+  const pathname = migrationsFolderUrl.pathname;
+  const migrationsFolder = /^\/[A-Za-z]:\//.test(pathname) ? pathname.slice(1) : pathname;
+  await migrate(db, { migrationsFolder });
+  logger.info("drizzle migrations applied", { folder: migrationsFolder });
 
   const cache = memoryCacheAdapter();
   const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
@@ -227,7 +234,7 @@ async function main(): Promise<void> {
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
-    migrations,
+    migrationsFolder,
     confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES"))
   };
 

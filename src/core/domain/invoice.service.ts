@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { and, eq, inArray } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainFamilySchema, ChainIdSchema, type ChainFamily } from "../types/chain.js";
 import { AmountRawSchema, FiatAmountSchema, FiatCurrencySchema } from "../types/money.js";
@@ -7,10 +8,11 @@ import type { Invoice, InvoiceId, InvoiceReceiveAddress } from "../types/invoice
 import { TokenSymbolSchema } from "../types/token.js";
 import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
 import { findChainAdapter } from "./chain-lookup.js";
-import { fetchInvoiceReceiveAddresses, loadInvoice, rowToInvoice, type InvoiceRow } from "./mappers.js";
+import { drizzleRowToInvoice, fetchInvoiceReceiveAddresses, loadInvoice } from "./mappers.js";
 import { DomainError } from "../errors.js";
 import { allocateForInvoice } from "./pool.service.js";
 import { snapshotRates, tokensForFamilies } from "./rate-window.js";
+import { invoices, invoiceReceiveAddresses, merchants } from "../../db/schema.js";
 
 // ---- Input validation ----
 
@@ -68,10 +70,11 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
   const parsed = CreateInvoiceInputSchema.parse(input);
 
   // 1. Merchant must exist + be active.
-  const merchant = await deps.db
-    .prepare("SELECT id, active FROM merchants WHERE id = ?")
-    .bind(parsed.merchantId)
-    .first<{ id: string; active: number }>();
+  const [merchant] = await deps.db
+    .select({ id: merchants.id, active: merchants.active })
+    .from(merchants)
+    .where(eq(merchants.id, parsed.merchantId))
+    .limit(1);
   if (!merchant) {
     throw new InvoiceError("MERCHANT_NOT_FOUND", `Merchant not found: ${parsed.merchantId}`);
   }
@@ -191,78 +194,48 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
   //    can't leave the invoice unreachable for detection.
   const expiresAt = now + parsed.expiresInMinutes * 60_000;
   const metadataJson = parsed.metadata !== undefined ? JSON.stringify(parsed.metadata) : null;
-  const statements = [
-    deps.db
-      .prepare(
-        `INSERT INTO invoices
-           (id, merchant_id, status, chain_id, token, receive_address, address_index,
-            required_amount_raw, received_amount_raw, fiat_amount, fiat_currency, quoted_rate,
-            external_id, metadata_json, accepted_families,
-            amount_usd, paid_usd, overpaid_usd, rate_window_expires_at, rates_json,
-            created_at, expires_at, updated_at)
-         VALUES (?, ?, 'created', ?, ?, ?, ?, ?, '0', ?, ?, ?, ?, ?, ?, ?, '0', '0', ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        invoiceId,
-        parsed.merchantId,
-        parsed.chainId,
-        parsed.token,
-        primaryAddress,
-        primaryAddressIndex,
-        requiredAmountRaw,
-        parsed.fiatAmount ?? null,
-        parsed.fiatCurrency ?? null,
-        quotedRate,
-        parsed.externalId ?? null,
-        metadataJson,
-        JSON.stringify(acceptedFamilies),
-        amountUsd,
-        rateWindowExpiresAt,
-        ratesJson,
-        now,
-        expiresAt,
-        now
-      ),
-    ...receiveRows.map((rx) =>
-      deps.db
-        .prepare(
-          `INSERT INTO invoice_receive_addresses (invoice_id, family, address, pool_address_id, created_at)
-           VALUES (?, ?, ?, ?, ?)`
-        )
-        .bind(invoiceId, rx.family, rx.address, rx.poolAddressId, now)
-    )
-  ];
-  await deps.db.batch(statements);
-
-  const invoice = rowToInvoice(
-    {
-      id: invoiceId,
-      merchant_id: parsed.merchantId,
-      status: "created",
-      chain_id: parsed.chainId,
-      token: parsed.token,
-      receive_address: primaryAddress,
-      address_index: primaryAddressIndex,
-      required_amount_raw: requiredAmountRaw,
-      received_amount_raw: "0",
-      fiat_amount: parsed.fiatAmount ?? null,
-      fiat_currency: parsed.fiatCurrency ?? null,
-      quoted_rate: quotedRate,
-      external_id: parsed.externalId ?? null,
-      metadata_json: metadataJson,
-      accepted_families: JSON.stringify(acceptedFamilies),
-      amount_usd: amountUsd,
-      paid_usd: "0",
-      overpaid_usd: "0",
-      rate_window_expires_at: rateWindowExpiresAt,
-      rates_json: ratesJson,
-      created_at: now,
-      expires_at: expiresAt,
-      confirmed_at: null,
-      updated_at: now
-    },
-    receiveRows
+  const invoiceInsert = {
+    id: invoiceId,
+    merchantId: parsed.merchantId,
+    status: "created" as const,
+    chainId: parsed.chainId,
+    token: parsed.token,
+    receiveAddress: primaryAddress,
+    addressIndex: primaryAddressIndex,
+    requiredAmountRaw: requiredAmountRaw,
+    receivedAmountRaw: "0",
+    fiatAmount: parsed.fiatAmount ?? null,
+    fiatCurrency: parsed.fiatCurrency ?? null,
+    quotedRate: quotedRate,
+    externalId: parsed.externalId ?? null,
+    metadataJson: metadataJson,
+    acceptedFamilies: JSON.stringify(acceptedFamilies),
+    amountUsd: amountUsd,
+    paidUsd: "0",
+    overpaidUsd: "0",
+    rateWindowExpiresAt: rateWindowExpiresAt,
+    ratesJson: ratesJson,
+    createdAt: now,
+    expiresAt: expiresAt,
+    confirmedAt: null,
+    updatedAt: now
+  };
+  const invoiceInsertStmt = deps.db.insert(invoices).values(invoiceInsert);
+  const rxInsertStmts = receiveRows.map((rx) =>
+    deps.db.insert(invoiceReceiveAddresses).values({
+      invoiceId,
+      family: rx.family,
+      address: rx.address,
+      poolAddressId: rx.poolAddressId,
+      createdAt: now
+    })
   );
+  await deps.db.batch([invoiceInsertStmt, ...rxInsertStmts] as [
+    typeof invoiceInsertStmt,
+    ...typeof rxInsertStmts
+  ]);
+
+  const invoice = drizzleRowToInvoice(invoiceInsert, receiveRows);
 
   await deps.events.publish({ type: "invoice.created", invoiceId: invoice.id, invoice, at: new Date(now) });
 
@@ -275,15 +248,11 @@ export async function getInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<I
 
 export async function expireInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<Invoice> {
   const now = deps.clock.now().getTime();
-  const row = await deps.db
-    .prepare(
-      `UPDATE invoices
-         SET status = 'expired', updated_at = ?
-       WHERE id = ? AND status IN ('created','partial')
-       RETURNING *`
-    )
-    .bind(now, invoiceId)
-    .first<InvoiceRow>();
+  const [row] = await deps.db
+    .update(invoices)
+    .set({ status: "expired", updatedAt: now })
+    .where(and(eq(invoices.id, invoiceId), inArray(invoices.status, ["created", "partial"])))
+    .returning();
   if (!row) {
     throw new InvoiceError(
       "EXPIRE_NOT_ALLOWED",
@@ -291,7 +260,7 @@ export async function expireInvoice(deps: AppDeps, invoiceId: InvoiceId): Promis
     );
   }
   const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceId);
-  const invoice = rowToInvoice(row, addresses);
+  const invoice = drizzleRowToInvoice(row, addresses);
   await deps.events.publish({ type: "invoice.expired", invoiceId: invoice.id, invoice, at: new Date(now) });
   return invoice;
 }

@@ -1,7 +1,9 @@
+import { and, eq } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent, DomainEventType } from "../events/event-bus.port.js";
 import type { WebhookDeliveryRecord } from "../ports/webhook-delivery-store.port.js";
 import { composeWebhook } from "./webhook-composer.js";
+import { merchants } from "../../db/schema.js";
 
 // Subscribes to domain events and dispatches composed webhooks. Called once
 // per AppDeps from buildApp — the subscriptions stay active for the lifetime
@@ -218,14 +220,16 @@ async function loadMerchantWebhook(
   deps: AppDeps,
   merchantId: string
 ): Promise<{ webhookUrl: string; secretCiphertext: string } | undefined> {
-  const row = await deps.db
-    .prepare(
-      "SELECT webhook_url, webhook_secret_ciphertext FROM merchants WHERE id = ? AND active = 1"
-    )
-    .bind(merchantId)
-    .first<{ webhook_url: string | null; webhook_secret_ciphertext: string | null }>();
-  if (!row?.webhook_url || !row.webhook_secret_ciphertext) return undefined;
-  return { webhookUrl: row.webhook_url, secretCiphertext: row.webhook_secret_ciphertext };
+  const [row] = await deps.db
+    .select({
+      webhookUrl: merchants.webhookUrl,
+      webhookSecretCiphertext: merchants.webhookSecretCiphertext
+    })
+    .from(merchants)
+    .where(and(eq(merchants.id, merchantId), eq(merchants.active, 1)))
+    .limit(1);
+  if (!row?.webhookUrl || !row.webhookSecretCiphertext) return undefined;
+  return { webhookUrl: row.webhookUrl, secretCiphertext: row.webhookSecretCiphertext };
 }
 
 // Exported for tests that need to assert against a single record.

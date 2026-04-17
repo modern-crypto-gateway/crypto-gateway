@@ -1,8 +1,10 @@
+import { and, asc, count, eq, max, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { PoolExhaustedError } from "../errors.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import type { ChainFamily } from "../types/chain.js";
 import type { PoolAddress, PoolFamilyStats } from "../types/pool.js";
+import { addressPool } from "../../db/schema.js";
 
 // Address pool: shared-across-merchants, HD-derived, reused across invoices.
 //
@@ -100,17 +102,18 @@ export async function allocateForInvoice(
   const now = deps.clock.now().getTime();
 
   for (let attempt = 0; attempt < ALLOCATE_RETRY_LIMIT; attempt += 1) {
-    const candidate = await deps.db
-      .prepare(
-        `SELECT id, address, address_index FROM address_pool
-         WHERE family = ? AND status = 'available'
-         ORDER BY total_allocations ASC, address_index ASC
-         LIMIT 1`
-      )
-      .bind(family)
-      .first<{ id: string; address: string; address_index: number }>();
+    const [candidate] = await deps.db
+      .select({
+        id: addressPool.id,
+        address: addressPool.address,
+        addressIndex: addressPool.addressIndex
+      })
+      .from(addressPool)
+      .where(and(eq(addressPool.family, family), eq(addressPool.status, "available")))
+      .orderBy(asc(addressPool.totalAllocations), asc(addressPool.addressIndex))
+      .limit(1);
 
-    if (candidate === null) {
+    if (!candidate) {
       // Empty pool — kick off a background refill so the next invoice
       // creation has something to allocate, then surface the 503 so this
       // invoice-create call fails fast (merchant retries and succeeds once
@@ -119,18 +122,13 @@ export async function allocateForInvoice(
       throw new PoolExhaustedError(family);
     }
 
-    const claim = await deps.db
-      .prepare(
-        `UPDATE address_pool
-           SET status = 'allocated', allocated_to_invoice_id = ?, allocated_at = ?
-         WHERE id = ? AND status = 'available'
-         RETURNING id, family, address_index, address, status,
-                   allocated_to_invoice_id, allocated_at, total_allocations, created_at`
-      )
-      .bind(invoiceId, now, candidate.id)
-      .first<PoolRow>();
+    const [claim] = await deps.db
+      .update(addressPool)
+      .set({ status: "allocated", allocatedToInvoiceId: invoiceId, allocatedAt: now })
+      .where(and(eq(addressPool.id, candidate.id), eq(addressPool.status, "available")))
+      .returning();
 
-    if (claim !== null) {
+    if (claim) {
       // Post-allocation: check the available count; if below trigger,
       // schedule a background refill. This is what keeps the pool self-
       // healing without any cron support.
@@ -138,7 +136,7 @@ export async function allocateForInvoice(
       if (available < REFILL_TRIGGER_THRESHOLD) {
         scheduleRefill(deps, family);
       }
-      return rowToPoolAddress(claim);
+      return drizzleRowToPoolAddress(claim);
     }
     // CAS miss — another allocator got this row first. Retry with the next
     // cheapest candidate. This loop terminates because the pool is finite
@@ -153,16 +151,14 @@ export async function allocateForInvoice(
 // moves it to the back of the queue.
 export async function releaseFromInvoice(deps: AppDeps, invoiceId: string): Promise<void> {
   await deps.db
-    .prepare(
-      `UPDATE address_pool
-         SET status = 'available',
-             allocated_to_invoice_id = NULL,
-             allocated_at = NULL,
-             total_allocations = total_allocations + 1
-       WHERE allocated_to_invoice_id = ?`
-    )
-    .bind(invoiceId)
-    .run();
+    .update(addressPool)
+    .set({
+      status: "available",
+      allocatedToInvoiceId: null,
+      allocatedAt: null,
+      totalAllocations: sql`${addressPool.totalAllocations} + 1`
+    })
+    .where(eq(addressPool.allocatedToInvoiceId, invoiceId));
 }
 
 // Re-claim the pool addresses previously held by `invoiceId` after a reorg
@@ -187,29 +183,24 @@ export async function reacquireForInvoice(
   let reacquired = 0;
   let collided = 0;
   for (const address of addresses) {
-    const upd = await deps.db
-      .prepare(
-        `UPDATE address_pool
-           SET status = 'allocated',
-               allocated_to_invoice_id = ?,
-               allocated_at = ?
-         WHERE address = ? AND status = 'available'`
-      )
-      .bind(invoiceId, now, address)
-      .run();
-    const changes = upd.meta.changes ?? 0;
-    if (changes > 0) {
+    const updated = await deps.db
+      .update(addressPool)
+      .set({ status: "allocated", allocatedToInvoiceId: invoiceId, allocatedAt: now })
+      .where(and(eq(addressPool.address, address), eq(addressPool.status, "available")))
+      .returning({ id: addressPool.id });
+    if (updated.length > 0) {
       reacquired += 1;
       continue;
     }
     // Nothing changed — either this invoice already holds the row (safe) or
     // a different invoice does (collision). One extra SELECT to tell them
     // apart. The cost is per-reorg-demotion, which is rare.
-    const row = await deps.db
-      .prepare("SELECT allocated_to_invoice_id FROM address_pool WHERE address = ?")
-      .bind(address)
-      .first<{ allocated_to_invoice_id: string | null }>();
-    const held = row?.allocated_to_invoice_id ?? null;
+    const [row] = await deps.db
+      .select({ allocatedToInvoiceId: addressPool.allocatedToInvoiceId })
+      .from(addressPool)
+      .where(eq(addressPool.address, address))
+      .limit(1);
+    const held = row?.allocatedToInvoiceId ?? null;
     if (held !== null && held !== invoiceId) collided += 1;
   }
   return { reacquired, collided };
@@ -235,11 +226,11 @@ export async function refillFamily(
       return 0;
     }
     const seed = deps.secrets.getRequired("MASTER_SEED");
-    const maxRow = await deps.db
-      .prepare("SELECT MAX(address_index) AS max_idx FROM address_pool WHERE family = ?")
-      .bind(family)
-      .first<{ max_idx: number | null }>();
-    const startIdx = (maxRow?.max_idx ?? -1) + 1;
+    const [maxRow] = await deps.db
+      .select({ maxIdx: max(addressPool.addressIndex) })
+      .from(addressPool)
+      .where(eq(addressPool.family, family));
+    const startIdx = (maxRow?.maxIdx ?? -1) + 1;
     const now = deps.clock.now().getTime();
 
     // Derive addresses synchronously (local crypto, no I/O), then insert in
@@ -255,15 +246,20 @@ export async function refillFamily(
     }
 
     const inserts = derived.map((d) =>
-      deps.db
-        .prepare(
-          `INSERT INTO address_pool
-             (id, family, address_index, address, status, total_allocations, created_at)
-           VALUES (?, ?, ?, ?, 'available', 0, ?)`
-        )
-        .bind(d.id, family, d.index, d.address, now)
+      deps.db.insert(addressPool).values({
+        id: d.id,
+        family,
+        addressIndex: d.index,
+        address: d.address,
+        status: "available",
+        totalAllocations: 0,
+        createdAt: now
+      })
     );
-    await deps.db.batch(inserts);
+    if (inserts.length > 0) {
+      type InsertStmt = (typeof inserts)[number];
+      await deps.db.batch(inserts as [InsertStmt, ...InsertStmt[]]);
+    }
 
     // Publish pool.address.created events so the Alchemy subscription
     // tracker can enqueue per-chain `add` rows. Publish is fire-and-forget
@@ -319,15 +315,17 @@ export function registerPoolReleaseHandler(deps: AppDeps): () => void {
 
 export async function getStats(deps: AppDeps): Promise<readonly PoolFamilyStats[]> {
   const rows = await deps.db
-    .prepare(
-      `SELECT family, status, COUNT(*) AS cnt, MAX(address_index) AS max_idx
-         FROM address_pool
-         GROUP BY family, status`
-    )
-    .all<{ family: ChainFamily; status: "available" | "allocated" | "quarantined"; cnt: number; max_idx: number | null }>();
+    .select({
+      family: addressPool.family,
+      status: addressPool.status,
+      cnt: count(),
+      maxIdx: max(addressPool.addressIndex)
+    })
+    .from(addressPool)
+    .groupBy(addressPool.family, addressPool.status);
 
   const byFamily = new Map<ChainFamily, PoolFamilyStats>();
-  for (const row of rows.results) {
+  for (const row of rows) {
     const agg = byFamily.get(row.family) ?? {
       family: row.family,
       available: 0,
@@ -338,8 +336,8 @@ export async function getStats(deps: AppDeps): Promise<readonly PoolFamilyStats[
     };
     agg[row.status] = row.cnt;
     agg.total += row.cnt;
-    if (row.max_idx !== null && (agg.highestIndex === null || row.max_idx > agg.highestIndex)) {
-      agg.highestIndex = row.max_idx;
+    if (row.maxIdx !== null && (agg.highestIndex === null || row.maxIdx > agg.highestIndex)) {
+      agg.highestIndex = row.maxIdx;
     }
     byFamily.set(row.family, agg);
   }
@@ -348,29 +346,17 @@ export async function getStats(deps: AppDeps): Promise<readonly PoolFamilyStats[
 
 // ---- Internals ----
 
-interface PoolRow {
-  id: string;
-  family: ChainFamily;
-  address_index: number;
-  address: string;
-  status: "available" | "allocated" | "quarantined";
-  allocated_to_invoice_id: string | null;
-  allocated_at: number | null;
-  total_allocations: number;
-  created_at: number;
-}
-
-function rowToPoolAddress(row: PoolRow): PoolAddress {
+function drizzleRowToPoolAddress(row: typeof addressPool.$inferSelect): PoolAddress {
   return {
     id: row.id,
     family: row.family,
-    addressIndex: row.address_index,
+    addressIndex: row.addressIndex,
     address: row.address,
     status: row.status,
-    allocatedToInvoiceId: row.allocated_to_invoice_id,
-    allocatedAt: row.allocated_at !== null ? new Date(row.allocated_at) : null,
-    totalAllocations: row.total_allocations,
-    createdAt: new Date(row.created_at)
+    allocatedToInvoiceId: row.allocatedToInvoiceId,
+    allocatedAt: row.allocatedAt !== null ? new Date(row.allocatedAt) : null,
+    totalAllocations: row.totalAllocations,
+    createdAt: new Date(row.createdAt)
   };
 }
 
@@ -379,18 +365,18 @@ function findAdapterForFamily(deps: AppDeps, family: ChainFamily): ChainAdapter 
 }
 
 async function countPool(deps: AppDeps, family: ChainFamily): Promise<number> {
-  const row = await deps.db
-    .prepare("SELECT COUNT(*) AS cnt FROM address_pool WHERE family = ?")
-    .bind(family)
-    .first<{ cnt: number }>();
+  const [row] = await deps.db
+    .select({ cnt: count() })
+    .from(addressPool)
+    .where(eq(addressPool.family, family));
   return row?.cnt ?? 0;
 }
 
 async function countAvailable(deps: AppDeps, family: ChainFamily): Promise<number> {
-  const row = await deps.db
-    .prepare("SELECT COUNT(*) AS cnt FROM address_pool WHERE family = ? AND status = 'available'")
-    .bind(family)
-    .first<{ cnt: number }>();
+  const [row] = await deps.db
+    .select({ cnt: count() })
+    .from(addressPool)
+    .where(and(eq(addressPool.family, family), eq(addressPool.status, "available")));
   return row?.cnt ?? 0;
 }
 

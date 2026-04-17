@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import type { D1Database, D1PreparedStatement, D1Result, ExecutionContext, KVNamespace } from "@cloudflare/workers-types";
+import type { ExecutionContext, KVNamespace } from "@cloudflare/workers-types";
 import { cfKvAdapter } from "../../adapters/cache/cf-kv.adapter.js";
-import { d1Adapter } from "../../adapters/db/d1.adapter.js";
 import { waitUntilJobs } from "../../adapters/jobs/wait-until.adapter.js";
 import { workersEnvSecrets } from "../../adapters/secrets/workers-env.js";
 
@@ -9,85 +8,6 @@ import { workersEnvSecrets } from "../../adapters/secrets/workers-env.js";
 // binding interfaces and our port interfaces. They don't boot a full Worker —
 // just assert that each port method delegates correctly to the underlying
 // binding and normalizes the response shape.
-
-// ---- D1 ----
-
-function fakeD1Statement(handlers: {
-  first?: (col?: string) => unknown;
-  all?: () => D1Result;
-  run?: () => D1Result;
-}): D1PreparedStatement {
-  const stmt = {
-    bind: (..._args: unknown[]) => stmt,
-    first: async (col?: string) => handlers.first?.(col),
-    all: async () => handlers.all?.() ?? ({ results: [], success: true, meta: { duration: 0 } } as unknown as D1Result),
-    run: async () => handlers.run?.() ?? ({ success: true, meta: { duration: 0 } } as unknown as D1Result),
-    raw: async () => [],
-    getMeta: () => undefined
-  };
-  return stmt as unknown as D1PreparedStatement;
-}
-
-describe("d1Adapter", () => {
-  it("prepare + bind + first returns the first row or null", async () => {
-    const boundArgs: unknown[][] = [];
-    const statement = fakeD1Statement({ first: () => ({ id: "abc", n: 42 }) });
-    const boundStatement: D1PreparedStatement = {
-      ...statement,
-      bind: vi.fn((...args: unknown[]) => {
-        boundArgs.push(args);
-        return statement;
-      })
-    } as unknown as D1PreparedStatement;
-
-    const db: Partial<D1Database> = {
-      prepare: vi.fn(() => boundStatement)
-    };
-    const adapter = d1Adapter(db as D1Database);
-    const result = await adapter.prepare("SELECT * FROM t WHERE id = ?").bind("abc").first<{ id: string; n: number }>();
-    expect(result).toEqual({ id: "abc", n: 42 });
-    expect(boundArgs).toEqual([["abc"]]);
-  });
-
-  it("first returns null when the underlying returns undefined", async () => {
-    const statement = fakeD1Statement({ first: () => undefined });
-    const db: Partial<D1Database> = { prepare: () => statement };
-    const adapter = d1Adapter(db as D1Database);
-    const result = await adapter.prepare("SELECT 1").first();
-    expect(result).toBeNull();
-  });
-
-  it("all normalizes D1Result.results + meta.duration + meta.changes", async () => {
-    const statement = fakeD1Statement({
-      all: () => ({ results: [{ id: "a" }, { id: "b" }], success: true, meta: { duration: 12, changes: 2 } } as unknown as D1Result)
-    });
-    const db: Partial<D1Database> = { prepare: () => statement };
-    const adapter = d1Adapter(db as D1Database);
-    const res = await adapter.prepare("SELECT id FROM t").all();
-    expect(res.results).toEqual([{ id: "a" }, { id: "b" }]);
-    expect(res.meta).toEqual({ duration: 12, changes: 2 });
-  });
-
-  it("run forwards last_row_id as lastRowId in the normalized meta", async () => {
-    const statement = fakeD1Statement({
-      run: () => ({ success: true, meta: { duration: 3, changes: 1, last_row_id: 77 } } as unknown as D1Result)
-    });
-    const db: Partial<D1Database> = { prepare: () => statement };
-    const adapter = d1Adapter(db as D1Database);
-    const res = await adapter.prepare("INSERT INTO t VALUES (?)").bind("x").run();
-    expect(res.success).toBe(true);
-    expect(res.meta.lastRowId).toBe(77);
-  });
-
-  it("exec returns the count + duration from the native D1 response", async () => {
-    const db: Partial<D1Database> = {
-      exec: vi.fn(async () => ({ count: 3, duration: 42 }))
-    };
-    const adapter = d1Adapter(db as D1Database);
-    const res = await adapter.exec("CREATE TABLE t (id TEXT); CREATE INDEX ... ; CREATE ...");
-    expect(res).toEqual({ count: 3, duration: 42 });
-  });
-});
 
 // ---- CF KV ----
 

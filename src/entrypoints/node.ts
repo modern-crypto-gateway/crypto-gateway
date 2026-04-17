@@ -2,10 +2,9 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import "dotenv/config";
+import { migrate } from "drizzle-orm/libsql/migrator";
 import { buildApp } from "../app.js";
-import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
-import { loadMigrationsFromDir } from "../adapters/db/fs-migration-loader.js";
-import { applyMigrations } from "../adapters/db/migration-runner.js";
+import { createDb, createLibsqlClient } from "../db/client.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
@@ -30,6 +29,7 @@ import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-s
 import { readAlchemyNotifyToken } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
+import { merchants } from "../db/schema.js";
 import { loadConfig, ConfigValidationError } from "../config/config.schema.js";
 import type { ChainAdapter } from "../core/ports/chain.port.js";
 import type { DetectionStrategy } from "../core/ports/detection.port.js";
@@ -84,16 +84,19 @@ async function main(): Promise<void> {
   const secrets = processEnvSecrets();
   const databaseUrl = config.databaseUrl ?? "file:./local.db";
   const dbAuthToken = config.databaseToken;
-  const db = libsqlAdapter(
+  const libsqlClient = createLibsqlClient(
     dbAuthToken !== undefined ? { url: databaseUrl, authToken: dbAuthToken } : { url: databaseUrl }
   );
+  const db = createDb(libsqlClient);
 
-  const migrationsDir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "migrations");
-  const migrations = loadMigrationsFromDir(migrationsDir);
-  const migrationResult = await applyMigrations(db, migrations);
-  if (migrationResult.applied.length > 0) {
-    logger.info("migrations applied", { applied: migrationResult.applied });
-  }
+  // Drizzle's migrator tracks applied ids in a `__drizzle_migrations` table,
+  // reads the `meta/_journal.json` emitted by drizzle-kit, and applies only
+  // migrations the journal marks as new. Idempotent across reboots. On
+  // Workers + Vercel Edge there's no filesystem, so migrations are applied
+  // CLI-side via `npx drizzle-kit push` (see README).
+  const migrationsFolder = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "drizzle", "migrations");
+  await migrate(db, { migrationsFolder });
+  logger.info("drizzle migrations applied", { folder: migrationsFolder });
   if (!production) {
     await seedDefaultMerchantIfMissing(db, logger);
   }
@@ -248,7 +251,7 @@ async function main(): Promise<void> {
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
-    migrations,
+    migrationsFolder,
     confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES"))
   };
 
@@ -271,27 +274,27 @@ async function main(): Promise<void> {
 
 // Dev-only helper. Guarded at the call site by `if (!production)`; this
 // function itself remains single-purpose so the dev-only behavior is obvious.
-async function seedDefaultMerchantIfMissing(db: AppDeps["db"], logger: AppDeps["logger"]): Promise<void> {
-  const existing = await db.prepare("SELECT id FROM merchants LIMIT 1").first<{ id: string }>();
+async function seedDefaultMerchantIfMissing(
+  db: AppDeps["db"],
+  logger: AppDeps["logger"]
+): Promise<void> {
+  const [existing] = await db.select({ id: merchants.id }).from(merchants).limit(1);
   if (existing) return;
   const now = Date.now();
-  await db
-    .prepare(
-      `INSERT INTO merchants (id, name, api_key_hash, webhook_url, webhook_secret_ciphertext, active, created_at, updated_at)
-       VALUES (?, ?, ?, NULL, NULL, 1, ?, ?)`
-    )
-    .bind(
-      "00000000-0000-0000-0000-000000000001",
-      "Dev Merchant",
-      // Placeholder api_key_hash — no known plaintext preimage. Even if this row
-      // leaked to prod (which the environment guard prevents) nobody could
-      // authenticate as this merchant. Real merchants are created via
-      // POST /admin/merchants and return their plaintext key once.
-      "d1f4b2a4a7e7c6d5c5c3a4e4c3d5e3f3c3e3e3c3d3f3a3e3c3d3e3f3c3e3e3c3",
-      now,
-      now
-    )
-    .run();
+  await db.insert(merchants).values({
+    id: "00000000-0000-0000-0000-000000000001",
+    name: "Dev Merchant",
+    // Placeholder api_key_hash — no known plaintext preimage. Even if this row
+    // leaked to prod (which the environment guard prevents) nobody could
+    // authenticate as this merchant. Real merchants are created via
+    // POST /admin/merchants and return their plaintext key once.
+    apiKeyHash: "d1f4b2a4a7e7c6d5c5c3a4e4c3d5e3f3c3e3e3c3d3f3a3e3c3d3e3f3c3e3e3c3",
+    webhookUrl: null,
+    webhookSecretCiphertext: null,
+    active: 1,
+    createdAt: now,
+    updatedAt: now
+  });
   logger.warn("dev-only: seeded default merchant", { id: "00000000-0000-0000-0000-000000000001" });
 }
 

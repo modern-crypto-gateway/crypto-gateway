@@ -1,18 +1,28 @@
 // Cloudflare Workers deployment config.
 //
 // >>> For local dev / deployment, copy this file to `wrangler.jsonc` and fill
-//     in your own D1 + KV ids (the real file is gitignored). <<<
+//     in your own Turso + KV ids (the real file is gitignored). <<<
 //
 // First-time setup:
 //   cp wrangler.jsonc.example wrangler.jsonc
-//   npx wrangler d1 create crypto-gateway-dev           # paste database_id below
-//   # Apply every SQL file in migrations/ in order against the REMOTE D1.
-//   # Workers cannot read the filesystem at runtime, so migrations are applied
-//   # CLI-side. Omitting --remote writes only to the local .wrangler sandbox,
-//   # which is fine for `wrangler dev` but NOT for a deployed worker:
-//   for f in migrations/*.sql; do npx wrangler d1 execute crypto-gateway-dev --remote --file="$f"; done
-//   # For local dev against `wrangler dev`, repeat without --remote:
-//   # for f in migrations/*.sql; do npx wrangler d1 execute crypto-gateway-dev --file="$f"; done
+//
+//   # Create a Turso database and get its HTTP URL + auth token:
+//   #   turso db create crypto-gateway-dev
+//   #   turso db show crypto-gateway-dev --url        # -> libsql://...turso.io
+//   #   turso db tokens create crypto-gateway-dev     # -> eyJhbGciOi...
+//   # Or from the dashboard: https://app.turso.tech
+//
+//   # Apply Drizzle migrations against the remote Turso DB. This is CLI-side
+//   # because Workers has no filesystem at runtime. `drizzle-kit push` reads
+//   # drizzle.config.ts (which in turn reads TURSO_URL / TURSO_AUTH_TOKEN
+//   # from your local env) and applies drizzle/migrations/*.sql in order:
+//   TURSO_URL="libsql://..." TURSO_AUTH_TOKEN="eyJ..." npx drizzle-kit push
+//
+//   # Register the Turso URL + token as Worker secrets (not [vars] — they
+//   # grant write access, so treat them as credentials):
+//   npx wrangler secret put TURSO_URL                       # libsql://<db>-<org>.turso.io
+//   npx wrangler secret put TURSO_AUTH_TOKEN                # token from `turso db tokens create`
+//
 //   npx wrangler kv namespace create CACHE              # paste id below
 //   npx wrangler secret put MASTER_SEED                 # BIP39 mnemonic
 //   npx wrangler secret put ADMIN_KEY                   # random 32+ chars
@@ -38,10 +48,13 @@
 //   npx wrangler secret put ALERT_WEBHOOK_URL               # optional; error/fatal logs POSTed here (30/min rate-limit, JSON body)
 //   npx wrangler secret put ALERT_WEBHOOK_AUTH_HEADER       # optional; Authorization header value for ALERT_WEBHOOK_URL
 //
-// When a new migration is added (e.g. `migrations/0002_foo.sql`): re-run the
-// loop above. D1 has no runtime filesystem access, so the wrangler CLI is the
-// canonical migration applier for Workers deployments. Node / Deno run the
-// migration-runner at boot and apply any new files automatically.
+// When a new migration is added (e.g. `drizzle/migrations/0001_xxx.sql` +
+// `meta/_journal.json` entry from `npx drizzle-kit generate`): re-run
+// `npx drizzle-kit push` against the remote TURSO_URL. Workers has no
+// filesystem at runtime, so the `/admin/migrate` endpoint returns 501 on
+// this runtime — drizzle-kit is the canonical migration applier for Workers.
+// Node / Deno entrypoints run Drizzle's migrator at boot and apply any new
+// files automatically.
 //
 // Deploy:
 //   npx wrangler deploy -e dev
@@ -59,14 +72,10 @@
     "crons": ["* * * * *"]
   },
 
-  // D1 database binding. See setup steps above; paste your `database_id` here.
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "crypto-gateway-dev",
-      "database_id": "REPLACE_WITH_D1_ID"
-    }
-  ],
+  // No d1_databases binding — Turso replaces D1 as of 2026-Q1. The
+  // @libsql/client library ships a workerd-compatible HTTP-only build
+  // (no node:net), so the entrypoint talks to Turso over HTTPS using
+  // TURSO_URL + TURSO_AUTH_TOKEN secrets (set via `wrangler secret put`).
 
   // KV namespace for CacheStore. See setup steps above; paste your `id` here.
   // Add `preview_id` as well if you run `wrangler dev`.
@@ -98,17 +107,17 @@
     { "name": "RATE_LIMIT_MERCHANT_API",    "namespace_id": "4004", "simple": { "limit": 1000, "period": 60 } }
   ],
 
-  // Public env vars. Secrets (MASTER_SEED, ADMIN_KEY, CRON_SECRET,
-  // ALCHEMY_NOTIFY_TOKEN, SECRETS_ENCRYPTION_KEY, ...) are set via
-  // `wrangler secret put <NAME>` and do NOT go here.
+  // Public env vars. Secrets (TURSO_URL, TURSO_AUTH_TOKEN, MASTER_SEED,
+  // ADMIN_KEY, CRON_SECRET, ALCHEMY_NOTIFY_TOKEN, SECRETS_ENCRYPTION_KEY, ...)
+  // are set via `wrangler secret put <NAME>` and do NOT go here.
   "vars": {
-    "DB_ADAPTER": "d1",
+    "DB_ADAPTER": "turso",
     "CACHE_ADAPTER": "cf-kv",
     "JOBS_ADAPTER": "wait-until"
   },
 
   // Named per-environment overrides. Start with a dev env; staging / production
-  // get their own D1 + KV ids to keep data isolated.
+  // get their own Turso + KV ids to keep data isolated.
   "env": {
     "dev": {
       "name": "crypto-gateway-dev",

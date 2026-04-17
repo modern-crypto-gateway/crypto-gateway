@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { and, asc, eq, inArray, isNotNull, isNull, lt } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import { ChainIdSchema, type Address, type ChainId } from "../types/chain.js";
@@ -9,9 +10,10 @@ import { TokenSymbolSchema, type TokenSymbol } from "../types/token.js";
 import { findToken } from "../types/token-registry.js";
 import type { SignerScope } from "../types/signer.js";
 import { findChainAdapter } from "./chain-lookup.js";
-import { rowToPayout, type PayoutRow } from "./mappers.js";
+import { drizzleRowToPayout } from "./mappers.js";
 import { confirmationThreshold } from "./payment-config.js";
 import { DomainError } from "../errors.js";
+import { feeWallets, merchants, payouts } from "../../db/schema.js";
 
 // PayoutService lifecycle:
 //
@@ -68,10 +70,11 @@ export class PayoutError extends DomainError {
 export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout> {
   const parsed = PlanPayoutInputSchema.parse(input);
 
-  const merchant = await deps.db
-    .prepare("SELECT id, active FROM merchants WHERE id = ?")
-    .bind(parsed.merchantId)
-    .first<{ id: string; active: number }>();
+  const [merchant] = await deps.db
+    .select({ id: merchants.id, active: merchants.active })
+    .from(merchants)
+    .where(eq(merchants.id, parsed.merchantId))
+    .limit(1);
   if (!merchant) throw new PayoutError("MERCHANT_NOT_FOUND", `Merchant not found: ${parsed.merchantId}`);
   if (merchant.active !== 1) throw new PayoutError("MERCHANT_INACTIVE", `Merchant is inactive: ${parsed.merchantId}`);
 
@@ -91,16 +94,23 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
 
   const now = deps.clock.now().getTime();
   const payoutId = globalThis.crypto.randomUUID();
-  await deps.db
-    .prepare(
-      `INSERT INTO payouts
-         (id, merchant_id, status, chain_id, token, amount_raw, destination_address,
-          source_address, tx_hash, fee_estimate_native, last_error,
-          created_at, submitted_at, confirmed_at, updated_at)
-       VALUES (?, ?, 'planned', ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, NULL, NULL, ?)`
-    )
-    .bind(payoutId, parsed.merchantId, parsed.chainId, parsed.token, parsed.amountRaw, destination, now, now)
-    .run();
+  await deps.db.insert(payouts).values({
+    id: payoutId,
+    merchantId: parsed.merchantId,
+    status: "planned",
+    chainId: parsed.chainId,
+    token: parsed.token,
+    amountRaw: parsed.amountRaw,
+    destinationAddress: destination,
+    sourceAddress: null,
+    txHash: null,
+    feeEstimateNative: null,
+    lastError: null,
+    createdAt: now,
+    submittedAt: null,
+    confirmedAt: null,
+    updatedAt: now
+  });
 
   const row = await fetchPayout(deps, payoutId);
   if (!row) throw new Error(`planPayout: inserted row ${payoutId} disappeared`);
@@ -120,14 +130,21 @@ export async function registerFeeWallet(
   const chainAdapter = findChainAdapter(deps, args.chainId);
   const canonical = chainAdapter.canonicalizeAddress(args.address);
   await deps.db
-    .prepare(
-      `INSERT INTO fee_wallets (id, chain_id, address, label, active, reserved_by_payout_id, reserved_at, created_at)
-       VALUES (?, ?, ?, ?, 1, NULL, NULL, ?)
-       ON CONFLICT(chain_id, address) DO UPDATE
-         SET label = excluded.label, active = 1`
-    )
-    .bind(globalThis.crypto.randomUUID(), args.chainId, canonical, args.label, now)
-    .run();
+    .insert(feeWallets)
+    .values({
+      id: globalThis.crypto.randomUUID(),
+      chainId: args.chainId,
+      address: canonical,
+      label: args.label,
+      active: 1,
+      reservedByPayoutId: null,
+      reservedAt: null,
+      createdAt: now
+    })
+    .onConflictDoUpdate({
+      target: [feeWallets.chainId, feeWallets.address],
+      set: { label: args.label, active: 1 }
+    });
 }
 
 export interface ExecuteSweepResult {
@@ -152,18 +169,20 @@ export async function executeReservedPayouts(
 ): Promise<ExecuteSweepResult> {
   const limit = opts.maxBatch ?? 200;
   const planned = await deps.db
-    .prepare("SELECT * FROM payouts WHERE status = 'planned' ORDER BY created_at ASC LIMIT ?")
-    .bind(limit)
-    .all<PayoutRow>();
+    .select()
+    .from(payouts)
+    .where(eq(payouts.status, "planned"))
+    .orderBy(asc(payouts.createdAt))
+    .limit(limit);
 
   let submitted = 0;
   let failed = 0;
   let deferred = 0;
-  for (const row of planned.results) {
-    const chainAdapter = findChainAdapter(deps, row.chain_id);
+  for (const row of planned) {
+    const chainAdapter = findChainAdapter(deps, row.chainId);
 
     // 1. CAS-reserve a free fee wallet for this chain.
-    const wallet = await tryReserveFeeWallet(deps, row.chain_id, row.id);
+    const wallet = await tryReserveFeeWallet(deps, row.chainId, row.id);
     if (!wallet) {
       deferred += 1;
       continue;
@@ -172,9 +191,9 @@ export async function executeReservedPayouts(
     // 2. Move the payout to 'reserved' and record the source address.
     const now1 = deps.clock.now().getTime();
     await deps.db
-      .prepare("UPDATE payouts SET status = 'reserved', source_address = ?, updated_at = ? WHERE id = ?")
-      .bind(wallet.address, now1, row.id)
-      .run();
+      .update(payouts)
+      .set({ status: "reserved", sourceAddress: wallet.address, updatedAt: now1 })
+      .where(eq(payouts.id, row.id));
 
     // 3. Claim the broadcast slot (CAS on broadcast_attempted_at) BEFORE calling
     //    the chain adapter. If the CAS loses (returns null) either another
@@ -183,17 +202,17 @@ export async function executeReservedPayouts(
     //    MUST NOT broadcast again — doing so would double-spend the fee wallet.
     //    Fail-shut: flip to 'failed' and release the wallet so an operator can
     //    manually reconcile with on-chain state before retrying.
-    const broadcastClaim = await deps.db
-      .prepare(
-        `UPDATE payouts
-            SET broadcast_attempted_at = ?
-          WHERE id = ?
-            AND broadcast_attempted_at IS NULL
-            AND status = 'reserved'
-          RETURNING id`
+    const [broadcastClaim] = await deps.db
+      .update(payouts)
+      .set({ broadcastAttemptedAt: deps.clock.now().getTime() })
+      .where(
+        and(
+          eq(payouts.id, row.id),
+          isNull(payouts.broadcastAttemptedAt),
+          eq(payouts.status, "reserved")
+        )
       )
-      .bind(deps.clock.now().getTime(), row.id)
-      .first<{ id: string }>();
+      .returning({ id: payouts.id });
     if (!broadcastClaim) {
       // Someone else is broadcasting this row (or already did). Don't touch it.
       deferred += 1;
@@ -208,14 +227,14 @@ export async function executeReservedPayouts(
     //    existing flows while the coverage gap is closed iteratively.
     try {
       const walletBalance = await chainAdapter.getBalance({
-        chainId: row.chain_id as ChainId,
+        chainId: row.chainId as ChainId,
         address: wallet.address as Address,
         token: row.token as TokenSymbol
       });
-      if (BigInt(walletBalance) < BigInt(row.amount_raw)) {
+      if (BigInt(walletBalance) < BigInt(row.amountRaw)) {
         throw new Error(
           `Insufficient ${row.token} balance on fee wallet ${wallet.address}: ` +
-            `have ${walletBalance}, need ${row.amount_raw}`
+            `have ${walletBalance}, need ${row.amountRaw}`
         );
       }
     } catch (err) {
@@ -225,19 +244,19 @@ export async function executeReservedPayouts(
       if (message.includes("not implemented")) {
         deps.logger.debug("balance pre-check skipped (adapter not implemented)", {
           payoutId: row.id,
-          chainId: row.chain_id
+          chainId: row.chainId
         });
       } else if (message.startsWith("Insufficient ")) {
         // Hard fail — fee wallet short. Mark failed + release the wallet so
         // the operator can top it up and the payout gets re-planned manually
         // (we don't auto-retry a known-bad wallet).
         const now2 = deps.clock.now().getTime();
-        await deps.db.batch([
-          deps.db
-            .prepare("UPDATE payouts SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?")
-            .bind(message.slice(0, 2048), now2, row.id),
-          releaseFeeWalletStmt(deps, row.id)
-        ]);
+        const failStmt = deps.db
+          .update(payouts)
+          .set({ status: "failed", lastError: message.slice(0, 2048), updatedAt: now2 })
+          .where(eq(payouts.id, row.id));
+        const releaseStmt = releaseFeeWalletStmt(deps, row.id);
+        await deps.db.batch([failStmt, releaseStmt] as [typeof failStmt, typeof releaseStmt]);
         const updated = await fetchPayout(deps, row.id);
         if (updated) {
           await deps.events.publish({
@@ -254,7 +273,7 @@ export async function executeReservedPayouts(
         // the chain's own simulation/preflight is our backstop.
         deps.logger.warn("balance pre-check failed; proceeding to broadcast", {
           payoutId: row.id,
-          chainId: row.chain_id,
+          chainId: row.chainId,
           error: message
         });
       }
@@ -266,11 +285,11 @@ export async function executeReservedPayouts(
     //    retry after this point will not re-enter this block for this row.
     try {
       const unsigned = await chainAdapter.buildTransfer({
-        chainId: row.chain_id,
+        chainId: row.chainId,
         fromAddress: wallet.address,
-        toAddress: row.destination_address,
+        toAddress: row.destinationAddress,
         token: row.token,
-        amountRaw: row.amount_raw
+        amountRaw: row.amountRaw
       });
 
       const signerScope: SignerScope = feeWalletScope(chainAdapter, wallet.label);
@@ -279,11 +298,9 @@ export async function executeReservedPayouts(
 
       const now2 = deps.clock.now().getTime();
       await deps.db
-        .prepare(
-          "UPDATE payouts SET status = 'submitted', tx_hash = ?, submitted_at = ?, updated_at = ? WHERE id = ?"
-        )
-        .bind(txHash, now2, now2, row.id)
-        .run();
+        .update(payouts)
+        .set({ status: "submitted", txHash, submittedAt: now2, updatedAt: now2 })
+        .where(eq(payouts.id, row.id));
 
       const updated = await fetchPayout(deps, row.id);
       if (updated) {
@@ -301,12 +318,12 @@ export async function executeReservedPayouts(
       // Terminal transition: flip payout to 'failed' AND release the fee wallet
       // in a single atomic batch. A crash between the two statements would
       // otherwise leave the wallet reserved forever.
-      await deps.db.batch([
-        deps.db
-          .prepare("UPDATE payouts SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?")
-          .bind(message.slice(0, 2048), now2, row.id),
-        releaseFeeWalletStmt(deps, row.id)
-      ]);
+      const failStmt = deps.db
+        .update(payouts)
+        .set({ status: "failed", lastError: message.slice(0, 2048), updatedAt: now2 })
+        .where(eq(payouts.id, row.id));
+      const releaseStmt = releaseFeeWalletStmt(deps, row.id);
+      await deps.db.batch([failStmt, releaseStmt] as [typeof failStmt, typeof releaseStmt]);
 
       const updated = await fetchPayout(deps, row.id);
       if (updated) {
@@ -321,7 +338,7 @@ export async function executeReservedPayouts(
     }
   }
 
-  return { attempted: planned.results.length, submitted, failed, deferred };
+  return { attempted: planned.length, submitted, failed, deferred };
 }
 
 export interface ConfirmPayoutsResult {
@@ -343,27 +360,29 @@ export async function confirmPayouts(
 ): Promise<ConfirmPayoutsResult> {
   const limit = opts.maxBatch ?? 200;
   const submitted = await deps.db
-    .prepare("SELECT * FROM payouts WHERE status = 'submitted' ORDER BY submitted_at ASC LIMIT ?")
-    .bind(limit)
-    .all<PayoutRow>();
+    .select()
+    .from(payouts)
+    .where(eq(payouts.status, "submitted"))
+    .orderBy(asc(payouts.submittedAt))
+    .limit(limit);
 
   let confirmed = 0;
   let failed = 0;
-  for (const row of submitted.results) {
-    if (!row.tx_hash) continue;
-    const chainAdapter = findChainAdapter(deps, row.chain_id);
-    const status = await chainAdapter.getConfirmationStatus(row.chain_id, row.tx_hash);
+  for (const row of submitted) {
+    if (!row.txHash) continue;
+    const chainAdapter = findChainAdapter(deps, row.chainId);
+    const status = await chainAdapter.getConfirmationStatus(row.chainId, row.txHash);
     const now = deps.clock.now().getTime();
-    const threshold = confirmationThreshold(row.chain_id, deps.confirmationThresholds);
+    const threshold = confirmationThreshold(row.chainId, deps.confirmationThresholds);
 
     if (status.reverted) {
       // Batched with releaseFeeWallet so the two writes commit together.
-      await deps.db.batch([
-        deps.db
-          .prepare("UPDATE payouts SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?")
-          .bind("Transaction reverted on-chain", now, row.id),
-        releaseFeeWalletStmt(deps, row.id)
-      ]);
+      const failStmt = deps.db
+        .update(payouts)
+        .set({ status: "failed", lastError: "Transaction reverted on-chain", updatedAt: now })
+        .where(eq(payouts.id, row.id));
+      const releaseStmt = releaseFeeWalletStmt(deps, row.id);
+      await deps.db.batch([failStmt, releaseStmt] as [typeof failStmt, typeof releaseStmt]);
       const updated = await fetchPayout(deps, row.id);
       if (updated) {
         await deps.events.publish({ type: "payout.failed", payoutId: updated.id, payout: updated, at: new Date(now) });
@@ -374,12 +393,12 @@ export async function confirmPayouts(
 
     if (status.confirmations >= threshold) {
       // Batched with releaseFeeWallet so the two writes commit together.
-      await deps.db.batch([
-        deps.db
-          .prepare("UPDATE payouts SET status = 'confirmed', confirmed_at = ?, updated_at = ? WHERE id = ?")
-          .bind(now, now, row.id),
-        releaseFeeWalletStmt(deps, row.id)
-      ]);
+      const confirmStmt = deps.db
+        .update(payouts)
+        .set({ status: "confirmed", confirmedAt: now, updatedAt: now })
+        .where(eq(payouts.id, row.id));
+      const releaseStmt = releaseFeeWalletStmt(deps, row.id);
+      await deps.db.batch([confirmStmt, releaseStmt] as [typeof confirmStmt, typeof releaseStmt]);
       const updated = await fetchPayout(deps, row.id);
       if (updated) {
         await deps.events.publish({ type: "payout.confirmed", payoutId: updated.id, payout: updated, at: new Date(now) });
@@ -388,7 +407,7 @@ export async function confirmPayouts(
     }
   }
 
-  return { checked: submitted.results.length, confirmed, failed };
+  return { checked: submitted.length, confirmed, failed };
 }
 
 export async function getPayout(deps: AppDeps, id: PayoutId): Promise<Payout | null> {
@@ -436,57 +455,62 @@ export async function sweepStuckFeeWalletReservations(
   const now = deps.clock.now().getTime();
 
   const terminalRelease = await deps.db
-    .prepare(
-      `UPDATE fee_wallets
-          SET reserved_by_payout_id = NULL, reserved_at = NULL
-        WHERE reserved_by_payout_id IS NOT NULL
-          AND reserved_by_payout_id IN (
-            SELECT id FROM payouts WHERE status IN ('confirmed', 'failed', 'canceled')
-          )`
+    .update(feeWallets)
+    .set({ reservedByPayoutId: null, reservedAt: null })
+    .where(
+      and(
+        isNotNull(feeWallets.reservedByPayoutId),
+        inArray(
+          feeWallets.reservedByPayoutId,
+          deps.db
+            .select({ id: payouts.id })
+            .from(payouts)
+            .where(inArray(payouts.status, ["confirmed", "failed", "canceled"]))
+        )
+      )
     )
-    .run();
+    .returning({ id: feeWallets.id });
 
   const stuck = await deps.db
-    .prepare(
-      `SELECT fw.id AS wallet_id, fw.address, fw.reserved_by_payout_id AS payout_id,
-              fw.reserved_at, p.status AS payout_status
-         FROM fee_wallets fw
-         JOIN payouts p ON p.id = fw.reserved_by_payout_id
-        WHERE fw.reserved_at IS NOT NULL
-          AND fw.reserved_at < ?
-          AND p.status = 'reserved'`
-    )
-    .bind(now - stuckThresholdMs)
-    .all<{
-      wallet_id: string;
-      address: string;
-      payout_id: string;
-      reserved_at: number;
-      payout_status: string;
-    }>();
+    .select({
+      walletId: feeWallets.id,
+      address: feeWallets.address,
+      payoutId: feeWallets.reservedByPayoutId,
+      reservedAt: feeWallets.reservedAt,
+      payoutStatus: payouts.status
+    })
+    .from(feeWallets)
+    .innerJoin(payouts, eq(payouts.id, feeWallets.reservedByPayoutId))
+    .where(
+      and(
+        isNotNull(feeWallets.reservedAt),
+        lt(feeWallets.reservedAt, now - stuckThresholdMs),
+        eq(payouts.status, "reserved")
+      )
+    );
 
-  for (const row of stuck.results) {
+  for (const row of stuck) {
     deps.logger.warn("fee wallet reservation stuck mid-broadcast; operator review required", {
-      walletId: row.wallet_id,
+      walletId: row.walletId,
       address: row.address,
-      payoutId: row.payout_id,
-      payoutStatus: row.payout_status,
-      reservedAt: new Date(row.reserved_at).toISOString(),
-      heldMinutes: Math.round((now - row.reserved_at) / 60_000)
+      payoutId: row.payoutId,
+      payoutStatus: row.payoutStatus,
+      reservedAt: row.reservedAt === null ? null : new Date(row.reservedAt).toISOString(),
+      heldMinutes: row.reservedAt === null ? null : Math.round((now - row.reservedAt) / 60_000)
     });
   }
 
   return {
-    releasedTerminal: terminalRelease.meta.changes ?? 0,
-    stuckPending: stuck.results.length
+    releasedTerminal: terminalRelease.length,
+    stuckPending: stuck.length
   };
 }
 
 // ---- Internals ----
 
 async function fetchPayout(deps: AppDeps, id: string): Promise<Payout | null> {
-  const row = await deps.db.prepare("SELECT * FROM payouts WHERE id = ?").bind(id).first<PayoutRow>();
-  return row ? rowToPayout(row) : null;
+  const [row] = await deps.db.select().from(payouts).where(eq(payouts.id, id)).limit(1);
+  return row ? drizzleRowToPayout(row) : null;
 }
 
 // Atomic fee-wallet selection: pick any active, unreserved wallet on this
@@ -507,23 +531,24 @@ async function tryReserveFeeWallet(
 ): Promise<{ id: string; address: string; label: string } | null> {
   const now = deps.clock.now().getTime();
   for (let attempt = 0; attempt < FEE_WALLET_CAS_MAX_ATTEMPTS; attempt += 1) {
-    const candidate = await deps.db
-      .prepare(
-        "SELECT id, address, label FROM fee_wallets WHERE chain_id = ? AND active = 1 AND reserved_by_payout_id IS NULL LIMIT 1"
+    const [candidate] = await deps.db
+      .select({ id: feeWallets.id, address: feeWallets.address, label: feeWallets.label })
+      .from(feeWallets)
+      .where(
+        and(
+          eq(feeWallets.chainId, chainId),
+          eq(feeWallets.active, 1),
+          isNull(feeWallets.reservedByPayoutId)
+        )
       )
-      .bind(chainId)
-      .first<{ id: string; address: string; label: string }>();
+      .limit(1);
     if (!candidate) return null;
 
-    const claim = await deps.db
-      .prepare(
-        `UPDATE fee_wallets
-            SET reserved_by_payout_id = ?, reserved_at = ?
-          WHERE id = ? AND reserved_by_payout_id IS NULL
-          RETURNING id, address, label`
-      )
-      .bind(payoutId, now, candidate.id)
-      .first<{ id: string; address: string; label: string }>();
+    const [claim] = await deps.db
+      .update(feeWallets)
+      .set({ reservedByPayoutId: payoutId, reservedAt: now })
+      .where(and(eq(feeWallets.id, candidate.id), isNull(feeWallets.reservedByPayoutId)))
+      .returning({ id: feeWallets.id, address: feeWallets.address, label: feeWallets.label });
     if (claim) return claim;
     // CAS lost — someone else reserved this wallet between our SELECT and
     // UPDATE. Loop to pick the next free candidate.
@@ -531,15 +556,15 @@ async function tryReserveFeeWallet(
   return null;
 }
 
-// Returns the prepared statement without executing it, so callers can include
-// it in a `db.batch([...])` alongside the terminal status update. The two
-// writes must commit atomically — a crash between them strands the wallet.
+// Returns a Drizzle update builder without executing it, so callers can
+// include it in a `db.batch([...])` alongside the terminal status
+// update. The two writes must commit atomically — a crash between them
+// strands the wallet.
 function releaseFeeWalletStmt(deps: AppDeps, payoutId: string) {
   return deps.db
-    .prepare(
-      "UPDATE fee_wallets SET reserved_by_payout_id = NULL, reserved_at = NULL WHERE reserved_by_payout_id = ?"
-    )
-    .bind(payoutId);
+    .update(feeWallets)
+    .set({ reservedByPayoutId: null, reservedAt: null })
+    .where(eq(feeWallets.reservedByPayoutId, payoutId));
 }
 
 function feeWalletScope(chainAdapter: ChainAdapter, label: string): SignerScope {

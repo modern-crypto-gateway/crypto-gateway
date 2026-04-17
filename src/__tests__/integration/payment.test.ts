@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { eq, sql } from "drizzle-orm";
+import { invoices, transactions } from "../../db/schema.js";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
 import { ingestDetectedTransfer, confirmTransactions } from "../../core/domain/payment.service.js";
 import { bootTestApp, createInvoiceViaApi, type BootedTestApp } from "../helpers/boot.js";
@@ -51,10 +53,11 @@ describe("PaymentService.ingestDetectedTransfer", () => {
     expect(events).toContain("invoice.detected");
 
     // Verify persisted row
-    const row = await booted.deps.db
-      .prepare("SELECT status, received_amount_raw FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ status: string; received_amount_raw: string }>();
+    const [row] = await booted.deps.db
+      .select({ status: invoices.status, received_amount_raw: invoices.receivedAmountRaw })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     expect(row?.status).toBe("detected");
     expect(row?.received_amount_raw).toBe("1000000");
   });
@@ -90,10 +93,11 @@ describe("PaymentService.ingestDetectedTransfer", () => {
     });
     expect(r2.invoiceStatusAfter).toBe("detected");
 
-    const row = await booted.deps.db
-      .prepare("SELECT received_amount_raw FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ received_amount_raw: string }>();
+    const [row] = await booted.deps.db
+      .select({ received_amount_raw: invoices.receivedAmountRaw })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     // 400 + 700 = 1100 (overpayment is accepted)
     expect(row?.received_amount_raw).toBe("1100");
   });
@@ -118,11 +122,12 @@ describe("PaymentService.ingestDetectedTransfer", () => {
     // One tx, immediately confirmed, covers the full amount -> invoice goes to confirmed.
     expect(result.invoiceStatusAfter).toBe("confirmed");
 
-    const row = await booted.deps.db
-      .prepare("SELECT confirmed_at FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ confirmed_at: number }>();
-    expect(row?.confirmed_at).toBeGreaterThan(0);
+    const [row] = await booted.deps.db
+      .select({ confirmed_at: invoices.confirmedAt })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
+    expect(row?.confirmed_at ?? 0).toBeGreaterThan(0);
   });
 
   it("is idempotent: ingesting the same (chainId, txHash, logIndex) twice returns inserted=false", async () => {
@@ -157,11 +162,11 @@ describe("PaymentService.ingestDetectedTransfer", () => {
     expect(r2.inserted).toBe(false);
 
     // Only one transactions row should exist for this hash.
-    const count = await booted.deps.db
-      .prepare("SELECT COUNT(*) AS n FROM transactions WHERE tx_hash = ?")
-      .bind("0xabc4")
-      .first<{ n: number }>();
-    expect(count?.n).toBe(1);
+    const [count] = await booted.deps.db
+      .select({ n: sql<number>`COUNT(*)` })
+      .from(transactions)
+      .where(eq(transactions.txHash, "0xabc4"));
+    expect(Number(count?.n)).toBe(1);
   });
 
   it("records orphan transfers (no matching invoice) with invoice_id = NULL", async () => {
@@ -181,10 +186,11 @@ describe("PaymentService.ingestDetectedTransfer", () => {
     expect(result.inserted).toBe(true);
     expect(result.invoiceId).toBeUndefined();
 
-    const row = await booted.deps.db
-      .prepare("SELECT invoice_id FROM transactions WHERE tx_hash = ?")
-      .bind("0xdeadbeef")
-      .first<{ invoice_id: string | null }>();
+    const [row] = await booted.deps.db
+      .select({ invoice_id: transactions.invoiceId })
+      .from(transactions)
+      .where(eq(transactions.txHash, "0xdeadbeef"))
+      .limit(1);
     expect(row?.invoice_id).toBeNull();
   });
 });
@@ -215,10 +221,11 @@ describe("PaymentService.confirmTransactions", () => {
         seenAt: new Date()
       });
 
-      const beforeSweep = await booted.deps.db
-        .prepare("SELECT status FROM invoices WHERE id = ?")
-        .bind(invoice.id)
-        .first<{ status: string }>();
+      const [beforeSweep] = await booted.deps.db
+        .select({ status: invoices.status })
+        .from(invoices)
+        .where(eq(invoices.id, invoice.id))
+        .limit(1);
       expect(beforeSweep?.status).toBe("detected");
 
       // Now tell the chain adapter this tx has enough confirmations.
@@ -232,10 +239,11 @@ describe("PaymentService.confirmTransactions", () => {
       expect(sweep.confirmed).toBe(1);
       expect(sweep.promotedInvoices).toBe(1);
 
-      const afterSweep = await booted.deps.db
-        .prepare("SELECT status, confirmed_at FROM invoices WHERE id = ?")
-        .bind(invoice.id)
-        .first<{ status: string; confirmed_at: number | null }>();
+      const [afterSweep] = await booted.deps.db
+        .select({ status: invoices.status, confirmed_at: invoices.confirmedAt })
+        .from(invoices)
+        .where(eq(invoices.id, invoice.id))
+        .limit(1);
       expect(afterSweep?.status).toBe("confirmed");
       expect(afterSweep?.confirmed_at).not.toBeNull();
 
@@ -274,19 +282,21 @@ describe("PaymentService.confirmTransactions", () => {
       const sweep = await confirmTransactions(booted.deps);
       expect(sweep.reverted).toBe(1);
 
-      const txRow = await booted.deps.db
-        .prepare("SELECT status FROM transactions WHERE tx_hash = ?")
-        .bind("0xrevert1")
-        .first<{ status: string }>();
+      const [txRow] = await booted.deps.db
+        .select({ status: transactions.status })
+        .from(transactions)
+        .where(eq(transactions.txHash, "0xrevert1"))
+        .limit(1);
       expect(txRow?.status).toBe("reverted");
 
       // Reverted tx no longer contributes -> total drops to 0. The invoice re-opens
       // (moves back to 'created') so new payments can still satisfy it before
       // the expiry window elapses.
-      const invoiceRow = await booted.deps.db
-        .prepare("SELECT status, received_amount_raw FROM invoices WHERE id = ?")
-        .bind(invoice.id)
-        .first<{ status: string; received_amount_raw: string }>();
+      const [invoiceRow] = await booted.deps.db
+        .select({ status: invoices.status, received_amount_raw: invoices.receivedAmountRaw })
+        .from(invoices)
+        .where(eq(invoices.id, invoice.id))
+        .limit(1);
       expect(invoiceRow?.received_amount_raw).toBe("0");
       expect(invoiceRow?.status).toBe("created");
     } finally {

@@ -1,17 +1,26 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { libsqlAdapter } from "../../adapters/db/libsql.adapter.js";
-import { loadMigrationsFromDir } from "../../adapters/db/fs-migration-loader.js";
-import { applyMigrations } from "../../adapters/db/migration-runner.js";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+import { migrate } from "drizzle-orm/libsql/migrator";
+import { createDb, createLibsqlClient } from "../../db/client.js";
 import {
   dbAlchemySubscriptionStore,
   type AlchemySubscriptionStore
 } from "../../adapters/detection/alchemy-subscription-store.js";
 
-async function freshStore(): Promise<{ store: AlchemySubscriptionStore; db: ReturnType<typeof libsqlAdapter> }> {
-  const db = libsqlAdapter({ url: ":memory:" });
-  const migrationsDir = new URL("../../../migrations/", import.meta.url);
-  await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
-  return { store: dbAlchemySubscriptionStore(db), db };
+async function freshStore(): Promise<{ store: AlchemySubscriptionStore }> {
+  const client = createLibsqlClient({ url: ":memory:" });
+  const db = createDb(client);
+  const migrationsFolder = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "..",
+    "drizzle",
+    "migrations"
+  );
+  await migrate(db, { migrationsFolder });
+  return { store: dbAlchemySubscriptionStore(db) };
 }
 
 describe("dbAlchemySubscriptionStore", () => {

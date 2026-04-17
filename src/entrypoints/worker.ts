@@ -1,4 +1,4 @@
-import type { D1Database, ExecutionContext, KVNamespace, RateLimit, ScheduledController } from "@cloudflare/workers-types";
+import type { ExecutionContext, KVNamespace, RateLimit, ScheduledController } from "@cloudflare/workers-types";
 import { buildApp } from "../app.js";
 import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
@@ -14,7 +14,7 @@ import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-s
 import { readAlchemyNotifyTokenFromEnv } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
-import { d1Adapter } from "../adapters/db/d1.adapter.js";
+import { createDb, createLibsqlClient } from "../db/client.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { waitUntilJobs } from "../adapters/jobs/wait-until.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
@@ -41,8 +41,14 @@ import { parseFinalityOverridesEnv } from "../core/domain/payment-config.js";
 
 export interface WorkerEnv {
   // Bindings declared in wrangler.jsonc
-  DB: D1Database;
   KV: KVNamespace;
+  // Turso (libSQL) connection — REQUIRED. No D1 fallback: D1's dependency on
+  // Durable Objects gives 10-15s cold-start tails under low traffic, which
+  // is unacceptable for a payment gateway. TURSO_URL points at the libSQL
+  // instance (typically `libsql://<db>-<org>.turso.io`) and TURSO_AUTH_TOKEN
+  // holds the database's auth token (set via `wrangler secret put`).
+  TURSO_URL: string;
+  TURSO_AUTH_TOKEN: string;
   // Cloudflare built-in rate-limit bindings. Each (scope, limit, period) is
   // declared in wrangler.jsonc. The adapter falls through to the cache-backed
   // limiter for any scope whose binding is absent, so operators can roll
@@ -189,11 +195,24 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     logger.warn("SECRETS_ENCRYPTION_KEY not set; using dev cipher (NOT safe for production)");
   }
 
-  // Alchemy subscription-sync sweep (9b) — only when ALCHEMY_NOTIFY_TOKEN
-  // (or the deprecated ALCHEMY_AUTH_TOKEN) is set AND a D1 binding is
-  // available. Same pattern as node.ts; both entrypoints compose the same
-  // adapter graph.
-  const db = d1Adapter(env.DB);
+  // Turso (libSQL) client — REQUIRED. The `@libsql/client` package
+  // auto-routes to `./web.js` on workerd via its conditional exports, giving
+  // us HTTP-only Turso access with no node:net deps. Migrations are applied
+  // CLI-side on Workers deploys (see README).
+  if (typeof env.TURSO_URL !== "string" || env.TURSO_URL.length === 0) {
+    throw new Error(
+      "TURSO_URL is required — set via `wrangler secret put TURSO_URL`. " +
+        "D1 is no longer supported (see the 2026-Q1 Turso migration note)."
+    );
+  }
+  if (typeof env.TURSO_AUTH_TOKEN !== "string" || env.TURSO_AUTH_TOKEN.length === 0) {
+    throw new Error(
+      "TURSO_AUTH_TOKEN is required — set via `wrangler secret put TURSO_AUTH_TOKEN`. " +
+        "Get it from `turso db tokens create <db-name>`."
+    );
+  }
+  const libsqlClient = createLibsqlClient({ url: env.TURSO_URL, authToken: env.TURSO_AUTH_TOKEN });
+  const db = createDb(libsqlClient);
   let alchemy: AppDeps["alchemy"];
   const alchemyNotifyToken = readAlchemyNotifyTokenFromEnv(env as unknown as Record<string, unknown>, logger);
   if (alchemyNotifyToken !== undefined) {

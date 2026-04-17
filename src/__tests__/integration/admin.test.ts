@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { feeWallets } from "../../db/schema.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 
 const ADMIN_KEY = "super-secret-admin-key";
@@ -121,9 +122,10 @@ describe("POST /admin/fee-wallets", () => {
     // Dev adapter's canonical form is lowercase.
     expect(body.feeWallet.address).toBe("0xaabbccddeeff00112233445566778899aabbccdd");
 
-    const walletRow = await booted.deps.db
-      .prepare("SELECT address, label FROM fee_wallets")
-      .first<{ address: string; label: string }>();
+    const [walletRow] = await booted.deps.db
+      .select({ address: feeWallets.address, label: feeWallets.label })
+      .from(feeWallets)
+      .limit(1);
     expect(walletRow?.label).toBe("hot-1");
 
     // Key is accessible via the SignerStore at the expected scope.

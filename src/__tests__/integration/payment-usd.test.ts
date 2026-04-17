@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { custom } from "viem";
+import { invoices, transactions } from "../../db/schema.js";
 import { evmChainAdapter } from "../../adapters/chains/evm/evm-chain.adapter.js";
 import { solanaChainAdapter, SOLANA_MAINNET_CHAIN_ID } from "../../adapters/chains/solana/solana-chain.adapter.js";
 import { tronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../adapters/chains/tron/tron-chain.adapter.js";
@@ -105,20 +107,27 @@ describe("USD-path ingest — single payment", () => {
     expect(result.inserted).toBe(true);
     expect(result.invoiceStatusAfter).toBe("confirmed");
 
-    const row = await booted.deps.db
-      .prepare("SELECT status, paid_usd, overpaid_usd, confirmed_at FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ status: string; paid_usd: string; overpaid_usd: string; confirmed_at: number | null }>();
+    const [row] = await booted.deps.db
+      .select({
+        status: invoices.status,
+        paid_usd: invoices.paidUsd,
+        overpaid_usd: invoices.overpaidUsd,
+        confirmed_at: invoices.confirmedAt
+      })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     expect(row?.status).toBe("confirmed");
     expect(row?.paid_usd).toBe("100.00");
     expect(row?.overpaid_usd).toBe("0");
     expect(row?.confirmed_at).not.toBeNull();
 
     // amount_usd + usd_rate are pinned on the tx row at detection.
-    const txRow = await booted.deps.db
-      .prepare("SELECT amount_usd, usd_rate FROM transactions WHERE invoice_id = ?")
-      .bind(invoice.id)
-      .first<{ amount_usd: string; usd_rate: string }>();
+    const [txRow] = await booted.deps.db
+      .select({ amount_usd: transactions.amountUsd, usd_rate: transactions.usdRate })
+      .from(transactions)
+      .where(eq(transactions.invoiceId, invoice.id))
+      .limit(1);
     expect(txRow?.amount_usd).toBe("100.00");
     expect(txRow?.usd_rate).toBe("1");
   });
@@ -157,10 +166,11 @@ describe("USD-path ingest — single payment", () => {
     });
     expect(r2.invoiceStatusAfter).toBe("confirmed");
 
-    const row = await booted.deps.db
-      .prepare("SELECT paid_usd FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ paid_usd: string }>();
+    const [row] = await booted.deps.db
+      .select({ paid_usd: invoices.paidUsd })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     expect(row?.paid_usd).toBe("50.00");
   });
 
@@ -184,10 +194,16 @@ describe("USD-path ingest — single payment", () => {
     });
     expect(result.invoiceStatusAfter).toBe("overpaid");
 
-    const row = await booted.deps.db
-      .prepare("SELECT status, paid_usd, overpaid_usd, confirmed_at FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ status: string; paid_usd: string; overpaid_usd: string; confirmed_at: number | null }>();
+    const [row] = await booted.deps.db
+      .select({
+        status: invoices.status,
+        paid_usd: invoices.paidUsd,
+        overpaid_usd: invoices.overpaidUsd,
+        confirmed_at: invoices.confirmedAt
+      })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     expect(row?.status).toBe("overpaid");
     expect(row?.paid_usd).toBe("40.00");
     expect(row?.overpaid_usd).toBe("15.00");
@@ -216,10 +232,11 @@ describe("USD-path ingest — single payment", () => {
     // Invoice stays on 'created' since nothing is confirmed yet.
     expect(result.invoiceStatusAfter).toBe("created");
 
-    const row = await booted.deps.db
-      .prepare("SELECT status, paid_usd FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ status: string; paid_usd: string }>();
+    const [row] = await booted.deps.db
+      .select({ status: invoices.status, paid_usd: invoices.paidUsd })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     expect(row?.status).toBe("created");
     expect(row?.paid_usd).toBe("0");
   });
@@ -288,10 +305,11 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
     });
     expect(last.invoiceStatusAfter).toBe("confirmed");
 
-    const row = await booted.deps.db
-      .prepare("SELECT status, paid_usd FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ status: string; paid_usd: string }>();
+    const [row] = await booted.deps.db
+      .select({ status: invoices.status, paid_usd: invoices.paidUsd })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     expect(row?.status).toBe("confirmed");
     expect(row?.paid_usd).toBe("90.00");
   });
@@ -318,10 +336,11 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
     });
     expect(result.invoiceStatusAfter).toBe("confirmed");
 
-    const txRow = await booted.deps.db
-      .prepare("SELECT amount_usd, usd_rate FROM transactions WHERE tx_hash = ?")
-      .bind("0x" + "44".repeat(32))
-      .first<{ amount_usd: string; usd_rate: string }>();
+    const [txRow] = await booted.deps.db
+      .select({ amount_usd: transactions.amountUsd, usd_rate: transactions.usdRate })
+      .from(transactions)
+      .where(eq(transactions.txHash, "0x" + "44".repeat(32)))
+      .limit(1);
     expect(txRow?.amount_usd).toBe("50.00");
     expect(txRow?.usd_rate).toBe("2500");
   });
@@ -348,16 +367,18 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
       seenAt: new Date()
     });
 
-    const txRow = await booted.deps.db
-      .prepare("SELECT amount_usd FROM transactions WHERE tx_hash = ?")
-      .bind("0x" + "55".repeat(32))
-      .first<{ amount_usd: string | null }>();
+    const [txRow] = await booted.deps.db
+      .select({ amount_usd: transactions.amountUsd })
+      .from(transactions)
+      .where(eq(transactions.txHash, "0x" + "55".repeat(32)))
+      .limit(1);
     expect(txRow?.amount_usd).toBeNull();
 
-    const invoiceRow = await booted.deps.db
-      .prepare("SELECT paid_usd, status FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ paid_usd: string; status: string }>();
+    const [invoiceRow] = await booted.deps.db
+      .select({ paid_usd: invoices.paidUsd, status: invoices.status })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     expect(invoiceRow?.paid_usd).toBe("0");
     expect(invoiceRow?.status).toBe("created");
   });
@@ -479,10 +500,14 @@ describe("rate-window refresh on detection past expiry", () => {
         acceptedFamilies: ["evm"]
       });
 
-      const before = await booted.deps.db
-        .prepare("SELECT rate_window_expires_at, rates_json FROM invoices WHERE id = ?")
-        .bind(invoice.id)
-        .first<{ rate_window_expires_at: number; rates_json: string }>();
+      const [before] = await booted.deps.db
+        .select({
+          rate_window_expires_at: invoices.rateWindowExpiresAt,
+          rates_json: invoices.ratesJson
+        })
+        .from(invoices)
+        .where(eq(invoices.id, invoice.id))
+        .limit(1);
       expect(before?.rate_window_expires_at).toBe(t0.getTime() + RATE_WINDOW_DURATION_MS);
 
       // Jump 11 minutes past creation — safely past the 10-minute window.
@@ -501,13 +526,14 @@ describe("rate-window refresh on detection past expiry", () => {
         seenAt: currentNow
       });
 
-      const after = await booted.deps.db
-        .prepare("SELECT rate_window_expires_at FROM invoices WHERE id = ?")
-        .bind(invoice.id)
-        .first<{ rate_window_expires_at: number }>();
+      const [after] = await booted.deps.db
+        .select({ rate_window_expires_at: invoices.rateWindowExpiresAt })
+        .from(invoices)
+        .where(eq(invoices.id, invoice.id))
+        .limit(1);
       // New window starts at the ingest clock, not t0.
       expect(after?.rate_window_expires_at).toBe(currentNow.getTime() + RATE_WINDOW_DURATION_MS);
-      expect(after?.rate_window_expires_at).toBeGreaterThan(before!.rate_window_expires_at);
+      expect(after?.rate_window_expires_at ?? 0).toBeGreaterThan(before?.rate_window_expires_at ?? 0);
     } finally {
       await booted.close();
     }
@@ -526,10 +552,11 @@ describe("rate-window refresh on detection past expiry", () => {
         acceptedFamilies: ["evm"]
       });
 
-      const before = await booted.deps.db
-        .prepare("SELECT rate_window_expires_at FROM invoices WHERE id = ?")
-        .bind(invoice.id)
-        .first<{ rate_window_expires_at: number }>();
+      const [before] = await booted.deps.db
+        .select({ rate_window_expires_at: invoices.rateWindowExpiresAt })
+        .from(invoices)
+        .where(eq(invoices.id, invoice.id))
+        .limit(1);
 
       // 2 minutes in — well within the 10-minute window.
       currentNow = new Date(t0.getTime() + 2 * 60 * 1000);
@@ -547,10 +574,11 @@ describe("rate-window refresh on detection past expiry", () => {
         seenAt: currentNow
       });
 
-      const after = await booted.deps.db
-        .prepare("SELECT rate_window_expires_at FROM invoices WHERE id = ?")
-        .bind(invoice.id)
-        .first<{ rate_window_expires_at: number }>();
+      const [after] = await booted.deps.db
+        .select({ rate_window_expires_at: invoices.rateWindowExpiresAt })
+        .from(invoices)
+        .where(eq(invoices.id, invoice.id))
+        .limit(1);
       expect(after?.rate_window_expires_at).toBe(before?.rate_window_expires_at);
     } finally {
       await booted.close();

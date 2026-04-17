@@ -1,4 +1,6 @@
-import type { DbAdapter } from "../../core/ports/db.port.js";
+import { asc, eq } from "drizzle-orm";
+import type { Db } from "../../db/client.js";
+import { alchemyWebhookRegistry } from "../../db/schema.js";
 
 // Per-chain Alchemy webhook registry. Persists the { chainId, webhookId,
 // signingKeyCiphertext, webhookUrl } tuple so the inbound /webhooks/alchemy
@@ -46,65 +48,65 @@ export interface AlchemyRegistryStore {
   list(): Promise<readonly AlchemyWebhookRegistryRow[]>;
 }
 
-interface Row {
-  chain_id: number;
-  webhook_id: string;
-  signing_key_ciphertext: string;
-  webhook_url: string;
-  created_at: number;
-  updated_at: number;
-}
-
-function rowToRegistry(row: Row): AlchemyWebhookRegistryRow {
+function drizzleRowToRegistry(row: typeof alchemyWebhookRegistry.$inferSelect): AlchemyWebhookRegistryRow {
   return {
-    chainId: row.chain_id,
-    webhookId: row.webhook_id,
-    signingKeyCiphertext: row.signing_key_ciphertext,
-    webhookUrl: row.webhook_url,
-    createdAt: new Date(row.created_at),
-    updatedAt: new Date(row.updated_at)
+    chainId: row.chainId,
+    webhookId: row.webhookId,
+    signingKeyCiphertext: row.signingKeyCiphertext,
+    webhookUrl: row.webhookUrl,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt)
   };
 }
 
-export function dbAlchemyRegistryStore(db: DbAdapter): AlchemyRegistryStore {
+export function dbAlchemyRegistryStore(db: Db): AlchemyRegistryStore {
   return {
     async findByWebhookId(webhookId) {
-      const row = await db
-        .prepare("SELECT * FROM alchemy_webhook_registry WHERE webhook_id = ?")
-        .bind(webhookId)
-        .first<Row>();
-      return row === null ? null : rowToRegistry(row);
+      const [row] = await db
+        .select()
+        .from(alchemyWebhookRegistry)
+        .where(eq(alchemyWebhookRegistry.webhookId, webhookId))
+        .limit(1);
+      return row ? drizzleRowToRegistry(row) : null;
     },
 
     async findByChainId(chainId) {
-      const row = await db
-        .prepare("SELECT * FROM alchemy_webhook_registry WHERE chain_id = ?")
-        .bind(chainId)
-        .first<Row>();
-      return row === null ? null : rowToRegistry(row);
+      const [row] = await db
+        .select()
+        .from(alchemyWebhookRegistry)
+        .where(eq(alchemyWebhookRegistry.chainId, chainId))
+        .limit(1);
+      return row ? drizzleRowToRegistry(row) : null;
     },
 
     async upsert({ chainId, webhookId, signingKeyCiphertext, webhookUrl, now }) {
       await db
-        .prepare(
-          `INSERT INTO alchemy_webhook_registry
-             (chain_id, webhook_id, signing_key_ciphertext, webhook_url, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(chain_id) DO UPDATE
-             SET webhook_id = excluded.webhook_id,
-                 signing_key_ciphertext = excluded.signing_key_ciphertext,
-                 webhook_url = excluded.webhook_url,
-                 updated_at = excluded.updated_at`
-        )
-        .bind(chainId, webhookId, signingKeyCiphertext, webhookUrl, now, now)
-        .run();
+        .insert(alchemyWebhookRegistry)
+        .values({
+          chainId,
+          webhookId,
+          signingKeyCiphertext,
+          webhookUrl,
+          createdAt: now,
+          updatedAt: now
+        })
+        .onConflictDoUpdate({
+          target: alchemyWebhookRegistry.chainId,
+          set: {
+            webhookId,
+            signingKeyCiphertext,
+            webhookUrl,
+            updatedAt: now
+          }
+        });
     },
 
     async list() {
-      const result = await db
-        .prepare("SELECT * FROM alchemy_webhook_registry ORDER BY chain_id ASC")
-        .all<Row>();
-      return result.results.map(rowToRegistry);
+      const rows = await db
+        .select()
+        .from(alchemyWebhookRegistry)
+        .orderBy(asc(alchemyWebhookRegistry.chainId));
+      return rows.map(drizzleRowToRegistry);
     }
   };
 }

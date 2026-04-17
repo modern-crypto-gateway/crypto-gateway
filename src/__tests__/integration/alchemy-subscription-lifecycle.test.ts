@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { and, eq, sql } from "drizzle-orm";
+import { alchemyAddressSubscriptions } from "../../db/schema.js";
 import { initializePool, refillFamily } from "../../core/domain/pool.service.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
+
+async function countSubs(booted: BootedTestApp, where: ReturnType<typeof and>): Promise<number> {
+  const [row] = await booted.deps.db
+    .select({ cnt: sql<number>`COUNT(*)` })
+    .from(alchemyAddressSubscriptions)
+    .where(where);
+  return Number(row?.cnt ?? 0);
+}
 
 // Pool-driven Alchemy subscription tracking (post-A1 rewrite). Subscription
 // rows are tied to pool lifecycle — not invoice lifecycle — so one EVM pool
@@ -33,18 +43,16 @@ describe("alchemy subscription tracker — pool-driven enqueue", () => {
     await initializePool(booted.deps, { families: ["evm"], initialSize: 2 });
     await booted.deps.jobs.drain(500);
 
-    const rowsForChain1 = await booted.deps.db
-      .prepare(
-        "SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions WHERE chain_id = 1 AND action = 'add'"
-      )
-      .first<{ cnt: number }>();
-    const rowsForChain137 = await booted.deps.db
-      .prepare(
-        "SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions WHERE chain_id = 137 AND action = 'add'"
-      )
-      .first<{ cnt: number }>();
-    expect(rowsForChain1?.cnt).toBe(2);
-    expect(rowsForChain137?.cnt).toBe(2);
+    const rowsForChain1 = await countSubs(
+      booted,
+      and(eq(alchemyAddressSubscriptions.chainId, 1), eq(alchemyAddressSubscriptions.action, "add"))
+    );
+    const rowsForChain137 = await countSubs(
+      booted,
+      and(eq(alchemyAddressSubscriptions.chainId, 137), eq(alchemyAddressSubscriptions.action, "add"))
+    );
+    expect(rowsForChain1).toBe(2);
+    expect(rowsForChain137).toBe(2);
   });
 
   it("does NOT enqueue Solana rows when only EVM family was added", async () => {
@@ -53,12 +61,8 @@ describe("alchemy subscription tracker — pool-driven enqueue", () => {
     await initializePool(booted.deps, { families: ["evm"], initialSize: 1 });
     await booted.deps.jobs.drain(500);
 
-    const rowsForSolana = await booted.deps.db
-      .prepare(
-        "SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions WHERE chain_id = 900"
-      )
-      .first<{ cnt: number }>();
-    expect(rowsForSolana?.cnt).toBe(0);
+    const rowsForSolana = await countSubs(booted, eq(alchemyAddressSubscriptions.chainId, 900));
+    expect(rowsForSolana).toBe(0);
   });
 
   it("emits nothing when alchemySubscribableChainsByFamily is absent (alchemy not configured)", async () => {
@@ -66,10 +70,10 @@ describe("alchemy subscription tracker — pool-driven enqueue", () => {
     try {
       await refillFamily(noAlchemy.deps, "evm", 1);
       await noAlchemy.deps.jobs.drain(500);
-      const rows = await noAlchemy.deps.db
-        .prepare("SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions")
-        .first<{ cnt: number }>();
-      expect(rows?.cnt).toBe(0);
+      const [rows] = await noAlchemy.deps.db
+        .select({ cnt: sql<number>`COUNT(*)` })
+        .from(alchemyAddressSubscriptions);
+      expect(Number(rows?.cnt ?? 0)).toBe(0);
     } finally {
       await noAlchemy.close();
     }
@@ -82,10 +86,8 @@ describe("alchemy subscription tracker — pool-driven enqueue", () => {
     await initializePool(booted.deps, { families: ["evm"], initialSize: 1 });
     await booted.deps.jobs.drain(500);
 
-    const rowsForChain10 = await booted.deps.db
-      .prepare("SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions WHERE chain_id = 10")
-      .first<{ cnt: number }>();
-    expect(rowsForChain10?.cnt).toBe(0);
+    const rowsForChain10 = await countSubs(booted, eq(alchemyAddressSubscriptions.chainId, 10));
+    expect(rowsForChain10).toBe(0);
   });
 });
 

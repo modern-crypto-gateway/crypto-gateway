@@ -13,7 +13,7 @@ import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-s
 import { readAlchemyNotifyToken } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
-import { libsqlAdapter } from "../adapters/db/libsql.adapter.js";
+import { createDb, createLibsqlClient } from "../db/client.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { promiseSetJobs } from "../adapters/jobs/promise-set.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
@@ -47,11 +47,16 @@ async function getDeps(): Promise<AppDeps> {
   const existing = cachedDeps;
   if (existing !== null) return existing;
   const secrets = processEnvSecrets();
-  const databaseUrl = secrets.getRequired("DATABASE_URL");
-  const dbAuthToken = secrets.getOptional("DATABASE_TOKEN");
-  const db = libsqlAdapter(
+  // TURSO_URL is the canonical post-Turso-pivot name; DATABASE_URL remains an
+  // alias for one release cycle. Edge runtime has no filesystem, so migrations
+  // are applied CLI-side via `npx drizzle-kit push` rather than at boot.
+  const databaseUrl = secrets.getOptional("TURSO_URL") ?? secrets.getRequired("DATABASE_URL");
+  const dbAuthToken =
+    secrets.getOptional("TURSO_AUTH_TOKEN") ?? secrets.getOptional("DATABASE_TOKEN");
+  const libsqlClient = createLibsqlClient(
     dbAuthToken !== undefined ? { url: databaseUrl, authToken: dbAuthToken } : { url: databaseUrl }
   );
+  const db = createDb(libsqlClient);
   const alertWebhookUrl = secrets.getOptional("ALERT_WEBHOOK_URL");
   const alertAuthHeader = secrets.getOptional("ALERT_WEBHOOK_AUTH_HEADER");
   const alertSink = alertWebhookUrl !== undefined

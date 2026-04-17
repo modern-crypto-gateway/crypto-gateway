@@ -1,6 +1,6 @@
 import type { CacheStore } from "./ports/cache.port.ts";
 import type { ChainAdapter } from "./ports/chain.port.ts";
-import type { DbAdapter } from "./ports/db.port.ts";
+import type { Db } from "../db/client.ts";
 import type { DetectionStrategy } from "./ports/detection.port.ts";
 import type { JobRunner } from "./ports/jobs.port.ts";
 import type { Logger } from "./ports/logger.port.ts";
@@ -21,7 +21,8 @@ import type { EventBus } from "./events/event-bus.port.ts";
 // Every field is a port interface — never a concrete class. That is the whole
 // point: swapping D1 for libSQL is changing one line in one entrypoint.
 export interface AppDeps {
-  readonly db: DbAdapter;
+  // Typed Drizzle db over libSQL.
+  readonly db: Db;
   readonly cache: CacheStore;
   readonly jobs: JobRunner;
   readonly secrets: SecretsProvider;
@@ -78,25 +79,19 @@ export interface AppDeps {
   // nothing (correctly, since there's nowhere to sync it to).
   readonly alchemySubscribableChainsByFamily?: Readonly<Partial<Record<ChainFamily, readonly number[]>>>;
 
-  // Pre-loaded migration set. Populated on runtimes with filesystem access
-  // (Node/Deno read the /migrations directory at boot) so the /admin/migrate
-  // endpoint can re-apply them on demand. Absent on Workers/Vercel-Edge,
-  // where migrations ship via `wrangler d1 migrations apply` / the Turso
-  // migration CLI — the endpoint returns 501 when this field is missing.
-  readonly migrations?: readonly MigrationEntry[];
+  // Absolute path to the Drizzle migrations folder (contains
+  // `0000_initial.sql` + `meta/_journal.json`). Populated on runtimes with
+  // filesystem access (Node/Deno) so the `/admin/migrate` endpoint can
+  // re-run Drizzle's migrator on demand. Absent on Workers/Vercel-Edge,
+  // where migrations are applied CLI-side via `npx drizzle-kit push` —
+  // the endpoint returns 501 when this field is missing.
+  readonly migrationsFolder?: string;
 
   // Per-chain confirmation-threshold overrides. Takes precedence over the
   // shipped `DEFAULT_CONFIRMATION_THRESHOLDS` — populated from the
   // FINALITY_OVERRIDES env var (e.g. "1:20,137:64"). Empty / undefined means
   // fall back to the defaults.
   readonly confirmationThresholds?: Readonly<Record<number, number>>;
-}
-
-// Mirrors `adapters/db/migration-runner.ts Migration` — duplicated here so
-// core/ doesn't import from adapter/. The runner references this shape too.
-export interface MigrationEntry {
-  readonly id: string;
-  readonly sql: string;
 }
 
 // Per-surface rate-limit caps. Populated from AppConfig by the entrypoint so

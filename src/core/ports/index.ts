@@ -1,5 +1,4 @@
 export type { ChainAdapter } from "./chain.port.js";
-export type { DbAdapter, PreparedStatement, QueryMeta, AllResult, RunResult, BatchResult } from "./db.port.js";
 export type { CacheStore, CacheListResult } from "./cache.port.js";
 export type { JobRunner } from "./jobs.port.js";
 export type { SecretsProvider } from "./secrets.port.js";

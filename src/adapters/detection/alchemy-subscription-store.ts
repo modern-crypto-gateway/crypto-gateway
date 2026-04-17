@@ -1,4 +1,6 @@
-import type { DbAdapter } from "../../core/ports/db.port.js";
+import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import type { Db } from "../../db/client.js";
+import { alchemyAddressSubscriptions } from "../../db/schema.js";
 
 // Alchemy address-subscription queue store. Each row is one pending/synced/failed
 // `add` or `remove` operation against a webhook's watched-addresses set. The
@@ -48,46 +50,37 @@ export interface AlchemySubscriptionStore {
   countByStatus(): Promise<Record<SubscriptionStatus, number>>;
 }
 
-interface RawRow {
-  id: string;
-  chain_id: number;
-  address: string;
-  action: string;
-  status: string;
-  attempts: number;
-  last_attempt_at: number | null;
-  last_error: string | null;
-  created_at: number;
-  updated_at: number;
-}
-
-function rowToSubscription(row: RawRow): SubscriptionRow {
+function drizzleRowToSubscription(row: typeof alchemyAddressSubscriptions.$inferSelect): SubscriptionRow {
   return {
     id: row.id,
-    chainId: row.chain_id,
+    chainId: row.chainId,
     address: row.address,
-    action: row.action as SubscriptionAction,
-    status: row.status as SubscriptionStatus,
+    action: row.action,
+    status: row.status,
     attempts: row.attempts,
-    lastAttemptAt: row.last_attempt_at === null ? null : new Date(row.last_attempt_at),
-    lastError: row.last_error,
-    createdAt: new Date(row.created_at),
-    updatedAt: new Date(row.updated_at)
+    lastAttemptAt: row.lastAttemptAt === null ? null : new Date(row.lastAttemptAt),
+    lastError: row.lastError,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt)
   };
 }
 
-export function dbAlchemySubscriptionStore(db: DbAdapter): AlchemySubscriptionStore {
+export function dbAlchemySubscriptionStore(db: Db): AlchemySubscriptionStore {
   return {
     async insertPending({ chainId, address, action, now }) {
       const id = globalThis.crypto.randomUUID();
-      await db
-        .prepare(
-          `INSERT INTO alchemy_address_subscriptions
-             (id, chain_id, address, action, status, attempts, last_attempt_at, last_error, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'pending', 0, NULL, NULL, ?, ?)`
-        )
-        .bind(id, chainId, address, action, now, now)
-        .run();
+      await db.insert(alchemyAddressSubscriptions).values({
+        id,
+        chainId,
+        address,
+        action,
+        status: "pending",
+        attempts: 0,
+        lastAttemptAt: null,
+        lastError: null,
+        createdAt: now,
+        updatedAt: now
+      });
       return id;
     },
 
@@ -99,76 +92,78 @@ export function dbAlchemySubscriptionStore(db: DbAdapter): AlchemySubscriptionSt
       // invocation runs at a time, so fine; a transactional claim is a Phase
       // 10+ concern when we have multiple horizontally scaled workers.
       const threshold = now - backoffMs;
-      const result = await db
-        .prepare(
-          `SELECT * FROM alchemy_address_subscriptions
-            WHERE status = 'pending'
-              AND (last_attempt_at IS NULL OR last_attempt_at <= ?)
-            ORDER BY chain_id ASC, created_at ASC
-            LIMIT ?`
+      const rows = await db
+        .select()
+        .from(alchemyAddressSubscriptions)
+        .where(
+          and(
+            eq(alchemyAddressSubscriptions.status, "pending"),
+            or(
+              isNull(alchemyAddressSubscriptions.lastAttemptAt),
+              lte(alchemyAddressSubscriptions.lastAttemptAt, threshold)
+            )
+          )
         )
-        .bind(threshold, limit)
-        .all<RawRow>();
-      return result.results.map(rowToSubscription);
+        .orderBy(asc(alchemyAddressSubscriptions.chainId), asc(alchemyAddressSubscriptions.createdAt))
+        .limit(limit);
+      return rows.map(drizzleRowToSubscription);
     },
 
     async markSynced(ids, now) {
       if (ids.length === 0) return;
-      const placeholders = ids.map(() => "?").join(",");
       await db
-        .prepare(
-          `UPDATE alchemy_address_subscriptions
-              SET status = 'synced', updated_at = ?, last_error = NULL
-            WHERE id IN (${placeholders})`
-        )
-        .bind(now, ...ids)
-        .run();
+        .update(alchemyAddressSubscriptions)
+        .set({
+          status: "synced",
+          updatedAt: now,
+          lastError: null
+        })
+        .where(inArray(alchemyAddressSubscriptions.id, ids as string[]));
     },
 
     async markAttempted({ ids, now, error, maxAttempts }) {
       if (ids.length === 0) return;
-      const placeholders = ids.map(() => "?").join(",");
       // Bump attempts + record error. Promote to 'failed' when attempts
       // reach maxAttempts — the row stops retrying, operator gets to decide
       // whether to reset it or delete the webhook+address pair upstream.
       await db
-        .prepare(
-          `UPDATE alchemy_address_subscriptions
-              SET attempts = attempts + 1,
-                  last_attempt_at = ?,
-                  last_error = ?,
-                  updated_at = ?,
-                  status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE status END
-            WHERE id IN (${placeholders})`
-        )
-        .bind(now, error.slice(0, 2048), now, maxAttempts, ...ids)
-        .run();
+        .update(alchemyAddressSubscriptions)
+        .set({
+          attempts: sql`${alchemyAddressSubscriptions.attempts} + 1`,
+          lastAttemptAt: now,
+          lastError: error.slice(0, 2048),
+          updatedAt: now,
+          status: sql`CASE WHEN ${alchemyAddressSubscriptions.attempts} + 1 >= ${maxAttempts} THEN 'failed' ELSE ${alchemyAddressSubscriptions.status} END`
+        })
+        .where(inArray(alchemyAddressSubscriptions.id, ids as string[]));
     },
 
     async findByAddress(chainId, address) {
-      const result = await db
-        .prepare(
-          `SELECT * FROM alchemy_address_subscriptions
-            WHERE chain_id = ? AND address = ?
-            ORDER BY created_at ASC`
+      const rows = await db
+        .select()
+        .from(alchemyAddressSubscriptions)
+        .where(
+          and(
+            eq(alchemyAddressSubscriptions.chainId, chainId),
+            eq(alchemyAddressSubscriptions.address, address)
+          )
         )
-        .bind(chainId, address)
-        .all<RawRow>();
-      return result.results.map(rowToSubscription);
+        .orderBy(asc(alchemyAddressSubscriptions.createdAt));
+      return rows.map(drizzleRowToSubscription);
     },
 
     async countByStatus() {
-      const result = await db
-        .prepare(
-          `SELECT status, COUNT(*) AS n
-             FROM alchemy_address_subscriptions
-            GROUP BY status`
-        )
-        .all<{ status: string; n: number }>();
+      const rows = await db
+        .select({
+          status: alchemyAddressSubscriptions.status,
+          n: sql<number>`COUNT(*)`
+        })
+        .from(alchemyAddressSubscriptions)
+        .groupBy(alchemyAddressSubscriptions.status);
       const out: Record<SubscriptionStatus, number> = { pending: 0, synced: 0, failed: 0 };
-      for (const row of result.results) {
+      for (const row of rows) {
         if (row.status === "pending" || row.status === "synced" || row.status === "failed") {
-          out[row.status] = row.n;
+          out[row.status] = Number(row.n);
         }
       }
       return out;

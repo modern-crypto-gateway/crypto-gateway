@@ -1,7 +1,9 @@
+import { eq } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainFamily } from "../types/chain.js";
 import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
 import type { TokenSymbol } from "../types/token.js";
+import { invoices } from "../../db/schema.js";
 
 // 10-minute rolling rate window for USD-path invoices.
 //
@@ -97,11 +99,13 @@ export async function refreshIfExpired(
   }
   const snapshot = await snapshotRates(deps, tokensForFamilies(acceptedFamilies));
   await deps.db
-    .prepare(
-      "UPDATE invoices SET rates_json = ?, rate_window_expires_at = ?, updated_at = ? WHERE id = ?"
-    )
-    .bind(JSON.stringify(snapshot.rates), snapshot.expiresAt, now, invoiceId)
-    .run();
+    .update(invoices)
+    .set({
+      ratesJson: JSON.stringify(snapshot.rates),
+      rateWindowExpiresAt: snapshot.expiresAt,
+      updatedAt: now
+    })
+    .where(eq(invoices.id, invoiceId));
   return snapshot.rates;
 }
 

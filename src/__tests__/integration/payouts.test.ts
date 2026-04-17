@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { asc, sql } from "drizzle-orm";
+import { feeWallets, payouts } from "../../db/schema.js";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
 import {
   confirmPayouts,
@@ -119,17 +121,19 @@ describe("PayoutService.executeReservedPayouts", () => {
       const result = await executeReservedPayouts(booted.deps);
       expect(result).toEqual({ attempted: 1, submitted: 1, failed: 0, deferred: 0 });
 
-      const row = await booted.deps.db
-        .prepare("SELECT status, tx_hash, source_address FROM payouts LIMIT 1")
-        .first<{ status: string; tx_hash: string; source_address: string }>();
+      const [row] = await booted.deps.db
+        .select({ status: payouts.status, tx_hash: payouts.txHash, source_address: payouts.sourceAddress })
+        .from(payouts)
+        .limit(1);
       expect(row?.status).toBe("submitted");
       expect(row?.tx_hash).toMatch(/^0x[0-9a-f]{64}$/);
       expect(row?.source_address).toBe("0x1111111111111111111111111111111111111111");
 
       // Fee wallet is still reserved by this payout (no confirmation yet).
-      const wallet = await booted.deps.db
-        .prepare("SELECT reserved_by_payout_id FROM fee_wallets LIMIT 1")
-        .first<{ reserved_by_payout_id: string | null }>();
+      const [wallet] = await booted.deps.db
+        .select({ reserved_by_payout_id: feeWallets.reservedByPayoutId })
+        .from(feeWallets)
+        .limit(1);
       expect(wallet?.reserved_by_payout_id).not.toBeNull();
     } finally {
       await booted.close();
@@ -153,9 +157,10 @@ describe("PayoutService.executeReservedPayouts", () => {
       const result = await executeReservedPayouts(booted.deps);
       expect(result).toEqual({ attempted: 1, submitted: 0, failed: 0, deferred: 1 });
 
-      const row = await booted.deps.db
-        .prepare("SELECT status FROM payouts LIMIT 1")
-        .first<{ status: string }>();
+      const [row] = await booted.deps.db
+        .select({ status: payouts.status })
+        .from(payouts)
+        .limit(1);
       expect(row?.status).toBe("planned");
     } finally {
       await booted.close();
@@ -194,9 +199,10 @@ describe("PayoutService.executeReservedPayouts", () => {
       expect(result).toEqual({ attempted: 2, submitted: 1, failed: 0, deferred: 1 });
 
       const counts = await booted.deps.db
-        .prepare("SELECT status, COUNT(*) as n FROM payouts GROUP BY status")
-        .all<{ status: string; n: number }>();
-      const byStatus = Object.fromEntries(counts.results.map((r) => [r.status, r.n]));
+        .select({ status: payouts.status, n: sql<number>`COUNT(*)` })
+        .from(payouts)
+        .groupBy(payouts.status);
+      const byStatus = Object.fromEntries(counts.map((r) => [r.status, Number(r.n)]));
       expect(byStatus).toEqual({ planned: 1, submitted: 1 });
     } finally {
       await booted.close();
@@ -231,16 +237,18 @@ describe("PayoutService.executeReservedPayouts", () => {
       const result = await executeReservedPayouts(booted.deps);
       expect(result).toEqual({ attempted: 1, submitted: 0, failed: 1, deferred: 0 });
 
-      const row = await booted.deps.db
-        .prepare("SELECT status, last_error FROM payouts LIMIT 1")
-        .first<{ status: string; last_error: string }>();
+      const [row] = await booted.deps.db
+        .select({ status: payouts.status, last_error: payouts.lastError })
+        .from(payouts)
+        .limit(1);
       expect(row?.status).toBe("failed");
       expect(row?.last_error).toContain("simulated broadcast failure");
 
       // The fee wallet must be released so future retries can use it.
-      const wallet = await booted.deps.db
-        .prepare("SELECT reserved_by_payout_id FROM fee_wallets LIMIT 1")
-        .first<{ reserved_by_payout_id: string | null }>();
+      const [wallet] = await booted.deps.db
+        .select({ reserved_by_payout_id: feeWallets.reservedByPayoutId })
+        .from(feeWallets)
+        .limit(1);
       expect(wallet?.reserved_by_payout_id).toBeNull();
     } finally {
       await booted.close();
@@ -270,11 +278,12 @@ describe("PayoutService.confirmPayouts", () => {
       await executeReservedPayouts(booted.deps);
 
       // Read back the deterministic tx hash to drive the sweeper.
-      const row = await booted.deps.db
-        .prepare("SELECT tx_hash FROM payouts LIMIT 1")
-        .first<{ tx_hash: string }>();
+      const [row] = await booted.deps.db
+        .select({ tx_hash: payouts.txHash })
+        .from(payouts)
+        .limit(1);
       expect(row?.tx_hash).toBeTruthy();
-      confirmations.set(row!.tx_hash, { blockNumber: 100, confirmations: 5, reverted: false });
+      confirmations.set(row!.tx_hash!, { blockNumber: 100, confirmations: 5, reverted: false });
 
       const events: string[] = [];
       booted.deps.events.subscribeAll((e) => { events.push(e.type); });
@@ -282,15 +291,17 @@ describe("PayoutService.confirmPayouts", () => {
       const sweep = await confirmPayouts(booted.deps);
       expect(sweep).toEqual({ checked: 1, confirmed: 1, failed: 0 });
 
-      const after = await booted.deps.db
-        .prepare("SELECT status, confirmed_at FROM payouts LIMIT 1")
-        .first<{ status: string; confirmed_at: number | null }>();
+      const [after] = await booted.deps.db
+        .select({ status: payouts.status, confirmed_at: payouts.confirmedAt })
+        .from(payouts)
+        .limit(1);
       expect(after?.status).toBe("confirmed");
       expect(after?.confirmed_at).not.toBeNull();
 
-      const wallet = await booted.deps.db
-        .prepare("SELECT reserved_by_payout_id FROM fee_wallets LIMIT 1")
-        .first<{ reserved_by_payout_id: string | null }>();
+      const [wallet] = await booted.deps.db
+        .select({ reserved_by_payout_id: feeWallets.reservedByPayoutId })
+        .from(feeWallets)
+        .limit(1);
       expect(wallet?.reserved_by_payout_id).toBeNull();
 
       expect(events).toContain("payout.confirmed");
@@ -318,23 +329,26 @@ describe("PayoutService.confirmPayouts", () => {
         destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       });
       await executeReservedPayouts(booted.deps);
-      const row = await booted.deps.db
-        .prepare("SELECT tx_hash FROM payouts LIMIT 1")
-        .first<{ tx_hash: string }>();
-      confirmations.set(row!.tx_hash, { blockNumber: 100, confirmations: 5, reverted: true });
+      const [row] = await booted.deps.db
+        .select({ tx_hash: payouts.txHash })
+        .from(payouts)
+        .limit(1);
+      confirmations.set(row!.tx_hash!, { blockNumber: 100, confirmations: 5, reverted: true });
 
       const sweep = await confirmPayouts(booted.deps);
       expect(sweep).toEqual({ checked: 1, confirmed: 0, failed: 1 });
 
-      const after = await booted.deps.db
-        .prepare("SELECT status, last_error FROM payouts LIMIT 1")
-        .first<{ status: string; last_error: string }>();
+      const [after] = await booted.deps.db
+        .select({ status: payouts.status, last_error: payouts.lastError })
+        .from(payouts)
+        .limit(1);
       expect(after?.status).toBe("failed");
       expect(after?.last_error).toContain("reverted");
 
-      const wallet = await booted.deps.db
-        .prepare("SELECT reserved_by_payout_id FROM fee_wallets LIMIT 1")
-        .first<{ reserved_by_payout_id: string | null }>();
+      const [wallet] = await booted.deps.db
+        .select({ reserved_by_payout_id: feeWallets.reservedByPayoutId })
+        .from(feeWallets)
+        .limit(1);
       expect(wallet?.reserved_by_payout_id).toBeNull();
     } finally {
       await booted.close();
@@ -362,10 +376,12 @@ describe("PayoutService.confirmPayouts", () => {
         destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       });
       await executeReservedPayouts(booted.deps);
-      const first = await booted.deps.db
-        .prepare("SELECT tx_hash FROM payouts ORDER BY created_at ASC LIMIT 1")
-        .first<{ tx_hash: string }>();
-      confirmations.set(first!.tx_hash, { blockNumber: 1, confirmations: 5, reverted: false });
+      const [first] = await booted.deps.db
+        .select({ tx_hash: payouts.txHash })
+        .from(payouts)
+        .orderBy(asc(payouts.createdAt))
+        .limit(1);
+      confirmations.set(first!.tx_hash!, { blockNumber: 1, confirmations: 5, reverted: false });
       await confirmPayouts(booted.deps);
 
       // Second payout: plan, submit. Should succeed — wallet was released.

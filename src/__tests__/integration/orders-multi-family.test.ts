@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { asc, eq, sql } from "drizzle-orm";
 import { custom } from "viem";
+import { addressPool, invoiceReceiveAddresses } from "../../db/schema.js";
 import { evmChainAdapter } from "../../adapters/chains/evm/evm-chain.adapter.js";
 import { solanaChainAdapter, SOLANA_MAINNET_CHAIN_ID } from "../../adapters/chains/solana/solana-chain.adapter.js";
 import { tronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../adapters/chains/tron/tron-chain.adapter.js";
@@ -137,12 +139,11 @@ describe("POST /api/v1/invoices — multi-family acceptance", () => {
     const body = (await res.json()) as { invoice: { id: string } };
 
     const rows = await booted.deps.db
-      .prepare(
-        "SELECT family, address FROM invoice_receive_addresses WHERE invoice_id = ? ORDER BY family ASC"
-      )
-      .bind(body.invoice.id)
-      .all<{ family: string; address: string }>();
-    expect(rows.results.map((r) => r.family)).toEqual(["evm", "tron"]);
+      .select({ family: invoiceReceiveAddresses.family, address: invoiceReceiveAddresses.address })
+      .from(invoiceReceiveAddresses)
+      .where(eq(invoiceReceiveAddresses.invoiceId, body.invoice.id))
+      .orderBy(asc(invoiceReceiveAddresses.family));
+    expect(rows.map((r) => r.family)).toEqual(["evm", "tron"]);
   });
 
   it("returns the invoiceId's pool rows to 'available' on expire (release-on-terminal)", async () => {
@@ -169,11 +170,11 @@ describe("POST /api/v1/invoices — multi-family acceptance", () => {
     );
     expect(expireRes.status).toBe(200);
 
-    const allocated = await booted.deps.db
-      .prepare("SELECT COUNT(*) AS cnt FROM address_pool WHERE allocated_to_invoice_id = ?")
-      .bind(invoice.id)
-      .first<{ cnt: number }>();
-    expect(allocated?.cnt).toBe(0);
+    const [allocated] = await booted.deps.db
+      .select({ cnt: sql<number>`COUNT(*)` })
+      .from(addressPool)
+      .where(eq(addressPool.allocatedToInvoiceId, invoice.id));
+    expect(Number(allocated?.cnt)).toBe(0);
   });
 });
 

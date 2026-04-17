@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { eq, sql } from "drizzle-orm";
+import { transactions } from "../../db/schema.js";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
 import { rpcPollDetection } from "../../adapters/detection/rpc-poll.adapter.js";
 import { ingestDetectedTransfer } from "../../core/domain/payment.service.js";
@@ -159,11 +161,11 @@ describe("pollPayments orchestrator", () => {
       expect(result.transfersFound).toBe(1);
       expect(result.transfersIngested).toBe(1);
 
-      const txRow = await booted.deps.db
-        .prepare("SELECT COUNT(*) AS n FROM transactions WHERE tx_hash = ?")
-        .bind("0xpoll1")
-        .first<{ n: number }>();
-      expect(txRow?.n).toBe(1);
+      const [txRow] = await booted.deps.db
+        .select({ n: sql<number>`COUNT(*)` })
+        .from(transactions)
+        .where(eq(transactions.txHash, "0xpoll1"));
+      expect(Number(txRow?.n)).toBe(1);
     } finally {
       await booted.close();
     }

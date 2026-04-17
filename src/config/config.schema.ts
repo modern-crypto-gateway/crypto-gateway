@@ -213,8 +213,11 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     solanaRpcUrl: env["SOLANA_RPC_URL"],
     solanaNetwork: env["SOLANA_NETWORK"],
     gatewayPublicUrl: env["GATEWAY_PUBLIC_URL"],
-    databaseUrl: env["DATABASE_URL"],
-    databaseToken: env["DATABASE_TOKEN"],
+    // Compulsory Turso post-2026-Q1; the env-var names reflect that.
+    // DATABASE_URL / DATABASE_TOKEN are still honored as aliases so existing
+    // local .env files keep working through one release cycle.
+    databaseUrl: env["TURSO_URL"] ?? env["DATABASE_URL"],
+    databaseToken: env["TURSO_AUTH_TOKEN"] ?? env["DATABASE_TOKEN"],
     redisUrl: env["REDIS_URL"],
     rateLimitMerchantPerMinute: env["RATE_LIMIT_MERCHANT_PER_MINUTE"],
     rateLimitCheckoutPerMinute: env["RATE_LIMIT_CHECKOUT_PER_MINUTE"],

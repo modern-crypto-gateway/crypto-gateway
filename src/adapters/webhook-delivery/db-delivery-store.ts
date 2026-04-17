@@ -1,4 +1,6 @@
-import type { DbAdapter } from "../../core/ports/db.port.js";
+import { and, asc, desc, eq, lte, sql } from "drizzle-orm";
+import type { Db } from "../../db/client.js";
+import { webhookDeliveries } from "../../db/schema.js";
 import type {
   InsertPendingArgs,
   MarkFailureArgs,
@@ -7,88 +9,68 @@ import type {
   WebhookDeliveryStore
 } from "../../core/ports/webhook-delivery-store.port.js";
 
-// SQL-backed outbox. `INSERT OR IGNORE` is used to dedupe by idempotency_key —
-// on SQLite that's the idiomatic "INSERT if not exists" and returns zero
-// changes when the row already exists, which we surface as `inserted: false`.
+// SQL-backed outbox. `INSERT … ON CONFLICT DO NOTHING` dedupes by
+// idempotency_key — Drizzle's `onConflictDoNothing()` plus a `RETURNING id`
+// reports whether the row was actually inserted vs. short-circuited by the
+// unique-violation.
 
-interface RawRow {
-  id: string;
-  merchant_id: string;
-  event_type: string;
-  idempotency_key: string;
-  payload_json: string;
-  target_url: string;
-  status: string;
-  attempts: number;
-  last_status_code: number | null;
-  last_error: string | null;
-  next_attempt_at: number;
-  delivered_at: number | null;
-  created_at: number;
-  updated_at: number;
-}
-
-function rowToRecord(row: RawRow): WebhookDeliveryRecord {
+function drizzleRowToRecord(row: typeof webhookDeliveries.$inferSelect): WebhookDeliveryRecord {
   return {
     id: row.id,
-    merchantId: row.merchant_id,
-    eventType: row.event_type,
-    idempotencyKey: row.idempotency_key,
-    payload: JSON.parse(row.payload_json) as Record<string, unknown>,
-    targetUrl: row.target_url,
+    merchantId: row.merchantId,
+    eventType: row.eventType,
+    idempotencyKey: row.idempotencyKey,
+    payload: JSON.parse(row.payloadJson) as Record<string, unknown>,
+    targetUrl: row.targetUrl,
     status: row.status as WebhookDeliveryStatus,
     attempts: row.attempts,
-    lastStatusCode: row.last_status_code,
-    lastError: row.last_error,
-    nextAttemptAt: row.next_attempt_at,
-    deliveredAt: row.delivered_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
+    lastStatusCode: row.lastStatusCode,
+    lastError: row.lastError,
+    nextAttemptAt: row.nextAttemptAt,
+    deliveredAt: row.deliveredAt,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
   };
 }
 
-export function dbWebhookDeliveryStore(db: DbAdapter): WebhookDeliveryStore {
+export function dbWebhookDeliveryStore(db: Db): WebhookDeliveryStore {
   return {
     async insertPending(args: InsertPendingArgs) {
-      const result = await db
-        .prepare(
-          `INSERT OR IGNORE INTO webhook_deliveries
-             (id, merchant_id, event_type, idempotency_key, payload_json, target_url,
-              status, attempts, last_status_code, last_error, next_attempt_at,
-              delivered_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, ?, NULL, ?, ?)`
-        )
-        .bind(
-          args.id,
-          args.merchantId,
-          args.eventType,
-          args.idempotencyKey,
-          JSON.stringify(args.payload),
-          args.targetUrl,
-          args.nextAttemptAt,
-          args.now,
-          args.now
-        )
-        .run();
-      // D1/libSQL return `meta.changes`; 0 means the idempotency_key collided
-      // with an existing row and the INSERT OR IGNORE short-circuited.
-      return { inserted: (result.meta.changes ?? 0) > 0 };
+      const inserted = await db
+        .insert(webhookDeliveries)
+        .values({
+          id: args.id,
+          merchantId: args.merchantId,
+          eventType: args.eventType,
+          idempotencyKey: args.idempotencyKey,
+          payloadJson: JSON.stringify(args.payload),
+          targetUrl: args.targetUrl,
+          status: "pending",
+          attempts: 0,
+          lastStatusCode: null,
+          lastError: null,
+          nextAttemptAt: args.nextAttemptAt,
+          deliveredAt: null,
+          createdAt: args.now,
+          updatedAt: args.now
+        })
+        .onConflictDoNothing()
+        .returning({ id: webhookDeliveries.id });
+      return { inserted: inserted.length > 0 };
     },
 
     async markDelivered({ id, statusCode, now }) {
       await db
-        .prepare(
-          `UPDATE webhook_deliveries
-              SET status = 'delivered',
-                  attempts = attempts + 1,
-                  last_status_code = ?,
-                  last_error = NULL,
-                  delivered_at = ?,
-                  updated_at = ?
-            WHERE id = ?`
-        )
-        .bind(statusCode, now, now, id)
-        .run();
+        .update(webhookDeliveries)
+        .set({
+          status: "delivered",
+          attempts: sql`${webhookDeliveries.attempts} + 1`,
+          lastStatusCode: statusCode,
+          lastError: null,
+          deliveredAt: now,
+          updatedAt: now
+        })
+        .where(eq(webhookDeliveries.id, id));
     },
 
     async markFailure(args: MarkFailureArgs) {
@@ -98,59 +80,46 @@ export function dbWebhookDeliveryStore(db: DbAdapter): WebhookDeliveryStore {
       // row is never re-picked.
       const nextAt = args.nextAttemptAt ?? args.now;
       await db
-        .prepare(
-          `UPDATE webhook_deliveries
-              SET status = ?,
-                  attempts = attempts + 1,
-                  last_status_code = ?,
-                  last_error = ?,
-                  next_attempt_at = ?,
-                  updated_at = ?
-            WHERE id = ?`
-        )
-        .bind(
+        .update(webhookDeliveries)
+        .set({
           status,
-          args.statusCode ?? null,
-          args.error.slice(0, 2000),
-          nextAt,
-          args.now,
-          args.id
-        )
-        .run();
+          attempts: sql`${webhookDeliveries.attempts} + 1`,
+          lastStatusCode: args.statusCode ?? null,
+          lastError: args.error.slice(0, 2000),
+          nextAttemptAt: nextAt,
+          updatedAt: args.now
+        })
+        .where(eq(webhookDeliveries.id, args.id));
     },
 
     async listDueForRetry({ now, limit }) {
       const rows = await db
-        .prepare(
-          `SELECT * FROM webhook_deliveries
-            WHERE status = 'pending' AND next_attempt_at <= ?
-            ORDER BY next_attempt_at ASC
-            LIMIT ?`
-        )
-        .bind(now, limit)
-        .all<RawRow>();
-      return rows.results.map(rowToRecord);
+        .select()
+        .from(webhookDeliveries)
+        .where(and(eq(webhookDeliveries.status, "pending"), lte(webhookDeliveries.nextAttemptAt, now)))
+        .orderBy(asc(webhookDeliveries.nextAttemptAt))
+        .limit(limit);
+      return rows.map(drizzleRowToRecord);
     },
 
     async listByStatus({ status, limit, offset }) {
       const rows = await db
-        .prepare(
-          `SELECT * FROM webhook_deliveries
-            WHERE status = ?
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?`
-        )
-        .bind(status, limit, offset)
-        .all<RawRow>();
-      return rows.results.map(rowToRecord);
+        .select()
+        .from(webhookDeliveries)
+        .where(eq(webhookDeliveries.status, status))
+        .orderBy(desc(webhookDeliveries.createdAt))
+        .limit(limit)
+        .offset(offset);
+      return rows.map(drizzleRowToRecord);
     },
 
     async getById(id) {
-      const row = await db
-        .prepare("SELECT * FROM webhook_deliveries WHERE id = ?")
-        .bind(id)
-        .first<RawRow>();
-      return row === null ? null : rowToRecord(row);
+      const [row] = await db
+        .select()
+        .from(webhookDeliveries)
+        .where(eq(webhookDeliveries.id, id))
+        .limit(1);
+      return row ? drizzleRowToRecord(row) : null;
     },
 
     async resetForReplay({ id, nextAttemptAt, now }) {
@@ -158,18 +127,17 @@ export function dbWebhookDeliveryStore(db: DbAdapter): WebhookDeliveryStore {
       // sweeper owns those); a delivered row is not replayable (if the
       // merchant insists, re-POSTing from the admin surface creates a new row
       // with a distinct idempotency key — out of scope for this port).
-      const result = await db
-        .prepare(
-          `UPDATE webhook_deliveries
-              SET status = 'pending',
-                  next_attempt_at = ?,
-                  last_error = COALESCE(last_error, '') || ' [replay ' || ? || ']',
-                  updated_at = ?
-            WHERE id = ? AND status = 'dead'`
-        )
-        .bind(nextAttemptAt, now, now, id)
-        .run();
-      return { reset: (result.meta.changes ?? 0) > 0 };
+      const updated = await db
+        .update(webhookDeliveries)
+        .set({
+          status: "pending",
+          nextAttemptAt,
+          lastError: sql`COALESCE(${webhookDeliveries.lastError}, '') || ${" [replay "} || ${now} || ${"]"}`,
+          updatedAt: now
+        })
+        .where(and(eq(webhookDeliveries.id, id), eq(webhookDeliveries.status, "dead")))
+        .returning({ id: webhookDeliveries.id });
+      return { reset: updated.length > 0 };
     }
   };
 }

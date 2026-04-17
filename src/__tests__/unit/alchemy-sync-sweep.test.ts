@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { libsqlAdapter } from "../../adapters/db/libsql.adapter.js";
-import { loadMigrationsFromDir } from "../../adapters/db/fs-migration-loader.js";
-import { applyMigrations } from "../../adapters/db/migration-runner.js";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+import { migrate } from "drizzle-orm/libsql/migrator";
+import { createDb, createLibsqlClient } from "../../db/client.js";
 import { bufferingLogger } from "../../adapters/logging/console.adapter.js";
 import type {
   AlchemyAdminClient,
@@ -32,9 +33,17 @@ interface Harness {
 }
 
 async function freshHarness(): Promise<Harness> {
-  const db = libsqlAdapter({ url: ":memory:" });
-  const migrationsDir = new URL("../../../migrations/", import.meta.url);
-  await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
+  const client = createLibsqlClient({ url: ":memory:" });
+  const db = createDb(client);
+  const migrationsFolder = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "..",
+    "drizzle",
+    "migrations"
+  );
+  await migrate(db, { migrationsFolder });
 
   const subscriptionStore = dbAlchemySubscriptionStore(db);
   const registryStore = dbAlchemyRegistryStore(db);

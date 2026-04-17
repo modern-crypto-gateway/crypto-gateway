@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
+import { alchemyWebhookRegistry } from "../../db/schema.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 
 // Shared ADMIN_KEY for this suite — ≥32 chars to match prod refinement rules,
@@ -69,12 +71,15 @@ describe("POST /admin/alchemy-webhooks/signing-keys", () => {
     });
 
     // Pull the DB row directly — the stored column is ciphertext, not plaintext.
-    const row = await booted.deps.db
-      .prepare(
-        "SELECT chain_id, webhook_id, signing_key_ciphertext FROM alchemy_webhook_registry WHERE webhook_id = ?"
-      )
-      .bind("wh_manual_test")
-      .first<{ chain_id: number; webhook_id: string; signing_key_ciphertext: string }>();
+    const [row] = await booted.deps.db
+      .select({
+        chain_id: alchemyWebhookRegistry.chainId,
+        webhook_id: alchemyWebhookRegistry.webhookId,
+        signing_key_ciphertext: alchemyWebhookRegistry.signingKeyCiphertext
+      })
+      .from(alchemyWebhookRegistry)
+      .where(eq(alchemyWebhookRegistry.webhookId, "wh_manual_test"))
+      .limit(1);
     expect(row?.chain_id).toBe(1);
     expect(row?.signing_key_ciphertext).toMatch(/^v1:/);
     expect(row?.signing_key_ciphertext).not.toContain("whsec_manual_test");
@@ -101,11 +106,15 @@ describe("POST /admin/alchemy-webhooks/signing-keys", () => {
 
     // Only one row per chainId (upsert on chain_id primary key).
     const rows = await booted.deps.db
-      .prepare("SELECT webhook_id, signing_key_ciphertext FROM alchemy_webhook_registry WHERE chain_id = 1")
-      .all<{ webhook_id: string; signing_key_ciphertext: string }>();
-    expect(rows.results).toHaveLength(1);
-    expect(rows.results[0]?.webhook_id).toBe("wh_new");
-    const decrypted = await booted.deps.secretsCipher.decrypt(rows.results[0]!.signing_key_ciphertext);
+      .select({
+        webhook_id: alchemyWebhookRegistry.webhookId,
+        signing_key_ciphertext: alchemyWebhookRegistry.signingKeyCiphertext
+      })
+      .from(alchemyWebhookRegistry)
+      .where(eq(alchemyWebhookRegistry.chainId, 1));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.webhook_id).toBe("wh_new");
+    const decrypted = await booted.deps.secretsCipher.decrypt(rows[0]!.signing_key_ciphertext);
     expect(decrypted).toBe("whsec_new");
   });
 

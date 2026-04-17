@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { eq, sql } from "drizzle-orm";
 import { custom } from "viem";
 import { alchemyNotifyDetection } from "../../adapters/detection/alchemy-notify.adapter.js";
 import { evmChainAdapter } from "../../adapters/chains/evm/evm-chain.adapter.js";
 import { bytesToHex, hmacSha256 } from "../../adapters/crypto/subtle.js";
+import { alchemyWebhookRegistry, invoices, transactions } from "../../db/schema.js";
 import { bootTestApp, createInvoiceViaApi, type BootedTestApp } from "../helpers/boot.js";
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
@@ -39,14 +41,14 @@ async function bootAlchemy(): Promise<BootedTestApp> {
   // SIGNING_KEY.
   const now = Date.now();
   const ciphertext = await booted.deps.secretsCipher.encrypt(SIGNING_KEY);
-  await booted.deps.db
-    .prepare(
-      `INSERT INTO alchemy_webhook_registry
-         (chain_id, webhook_id, signing_key_ciphertext, webhook_url, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    )
-    .bind(1, "wh_test", ciphertext, "https://test.local/webhooks/alchemy", now, now)
-    .run();
+  await booted.deps.db.insert(alchemyWebhookRegistry).values({
+    chainId: 1,
+    webhookId: "wh_test",
+    signingKeyCiphertext: ciphertext,
+    webhookUrl: "https://test.local/webhooks/alchemy",
+    createdAt: now,
+    updatedAt: now
+  });
   return booted;
 }
 
@@ -179,20 +181,22 @@ describe("POST /webhooks/alchemy", () => {
     // The ingest is deferred via jobs.defer — drain to flush.
     await booted.deps.jobs.drain(2_000);
 
-    const tx = await booted.deps.db
-      .prepare("SELECT invoice_id, amount_raw, status FROM transactions WHERE tx_hash = ?")
-      .bind(`0x${"a".repeat(64)}`)
-      .first<{ invoice_id: string; amount_raw: string; status: string }>();
-    expect(tx).not.toBeNull();
+    const [tx] = await booted.deps.db
+      .select({ invoice_id: transactions.invoiceId, amount_raw: transactions.amountRaw, status: transactions.status })
+      .from(transactions)
+      .where(eq(transactions.txHash, `0x${"a".repeat(64)}`))
+      .limit(1);
+    expect(tx).toBeDefined();
     expect(tx?.invoice_id).toBe(invoice.id);
     expect(tx?.amount_raw).toBe("1000000");
 
     // Invoice should have progressed to 'detected' (amount met, 1 confirmation
     // below mainnet's 12-block threshold).
-    const invoiceRow = await booted.deps.db
-      .prepare("SELECT status FROM invoices WHERE id = ?")
-      .bind(invoice.id)
-      .first<{ status: string }>();
+    const [invoiceRow] = await booted.deps.db
+      .select({ status: invoices.status })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
     expect(invoiceRow?.status).toBe("detected");
   });
 
@@ -214,10 +218,10 @@ describe("POST /webhooks/alchemy", () => {
     expect(res.status).toBe(200);
     await booted.deps.jobs.drain(500);
 
-    const count = await booted.deps.db
-      .prepare("SELECT COUNT(*) AS n FROM transactions")
-      .first<{ n: number }>();
-    expect(count?.n).toBe(0);
+    const [count] = await booted.deps.db
+      .select({ n: sql<number>`COUNT(*)` })
+      .from(transactions);
+    expect(Number(count?.n)).toBe(0);
   });
 
   it("skips activities whose contract isn't in our token registry", async () => {
@@ -241,10 +245,10 @@ describe("POST /webhooks/alchemy", () => {
     expect(res.status).toBe(200);
     await booted.deps.jobs.drain(500);
 
-    const count = await booted.deps.db
-      .prepare("SELECT COUNT(*) AS n FROM transactions")
-      .first<{ n: number }>();
-    expect(count?.n).toBe(0);
+    const [count] = await booted.deps.db
+      .select({ n: sql<number>`COUNT(*)` })
+      .from(transactions);
+    expect(Number(count?.n)).toBe(0);
   });
 
   it("skips non-token categories (external / internal)", async () => {
@@ -266,10 +270,10 @@ describe("POST /webhooks/alchemy", () => {
     expect(res.status).toBe(200);
     await booted.deps.jobs.drain(500);
 
-    const count = await booted.deps.db
-      .prepare("SELECT COUNT(*) AS n FROM transactions")
-      .first<{ n: number }>();
-    expect(count?.n).toBe(0);
+    const [count] = await booted.deps.db
+      .select({ n: sql<number>`COUNT(*)` })
+      .from(transactions);
+    expect(Number(count?.n)).toBe(0);
   });
 
   it("returns 400 on malformed JSON after a valid signature", async () => {
@@ -325,14 +329,14 @@ describe("POST /webhooks/alchemy — per-webhook signing key from DB registry", 
       // encrypted via secretsCipher — the ingest handler decrypts on read.
       const now = Date.now();
       const ciphertext = await booted.deps.secretsCipher.encrypt(perChainKey);
-      await booted.deps.db
-        .prepare(
-          `INSERT INTO alchemy_webhook_registry
-             (chain_id, webhook_id, signing_key_ciphertext, webhook_url, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)`
-        )
-        .bind(1, "wh_eth_mainnet", ciphertext, "https://test.local/webhooks/alchemy", now, now)
-        .run();
+      await booted.deps.db.insert(alchemyWebhookRegistry).values({
+        chainId: 1,
+        webhookId: "wh_eth_mainnet",
+        signingKeyCiphertext: ciphertext,
+        webhookUrl: "https://test.local/webhooks/alchemy",
+        createdAt: now,
+        updatedAt: now
+      });
 
       const body = JSON.stringify({
         webhookId: "wh_eth_mainnet",
