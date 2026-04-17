@@ -56,7 +56,7 @@ function buildPayload(activity: ReadonlyArray<Record<string, unknown>>, network 
   return JSON.stringify({
     webhookId: "wh_test",
     id: "whevt_test",
-    createdAt: "2026-04-16T10:00:00Z",
+    createdAt: new Date().toISOString(),
     type: "ADDRESS_ACTIVITY",
     event: { network, activity }
   });
@@ -341,7 +341,7 @@ describe("POST /webhooks/alchemy — per-webhook signing key from DB registry", 
       const body = JSON.stringify({
         webhookId: "wh_eth_mainnet",
         id: "whevt_test",
-        createdAt: "2026-04-16T10:00:00Z",
+        createdAt: new Date().toISOString(),
         type: "ADDRESS_ACTIVITY",
         event: { network: "ETH_MAINNET", activity: [] }
       });
