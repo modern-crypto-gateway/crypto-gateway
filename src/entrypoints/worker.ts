@@ -23,7 +23,7 @@ import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { cloudflareRateLimiter } from "../adapters/rate-limit/cloudflare.adapter.js";
 import { workersEnvSecrets } from "../adapters/secrets/workers-env.js";
-import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
+import { hdSignerStore } from "../adapters/signer-store/hd.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import type { AppDeps } from "../core/app-deps.js";
@@ -231,11 +231,7 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     jobs: waitUntilJobs(ctx),
     secrets: workersEnvSecrets(env as unknown as Record<string, unknown>),
     secretsCipher,
-    signerStore: memorySignerStore({
-      runtime: "workers",
-      ...(typeof env["NODE_ENV"] === "string" ? { environment: env["NODE_ENV"] } : {}),
-      logger
-    }),
+    signerStore: hdSignerStore({ masterSeed: env.MASTER_SEED, chains }),
     priceOracle: selectPriceOracle({
       ...(env["PRICE_ADAPTER"] === "coingecko" || env["PRICE_ADAPTER"] === "static-peg" || env["PRICE_ADAPTER"] === "alchemy"
         ? { priceAdapter: env["PRICE_ADAPTER"] as "coingecko" | "static-peg" | "alchemy" }
@@ -300,10 +296,10 @@ function parseTrustedIpHeaders(raw: unknown, fallback: readonly string[]): reado
 }
 
 // Boot-error handler shared by fetch + scheduled. Any failure inside depsFor
-// (missing SECRETS_ENCRYPTION_KEY in prod, D1 binding missing, bad env) would
-// otherwise surface as an opaque 500 — log with structured fields and
-// best-effort POST to ALERT_WEBHOOK_URL if it's set, so ops know cold-boot
-// failed rather than discovering via a paging merchant.
+// (missing SECRETS_ENCRYPTION_KEY in prod, missing TURSO_URL / TURSO_AUTH_TOKEN,
+// bad env) would otherwise surface as an opaque 500 — log with structured
+// fields and best-effort POST to ALERT_WEBHOOK_URL if it's set, so ops know
+// cold-boot failed rather than discovering via a paging merchant.
 async function reportBootFailure(err: unknown, env: WorkerEnv): Promise<void> {
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;

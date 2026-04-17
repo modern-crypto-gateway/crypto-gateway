@@ -17,7 +17,7 @@ export const AppConfigSchema = z
 
     // Adapter selection (documentation + validation; entrypoints still pick
     // concrete adapters based on the runtime they're compiled for).
-    dbAdapter: z.enum(["d1", "libsql", "pg"]).optional(),
+    dbAdapter: z.enum(["libsql", "turso", "pg"]).optional(),
     cacheAdapter: z.enum(["cf-kv", "redis", "memory", "libsql-table"]).optional(),
     jobsAdapter: z.enum(["wait-until", "promise-set", "queue"]).optional(),
     priceAdapter: z.enum(["alchemy", "coingecko", "static-peg"]).optional(),

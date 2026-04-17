@@ -120,8 +120,8 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
 }
 
 // Register a fee wallet for a chain. Payouts on `chainId` will CAS-reserve from
-// this pool. The matching private key must be put into the SignerStore before
-// executions run (the adapter pulls it on demand at signing time).
+// this pool. The matching private key is HD-derived on demand from MASTER_SEED
+// at execution time — nothing is stored at rest.
 export async function registerFeeWallet(
   deps: AppDeps,
   args: { chainId: number; address: string; label: string }
@@ -439,7 +439,7 @@ export interface SweepStuckFeeWalletReservationsOptions {
 //    it. The atomic batch in confirmPayouts / executeReservedPayouts.failed
 //    path makes this a no-op on new rows; it catches legacy strands and
 //    covers the (rare) case where the batch itself partially committed
-//    under a D1/libSQL failure.
+//    under a libSQL failure.
 //
 // 2. **Stuck-pending alert** — any fee wallet reserved > `stuckThresholdMs` ago
 //    whose payout is still `reserved` (no tx_hash recorded) is logged at WARN.
@@ -518,8 +518,8 @@ async function fetchPayout(deps: AppDeps, id: string): Promise<Payout | null> {
 //
 // Two-step pattern (SELECT candidate, then CAS UPDATE): doing it as a single
 // UPDATE with a subselect would be one round-trip but libSQL's UPDATE-with-
-// subquery edge cases have historically been flaky compared to D1. Instead,
-// we loop: if the CAS loses to a racing concurrent reservation of the same
+// subquery edge cases have historically been flaky. Instead, we loop: if the
+// CAS loses to a racing concurrent reservation of the same
 // candidate, pick the next free wallet and try again. Without the retry,
 // contention on a busy chain returned a spurious "NO_FEE_WALLETS" even when
 // additional free wallets existed.

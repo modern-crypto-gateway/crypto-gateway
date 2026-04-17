@@ -112,8 +112,8 @@ describe("loadConfig", () => {
       expect(() => loadConfig({ CACHE_ADAPTER: "redis" })).toThrow(/REDIS_URL/);
     });
 
-    it("is fine with DB_ADAPTER=d1 and no DATABASE_URL (D1 is a binding, not a URL)", () => {
-      expect(() => loadConfig({ DB_ADAPTER: "d1" })).not.toThrow();
+    it("accepts DB_ADAPTER=turso (alias for libsql) and still enforces DATABASE_URL", () => {
+      expect(() => loadConfig({ DB_ADAPTER: "turso" })).not.toThrow();
     });
   });
 

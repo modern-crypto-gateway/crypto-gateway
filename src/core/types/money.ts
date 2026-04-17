@@ -5,7 +5,7 @@ export const FiatAmountSchema = z.string().regex(/^\d+(\.\d+)?$/, "FiatAmount mu
 export type FiatAmount = z.infer<typeof FiatAmountSchema>;
 
 // Raw on-chain amount in the token's smallest unit, as a decimal string
-// (e.g. "1000000" for 1 USDC at 6 decimals). Stored as TEXT in D1/libSQL.
+// (e.g. "1000000" for 1 USDC at 6 decimals). Stored as TEXT in libSQL.
 export const AmountRawSchema = z.string().regex(/^\d+$/, "AmountRaw must be a non-negative integer string");
 export type AmountRaw = z.infer<typeof AmountRawSchema>;
 

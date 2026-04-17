@@ -2,7 +2,7 @@ import type { SecretsProvider } from "../../core/ports/secrets.port.ts";
 
 // SecretsProvider backed by a Cloudflare Worker's env binding. `env` is a
 // plain object populated from wrangler.jsonc `vars` + `secrets` (injected via
-// `wrangler secret put`) + binding objects (D1, KV, etc.).
+// `wrangler secret put`) + binding objects (KV, rate-limit bindings, etc.).
 //
 // We accept `Record<string, unknown>` rather than the generated Env interface
 // so this adapter stays decoupled from wrangler's type generation. The worker

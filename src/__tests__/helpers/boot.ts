@@ -10,7 +10,7 @@ import { devCipher } from "../../adapters/crypto/secrets-cipher.js";
 import { initializePool } from "../../core/domain/pool.service.js";
 import { promiseSetJobs } from "../../adapters/jobs/promise-set.adapter.js";
 import { staticPegPriceOracle } from "../../adapters/price-oracle/static-peg.adapter.js";
-import { memorySignerStore } from "../../adapters/signer-store/memory.adapter.js";
+import { hdSignerStore } from "../../adapters/signer-store/hd.adapter.js";
 import { capturingWebhookDispatcher, type CapturingDispatcher } from "../../adapters/webhook-delivery/noop.adapter.js";
 import { dbWebhookDeliveryStore } from "../../adapters/webhook-delivery/db-delivery-store.js";
 import { sha256Hex } from "../../adapters/crypto/subtle.js";
@@ -213,13 +213,18 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
   // windowing is exact in tests.
   const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
 
+  const chains = options.chains ?? [devChainAdapter()];
+
   const deps: AppDeps = {
     db,
     cache,
     jobs: promiseSetJobs(),
     secrets,
     secretsCipher,
-    signerStore: memorySignerStore({ runtime: "test" }),
+    signerStore: hdSignerStore({
+      masterSeed: secretsOverrides["MASTER_SEED"]!,
+      chains
+    }),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: options.webhookDispatcher ?? capturingDispatcher!,
     webhookDeliveryStore: dbWebhookDeliveryStore(db),
@@ -227,7 +232,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     logger,
     rateLimiter,
     rateLimits,
-    chains: options.chains ?? [devChainAdapter()],
+    chains,
     detectionStrategies: options.detectionStrategies ?? {},
     pushStrategies: options.pushStrategies ?? {},
     clock: options.clock ?? { now: () => options.now ?? new Date() },

@@ -734,7 +734,7 @@ function invoiceEventFor(status: InvoiceStatus, invoice: Invoice, now: number): 
 // ---- Error helpers ----
 
 function isUniqueViolation(err: unknown): boolean {
-  // libSQL / D1 / SQLite all surface UNIQUE violations with "UNIQUE constraint failed"
+  // libSQL / SQLite surface UNIQUE violations with "UNIQUE constraint failed"
   // in the message. Drizzle wraps the driver error in a DrizzleQueryError whose own
   // message is "Failed query: ..." — walk the `.cause` chain to find the inner error.
   let current: unknown = err;

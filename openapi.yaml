@@ -417,7 +417,13 @@ paths:
   /admin/fee-wallets:
     post:
       tags: [admin]
-      summary: Register a fee wallet + store its private key in the SignerStore
+      summary: Register a fee wallet — address is HD-derived from MASTER_SEED
+      description: |
+        The gateway derives the fee-wallet's `(address, privateKey)` pair
+        from `MASTER_SEED` at a deterministic index keyed by `(family, label)`.
+        No private key is accepted over the admin API — fund the returned
+        derived address out-of-band. The same label always derives to the
+        same address across redeploys.
       security:
         - AdminKey: []
       requestBody:
@@ -426,22 +432,34 @@ paths:
           application/json:
             schema:
               type: object
-              required: [chainId, address, label, privateKey, family]
+              required: [chainId, label, family]
               properties:
                 chainId: { type: integer }
-                address: { type: string }
-                label: { type: string, maxLength: 64 }
-                privateKey:
+                label:
                   type: string
-                  description: Hex or family-specific. Stored in the SignerStore at `{kind:"fee-wallet", family, label}`.
+                  maxLength: 64
+                  description: Scope key (e.g. "hot-1", "cold-archive"). Hashed into a BIP32 index.
                 family:
                   type: string
                   enum: [evm, tron, solana]
       responses:
         "201":
-          description: Fee wallet registered
+          description: Fee wallet registered; fund the returned address externally.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallet:
+                    type: object
+                    properties:
+                      chainId: { type: integer }
+                      address:
+                        type: string
+                        description: Derived address the operator must fund.
+                      label: { type: string }
         "400":
-          description: Invalid address OR family does not match the chain adapter
+          description: Family mismatch, MASTER_SEED missing, or validation error
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

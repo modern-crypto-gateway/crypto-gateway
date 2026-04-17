@@ -19,7 +19,8 @@ import type { EventBus } from "./events/event-bus.port.ts";
 // then pass it to `buildApp(deps)` to produce a runtime-agnostic app.
 //
 // Every field is a port interface — never a concrete class. That is the whole
-// point: swapping D1 for libSQL is changing one line in one entrypoint.
+// point: swapping libSQL for Postgres (or any other store) is changing one
+// line in one entrypoint.
 export interface AppDeps {
   // Typed Drizzle db over libSQL.
   readonly db: Db;
@@ -105,7 +106,7 @@ export interface RateLimitConfig {
   webhookIngestPerMinute: number;
   // Per-IP cap on /admin/*. Admin routes are protected by ADMIN_KEY but an
   // attacker with a leaked/guessed key (or a misbehaving operator tool)
-  // should still hit a throttle before exhausting D1/libsql write capacity.
+  // should still hit a throttle before exhausting libsql write capacity.
   // Bucketed by client IP so one compromised key from one box does not
   // starve another operator's legitimate tooling.
   adminPerMinute: number;

@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { feeWallets } from "../../db/schema.js";
+import { feeWalletIndex } from "../../adapters/signer-store/hd.adapter.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 
 const ADMIN_KEY = "super-secret-admin-key";
+const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
 
 describe("POST /admin/merchants", () => {
   let booted: BootedTestApp;
@@ -103,51 +105,38 @@ describe("POST /admin/fee-wallets", () => {
     await booted.close();
   });
 
-  it("registers a fee wallet, canonicalizes the address, and stores the private key", async () => {
+  it("registers a fee wallet by deriving its address from MASTER_SEED and label", async () => {
     const res = await booted.app.fetch(
       new Request("http://test.local/admin/fee-wallets", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
-        body: JSON.stringify({
-          chainId: 999,
-          address: "0xAABBCCDDEEFF00112233445566778899AABBCCDD",
-          label: "hot-1",
-          privateKey: `0x${"11".repeat(32)}`,
-          family: "evm"
-        })
+        body: JSON.stringify({ chainId: 999, label: "hot-1", family: "evm" })
       })
     );
     expect(res.status).toBe(201);
     const body = (await res.json()) as { feeWallet: { address: string; label: string } };
-    // Dev adapter's canonical form is lowercase.
-    expect(body.feeWallet.address).toBe("0xaabbccddeeff00112233445566778899aabbccdd");
+
+    // The returned address must match what the adapter derives at the
+    // deterministic fee-wallet index for (family, label).
+    const adapter = booted.deps.chains.find((c) => c.family === "evm")!;
+    const { address: expectedAddress, privateKey: expectedPrivateKey } = adapter.deriveAddress(
+      TEST_MASTER_SEED,
+      feeWalletIndex("evm", "hot-1")
+    );
+    const canonicalExpected = adapter.canonicalizeAddress(expectedAddress);
+    expect(body.feeWallet.address).toBe(canonicalExpected);
 
     const [walletRow] = await booted.deps.db
       .select({ address: feeWallets.address, label: feeWallets.label })
       .from(feeWallets)
       .limit(1);
     expect(walletRow?.label).toBe("hot-1");
+    expect(walletRow?.address).toBe(canonicalExpected);
 
-    // Key is accessible via the SignerStore at the expected scope.
+    // SignerStore.get returns the matching private key derived from the same
+    // seed+index — no put() was ever called, and none is needed.
     const storedKey = await booted.deps.signerStore.get({ kind: "fee-wallet", family: "evm", label: "hot-1" });
-    expect(storedKey).toBe(`0x${"11".repeat(32)}`);
-  });
-
-  it("rejects a malformed address with 400", async () => {
-    const res = await booted.app.fetch(
-      new Request("http://test.local/admin/fee-wallets", {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
-        body: JSON.stringify({
-          chainId: 999,
-          address: "not-an-address",
-          label: "broken",
-          privateKey: "0x00",
-          family: "evm"
-        })
-      })
-    );
-    expect(res.status).toBe(400);
+    expect(storedKey).toBe(expectedPrivateKey);
   });
 
   it("rejects a family that doesn't match the chain adapter", async () => {
@@ -157,9 +146,7 @@ describe("POST /admin/fee-wallets", () => {
         headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
         body: JSON.stringify({
           chainId: 999, // dev adapter declares family="evm"
-          address: "0xAABBCCDDEEFF00112233445566778899AABBCCDD",
           label: "broken",
-          privateKey: "0x00",
           family: "tron"
         })
       })

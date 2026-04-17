@@ -8,20 +8,25 @@ import {
   planPayout,
   registerFeeWallet
 } from "../../core/domain/payout.service.js";
+import { feeWalletIndex } from "../../adapters/signer-store/hd.adapter.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
+// Must match bootTestApp's MASTER_SEED so seeded fee-wallets derive to the
+// same address the PayoutService will resolve via signerStore.get at exec time.
+const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
 
 async function seedFeeWallet(
   booted: BootedTestApp,
-  args: { address: string; label: string; privateKey: string }
-): Promise<void> {
-  await registerFeeWallet(booted.deps, { chainId: 999, address: args.address, label: args.label });
-  // Put the private key in the SignerStore at the scope the PayoutService expects.
-  await booted.deps.signerStore.put(
-    { kind: "fee-wallet", family: "evm", label: args.label },
-    args.privateKey
-  );
+  args: { label: string }
+): Promise<{ address: string }> {
+  const adapter = booted.deps.chains.find((c) => c.family === "evm");
+  if (!adapter) throw new Error("seedFeeWallet: no EVM adapter in test deps");
+  const index = feeWalletIndex("evm", args.label);
+  const { address } = adapter.deriveAddress(TEST_MASTER_SEED, index);
+  const canonical = adapter.canonicalizeAddress(address);
+  await registerFeeWallet(booted.deps, { chainId: 999, address: canonical, label: args.label });
+  return { address: canonical };
 }
 
 describe("PayoutService.planPayout", () => {
@@ -104,11 +109,7 @@ describe("PayoutService.executeReservedPayouts", () => {
       chains: [devChainAdapter({ deterministicTxHashes: true })]
     });
     try {
-      await seedFeeWallet(booted, {
-        address: "0x1111111111111111111111111111111111111111",
-        label: "hot-1",
-        privateKey: `0x${"11".repeat(32)}`
-      });
+      const { address: feeAddress } = await seedFeeWallet(booted, { label: "hot-1" });
 
       await planPayout(booted.deps, {
         merchantId: MERCHANT_ID,
@@ -127,7 +128,7 @@ describe("PayoutService.executeReservedPayouts", () => {
         .limit(1);
       expect(row?.status).toBe("submitted");
       expect(row?.tx_hash).toMatch(/^0x[0-9a-f]{64}$/);
-      expect(row?.source_address).toBe("0x1111111111111111111111111111111111111111");
+      expect(row?.source_address).toBe(feeAddress);
 
       // Fee wallet is still reserved by this payout (no confirmation yet).
       const [wallet] = await booted.deps.db
@@ -172,11 +173,7 @@ describe("PayoutService.executeReservedPayouts", () => {
       chains: [devChainAdapter({ deterministicTxHashes: true })]
     });
     try {
-      await seedFeeWallet(booted, {
-        address: "0x1111111111111111111111111111111111111111",
-        label: "hot-1",
-        privateKey: `0x${"11".repeat(32)}`
-      });
+      await seedFeeWallet(booted, { label: "hot-1" });
 
       // Two payouts, two different destinations (so tx hashes differ deterministically).
       await planPayout(booted.deps, {
@@ -220,11 +217,7 @@ describe("PayoutService.executeReservedPayouts", () => {
     };
     const booted = await bootTestApp({ chains: [failing] });
     try {
-      await seedFeeWallet(booted, {
-        address: "0x1111111111111111111111111111111111111111",
-        label: "hot-1",
-        privateKey: `0x${"11".repeat(32)}`
-      });
+      await seedFeeWallet(booted, { label: "hot-1" });
 
       await planPayout(booted.deps, {
         merchantId: MERCHANT_ID,
@@ -263,11 +256,7 @@ describe("PayoutService.confirmPayouts", () => {
       chains: [devChainAdapter({ deterministicTxHashes: true, confirmationStatuses: confirmations })]
     });
     try {
-      await seedFeeWallet(booted, {
-        address: "0x1111111111111111111111111111111111111111",
-        label: "hot-1",
-        privateKey: `0x${"11".repeat(32)}`
-      });
+      await seedFeeWallet(booted, { label: "hot-1" });
       await planPayout(booted.deps, {
         merchantId: MERCHANT_ID,
         chainId: 999,
@@ -316,11 +305,7 @@ describe("PayoutService.confirmPayouts", () => {
       chains: [devChainAdapter({ deterministicTxHashes: true, confirmationStatuses: confirmations })]
     });
     try {
-      await seedFeeWallet(booted, {
-        address: "0x1111111111111111111111111111111111111111",
-        label: "hot-1",
-        privateKey: `0x${"11".repeat(32)}`
-      });
+      await seedFeeWallet(booted, { label: "hot-1" });
       await planPayout(booted.deps, {
         merchantId: MERCHANT_ID,
         chainId: 999,
@@ -361,11 +346,7 @@ describe("PayoutService.confirmPayouts", () => {
       chains: [devChainAdapter({ deterministicTxHashes: true, confirmationStatuses: confirmations })]
     });
     try {
-      await seedFeeWallet(booted, {
-        address: "0x1111111111111111111111111111111111111111",
-        label: "hot-1",
-        privateKey: `0x${"11".repeat(32)}`
-      });
+      await seedFeeWallet(booted, { label: "hot-1" });
 
       // First payout: plan, submit, confirm.
       await planPayout(booted.deps, {

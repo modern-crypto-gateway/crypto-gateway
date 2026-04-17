@@ -152,9 +152,9 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"chainId\": 999,\n  \"family\": \"evm\",\n  \"address\": \"0xAABBCCDDEEFF00112233445566778899AABBCCDD\",\n  \"label\": \"dev-hot-1\",\n  \"privateKey\": \"0x1111111111111111111111111111111111111111111111111111111111111111\"\n}"
+              "raw": "{\n  \"chainId\": 999,\n  \"family\": \"evm\",\n  \"label\": \"dev-hot-1\"\n}"
             },
-            "description": "Registers a fee wallet for payouts. The `privateKey` is encrypted at rest via `SECRETS_ENCRYPTION_KEY`. `family` is required and is NOT inferred from `chainId`. Use `chainId: 999` (the dev chain) + `family: evm` for local runs. For real chains use the appropriate chainId from the table in the README."
+            "description": "Registers a fee wallet for payouts. The gateway HD-derives the `(address, privateKey)` pair from `MASTER_SEED` at a deterministic index keyed by `(family, label)` and returns the derived address in `feeWallet.address`. No private key is accepted here — the operator funds the returned address out-of-band. The same `label` always derives to the same address across redeploys. Use `chainId: 999` + `family: evm` for local runs; for real chains use the appropriate chainId from the table in the README."
           }
         },
         {

@@ -22,7 +22,7 @@ import { httpAlertSink } from "../adapters/logging/http-alert.adapter.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { denoEnvSecrets } from "../adapters/secrets/deno-env.js";
-import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
+import { hdSignerStore } from "../adapters/signer-store/hd.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import type { AppDeps } from "../core/app-deps.js";
@@ -183,10 +183,9 @@ async function main(): Promise<void> {
     }),
     secrets,
     secretsCipher,
-    signerStore: memorySignerStore({
-      runtime: "deno",
-      ...(secrets.getOptional("NODE_ENV") !== undefined ? { environment: secrets.getOptional("NODE_ENV")! } : {}),
-      logger
+    signerStore: hdSignerStore({
+      masterSeed: secrets.getOptional("MASTER_SEED") ?? "dev-seed",
+      chains
     }),
     priceOracle: selectPriceOracle({
       ...(secrets.getOptional("PRICE_ADAPTER") === "coingecko" ||

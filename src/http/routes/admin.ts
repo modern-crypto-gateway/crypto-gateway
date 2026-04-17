@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { AppDeps } from "../../core/app-deps.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import { registerFeeWallet } from "../../core/domain/payout.service.js";
+import { feeWalletIndex } from "../../adapters/signer-store/hd.adapter.js";
 import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
 import { ChainFamilySchema, type ChainFamily } from "../../core/types/chain.js";
 import { sha256Hex, bytesToHex, getRandomValues } from "../../adapters/crypto/subtle.js";
@@ -35,12 +36,10 @@ const CreateMerchantSchema = z.object({
 
 const RegisterFeeWalletSchema = z.object({
   chainId: z.number().int().positive(),
-  address: z.string().min(1).max(128),
-  // Human-readable label used as the SignerStore scope key ("hot-1", "cold-archive", ...)
+  // Human-readable scope key ("hot-1", "cold-archive", ...). Deterministically
+  // hashed into a BIP32 index so the same label always derives to the same
+  // address — stable across redeploys.
   label: z.string().min(1).max(64),
-  // Plaintext private key. Put into the SignerStore at scope
-  // { kind: 'fee-wallet', family, label }. The route never echoes it back.
-  privateKey: z.string().min(1).max(256),
   family: z.enum(["evm", "tron", "solana"] as const)
 });
 
@@ -86,7 +85,7 @@ export interface AdminRouterOptions {
 export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono {
   const app = new Hono();
   // Rate-limit BEFORE auth: a caller hammering the surface with wrong keys
-  // shouldn't be able to exhaust D1 writes or crowd out a legitimate operator.
+  // shouldn't be able to exhaust Turso writes or crowd out a legitimate operator.
   // Bucketed by client IP (trusted headers only — same rule as the rest of
   // the gateway) so the limit is per box, not per connection.
   app.use(
@@ -177,6 +176,10 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     }
   });
 
+  // Register a fee wallet. The gateway derives address + private key from
+  // MASTER_SEED at a deterministic index keyed by (family, label). Operator
+  // never supplies a private key (none to leak over the admin API), and funds
+  // the returned derived address out-of-band.
   app.post("/fee-wallets", async (c) => {
     const body = (await c.req.json().catch(() => null)) as unknown;
     if (body === null) {
@@ -185,23 +188,36 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     try {
       const parsed = RegisterFeeWalletSchema.parse(body);
       const chainAdapter = findChainAdapter(deps, parsed.chainId);
-      if (!chainAdapter.validateAddress(parsed.address)) {
-        return c.json({ error: { code: "INVALID_ADDRESS" } }, 400);
-      }
       if (chainAdapter.family !== (parsed.family as ChainFamily)) {
         return c.json(
           { error: { code: "FAMILY_MISMATCH", message: `chainId ${parsed.chainId} is ${chainAdapter.family}, not ${parsed.family}` } },
           400
         );
       }
-      const canonical = chainAdapter.canonicalizeAddress(parsed.address);
+
+      const masterSeed = deps.secrets.getOptional("MASTER_SEED");
+      if (masterSeed === undefined || masterSeed === "") {
+        return c.json(
+          {
+            error: {
+              code: "MISSING_MASTER_SEED",
+              message:
+                "MASTER_SEED secret is not set. Fee-wallet addresses are HD-derived from MASTER_SEED; configure it before registering fee wallets."
+            }
+          },
+          400
+        );
+      }
+
+      const index = feeWalletIndex(parsed.family, parsed.label);
+      const { address: derived } = chainAdapter.deriveAddress(masterSeed, index);
+      const canonical = chainAdapter.canonicalizeAddress(derived);
 
       await registerFeeWallet(deps, { chainId: parsed.chainId, address: canonical, label: parsed.label });
-      await deps.signerStore.put(
-        { kind: "fee-wallet", family: parsed.family, label: parsed.label },
-        parsed.privateKey
+      return c.json(
+        { feeWallet: { chainId: parsed.chainId, address: canonical, label: parsed.label } },
+        201
       );
-      return c.json({ feeWallet: { chainId: parsed.chainId, address: canonical, label: parsed.label } }, 201);
     } catch (err) {
       return renderError(c, err, deps.logger);
     }

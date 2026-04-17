@@ -12,7 +12,7 @@ import { consoleLogger } from "../adapters/logging/console.adapter.js";
 import { httpAlertSink } from "../adapters/logging/http-alert.adapter.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { processEnvSecrets } from "../adapters/secrets/process-env.js";
-import { memorySignerStore } from "../adapters/signer-store/memory.adapter.js";
+import { hdSignerStore } from "../adapters/signer-store/hd.adapter.js";
 import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
@@ -206,11 +206,7 @@ async function main(): Promise<void> {
     }),
     secrets,
     secretsCipher,
-    signerStore: memorySignerStore({
-      runtime: "node",
-      environment: config.environment,
-      logger
-    }),
+    signerStore: hdSignerStore({ masterSeed: config.masterSeed ?? "dev-seed", chains }),
     priceOracle: selectPriceOracle({
       ...(config.priceAdapter !== undefined ? { priceAdapter: config.priceAdapter } : {}),
       ...(config.coingeckoApiKey !== undefined ? { coingeckoApiKey: config.coingeckoApiKey } : {}),

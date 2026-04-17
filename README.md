@@ -121,7 +121,7 @@ for the full list. Highlights:
 | Var                               | Required        | Default    | Notes                                                |
 | --------------------------------- | --------------- | ---------- | ---------------------------------------------------- |
 | `NODE_ENV`                        | no              | `development` | `production` enables strict boot-time validation |
-| `MASTER_SEED`                     | **prod only**   | —          | BIP39 mnemonic. Rejects the literal `dev-seed` in prod |
+| `MASTER_SEED`                     | **prod only**   | —          | BIP39 mnemonic. Every receive address AND every fee-wallet address is HD-derived from this seed — keep it backed up. Rejects the literal `dev-seed` in prod. |
 | `ADMIN_KEY`                       | **prod only**   | —          | ≥32 chars required in prod                           |
 | `CRON_SECRET`                     | optional        | —          | Enables `POST /internal/cron/tick`                   |
 | `ALCHEMY_API_KEY`                 | optional        | —          | Auto-wires a real EVM chain adapter + RPC-poll detection across the default mainnet set (ETH, OP, Polygon, Base, Arbitrum). See below. |
