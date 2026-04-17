@@ -213,9 +213,11 @@ async function main(): Promise<void> {
       ...(config.coingeckoApiKey !== undefined ? { coingeckoApiKey: config.coingeckoApiKey } : {}),
       coingeckoPlan: config.coingeckoPlan,
       ...(config.coincapApiKey !== undefined ? { coincapApiKey: config.coincapApiKey } : {}),
+      ...(config.alchemyApiKey !== undefined ? { alchemyApiKey: config.alchemyApiKey } : {}),
       ...(config.disableCoingecko !== undefined ? { disableCoingecko: config.disableCoingecko } : {}),
       ...(config.disableCoincap !== undefined ? { disableCoincap: config.disableCoincap } : {}),
       ...(config.disableBinance !== undefined ? { disableBinance: config.disableBinance } : {}),
+      ...(config.disableAlchemy !== undefined ? { disableAlchemy: config.disableAlchemy } : {}),
       cache,
       logger
     }),

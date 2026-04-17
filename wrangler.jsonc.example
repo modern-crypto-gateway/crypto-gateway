@@ -26,6 +26,18 @@
 //                                                           # (Old name ALCHEMY_AUTH_TOKEN still accepted for one release.)
 //   npx wrangler secret put GATEWAY_PUBLIC_URL              # required for webhook bootstrap — e.g. https://your-worker.workers.dev
 //
+// Optional price-oracle + alerting knobs (see README "Price oracle fallback
+// chain" and "Log shipping + alerting"):
+//   npx wrangler secret put COINGECKO_API_KEY               # optional; raises CoinGecko rate budget (keyless free tier works too)
+//   npx wrangler secret put COINCAP_API_KEY                 # optional; raises CoinCap rate budget
+//   # Set these as plain vars (not secrets) via [vars] below if you want to
+//   # disable individual providers or pick a non-default PRICE_ADAPTER:
+//   #   PRICE_ADAPTER=coingecko|alchemy|static-peg
+//   #   COINGECKO_PLAN=demo|pro
+//   #   DISABLE_COINGECKO=1 / DISABLE_COINCAP=1 / DISABLE_BINANCE=1 / DISABLE_ALCHEMY=1
+//   npx wrangler secret put ALERT_WEBHOOK_URL               # optional; error/fatal logs POSTed here (30/min rate-limit, JSON body)
+//   npx wrangler secret put ALERT_WEBHOOK_AUTH_HEADER       # optional; Authorization header value for ALERT_WEBHOOK_URL
+//
 // When a new migration is added (e.g. `migrations/0002_foo.sql`): re-run the
 // loop above. D1 has no runtime filesystem access, so the wrangler CLI is the
 // canonical migration applier for Workers deployments. Node / Deno run the

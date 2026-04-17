@@ -51,6 +51,7 @@ export const AppConfigSchema = z
     disableCoingecko: z.coerce.boolean().optional(),
     disableCoincap: z.coerce.boolean().optional(),
     disableBinance: z.coerce.boolean().optional(),
+    disableAlchemy: z.coerce.boolean().optional(),
     // Comma-separated chain-id override for which chains to wire via Alchemy
     // when `alchemyApiKey` is set. Absent = default mainnet set (ETH / OP /
     // Polygon / Base / Arbitrum). Useful for narrowing to a subset, or for
@@ -204,6 +205,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     disableCoingecko: env["DISABLE_COINGECKO"],
     disableCoincap: env["DISABLE_COINCAP"],
     disableBinance: env["DISABLE_BINANCE"],
+    disableAlchemy: env["DISABLE_ALCHEMY"],
     trongridApiKey: env["TRONGRID_API_KEY"],
     tronNetwork: env["TRON_NETWORK"],
     tronPollIntervalMs: env["TRON_POLL_INTERVAL_MS"],

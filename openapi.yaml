@@ -10,6 +10,35 @@ info:
     Deploys on Cloudflare Workers, Node/Bun, Deno, and Vercel Edge from one
     codebase.
 
+    ### Deployment knobs (not HTTP routes)
+
+    The behaviors below are server-side config read at boot and do not
+    surface as endpoints. They're documented here so operators who only
+    have the OpenAPI spec can discover them.
+
+    **Price oracle fallback chain.** Invoice quoting walks a chained list
+    of providers on every request; each link tries itself first and
+    delegates to the next on error/timeout/unmapped symbol. Only the
+    terminal `static-peg` link serves hardcoded values. Default ordering
+    when `ALCHEMY_API_KEY` is set:
+    `CoinGecko → Alchemy → CoinCap → Binance → static-peg`.
+    Knobs: `PRICE_ADAPTER=alchemy|coingecko|static-peg` (swaps the primary
+    or collapses to the static link), `COINGECKO_API_KEY` +
+    `COINGECKO_PLAN=demo|pro`, `COINCAP_API_KEY`, and per-provider
+    opt-outs `DISABLE_COINGECKO=1` / `DISABLE_COINCAP=1` /
+    `DISABLE_BINANCE=1` / `DISABLE_ALCHEMY=1`. `PRICE_ADAPTER=alchemy`
+    without a key logs a warning and falls back to the default ordering.
+
+    **Log shipping + alerting.** Setting `ALERT_WEBHOOK_URL` attaches an
+    HTTP sink to the structured logger; every `error` or `fatal` log is
+    POSTed as `{ ts, level, msg, ...fields }` JSON. Sliding-window rate
+    limited to 30/min with a `droppedSinceLast` counter piggybacked on
+    the next successful delivery. Use `ALERT_WEBHOOK_AUTH_HEADER` for the
+    `Authorization` header value (e.g. `Bearer xyz`). Fire-and-forget —
+    a broken sink never breaks the caller's log path.
+
+    See the repository README for the full env-var table.
+
 servers:
   - url: http://localhost:8787
     description: Local Node dev

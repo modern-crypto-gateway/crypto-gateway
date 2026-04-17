@@ -119,6 +119,53 @@ for the full list. Highlights:
 | `RATE_LIMIT_MERCHANT_PER_MINUTE`  | no              | `1000`     | Per-merchant cap on `/api/v1/*`                      |
 | `RATE_LIMIT_CHECKOUT_PER_MINUTE`  | no              | `60`       | Per-IP cap on `/checkout/*`                          |
 | `RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE` | no         | `300`      | Per-IP cap on `/webhooks/*`                          |
+| `PRICE_ADAPTER`                   | no              | (full chain) | `coingecko` (default ordering), `alchemy` (Alchemy-first — requires `ALCHEMY_API_KEY`), or `static-peg` (disable all live sources). See [Price oracle fallback chain](#price-oracle-fallback-chain). |
+| `COINGECKO_API_KEY`               | no              | —          | Raises the CoinGecko rate budget. Keyless free tier also works. |
+| `COINGECKO_PLAN`                  | no              | `demo`     | `demo` → sends `x-cg-demo-api-key`; `pro` → `x-cg-pro-api-key`. |
+| `COINCAP_API_KEY`                 | no              | —          | Optional CoinCap (Messari) key. `/v2/assets` is keyless in practice. |
+| `DISABLE_COINGECKO` / `DISABLE_COINCAP` / `DISABLE_BINANCE` / `DISABLE_ALCHEMY` | no | — | Set `=1` to drop that provider from the fallback chain. Useful for jurisdiction constraints or incident-response. |
+| `ALERT_WEBHOOK_URL`               | no              | —          | When set, `error`/`fatal` logs are POSTed here (JSON body). Sliding-window rate-limited to 30/min; drops are piggybacked on the next delivery. |
+| `ALERT_WEBHOOK_AUTH_HEADER`       | no              | —          | Value for the `Authorization` header when calling `ALERT_WEBHOOK_URL` (e.g. `Bearer xyz`). |
+
+## Price oracle fallback chain
+
+Invoice quoting and the USD rate-window pull spot prices from a chained set of
+providers. Each link tries itself first; on HTTP error, timeout, unmapped
+symbol, or malformed response it delegates to the next link. Only the terminal
+`static-peg` link is allowed to serve hardcoded numbers (stables at `1` + the
+override map in [`static-peg.adapter.ts`](src/adapters/price-oracle/static-peg.adapter.ts)),
+so a single provider outage never blocks a quote.
+
+Default ordering when `ALCHEMY_API_KEY` is set:
+
+```
+CoinGecko → Alchemy → CoinCap → Binance → static-peg
+```
+
+`PRICE_ADAPTER=alchemy` promotes Alchemy to the front:
+
+```
+Alchemy → CoinGecko → CoinCap → Binance → static-peg
+```
+
+`PRICE_ADAPTER=static-peg` skips every live source (use for deterministic
+tests or jurisdictions that can't reach the public providers).
+
+Each provider is individually disableable via `DISABLE_COINGECKO=1`,
+`DISABLE_COINCAP=1`, `DISABLE_BINANCE=1`, `DISABLE_ALCHEMY=1`. Disabling
+collapses the chain to the remaining providers in the same order. Each
+adapter caches responses in the shared `CacheStore` (30s TTL) so a burst of
+invoice creations against the same token hits the upstream once.
+
+## Log shipping + alerting
+
+Setting `ALERT_WEBHOOK_URL` turns on a sync-fire-and-forget HTTP sink attached
+to the structured logger. Every `error` or `fatal` log is POSTed as a JSON
+body `{ ts, level, msg, ...fields }`. A 3s timeout protects the caller, a
+sliding-window rate limit caps deliveries at 30/min, and any drops caused by
+the rate limiter are reported on the `droppedSinceLast` field of the next
+successful delivery. If you need auth, set `ALERT_WEBHOOK_AUTH_HEADER`
+(e.g. `Bearer xyz`) and it's sent verbatim as `Authorization`.
 
 ## Enabling Alchemy (optional)
 

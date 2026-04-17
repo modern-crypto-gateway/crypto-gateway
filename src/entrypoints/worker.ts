@@ -189,9 +189,11 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
       ...(typeof env["COINCAP_API_KEY"] === "string" && env["COINCAP_API_KEY"].length > 0
         ? { coincapApiKey: env["COINCAP_API_KEY"] }
         : {}),
+      ...(alchemyApiKey !== undefined && alchemyApiKey.length > 0 ? { alchemyApiKey } : {}),
       ...(env["DISABLE_COINGECKO"] === "1" ? { disableCoingecko: true } : {}),
       ...(env["DISABLE_COINCAP"] === "1" ? { disableCoincap: true } : {}),
       ...(env["DISABLE_BINANCE"] === "1" ? { disableBinance: true } : {}),
+      ...(env["DISABLE_ALCHEMY"] === "1" ? { disableAlchemy: true } : {}),
       cache,
       logger
     }),

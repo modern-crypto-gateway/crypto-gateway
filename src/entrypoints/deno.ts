@@ -185,9 +185,11 @@ async function main(): Promise<void> {
       ...(secrets.getOptional("COINCAP_API_KEY") !== undefined
         ? { coincapApiKey: secrets.getOptional("COINCAP_API_KEY")! }
         : {}),
+      ...(alchemyApiKey !== undefined ? { alchemyApiKey } : {}),
       ...(secrets.getOptional("DISABLE_COINGECKO") === "1" ? { disableCoingecko: true } : {}),
       ...(secrets.getOptional("DISABLE_COINCAP") === "1" ? { disableCoincap: true } : {}),
       ...(secrets.getOptional("DISABLE_BINANCE") === "1" ? { disableBinance: true } : {}),
+      ...(secrets.getOptional("DISABLE_ALCHEMY") === "1" ? { disableAlchemy: true } : {}),
       cache,
       logger
     }),
