@@ -61,7 +61,8 @@ async function main(): Promise<void> {
   // Apply migrations at boot. Deno supports node:fs + node:url natively, so
   // the shared fs loader works here too. Must run before any route handler.
   const migrationsDir = new URL("../../migrations/", import.meta.url);
-  const migrationResult = await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
+  const migrations = loadMigrationsFromDir(migrationsDir);
+  const migrationResult = await applyMigrations(db, migrations);
   if (migrationResult.applied.length > 0) {
     logger.info("migrations applied", { applied: migrationResult.applied });
   }
@@ -182,7 +183,8 @@ async function main(): Promise<void> {
     pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
-    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds)
+    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
+    migrations
   };
 
   const app = buildApp(deps);

@@ -77,7 +77,8 @@ async function main(): Promise<void> {
   );
 
   const migrationsDir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "migrations");
-  const migrationResult = await applyMigrations(db, loadMigrationsFromDir(migrationsDir));
+  const migrations = loadMigrationsFromDir(migrationsDir);
+  const migrationResult = await applyMigrations(db, migrations);
   if (migrationResult.applied.length > 0) {
     logger.info("migrations applied", { applied: migrationResult.applied });
   }
@@ -220,7 +221,8 @@ async function main(): Promise<void> {
     pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
-    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds)
+    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
+    migrations
   };
 
   const app = buildApp(deps);

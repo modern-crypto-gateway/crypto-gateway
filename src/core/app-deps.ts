@@ -72,6 +72,20 @@ export interface AppDeps {
   // Absent for deployments without Alchemy — the tracker then enqueues
   // nothing (correctly, since there's nowhere to sync it to).
   readonly alchemySubscribableChainsByFamily?: Readonly<Partial<Record<ChainFamily, readonly number[]>>>;
+
+  // Pre-loaded migration set. Populated on runtimes with filesystem access
+  // (Node/Deno read the /migrations directory at boot) so the /admin/migrate
+  // endpoint can re-apply them on demand. Absent on Workers/Vercel-Edge,
+  // where migrations ship via `wrangler d1 migrations apply` / the Turso
+  // migration CLI — the endpoint returns 501 when this field is missing.
+  readonly migrations?: readonly MigrationEntry[];
+}
+
+// Mirrors `adapters/db/migration-runner.ts Migration` — duplicated here so
+// core/ doesn't import from adapter/. The runner references this shape too.
+export interface MigrationEntry {
+  readonly id: string;
+  readonly sql: string;
 }
 
 // Per-surface rate-limit caps. Populated from AppConfig by the entrypoint so

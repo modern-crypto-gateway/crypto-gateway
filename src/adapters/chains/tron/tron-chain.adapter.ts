@@ -27,6 +27,13 @@ export const TRON_MAINNET_CHAIN_ID = 728126428;
 export const TRON_NILE_CHAIN_ID = 3448148188;
 
 const DEFAULT_FEE_LIMIT_SUN = 100_000_000; // 100 TRX cap per payout tx (generous, rarely consumed)
+// Hard energy cap for TRC-20 `transfer(address,uint256)`. Standard SRC-20
+// transfers use 14k-65k energy; 150k leaves headroom for cold-slot writes
+// and first-time recipient state. If the simulation reports more than this,
+// the target is almost certainly NOT a standard TRC-20 (proxy, fee-on-transfer,
+// or worse — a loop contract that would burn the full fee_limit). Refusing
+// to broadcast turns a silent fee burn into a loud build-time error.
+const MAX_EXPECTED_TRANSFER_ENERGY = 150_000;
 const DEFAULT_ACCOUNT_INDEX = 0;
 const DEFAULT_CHANGE_INDEX = 0;
 
@@ -217,6 +224,17 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
 
       if (resp.result.result !== true) {
         throw new Error(`Tron triggersmartcontract failed: ${resp.result.message ?? "unknown"}`);
+      }
+
+      // Energy-consumption guard. The fee_limit is a CEILING, not a quote —
+      // without this check, a non-standard transfer() implementation (proxy
+      // that loops, fee-on-transfer, malicious contract) could silently burn
+      // the full 100 TRX on each payout. Bail loudly at build time instead.
+      if (resp.energy_used !== undefined && resp.energy_used > MAX_EXPECTED_TRANSFER_ENERGY) {
+        throw new Error(
+          `Tron transfer simulation reported ${resp.energy_used} energy (cap=${MAX_EXPECTED_TRANSFER_ENERGY}); ` +
+            `refusing to broadcast. Token ${args.token} on chain ${args.chainId} may not be a standard TRC-20.`
+        );
       }
 
       return {

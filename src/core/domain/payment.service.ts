@@ -287,16 +287,24 @@ export async function confirmTransactions(deps: AppDeps): Promise<ConfirmSweepRe
     }
   }
 
+  // Batch-load every touched invoice in a single query instead of re-issuing
+  // `SELECT * FROM invoices WHERE id = ?` per transaction confirmed in this
+  // sweep. The recompute per invoice still runs sequentially (it issues its
+  // own read of the contributing txs) but the invoice fetch itself is one
+  // round-trip.
   let promotedInvoices = 0;
-  for (const invoiceId of touchedInvoiceIds) {
-    const invoiceRow = await deps.db
-      .prepare("SELECT * FROM invoices WHERE id = ?")
-      .bind(invoiceId)
-      .first<InvoiceRow>();
-    if (!invoiceRow) continue;
-    const before = invoiceRow.status as InvoiceStatus;
-    const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, deps.clock.now().getTime());
-    if (before !== "confirmed" && after === "confirmed") promotedInvoices += 1;
+  if (touchedInvoiceIds.size > 0) {
+    const ids = [...touchedInvoiceIds];
+    const placeholders = ids.map(() => "?").join(",");
+    const invoiceRows = await deps.db
+      .prepare(`SELECT * FROM invoices WHERE id IN (${placeholders})`)
+      .bind(...ids)
+      .all<InvoiceRow>();
+    for (const invoiceRow of invoiceRows.results) {
+      const before = invoiceRow.status as InvoiceStatus;
+      const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, deps.clock.now().getTime());
+      if (before !== "confirmed" && after === "confirmed") promotedInvoices += 1;
+    }
   }
 
   return { checked: pending.results.length, confirmed, reverted, promotedInvoices };

@@ -15,6 +15,7 @@ import { bootstrapAlchemyWebhooks } from "../../adapters/detection/bootstrap-alc
 import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registry-store.js";
 import { readAlchemyNotifyToken } from "../../adapters/detection/alchemy-token.js";
 import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
+import { applyMigrations } from "../../adapters/db/migration-runner.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 
@@ -389,6 +390,38 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
   app.get("/pool/stats", async (c) => {
     const stats = await getPoolStats(deps);
     return c.json({ stats }, 200);
+  });
+
+  // Runtime migration apply. Node/Deno already run migrations at boot — this
+  // endpoint is the same set, exposed for (a) the ops panel's "reapply"
+  // button and (b) restarting a Node worker after a hot-patch of the
+  // migrations directory. Workers/Vercel-Edge have no filesystem at runtime
+  // so `deps.migrations` is absent — operators apply via `wrangler d1
+  // migrations apply` or the Turso CLI, and this endpoint surfaces 501 so
+  // nobody thinks they've run migrations when they haven't.
+  app.post("/migrate", async (c) => {
+    if (deps.migrations === undefined) {
+      return c.json(
+        {
+          error: {
+            code: "MIGRATIONS_NOT_BUNDLED",
+            message:
+              "This runtime ships without a bundled migration set. Run migrations via `wrangler d1 migrations apply <db>` (Workers) or the Turso migration CLI (Vercel Edge)."
+          }
+        },
+        501
+      );
+    }
+    try {
+      const result = await applyMigrations(deps.db, deps.migrations);
+      deps.logger.info("admin /migrate", {
+        applied: result.applied,
+        skipped: result.skipped.length
+      });
+      return c.json(result, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
   });
 
   return app;
