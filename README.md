@@ -34,6 +34,45 @@ A three-layer boundary prevents leaks:
 3. ESLint `import/no-restricted-paths` prevents `core/**` from importing
    `adapters/**`, `entrypoints/**`, or `http/**`.
 
+## First-time Turso setup
+
+Every runtime except local Node/Deno-with-`file:`-DB needs a Turso database.
+Create it once, apply the schema once, and then feed `TURSO_URL` /
+`TURSO_AUTH_TOKEN` to whichever runtime you deploy to. **This is the step
+that creates all the tables** — `drizzle-kit push` reads
+[`src/db/schema.ts`](src/db/schema.ts) and emits the full schema against the
+empty remote DB.
+
+```bash
+# 0) Install the Turso CLI (one-time): https://docs.turso.tech/cli/installation
+turso auth login
+
+# 1) Create the DB + capture its URL + auth token
+turso db create crypto-gateway
+turso db show crypto-gateway --url           # → libsql://<db>-<org>.turso.io
+turso db tokens create crypto-gateway        # → eyJhbGciOi...
+
+# 2) Apply the schema. One command creates every table on the empty DB.
+TURSO_URL="libsql://<db>-<org>.turso.io" \
+TURSO_AUTH_TOKEN="eyJ..." \
+  npx drizzle-kit push
+```
+
+**You do not need to run `drizzle-kit generate` first for a fresh DB.** That
+command is only for version-controlling schema *changes* over time (see
+[Database migrations](#database-migrations)). `push` applies the current
+schema directly — perfect for an empty Turso DB on a first deploy.
+
+Re-run `drizzle-kit push` whenever `src/db/schema.ts` changes (Workers and
+Vercel Edge have no runtime filesystem, so boot-time `migrate()` isn't
+available there — CLI push is the canonical applier). Node / Deno replay
+`drizzle/migrations/*` at boot and will pick up schema changes automatically
+on restart.
+
+For **pure local development** this step is optional: the Node / Deno
+quick-starts below default to `file:./local.db`, and boot-time `migrate()`
+creates the schema in that SQLite file on first run.
+
 ## Quick start — Node
 
 ```bash
@@ -46,8 +85,9 @@ npm run dev:node
 ```
 
 Default port `8787`. libSQL data lands in `./local.db` (override with
-`TURSO_URL=libsql://…` + `TURSO_AUTH_TOKEN=…` for Turso; the legacy
-`DATABASE_URL` / `DATABASE_TOKEN` names still work for one release cycle).
+`TURSO_URL=libsql://…` + `TURSO_AUTH_TOKEN=…` after running the
+[Turso setup above](#first-time-turso-setup); the legacy `DATABASE_URL` /
+`DATABASE_TOKEN` names still work for one release cycle).
 
 A dev merchant is auto-seeded in non-production (`NODE_ENV != production`) with
 id `00000000-0000-0000-0000-000000000001`. Its API key hash has no known
@@ -56,18 +96,13 @@ the merchant API.
 
 ## Quick start — Cloudflare Workers
 
+Prerequisite: run [First-time Turso setup](#first-time-turso-setup) first —
+you'll paste the resulting URL + token into the `wrangler secret put` lines
+below. Workers has no runtime filesystem, so `/admin/migrate` returns 501 and
+`drizzle-kit push` is the only applier available for this runtime.
+
 ```bash
 cp wrangler.jsonc.example wrangler.jsonc
-
-# Create a Turso database and grab its URL + auth token:
-turso db create crypto-gateway-dev
-turso db show crypto-gateway-dev --url      # -> libsql://<db>-<org>.turso.io
-turso db tokens create crypto-gateway-dev   # -> eyJhbGciOi...
-
-# Apply Drizzle migrations CLI-side against the REMOTE Turso DB (Workers has
-# no filesystem at runtime, so the /admin/migrate endpoint 501s — drizzle-kit
-# is the canonical applier for this runtime):
-TURSO_URL="libsql://..." TURSO_AUTH_TOKEN="eyJ..." npx drizzle-kit push
 
 # Create the KV namespace for CacheStore and paste the id into wrangler.jsonc:
 npx wrangler kv namespace create CACHE
@@ -85,11 +120,6 @@ npx wrangler secret put CRON_SECRET                 # optional
 npx wrangler deploy -e dev
 ```
 
-Re-running `drizzle-kit push` after every new `drizzle/migrations/*.sql` file
-keeps the remote DB in sync. Node / Deno entrypoints replay the same folder
-at boot via Drizzle's `migrate()`, so CLI-side push is a Workers/Vercel-Edge
-concern only.
-
 The scheduled cron (`* * * * *`) runs `pollPayments` + `confirmTransactions` +
 `executeReservedPayouts` + `confirmPayouts` via the worker's `scheduled` export.
 
@@ -103,6 +133,9 @@ deno task dev     # runs src/entrypoints/deno.ts with --allow-net --allow-read -
 `Deno.cron` handles scheduling natively on Deno Deploy.
 
 ## Quick start — Vercel Edge
+
+Prerequisite: run [First-time Turso setup](#first-time-turso-setup) first —
+Edge runtime has no filesystem, so schema changes apply via CLI push only.
 
 ```bash
 vercel --prod    # respects vercel.json (routes all paths to src/entrypoints/vercel-edge.ts)
@@ -495,6 +528,10 @@ for replaying the detection path locally without waiting for a real on-chain
 transfer.
 
 ## Database migrations
+
+For creating a fresh Turso DB and applying the initial schema, see
+[First-time Turso setup](#first-time-turso-setup). This section covers
+ongoing schema changes after the DB exists.
 
 Drizzle Kit owns migrations. The schema is the source-of-truth
 ([`src/db/schema.ts`](src/db/schema.ts)); `drizzle-kit generate` diffs the
