@@ -213,7 +213,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     jobs: promiseSetJobs(),
     secrets,
     secretsCipher,
-    signerStore: memorySignerStore(),
+    signerStore: memorySignerStore({ runtime: "test" }),
     priceOracle: staticPegPriceOracle(),
     webhookDispatcher: options.webhookDispatcher ?? capturingDispatcher!,
     events: createInMemoryEventBus(),

@@ -154,9 +154,17 @@ async function main(): Promise<void> {
     }),
     secrets,
     secretsCipher,
-    signerStore: memorySignerStore(),
+    signerStore: memorySignerStore({
+      runtime: "deno",
+      ...(secrets.getOptional("NODE_ENV") !== undefined ? { environment: secrets.getOptional("NODE_ENV")! } : {}),
+      logger
+    }),
     priceOracle: staticPegPriceOracle(),
-    webhookDispatcher: inlineFetchDispatcher(),
+    webhookDispatcher: inlineFetchDispatcher({
+      allowHttp:
+        secrets.getOptional("NODE_ENV") === "development" ||
+        secrets.getOptional("NODE_ENV") === "test"
+    }),
     events: createInMemoryEventBus(),
     logger,
     rateLimiter,

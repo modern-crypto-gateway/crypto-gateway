@@ -157,9 +157,15 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     jobs: waitUntilJobs(ctx),
     secrets: workersEnvSecrets(env as unknown as Record<string, unknown>),
     secretsCipher,
-    signerStore: memorySignerStore(),
+    signerStore: memorySignerStore({
+      runtime: "workers",
+      ...(typeof env["NODE_ENV"] === "string" ? { environment: env["NODE_ENV"] } : {}),
+      logger
+    }),
     priceOracle: staticPegPriceOracle(),
-    webhookDispatcher: inlineFetchDispatcher(),
+    webhookDispatcher: inlineFetchDispatcher({
+      allowHttp: env["NODE_ENV"] === "development" || env["NODE_ENV"] === "test"
+    }),
     events: createInMemoryEventBus(),
     logger,
     rateLimiter,

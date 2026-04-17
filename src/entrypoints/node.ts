@@ -190,9 +190,15 @@ async function main(): Promise<void> {
     }),
     secrets,
     secretsCipher,
-    signerStore: memorySignerStore(),
+    signerStore: memorySignerStore({
+      runtime: "node",
+      environment: config.environment,
+      logger
+    }),
     priceOracle: staticPegPriceOracle(),
-    webhookDispatcher: inlineFetchDispatcher(),
+    webhookDispatcher: inlineFetchDispatcher({
+      allowHttp: config.environment === "development" || config.environment === "test"
+    }),
     events: createInMemoryEventBus(),
     logger,
     rateLimiter,

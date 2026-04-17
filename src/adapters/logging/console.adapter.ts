@@ -16,6 +16,31 @@ export interface ConsoleLoggerConfig {
 
 const LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
+// Known secret-carrying patterns that appear in upstream error messages
+// (viem RPC failures, fetch-level stack traces, Alchemy SDK logs). Applied to
+// the final serialized line before the sink writes, so no caller has to
+// remember to sanitize per-error fields. Conservative: only masks shapes we
+// know leak real secrets — never generic tokens or IDs.
+const SECRET_REDACTORS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
+  // Alchemy-style RPC URLs with key in path: /v2/<key>, /nft/v2/<key>, etc.
+  // The hostname is preserved so the log still identifies the provider.
+  { pattern: /(\/v2\/)[A-Za-z0-9_-]{20,}/g, replacement: "$1[REDACTED]" },
+  // Bearer tokens in Authorization headers echoed back in error strings.
+  { pattern: /([Bb]earer\s+)[A-Za-z0-9_.\-]+/g, replacement: "$1[REDACTED]" },
+  // `x-api-key`/`X-API-KEY` header values echoed in error strings or curl dumps.
+  { pattern: /([Xx]-[Aa]pi-[Kk]ey['":\s]+)[A-Za-z0-9_\-]{12,}/g, replacement: "$1[REDACTED]" },
+  // authToken=... in query strings or debug dumps.
+  { pattern: /(auth[_-]?token['"]?\s*[:=]\s*['"]?)[A-Za-z0-9_\-.]{12,}/gi, replacement: "$1[REDACTED]" }
+];
+
+function redactSecrets(line: string): string {
+  let out = line;
+  for (const { pattern, replacement } of SECRET_REDACTORS) {
+    out = out.replace(pattern, replacement);
+  }
+  return out;
+}
+
 export function consoleLogger(config: ConsoleLoggerConfig = {}): Logger {
   const format = config.format ?? "json";
   const minLevelOrder = LEVEL_ORDER[config.minLevel ?? "info"];
@@ -42,11 +67,10 @@ export function consoleLogger(config: ConsoleLoggerConfig = {}): Logger {
       if (LEVEL_ORDER[level] < minLevelOrder) return;
       const merged: LogFields = { ...boundFields, ...(fields ?? {}) };
       const timestamp = now().toISOString();
-      if (format === "json") {
-        sink(level, JSON.stringify({ ts: timestamp, level, msg: message, ...merged }));
-      } else {
-        sink(level, formatPretty(timestamp, level, message, merged));
-      }
+      const line = format === "json"
+        ? JSON.stringify({ ts: timestamp, level, msg: message, ...merged })
+        : formatPretty(timestamp, level, message, merged);
+      sink(level, redactSecrets(line));
     };
 
     return {

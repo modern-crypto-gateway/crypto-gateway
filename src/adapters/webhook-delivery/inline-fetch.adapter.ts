@@ -1,4 +1,5 @@
 import type { WebhookDispatcher } from "../../core/ports/webhook-delivery.port.ts";
+import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
 import { bytesToHex, hmacSha256 } from "../crypto/subtle.js";
 
 export interface InlineFetchDispatcherConfig {
@@ -14,6 +15,10 @@ export interface InlineFetchDispatcherConfig {
   // Statuses that trigger a retry rather than a permanent failure.
   // Defaults to 408, 425, 429, and anything in 5xx.
   retryOn?: (status: number) => boolean;
+  // Permit http:// webhook targets. Tests and local dev pass true; all other
+  // environments reject http at dispatch time as a defense-in-depth layer in
+  // case a merchant row was written before the ingress SSRF guard existed.
+  allowHttp?: boolean;
 }
 
 // Signs + POSTs the JSON payload to the merchant's URL with HMAC-SHA256 of the
@@ -32,11 +37,23 @@ export function inlineFetchDispatcher(config: InlineFetchDispatcherConfig = {}):
   const timeoutMs = config.timeoutMs ?? 10_000;
   const maxAttempts = config.maxAttempts ?? 4;
   const retryBaseMs = config.retryBaseMs ?? 250;
+  const allowHttp = config.allowHttp ?? false;
   const shouldRetry =
     config.retryOn ?? ((status: number) => status === 408 || status === 425 || status === 429 || status >= 500);
 
   return {
     async dispatch({ url, payload, secret, idempotencyKey }) {
+      // Second-line SSRF guard: even if the ingress check in admin routes is
+      // bypassed (rows pre-dating the check, or a future direct-DB-write path),
+      // the dispatcher refuses to fetch forbidden hosts.
+      const safety = assertWebhookUrlSafe(url, { allowHttp });
+      if (!safety.ok) {
+        return {
+          delivered: false,
+          error: `refused to dispatch to ${url}: ${safety.reason}`
+        };
+      }
+
       const body = JSON.stringify(payload);
       const sigBytes = await hmacSha256(secret, body);
       const signature = bytesToHex(sigBytes);

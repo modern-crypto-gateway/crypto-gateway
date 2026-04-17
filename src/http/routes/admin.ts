@@ -14,6 +14,7 @@ import {
 import { bootstrapAlchemyWebhooks } from "../../adapters/detection/bootstrap-alchemy-webhooks.js";
 import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registry-store.js";
 import { readAlchemyNotifyToken } from "../../adapters/detection/alchemy-token.js";
+import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 
@@ -92,6 +93,29 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     }
     try {
       const parsed = CreateMerchantSchema.parse(body);
+
+      // SSRF guard: reject webhook URLs pointing at private/loopback/metadata
+      // hosts before we ever accept the merchant. `allowHttp` is on in
+      // development so local-dev merchants can target http://localhost
+      // webhook receivers during testing — strict https/external-only in
+      // every other environment.
+      if (parsed.webhookUrl !== undefined) {
+        const envName = deps.secrets.getOptional("NODE_ENV");
+        const allowHttp = envName === "development" || envName === "test";
+        const safety = assertWebhookUrlSafe(parsed.webhookUrl, { allowHttp });
+        if (!safety.ok) {
+          return c.json(
+            {
+              error: {
+                code: "INVALID_WEBHOOK_URL",
+                message: `Webhook URL rejected: ${safety.detail ?? safety.reason}`
+              }
+            },
+            400
+          );
+        }
+      }
+
       const apiKey = `sk_${bytesToRandomHex(32)}`;
       const apiKeyHash = await sha256Hex(apiKey);
       const webhookSecret = parsed.webhookSecret ?? bytesToRandomHex(32);
@@ -188,10 +212,24 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       );
     }
 
-    const body = (await c.req.json().catch(() => ({}))) as unknown;
+    // Body is optional (every field has a default) but if the operator DID
+    // send something, it must be valid JSON — silently treating a malformed
+    // POST as `{}` would hide typos in `chainIds` / `seedAddressByChainId`
+    // and ship the defaults without warning. Empty body is permitted and
+    // parsed as `{}`; malformed JSON returns BAD_JSON like every other admin
+    // endpoint.
+    const rawBody = await c.req.text();
+    let parsedBody: unknown = {};
+    if (rawBody.length > 0) {
+      try {
+        parsedBody = JSON.parse(rawBody);
+      } catch {
+        return c.json({ error: { code: "BAD_JSON" } }, 400);
+      }
+    }
     let parsed: z.infer<typeof BootstrapAlchemyWebhooksSchema>;
     try {
-      parsed = BootstrapAlchemyWebhooksSchema.parse(body);
+      parsed = BootstrapAlchemyWebhooksSchema.parse(parsedBody);
     } catch (err) {
       return renderError(c, err, deps.logger);
     }
@@ -324,9 +362,20 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
   // 'skipped-no-adapter'. The endpoint is safe to call repeatedly and is
   // also the recovery path when the pool exhausts in prod.
   app.post("/pool/initialize", async (c) => {
-    const body = (await c.req.json().catch(() => null)) as unknown;
+    // Same rule as /bootstrap/alchemy-webhooks: empty body is fine (every
+    // field has a default), malformed JSON returns BAD_JSON so typos don't
+    // silently fall through to defaults.
+    const rawBody = await c.req.text();
+    let parsedBody: unknown = {};
+    if (rawBody.length > 0) {
+      try {
+        parsedBody = JSON.parse(rawBody);
+      } catch {
+        return c.json({ error: { code: "BAD_JSON" } }, 400);
+      }
+    }
     try {
-      const parsed = InitializePoolSchema.parse(body ?? {});
+      const parsed = InitializePoolSchema.parse(parsedBody);
       const results = await initializePool(deps, parsed);
       return c.json({ results }, 200);
     } catch (err) {
