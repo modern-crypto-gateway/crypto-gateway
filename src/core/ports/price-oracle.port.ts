@@ -18,4 +18,11 @@ export interface PriceOracle {
     fiatCurrency: FiatCurrency,
     decimals: number
   ): Promise<{ amountRaw: string; rate: string }>;
+
+  // Batch USD-rate lookup used by the rate-window snapshot. Returns a map
+  // keyed by the requested token symbols. Tokens the oracle doesn't
+  // recognize are omitted — callers should treat them as "not priced"
+  // rather than substituting a default. Values are decimal strings of USD
+  // per 1 whole token (so 1 USDC ≈ "1.00", 1 ETH ≈ "2500.00").
+  getUsdRates(tokens: readonly TokenSymbol[]): Promise<Readonly<Record<string, string>>>;
 }

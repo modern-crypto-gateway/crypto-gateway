@@ -22,6 +22,12 @@ export interface OrderRow {
   quoted_rate: string | null;
   external_id: string | null;
   metadata_json: string | null;
+  // A2 USD-path columns.
+  amount_usd: string | null;
+  paid_usd: string;
+  overpaid_usd: string;
+  rate_window_expires_at: number | null;
+  rates_json: string | null;
   created_at: number;
   expires_at: number;
   confirmed_at: number | null;
@@ -50,6 +56,14 @@ export function rowToOrder(row: OrderRow, receiveAddresses: readonly OrderReceiv
     fiatAmount: row.fiat_amount,
     fiatCurrency: row.fiat_currency,
     quotedRate: row.quoted_rate,
+    amountUsd: row.amount_usd,
+    paidUsd: row.paid_usd,
+    overpaidUsd: row.overpaid_usd,
+    rateWindowExpiresAt: row.rate_window_expires_at === null ? null : new Date(row.rate_window_expires_at),
+    rates:
+      row.rates_json === null
+        ? null
+        : (JSON.parse(row.rates_json) as Record<string, string>),
     externalId: row.external_id,
     metadata: row.metadata_json === null ? null : (JSON.parse(row.metadata_json) as Record<string, unknown>),
     createdAt: new Date(row.created_at),

@@ -10,6 +10,7 @@ import { findChainAdapter } from "./chain-lookup.js";
 import { fetchOrderReceiveAddresses, loadOrder, rowToOrder, type OrderRow } from "./mappers.js";
 import { DomainError } from "../errors.js";
 import { allocateForOrder } from "./pool.service.js";
+import { snapshotRates, tokensForFamilies } from "./rate-window.js";
 
 // ---- Input validation ----
 
@@ -18,17 +19,20 @@ export const CreateOrderInputSchema = z
     merchantId: MerchantIdSchema,
     chainId: ChainIdSchema,
     token: TokenSymbolSchema,
-    // Either provide a fiat-priced amount (+ currency) and let the oracle convert,
-    // OR provide a raw token amount directly. Enforced by the .refine below.
+    // Three mutually-compatible pricing modes:
+    //   - `amountUsd`: USD-pegged. Payments in any accepted-family token
+    //     convert via the pinned rate-window snapshot (A2).
+    //   - `amountRaw`: exact token amount. Single-token, payer must pay
+    //     in that token. Legacy.
+    //   - `fiatAmount + fiatCurrency`: single-token, amount derived at
+    //     creation via oracle.fiatToTokenAmount. Legacy.
+    // `.refine` below enforces exactly-one-is-present.
+    amountUsd: z.string().regex(/^\d+(\.\d{1,8})?$/).optional(),
     fiatAmount: FiatAmountSchema.optional(),
     fiatCurrency: FiatCurrencySchema.optional(),
     amountRaw: AmountRawSchema.optional(),
     // Multi-family acceptance. When set, the order gets one receive address
-    // per family (e.g. ["evm","tron"] = one EVM address + one Tron address).
-    // Omitted = single-family, derived from `chainId`'s family. In A1.b the
-    // token is still scoped per-chain; multi-family orders require the token
-    // to exist in the registry for at least one chain in each accepted family.
-    // A2 introduces USD-pegged amounts + any-token acceptance.
+    // per family. Omitted = single-family, derived from `chainId`'s family.
     acceptedFamilies: z.array(ChainFamilySchema).min(1).optional(),
     externalId: z.string().max(256).optional(),
     metadata: z.record(z.unknown()).optional(),
@@ -38,8 +42,23 @@ export const CreateOrderInputSchema = z
     expiresInMinutes: z.number().int().min(1).max(60 * 24).default(30)
   })
   .refine(
-    (v) => v.amountRaw !== undefined || (v.fiatAmount !== undefined && v.fiatCurrency !== undefined),
-    { message: "Either amountRaw or (fiatAmount + fiatCurrency) must be provided" }
+    (v) => {
+      // Exactly one pricing mode. All-three-absent rejected; combinations
+      // rejected so the path the order takes is unambiguous at read time.
+      const modes =
+        (v.amountUsd !== undefined ? 1 : 0) +
+        (v.amountRaw !== undefined ? 1 : 0) +
+        (v.fiatAmount !== undefined || v.fiatCurrency !== undefined ? 1 : 0);
+      return modes === 1;
+    },
+    {
+      message:
+        "Provide EXACTLY ONE of: `amountUsd` (USD-pegged, any-token), `amountRaw` (legacy single-token), or `fiatAmount` + `fiatCurrency` (legacy fiat-quoted)"
+    }
+  )
+  .refine(
+    (v) => v.fiatAmount === undefined || v.fiatCurrency !== undefined,
+    { message: "`fiatAmount` requires `fiatCurrency`" }
   );
 export type CreateOrderInput = z.infer<typeof CreateOrderInputSchema>;
 
@@ -60,27 +79,37 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     throw new OrderError("MERCHANT_INACTIVE", `Merchant is inactive: ${parsed.merchantId}`);
   }
 
-  // 2. Token must be registered for this chain.
+  // 2. Token must be registered for this chain. For the USD path this is
+  //    only a sanity check that the merchant's `token` + `chainId` pair is
+  //    real; detection accepts payments in ANY registered token on the
+  //    accepted families regardless.
   const token = findToken(parsed.chainId, parsed.token);
   if (!token) {
     throw new OrderError("TOKEN_NOT_SUPPORTED", `Token ${parsed.token} not supported on chain ${parsed.chainId}`);
   }
 
-  // 3. Compute required raw amount. Either merchant supplied it directly, or
-  //    we convert from fiat via the oracle and record the quoted rate.
+  // 3. Compute required raw amount for legacy paths (amountRaw / fiatAmount).
+  //    USD-path orders set `amountUsd` and leave `requiredAmountRaw` as "0"
+  //    — detection converts payments to USD using the rate-window snapshot
+  //    captured in step 6 below.
   let requiredAmountRaw: string;
   let quotedRate: string | null = null;
   if (parsed.amountRaw !== undefined) {
     requiredAmountRaw = parsed.amountRaw;
-  } else {
+  } else if (parsed.fiatAmount !== undefined) {
     const conversion = await deps.priceOracle.fiatToTokenAmount(
-      parsed.fiatAmount!,
+      parsed.fiatAmount,
       parsed.token,
       parsed.fiatCurrency!,
       token.decimals
     );
     requiredAmountRaw = conversion.amountRaw;
     quotedRate = conversion.rate;
+  } else {
+    // USD path: required raw amount isn't meaningful (payment can land in
+    // any accepted token). Store "0" so the column stays populated; the
+    // authoritative target is `amount_usd`.
+    requiredAmountRaw = "0";
   }
 
   // 4. Resolve the family set for this order.
@@ -143,7 +172,21 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     throw new Error("Invariant: primary family allocation missing");
   }
 
-  // 6. Insert the order row (denormalizes the primary family's address)
+  // 6. For USD-path orders, snapshot the rate window now. Covers every
+  //    token registered in the accepted families + the family natives the
+  //    oracle can quote. Rates pinned for 10 minutes; detection refreshes
+  //    when it fires past expiry. Legacy orders skip this entirely.
+  let amountUsd: string | null = null;
+  let ratesJson: string | null = null;
+  let rateWindowExpiresAt: number | null = null;
+  if (parsed.amountUsd !== undefined) {
+    amountUsd = parsed.amountUsd;
+    const snapshot = await snapshotRates(deps, tokensForFamilies(acceptedFamilies));
+    ratesJson = JSON.stringify(snapshot.rates);
+    rateWindowExpiresAt = snapshot.expiresAt;
+  }
+
+  // 7. Insert the order row (denormalizes the primary family's address)
   //    and the per-family join rows in a single batch so a partial write
   //    can't leave the order unreachable for detection.
   const expiresAt = now + parsed.expiresInMinutes * 60_000;
@@ -154,8 +197,10 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
         `INSERT INTO orders
            (id, merchant_id, status, chain_id, token, receive_address, address_index,
             required_amount_raw, received_amount_raw, fiat_amount, fiat_currency, quoted_rate,
-            external_id, metadata_json, accepted_families, created_at, expires_at, updated_at)
-         VALUES (?, ?, 'created', ?, ?, ?, ?, ?, '0', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            external_id, metadata_json, accepted_families,
+            amount_usd, paid_usd, overpaid_usd, rate_window_expires_at, rates_json,
+            created_at, expires_at, updated_at)
+         VALUES (?, ?, 'created', ?, ?, ?, ?, ?, '0', ?, ?, ?, ?, ?, ?, ?, '0', '0', ?, ?, ?, ?, ?)`
       )
       .bind(
         orderId,
@@ -171,6 +216,9 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
         parsed.externalId ?? null,
         metadataJson,
         JSON.stringify(acceptedFamilies),
+        amountUsd,
+        rateWindowExpiresAt,
+        ratesJson,
         now,
         expiresAt,
         now
@@ -202,6 +250,11 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
       quoted_rate: quotedRate,
       external_id: parsed.externalId ?? null,
       metadata_json: metadataJson,
+      amount_usd: amountUsd,
+      paid_usd: "0",
+      overpaid_usd: "0",
+      rate_window_expires_at: rateWindowExpiresAt,
+      rates_json: ratesJson,
       created_at: now,
       expires_at: expiresAt,
       confirmed_at: null,

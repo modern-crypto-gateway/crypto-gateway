@@ -323,6 +323,12 @@ function orderEventFor(status: OrderStatus, order: Order, now: number): DomainEv
       return { type: "order.canceled", orderId: order.id, order, at };
     case "created":
       return { type: "order.created", orderId: order.id, order, at };
+    // A2: overpaid is a terminal distinct from confirmed. Detection code in
+    // A2.b emits this; until then the legacy path never produces it. Treat
+    // it as order.confirmed semantically — merchants get the paid event, and
+    // the `overpaidUsd` field on the order body tells them the delta.
+    case "overpaid":
+      return { type: "order.confirmed", orderId: order.id, order, at };
   }
 }
 
