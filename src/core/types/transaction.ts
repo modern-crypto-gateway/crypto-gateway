@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { Brand } from "./branded.js";
 import { AddressSchema, ChainIdSchema, TxHashSchema } from "./chain.js";
 import { AmountRawSchema } from "./money.js";
-import { OrderIdSchema } from "./order.js";
+import { InvoiceIdSchema } from "./invoice.js";
 import { TokenSymbolSchema } from "./token.js";
 
 // Per-transaction lifecycle:
@@ -18,9 +18,9 @@ export type TransactionId = Brand<z.infer<typeof TransactionIdSchema>, "Transact
 
 export const TransactionSchema = z.object({
   id: TransactionIdSchema,
-  // null until we match the tx to an order (e.g. orphan incoming transfers to an
-  // unknown receive address pending manual reconciliation).
-  orderId: OrderIdSchema.nullable(),
+  // null until we match the tx to an invoice (e.g. orphan incoming transfers to
+  // an unknown receive address pending manual reconciliation).
+  invoiceId: InvoiceIdSchema.nullable(),
 
   chainId: ChainIdSchema,
   txHash: TxHashSchema,

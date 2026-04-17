@@ -25,7 +25,7 @@ export interface AlchemySyncSweepConfig {
   logger: Logger;
   now?: () => number;
   // Max subscription rows to claim per sweep. Prevents a bootstrap of
-  // thousands of existing orders from spiking Alchemy's API. Default 500.
+  // thousands of existing invoices from spiking Alchemy's API. Default 500.
   batchLimit?: number;
   // Per-row backoff before retry after a failure, ms. Default 5 min.
   retryBackoffMs?: number;

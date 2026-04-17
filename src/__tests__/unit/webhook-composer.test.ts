@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { composeWebhook } from "../../core/domain/webhook-composer.js";
-import type { Order, OrderId } from "../../core/types/order.js";
+import type { Invoice, InvoiceId } from "../../core/types/invoice.js";
 import type { Payout, PayoutId } from "../../core/types/payout.js";
 import type { MerchantId } from "../../core/types/merchant.js";
 
-function fixtureOrder(overrides: Partial<Order> = {}): Order {
+function fixtureInvoice(overrides: Partial<Invoice> = {}): Invoice {
   return {
-    id: "00000000-0000-0000-0000-0000000000aa" as OrderId,
+    id: "00000000-0000-0000-0000-0000000000aa" as InvoiceId,
     merchantId: "00000000-0000-0000-0000-000000000001" as MerchantId,
     status: "detected",
     chainId: 1,
@@ -63,32 +63,32 @@ function fixturePayout(overrides: Partial<Payout> = {}): Payout {
 }
 
 describe("composeWebhook", () => {
-  it("maps order.detected to a merchant-visible event with a stable idempotency key", () => {
-    const order = fixtureOrder();
+  it("maps invoice.detected to a merchant-visible event with a stable idempotency key", () => {
+    const invoice = fixtureInvoice();
     const composed = composeWebhook({
-      type: "order.detected",
-      orderId: order.id,
-      order,
+      type: "invoice.detected",
+      invoiceId: invoice.id,
+      invoice,
       at: new Date("2026-04-16T10:01:00Z")
     });
     expect(composed).not.toBeNull();
-    expect(composed!.merchantId).toBe(order.merchantId);
-    expect(composed!.payload.event).toBe("order.detected");
+    expect(composed!.merchantId).toBe(invoice.merchantId);
+    expect(composed!.payload.event).toBe("invoice.detected");
     expect(composed!.payload.timestamp).toBe("2026-04-16T10:01:00.000Z");
     expect(composed!.payload.data).toMatchObject({
-      id: order.id,
+      id: invoice.id,
       status: "detected",
       requiredAmountRaw: "1000000",
       receivedAmountRaw: "1000000",
       externalId: "cart-42"
     });
-    expect(composed!.idempotencyKey).toBe(`order.detected:${order.id}:detected`);
+    expect(composed!.idempotencyKey).toBe(`invoice.detected:${invoice.id}:detected`);
   });
 
-  it("returns null for internal events (order.created, tx.*, payout.planned)", () => {
-    const order = fixtureOrder({ status: "created" });
+  it("returns null for internal events (invoice.created, tx.*, payout.planned)", () => {
+    const invoice = fixtureInvoice({ status: "created" });
     expect(
-      composeWebhook({ type: "order.created", orderId: order.id, order, at: new Date() })
+      composeWebhook({ type: "invoice.created", invoiceId: invoice.id, invoice, at: new Date() })
     ).toBeNull();
   });
 
@@ -113,30 +113,30 @@ describe("composeWebhook", () => {
     expect(composed!.idempotencyKey).toBe(`payout.confirmed:${payout.id}:confirmed`);
   });
 
-  it("maps order.overpaid with overpaidUsd in the snapshot data", () => {
-    const order = fixtureOrder({
+  it("maps invoice.overpaid with overpaidUsd in the snapshot data", () => {
+    const invoice = fixtureInvoice({
       status: "overpaid",
       amountUsd: "100.00",
       paidUsd: "120.00",
       overpaidUsd: "20.00"
     });
     const composed = composeWebhook({
-      type: "order.overpaid",
-      orderId: order.id,
-      order,
+      type: "invoice.overpaid",
+      invoiceId: invoice.id,
+      invoice,
       at: new Date("2026-04-16T10:02:00Z")
     });
     expect(composed).not.toBeNull();
-    expect(composed!.payload.event).toBe("order.overpaid");
-    expect(composed!.idempotencyKey).toBe(`order.overpaid:${order.id}:overpaid`);
+    expect(composed!.payload.event).toBe("invoice.overpaid");
+    expect(composed!.idempotencyKey).toBe(`invoice.overpaid:${invoice.id}:overpaid`);
   });
 
-  it("maps order.payment_received and keys idempotency on txHash (not status)", () => {
-    const order = fixtureOrder({ status: "partial", paidUsd: "20.00", amountUsd: "50.00" });
+  it("maps invoice.payment_received and keys idempotency on txHash (not status)", () => {
+    const invoice = fixtureInvoice({ status: "partial", paidUsd: "20.00", amountUsd: "50.00" });
     const composed = composeWebhook({
-      type: "order.payment_received",
-      orderId: order.id,
-      order,
+      type: "invoice.payment_received",
+      invoiceId: invoice.id,
+      invoice,
       payment: {
         txHash: "0xpayment1",
         chainId: 1,
@@ -148,23 +148,23 @@ describe("composeWebhook", () => {
       at: new Date("2026-04-16T10:03:00Z")
     });
     expect(composed).not.toBeNull();
-    expect(composed!.payload.event).toBe("order.payment_received");
-    expect(composed!.idempotencyKey).toBe(`order.payment_received:${order.id}:0xpayment1`);
+    expect(composed!.payload.event).toBe("invoice.payment_received");
+    expect(composed!.idempotencyKey).toBe(`invoice.payment_received:${invoice.id}:0xpayment1`);
     const data = composed!.payload.data as {
-      order: { status: string };
+      invoice: { status: string };
       payment: { txHash: string; amountUsd: string | null };
     };
-    expect(data.order.status).toBe("partial");
+    expect(data.invoice.status).toBe("partial");
     expect(data.payment.txHash).toBe("0xpayment1");
     expect(data.payment.amountUsd).toBe("20.00");
   });
 
   it("serializes dates as ISO strings (no raw Date objects in the payload)", () => {
-    const order = fixtureOrder();
+    const invoice = fixtureInvoice();
     const composed = composeWebhook({
-      type: "order.confirmed",
-      orderId: order.id,
-      order,
+      type: "invoice.confirmed",
+      invoiceId: invoice.id,
+      invoice,
       at: new Date("2026-04-16T10:05:00Z")
     });
     const data = composed!.payload.data;

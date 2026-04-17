@@ -35,7 +35,7 @@ async function bootWithAllFamilies(): Promise<BootedTestApp> {
   });
 }
 
-describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
+describe("POST /api/v1/invoices — USD-pegged path (A2.a)", () => {
   let booted: BootedTestApp;
   let apiKey: string;
 
@@ -48,10 +48,10 @@ describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
     await booted.close();
   });
 
-  it("creates a USD-pegged order, snapshots current rates, and pins a 10-minute window", async () => {
+  it("creates a USD-pegged invoice, snapshots current rates, and pins a 10-minute window", async () => {
     const before = Date.now();
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -65,7 +65,7 @@ describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
     const after = Date.now();
     expect(res.status).toBe(201);
     const body = (await res.json()) as {
-      order: {
+      invoice: {
         amountUsd: string;
         paidUsd: string;
         overpaidUsd: string;
@@ -74,19 +74,19 @@ describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
         requiredAmountRaw: string;
       };
     };
-    expect(body.order.amountUsd).toBe("100.00");
-    expect(body.order.paidUsd).toBe("0");
-    expect(body.order.overpaidUsd).toBe("0");
-    expect(body.order.requiredAmountRaw).toBe("0"); // meaningless for USD-path
-    expect(body.order.rateWindowExpiresAt).toBeTruthy();
+    expect(body.invoice.amountUsd).toBe("100.00");
+    expect(body.invoice.paidUsd).toBe("0");
+    expect(body.invoice.overpaidUsd).toBe("0");
+    expect(body.invoice.requiredAmountRaw).toBe("0"); // meaningless for USD-path
+    expect(body.invoice.rateWindowExpiresAt).toBeTruthy();
 
-    const expiresAt = new Date(body.order.rateWindowExpiresAt!).getTime();
+    const expiresAt = new Date(body.invoice.rateWindowExpiresAt!).getTime();
     expect(expiresAt).toBeGreaterThanOrEqual(before + RATE_WINDOW_DURATION_MS);
     expect(expiresAt).toBeLessThanOrEqual(after + RATE_WINDOW_DURATION_MS);
 
     // Snapshot should include stables (pegged 1:1) for every family + native tokens.
-    expect(body.order.rates).toBeTruthy();
-    const rates = body.order.rates!;
+    expect(body.invoice.rates).toBeTruthy();
+    const rates = body.invoice.rates!;
     expect(rates["USDC"]).toBe("1");
     expect(rates["USDT"]).toBe("1");
     // EVM natives from DEFAULT_NATIVE_RATES in the static oracle.
@@ -99,7 +99,7 @@ describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
 
   it("persists amount_usd, paid_usd, rates_json, rate_window_expires_at on the row", async () => {
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -110,12 +110,12 @@ describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
         })
       })
     );
-    const { order } = (await res.json()) as { order: { id: string } };
+    const { invoice } = (await res.json()) as { invoice: { id: string } };
     const row = await booted.deps.db
       .prepare(
-        "SELECT amount_usd, paid_usd, overpaid_usd, rate_window_expires_at, rates_json FROM orders WHERE id = ?"
+        "SELECT amount_usd, paid_usd, overpaid_usd, rate_window_expires_at, rates_json FROM invoices WHERE id = ?"
       )
-      .bind(order.id)
+      .bind(invoice.id)
       .first<{
         amount_usd: string;
         paid_usd: string;
@@ -134,7 +134,7 @@ describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
 
   it("rejects when more than one pricing mode is supplied", async () => {
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -151,7 +151,7 @@ describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
 
   it("legacy amountRaw path keeps amount_usd NULL and rates_json NULL", async () => {
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -163,16 +163,16 @@ describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
     );
     expect(res.status).toBe(201);
     const body = (await res.json()) as {
-      order: { amountUsd: string | null; rates: unknown; rateWindowExpiresAt: unknown };
+      invoice: { amountUsd: string | null; rates: unknown; rateWindowExpiresAt: unknown };
     };
-    expect(body.order.amountUsd).toBeNull();
-    expect(body.order.rates).toBeNull();
-    expect(body.order.rateWindowExpiresAt).toBeNull();
+    expect(body.invoice.amountUsd).toBeNull();
+    expect(body.invoice.rates).toBeNull();
+    expect(body.invoice.rateWindowExpiresAt).toBeNull();
   });
 
   it("legacy fiat path sets quotedRate and keeps amount_usd NULL", async () => {
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -185,12 +185,12 @@ describe("POST /api/v1/orders — USD-pegged path (A2.a)", () => {
     );
     expect(res.status).toBe(201);
     const body = (await res.json()) as {
-      order: { amountUsd: string | null; quotedRate: string | null; requiredAmountRaw: string };
+      invoice: { amountUsd: string | null; quotedRate: string | null; requiredAmountRaw: string };
     };
-    expect(body.order.amountUsd).toBeNull();
-    expect(body.order.quotedRate).toBe("1");
+    expect(body.invoice.amountUsd).toBeNull();
+    expect(body.invoice.quotedRate).toBe("1");
     // 25 USDC at 6 decimals = 25_000_000.
-    expect(body.order.requiredAmountRaw).toBe("25000000");
+    expect(body.invoice.requiredAmountRaw).toBe("25000000");
   });
 });
 

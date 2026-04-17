@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "crypto-gateway",
-    "description": "Complete flow coverage for crypto-gateway: admin bootstrap, merchant API (orders + payouts), public checkout, provider webhook ingest, and internal cron.\n\n## Quick start\n1. Import this collection AND `crypto-gateway.local.postman_environment.json` (Environments tab).\n2. Select the `crypto-gateway (local)` environment.\n3. Fill in `adminKey` in the environment. Other values are auto-populated by test scripts as you run requests.\n4. Run `_Setup` → `1. Health` to confirm connectivity.\n5. Run `_Setup` → `2. Create merchant` — its test script saves `apiKey`, `merchantId`, `webhookSecret` into the environment for subsequent merchant API calls.\n6. Use the per-chain quick-starts under `Orders / Quick starts` to create sample orders on each supported chain.\n\n## Chaining\nTest scripts write `merchantId`, `merchantApiKey`, `webhookSecret`, `orderId`, `orderReceiveAddress`, `payoutId`, and per-chain `alchemySigningKey_<chainId>` into the environment so later requests can consume them without copy-paste.\n\n## Webhook simulation\nThe `Webhooks (simulate)` folder fires synthetic Alchemy payloads at `/webhooks/alchemy`. The pre-request script computes the correct HMAC using `alchemySigningKey` from the environment, so after bootstrap + signing-key save, the ingest route accepts them as if from Alchemy.",
+    "description": "Complete flow coverage for crypto-gateway: admin bootstrap, merchant API (invoices + payouts), public checkout, provider webhook ingest, and internal cron.\n\n## Quick start\n1. Import this collection AND `crypto-gateway.local.postman_environment.json` (Environments tab).\n2. Select the `crypto-gateway (local)` environment.\n3. Fill in `adminKey` in the environment. Other values are auto-populated by test scripts as you run requests.\n4. Run `_Setup` → `1. Health` to confirm connectivity.\n5. Run `_Setup` → `2. Create merchant` — its test script saves `apiKey`, `merchantId`, `webhookSecret` into the environment for subsequent merchant API calls.\n6. Use the per-chain quick-starts under `Invoices / Quick starts` to create sample invoices on each supported chain.\n\n## Chaining\nTest scripts write `merchantId`, `merchantApiKey`, `webhookSecret`, `invoiceId`, `invoiceReceiveAddress`, `payoutId`, and per-chain `alchemySigningKey_<chainId>` into the environment so later requests can consume them without copy-paste.\n\n## Webhook simulation\nThe `Webhooks (simulate)` folder fires synthetic Alchemy payloads at `/webhooks/alchemy`. The pre-request script computes the correct HMAC using `alchemySigningKey` from the environment, so after bootstrap + signing-key save, the ingest route accepts them as if from Alchemy.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "crypto-gateway-v2"
   },
@@ -112,7 +112,7 @@
               "mode": "raw",
               "raw": "{\n  \"families\": [\"evm\", \"tron\", \"solana\"],\n  \"initialSize\": 5\n}"
             },
-            "description": "Seeds the address pool. Creates N HD-derived addresses per family (evm/tron/solana), marks them 'available', fires `pool.address.created` events that the Alchemy subscription tracker fans out to per-chain webhook registrations.\n\nIdempotent: re-running tops up families below target size. Families whose chain adapter isn't wired on the gateway are reported as `skipped-no-adapter`.\n\nSubsequent order creations allocate from this pool. When the available count drops below the refill threshold, a background refill fires automatically — but the initial seed is explicit so operators see the pool filling up before traffic arrives."
+            "description": "Seeds the address pool. Creates N HD-derived addresses per family (evm/tron/solana), marks them 'available', fires `pool.address.created` events that the Alchemy subscription tracker fans out to per-chain webhook registrations.\n\nIdempotent: re-running tops up families below target size. Families whose chain adapter isn't wired on the gateway are reported as `skipped-no-adapter`.\n\nSubsequent invoice creations allocate from this pool. When the available count drops below the refill threshold, a background refill fires automatically — but the initial seed is explicit so operators see the pool filling up before traffic arrives."
           },
           "event": [
             {
@@ -138,7 +138,7 @@
               "path": ["admin", "pool", "stats"]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "Per-family pool snapshot: available / allocated / quarantined / total + highest address_index. Watch this with an alert on available-count under threshold to catch low-supply before POOL_EXHAUSTED fires on a live order-create."
+            "description": "Per-family pool snapshot: available / allocated / quarantined / total + highest address_index. Watch this with an alert on available-count under threshold to catch low-supply before POOL_EXHAUSTED fires on a live invoice-create."
           }
         },
         {
@@ -241,14 +241,14 @@
       ]
     },
     {
-      "name": "Orders",
-      "description": "Merchant-scoped order API. Requires `merchantApiKey` (auto-populated by `_Setup / 2. Create merchant`).",
+      "name": "Invoices",
+      "description": "Merchant-scoped invoice API. Requires `merchantApiKey` (auto-populated by `_Setup / 2. Create merchant`).",
       "item": [
         {
-          "name": "Create order (parametric)",
+          "name": "Create invoice (parametric)",
           "request": {
             "method": "POST",
-            "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+            "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
             "header": [
               { "key": "Content-Type", "value": "application/json" },
               { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
@@ -267,11 +267,11 @@
                 "exec": [
                   "pm.test('201 Created', () => pm.response.to.have.status(201));",
                   "const body = pm.response.json();",
-                  "if (body.order && body.order.id) {",
-                  "  pm.environment.set('orderId', body.order.id);",
-                  "  pm.environment.set('orderReceiveAddress', body.order.receiveAddress);",
-                  "  console.log('saved orderId =', body.order.id);",
-                  "  console.log('receiveAddress =', body.order.receiveAddress);",
+                  "if (body.invoice && body.invoice.id) {",
+                  "  pm.environment.set('invoiceId', body.invoice.id);",
+                  "  pm.environment.set('invoiceReceiveAddress', body.invoice.receiveAddress);",
+                  "  console.log('saved invoiceId =', body.invoice.id);",
+                  "  console.log('receiveAddress =', body.invoice.receiveAddress);",
                   "}"
                 ]
               }
@@ -279,13 +279,13 @@
           ]
         },
         {
-          "name": "Get order",
+          "name": "Get invoice",
           "request": {
             "method": "GET",
             "url": {
-              "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}",
+              "raw": "{{baseUrl}}/api/v1/invoices/{{invoiceId}}",
               "host": ["{{baseUrl}}"],
-              "path": ["api", "v1", "orders", "{{orderId}}"]
+              "path": ["api", "v1", "invoices", "{{invoiceId}}"]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }]
           },
@@ -302,105 +302,105 @@
           ]
         },
         {
-          "name": "Expire order",
+          "name": "Expire invoice",
           "request": {
             "method": "POST",
             "url": {
-              "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}/expire",
+              "raw": "{{baseUrl}}/api/v1/invoices/{{invoiceId}}/expire",
               "host": ["{{baseUrl}}"],
-              "path": ["api", "v1", "orders", "{{orderId}}", "expire"]
+              "path": ["api", "v1", "invoices", "{{invoiceId}}", "expire"]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
-            "description": "Transitions the order to `expired`. Idempotent-ish: already-terminal orders return 200 with their current state. Frees the HD-derived receive address for reuse lifecycle-wise (Alchemy address-subscription sweep will deregister it)."
+            "description": "Transitions the invoice to `expired`. Idempotent-ish: already-terminal invoices return 200 with their current state. Frees the HD-derived receive address for reuse lifecycle-wise (Alchemy address-subscription sweep will deregister it)."
           }
         },
         {
           "name": "Quick starts",
-          "description": "Pre-filled `Create order` variants — one per supported chain × stablecoin. Each overrides its own `chainId`/`token`/`amountRaw` via request-scoped variables so you don't have to edit the environment to try a different chain. Each saves `orderId` + `orderReceiveAddress` on success.",
+          "description": "Pre-filled `Create invoice` variants — one per supported chain × stablecoin. Each overrides its own `chainId`/`token`/`amountRaw` via request-scoped variables so you don't have to edit the environment to try a different chain. Each saves `invoiceId` + `invoiceReceiveAddress` on success.",
           "item": [
             {
               "name": "ETH mainnet — USDC (1 USDC)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "Polygon — USDT (1 USDT)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 137,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "Arbitrum — USDC (1 USDC)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 42161,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "Base — USDC (1 USDC)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 8453,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "OP mainnet — USDC (1 USDC)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 10,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "Avalanche — USDC (1 USDC)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 43114,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" }
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "BSC — USDT (1 USDT, 18-decimal!)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
@@ -408,13 +408,13 @@
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 56,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000000000000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
                 "description": "BSC USDT is **18 decimals** (Binance-Peg BEP-20, not the 6-decimal native tokens on other chains). 1 USDT = 10^18 raw. Don't hardcode 6 anywhere."
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "Tron — USDT (1 USDT)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
@@ -422,13 +422,13 @@
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 728126428,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
                 "description": "Requires `TRONGRID_API_KEY` on the gateway for incoming-transfer detection. Payouts work with Alchemy alone; detection does not."
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "Solana — USDC SPL (1 USDC)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
@@ -436,13 +436,13 @@
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 900,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
                 "description": "SPL USDC on Solana mainnet. Receive-only today — detection via Alchemy ADDRESS_ACTIVITY webhook (parses `event.transaction[].meta.post_token_balances`). SPL payouts are deferred."
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "Dev chain — DEV (1 DEV)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
@@ -450,49 +450,49 @@
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 999,\n  \"token\": \"DEV\",\n  \"amountRaw\": \"1000000\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
                 "description": "Local-only test chain. Payouts work against a synthetic broadcast shim — perfect for integration testing without touching a real network."
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "Multi-family — USDT accepted on EVM + Tron + Solana",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"acceptedFamilies\": [\"evm\", \"tron\", \"solana\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
-                "description": "Multi-family acceptance (A1.b). Order is allocated one pool address PER family; payer picks which chain to pay on and the gateway detects wherever it lands.\n\nResponse includes `receiveAddresses: [{family, address}, ...]` — render all three at checkout. `chainId` + `receiveAddress` echo the primary family (first in the list) for legacy clients.\n\nRequires the pool to be seeded for every family in `acceptedFamilies` (see `_Setup > 3a. Initialize address pool`). Missing chain adapters → `TOKEN_NOT_SUPPORTED`."
+                "description": "Multi-family acceptance (A1.b). Invoice is allocated one pool address PER family; payer picks which chain to pay on and the gateway detects wherever it lands.\n\nResponse includes `receiveAddresses: [{family, address}, ...]` — render all three at checkout. `chainId` + `receiveAddress` echo the primary family (first in the list) for legacy clients.\n\nRequires the pool to be seeded for every family in `acceptedFamilies` (see `_Setup > 3a. Initialize address pool`). Missing chain adapters → `TOKEN_NOT_SUPPORTED`."
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
               "name": "Multi-family — USDT accepted on EVM + Tron only",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"acceptedFamilies\": [\"evm\", \"tron\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
-                "description": "Subset of families. Two receive addresses returned — payer can pay USDT on any of the 7 EVM chains OR on Tron mainnet. Same order satisfies whichever chain gets the payment first."
+                "description": "Subset of families. Two receive addresses returned — payer can pay USDT on any of the 7 EVM chains OR on Tron mainnet. Same invoice satisfies whichever chain gets the payment first."
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
             {
-              "name": "Fiat-quoted order (USD → USDC, amount inferred)",
+              "name": "Fiat-quoted invoice (USD → USDC, amount inferred)",
               "request": {
                 "method": "POST",
-                "url": { "raw": "{{baseUrl}}/api/v1/orders", "host": ["{{baseUrl}}"], "path": ["api", "v1", "orders"] },
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
                 "header": [
                   { "key": "Content-Type", "value": "application/json" },
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDC\",\n  \"fiatAmount\": \"49.99\",\n  \"fiatCurrency\": \"USD\",\n  \"externalId\": \"{{runExternalId}}\"\n}" },
-                "description": "Alternative order-creation shape: instead of `amountRaw`, pass `fiatAmount` + `fiatCurrency`. The gateway quotes the token amount via `deps.priceOracle` (default = static USD peg for stablecoins) and persists the quoted rate on the order."
+                "description": "Alternative invoice-creation shape: instead of `amountRaw`, pass `fiatAmount` + `fiatCurrency`. The gateway quotes the token amount via `deps.priceOracle` (default = static USD peg for stablecoins) and persists the quoted rate on the invoice."
               },
-              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.order){pm.environment.set('orderId',b.order.id); pm.environment.set('orderReceiveAddress',b.order.receiveAddress);}"] } }]
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             }
           ]
         }
@@ -581,11 +581,11 @@
           "request": {
             "method": "GET",
             "url": {
-              "raw": "{{baseUrl}}/checkout/{{orderId}}",
+              "raw": "{{baseUrl}}/checkout/{{invoiceId}}",
               "host": ["{{baseUrl}}"],
-              "path": ["checkout", "{{orderId}}"]
+              "path": ["checkout", "{{invoiceId}}"]
             },
-            "description": "Returns the order in a payer-safe shape: receive address, required amount, expiry, status. `merchantId`, `metadata`, `externalId` are intentionally NOT exposed to the public path."
+            "description": "Returns the invoice in a payer-safe shape: receive address, required amount, expiry, status. `merchantId`, `metadata`, `externalId` are intentionally NOT exposed to the public path."
           }
         }
       ]
@@ -605,7 +605,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"webhookId\": \"wh_sim_evm\",\n  \"id\": \"whevt_sim_evm\",\n  \"createdAt\": \"2026-04-16T12:00:00Z\",\n  \"type\": \"ADDRESS_ACTIVITY\",\n  \"event\": {\n    \"network\": \"ETH_MAINNET\",\n    \"activity\": [\n      {\n        \"fromAddress\": \"0x1111111111111111111111111111111111111111\",\n        \"toAddress\": \"{{orderReceiveAddress}}\",\n        \"blockNum\": \"0x1234567\",\n        \"hash\": \"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\",\n        \"category\": \"token\",\n        \"rawContract\": {\n          \"rawValue\": \"0xF4240\",\n          \"address\": \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\",\n          \"decimals\": 6\n        },\n        \"log\": { \"logIndex\": \"0x2\" }\n      }\n    ]\n  }\n}"
+              "raw": "{\n  \"webhookId\": \"wh_sim_evm\",\n  \"id\": \"whevt_sim_evm\",\n  \"createdAt\": \"2026-04-16T12:00:00Z\",\n  \"type\": \"ADDRESS_ACTIVITY\",\n  \"event\": {\n    \"network\": \"ETH_MAINNET\",\n    \"activity\": [\n      {\n        \"fromAddress\": \"0x1111111111111111111111111111111111111111\",\n        \"toAddress\": \"{{invoiceReceiveAddress}}\",\n        \"blockNum\": \"0x1234567\",\n        \"hash\": \"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\",\n        \"category\": \"token\",\n        \"rawContract\": {\n          \"rawValue\": \"0xF4240\",\n          \"address\": \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\",\n          \"decimals\": 6\n        },\n        \"log\": { \"logIndex\": \"0x2\" }\n      }\n    ]\n  }\n}"
             }
           },
           "event": [
@@ -645,9 +645,9 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"webhookId\": \"wh_sim_sol\",\n  \"id\": \"whevt_sim_sol\",\n  \"createdAt\": \"2026-04-16T12:00:00Z\",\n  \"type\": \"ADDRESS_ACTIVITY\",\n  \"event\": {\n    \"network\": \"SOLANA_MAINNET\",\n    \"slot\": 290000000,\n    \"transaction\": [\n      {\n        \"signature\": \"5simTxSolanaUSDC\",\n        \"slot\": 290000000,\n        \"transaction\": [{ \"signatures\": [\"5simTxSolanaUSDC\"], \"message\": [{ \"account_keys\": [] }] }],\n        \"meta\": [{\n          \"err\": null,\n          \"fee\": 5000,\n          \"pre_token_balances\": [\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"{{orderReceiveAddress}}\", \"ui_token_amount\": { \"amount\": \"0\", \"decimals\": 6 } },\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"5auZoWJxJodSU8dwgKmAfmphv5Z9Su3HAzEdLz1EUZs7\", \"ui_token_amount\": { \"amount\": \"5000000\", \"decimals\": 6 } }\n          ],\n          \"post_token_balances\": [\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"{{orderReceiveAddress}}\", \"ui_token_amount\": { \"amount\": \"1000000\", \"decimals\": 6 } },\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"5auZoWJxJodSU8dwgKmAfmphv5Z9Su3HAzEdLz1EUZs7\", \"ui_token_amount\": { \"amount\": \"4000000\", \"decimals\": 6 } }\n          ]\n        }]\n      }\n    ]\n  }\n}"
+              "raw": "{\n  \"webhookId\": \"wh_sim_sol\",\n  \"id\": \"whevt_sim_sol\",\n  \"createdAt\": \"2026-04-16T12:00:00Z\",\n  \"type\": \"ADDRESS_ACTIVITY\",\n  \"event\": {\n    \"network\": \"SOLANA_MAINNET\",\n    \"slot\": 290000000,\n    \"transaction\": [\n      {\n        \"signature\": \"5simTxSolanaUSDC\",\n        \"slot\": 290000000,\n        \"transaction\": [{ \"signatures\": [\"5simTxSolanaUSDC\"], \"message\": [{ \"account_keys\": [] }] }],\n        \"meta\": [{\n          \"err\": null,\n          \"fee\": 5000,\n          \"pre_token_balances\": [\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"{{invoiceReceiveAddress}}\", \"ui_token_amount\": { \"amount\": \"0\", \"decimals\": 6 } },\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"5auZoWJxJodSU8dwgKmAfmphv5Z9Su3HAzEdLz1EUZs7\", \"ui_token_amount\": { \"amount\": \"5000000\", \"decimals\": 6 } }\n          ],\n          \"post_token_balances\": [\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"{{invoiceReceiveAddress}}\", \"ui_token_amount\": { \"amount\": \"1000000\", \"decimals\": 6 } },\n            { \"mint\": \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\", \"owner\": \"5auZoWJxJodSU8dwgKmAfmphv5Z9Su3HAzEdLz1EUZs7\", \"ui_token_amount\": { \"amount\": \"4000000\", \"decimals\": 6 } }\n          ]\n        }]\n      }\n    ]\n  }\n}"
             },
-            "description": "Simulates an incoming USDC SPL transfer (1.000000 USDC) to the Solana receive address saved by the most recent 'Create order' against Solana. Payload shape matches Alchemy's protobuf-JSON serialization (1-element arrays for `transaction` / `message` / `meta`)."
+            "description": "Simulates an incoming USDC SPL transfer (1.000000 USDC) to the Solana receive address saved by the most recent 'Create invoice' against Solana. Payload shape matches Alchemy's protobuf-JSON serialization (1-element arrays for `transaction` / `message` / `meta`)."
           },
           "event": [
             {
@@ -688,7 +688,7 @@
               "path": ["internal", "cron", "tick"]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{cronSecret}}" }],
-            "description": "Runs the full scheduled-jobs sequence out of band: `pollPayments → confirmTransactions → executeReservedPayouts → confirmPayouts → sweepStuckFeeWalletReservations (→ alchemySyncAddresses)`.\n\nOutside Cloudflare Workers / Deno Deploy (which have native cron), this is the only way to advance state between orders. Vercel Cron hits this on a schedule; for local Node runs it's handy to invoke manually after creating an order and simulating a webhook.\n\nReturns `{ ok: true, result: { <perJobOutcome> } }`."
+            "description": "Runs the full scheduled-jobs sequence out of band: `pollPayments → confirmTransactions → executeReservedPayouts → confirmPayouts → sweepStuckFeeWalletReservations (→ alchemySyncAddresses)`.\n\nOutside Cloudflare Workers / Deno Deploy (which have native cron), this is the only way to advance state between invoices. Vercel Cron hits this on a schedule; for local Node runs it's handy to invoke manually after creating an invoice and simulating a webhook.\n\nReturns `{ ok: true, result: { <perJobOutcome> } }`."
           },
           "event": [
             {

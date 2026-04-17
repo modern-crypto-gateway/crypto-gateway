@@ -17,12 +17,12 @@ servers:
     description: Dev Workers (placeholder — replace with your subdomain)
 
 tags:
-  - name: orders
-    description: Merchant-facing order lifecycle
+  - name: invoices
+    description: Merchant-facing invoice lifecycle
   - name: payouts
     description: Merchant-facing payout lifecycle
   - name: checkout
-    description: Public order view (for hosted checkout UIs)
+    description: Public invoice view (for hosted checkout UIs)
   - name: webhooks
     description: Inbound webhook ingest from on-chain providers
   - name: admin
@@ -52,12 +52,12 @@ paths:
                   status: { type: string, enum: [ok] }
                   phase: { type: integer }
 
-  /api/v1/orders:
+  /api/v1/invoices:
     post:
-      tags: [orders]
-      summary: Create an order
+      tags: [invoices]
+      summary: Create an invoice
       description: |
-        Creates an order and allocates a receive address derived from the
+        Creates an invoice and allocates a receive address derived from the
         gateway's HD seed. The merchant is resolved from the API key — the
         caller MUST NOT include `merchantId` in the body; if they do, it's
         ignored.
@@ -65,17 +65,17 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/CreateOrderInput" }
+            schema: { $ref: "#/components/schemas/CreateInvoiceInput" }
       responses:
         "201":
-          description: Order created
+          description: Invoice created
           content:
             application/json:
               schema:
                 type: object
-                required: [order]
+                required: [invoice]
                 properties:
-                  order: { $ref: "#/components/schemas/Order" }
+                  invoice: { $ref: "#/components/schemas/Invoice" }
           headers:
             X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
             X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
@@ -86,44 +86,44 @@ paths:
         "403": { $ref: "#/components/responses/MerchantInactive" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
-  /api/v1/orders/{id}:
+  /api/v1/invoices/{id}:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
     get:
-      tags: [orders]
-      summary: Fetch an order
+      tags: [invoices]
+      summary: Fetch an invoice
       responses:
         "200":
-          description: Order found
+          description: Invoice found
           content:
             application/json:
               schema:
                 type: object
-                required: [order]
+                required: [invoice]
                 properties:
-                  order: { $ref: "#/components/schemas/Order" }
+                  invoice: { $ref: "#/components/schemas/Invoice" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
-  /api/v1/orders/{id}/expire:
+  /api/v1/invoices/{id}/expire:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
     post:
-      tags: [orders]
-      summary: Force-expire an order before its expiry window elapses
+      tags: [invoices]
+      summary: Force-expire an invoice before its expiry window elapses
       responses:
         "200":
-          description: Order expired
+          description: Invoice expired
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  order: { $ref: "#/components/schemas/Order" }
+                  invoice: { $ref: "#/components/schemas/Invoice" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Order is in a terminal state and cannot be expired
+          description: Invoice is in a terminal state and cannot be expired
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -179,21 +179,21 @@ paths:
       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
     get:
       tags: [checkout]
-      summary: Public order snapshot (for checkout UIs)
+      summary: Public invoice snapshot (for checkout UIs)
       description: |
-        Narrow projection of an order suitable for end-user pages. The merchant
+        Narrow projection of an invoice suitable for end-user pages. The merchant
         identity and any merchant-private metadata are deliberately excluded.
         Rate limited per IP.
       security: []
       responses:
         "200":
-          description: Order snapshot
+          description: Invoice snapshot
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  order: { $ref: "#/components/schemas/PublicOrder" }
+                  invoice: { $ref: "#/components/schemas/PublicInvoice" }
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
@@ -529,7 +529,7 @@ components:
               additionalProperties: true
               description: Optional per-code payload (e.g. Zod issues on VALIDATION)
 
-    CreateOrderInput:
+    CreateInvoiceInput:
       type: object
       description: |
         Either `amountRaw` OR (`fiatAmount` + `fiatCurrency`) must be provided.
@@ -560,7 +560,7 @@ components:
           default: 30
       required: [chainId, token]
 
-    Order:
+    Invoice:
       type: object
       properties:
         id: { type: string, format: uuid }
@@ -584,9 +584,9 @@ components:
         confirmedAt: { type: [string, "null"], format: date-time }
         updatedAt: { type: string, format: date-time }
 
-    PublicOrder:
+    PublicInvoice:
       type: object
-      description: Same as Order but with merchant-private fields stripped
+      description: Same as Invoice but with merchant-private fields stripped
       properties:
         id: { type: string, format: uuid }
         status: { type: string }

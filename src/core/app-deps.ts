@@ -77,7 +77,7 @@ export interface AppDeps {
 // Per-surface rate-limit caps. Populated from AppConfig by the entrypoint so
 // ops can tune without a redeploy. Middlewares pull from deps.rateLimits.
 export interface RateLimitConfig {
-  // Per-merchant cap on /api/v1/* (orders + payouts).
+  // Per-merchant cap on /api/v1/* (invoices + payouts).
   merchantPerMinute: number;
   // Per-IP cap on the public checkout endpoint.
   checkoutPerMinute: number;

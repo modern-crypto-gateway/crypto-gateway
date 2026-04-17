@@ -38,7 +38,7 @@ async function bootMultiFamily(): Promise<BootedTestApp> {
   });
 }
 
-describe("POST /api/v1/orders — multi-family acceptance", () => {
+describe("POST /api/v1/invoices — multi-family acceptance", () => {
   let booted: BootedTestApp;
   let apiKey: string;
 
@@ -53,7 +53,7 @@ describe("POST /api/v1/orders — multi-family acceptance", () => {
 
   it("allocates one receive address per accepted family and returns them all", async () => {
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -66,27 +66,27 @@ describe("POST /api/v1/orders — multi-family acceptance", () => {
     );
     expect(res.status).toBe(201);
     const body = (await res.json()) as {
-      order: {
+      invoice: {
         acceptedFamilies: string[];
         receiveAddresses: Array<{ family: string; address: string }>;
         chainId: number;
         receiveAddress: string;
       };
     };
-    expect(body.order.acceptedFamilies.sort()).toEqual(["evm", "solana", "tron"]);
-    expect(body.order.receiveAddresses).toHaveLength(3);
-    const families = body.order.receiveAddresses.map((r) => r.family).sort();
+    expect(body.invoice.acceptedFamilies.sort()).toEqual(["evm", "solana", "tron"]);
+    expect(body.invoice.receiveAddresses).toHaveLength(3);
+    const families = body.invoice.receiveAddresses.map((r) => r.family).sort();
     expect(families).toEqual(["evm", "solana", "tron"]);
     // Primary denormalized fields reflect the first family (chainId=1 → evm).
-    expect(body.order.chainId).toBe(1);
+    expect(body.invoice.chainId).toBe(1);
     // The EVM entry's address matches the denormalized primary.
-    const evmEntry = body.order.receiveAddresses.find((r) => r.family === "evm");
-    expect(evmEntry?.address).toBe(body.order.receiveAddress);
+    const evmEntry = body.invoice.receiveAddresses.find((r) => r.family === "evm");
+    expect(evmEntry?.address).toBe(body.invoice.receiveAddress);
   });
 
   it("defaults to single-family [familyOf(chainId)] when acceptedFamilies is omitted", async () => {
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({ chainId: 1, token: "USDT", amountRaw: "1000000" })
@@ -94,18 +94,18 @@ describe("POST /api/v1/orders — multi-family acceptance", () => {
     );
     expect(res.status).toBe(201);
     const body = (await res.json()) as {
-      order: { acceptedFamilies: string[]; receiveAddresses: Array<{ family: string }> };
+      invoice: { acceptedFamilies: string[]; receiveAddresses: Array<{ family: string }> };
     };
-    expect(body.order.acceptedFamilies).toEqual(["evm"]);
-    expect(body.order.receiveAddresses).toHaveLength(1);
-    expect(body.order.receiveAddresses[0]?.family).toBe("evm");
+    expect(body.invoice.acceptedFamilies).toEqual(["evm"]);
+    expect(body.invoice.receiveAddresses).toHaveLength(1);
+    expect(body.invoice.receiveAddresses[0]?.family).toBe("evm");
   });
 
   it("rejects the token-family combo when the token isn't registered on any chain in the family", async () => {
     // Made-up token that passes TokenSymbol regex (uppercase/digits, <=16)
     // but isn't in the registry — triggers TOKEN_NOT_SUPPORTED at creation.
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -121,9 +121,9 @@ describe("POST /api/v1/orders — multi-family acceptance", () => {
     expect(body.error.code).toBe("TOKEN_NOT_SUPPORTED");
   });
 
-  it("persists one row per family in order_receive_addresses", async () => {
+  it("persists one row per family in invoice_receive_addresses", async () => {
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -134,20 +134,20 @@ describe("POST /api/v1/orders — multi-family acceptance", () => {
         })
       })
     );
-    const body = (await res.json()) as { order: { id: string } };
+    const body = (await res.json()) as { invoice: { id: string } };
 
     const rows = await booted.deps.db
       .prepare(
-        "SELECT family, address FROM order_receive_addresses WHERE order_id = ? ORDER BY family ASC"
+        "SELECT family, address FROM invoice_receive_addresses WHERE invoice_id = ? ORDER BY family ASC"
       )
-      .bind(body.order.id)
+      .bind(body.invoice.id)
       .all<{ family: string; address: string }>();
     expect(rows.results.map((r) => r.family)).toEqual(["evm", "tron"]);
   });
 
-  it("returns the orderId's pool rows to 'available' on expire (release-on-terminal)", async () => {
+  it("returns the invoiceId's pool rows to 'available' on expire (release-on-terminal)", async () => {
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -158,11 +158,11 @@ describe("POST /api/v1/orders — multi-family acceptance", () => {
         })
       })
     );
-    const { order } = (await res.json()) as { order: { id: string } };
-    // Expire the order → pool-release event handler flips both pool rows
+    const { invoice } = (await res.json()) as { invoice: { id: string } };
+    // Expire the invoice → pool-release event handler flips both pool rows
     // back to 'available'.
     const expireRes = await booted.app.fetch(
-      new Request(`http://test.local/api/v1/orders/${order.id}/expire`, {
+      new Request(`http://test.local/api/v1/invoices/${invoice.id}/expire`, {
         method: "POST",
         headers: authHeader(apiKey)
       })
@@ -170,8 +170,8 @@ describe("POST /api/v1/orders — multi-family acceptance", () => {
     expect(expireRes.status).toBe(200);
 
     const allocated = await booted.deps.db
-      .prepare("SELECT COUNT(*) AS cnt FROM address_pool WHERE allocated_to_order_id = ?")
-      .bind(order.id)
+      .prepare("SELECT COUNT(*) AS cnt FROM address_pool WHERE allocated_to_invoice_id = ?")
+      .bind(invoice.id)
       .first<{ cnt: number }>();
     expect(allocated?.cnt).toBe(0);
   });
@@ -190,14 +190,14 @@ describe("detection reconciliation — multi-family join lookup", () => {
     await booted.close();
   });
 
-  it("matches a transfer on any accepted family's chain back to the order", async () => {
-    // Create an order accepting EVM + Tron. We'll then submit a synthetic
+  it("matches a transfer on any accepted family's chain back to the invoice", async () => {
+    // Create an invoice accepting EVM + Tron. We'll then submit a synthetic
     // detected transfer on chainId=1 (EVM) to the EVM receive address and
-    // verify it matches this specific order — even though the order's
+    // verify it matches this specific invoice — even though the invoice's
     // primary chainId is also 1. The key is: the matcher resolves by
     // (family, address), not by the chainId directly.
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({
@@ -208,10 +208,10 @@ describe("detection reconciliation — multi-family join lookup", () => {
         })
       })
     );
-    const { order } = (await res.json()) as {
-      order: { id: string; receiveAddresses: Array<{ family: string; address: string }> };
+    const { invoice } = (await res.json()) as {
+      invoice: { id: string; receiveAddresses: Array<{ family: string; address: string }> };
     };
-    const evmAddress = order.receiveAddresses.find((r) => r.family === "evm")!.address;
+    const evmAddress = invoice.receiveAddresses.find((r) => r.family === "evm")!.address;
 
     const result = await ingestDetectedTransfer(booted.deps, {
       chainId: 1,
@@ -226,12 +226,12 @@ describe("detection reconciliation — multi-family join lookup", () => {
       seenAt: new Date()
     });
     expect(result.inserted).toBe(true);
-    expect(result.orderId).toBe(order.id);
+    expect(result.invoiceId).toBe(invoice.id);
   });
 
-  it("cross-chain match: USDT on Arbitrum (42161) hits an order with primary chainId=1", async () => {
+  it("cross-chain match: USDT on Arbitrum (42161) hits an invoice with primary chainId=1", async () => {
     // This is the headline feature — an EVM pool address is the same pubkey
-    // on every EVM chain, so the order created for ETH mainnet can also be
+    // on every EVM chain, so the invoice created for ETH mainnet can also be
     // paid on Arbitrum. Requires the Arbitrum EVM adapter to be in deps;
     // we wire one just for this test case.
     const boot = await bootTestApp({
@@ -246,7 +246,7 @@ describe("detection reconciliation — multi-family join lookup", () => {
     const keyForBoot = boot.apiKeys[MERCHANT_ID]!;
     try {
       const res = await boot.app.fetch(
-        new Request("http://test.local/api/v1/orders", {
+        new Request("http://test.local/api/v1/invoices", {
           method: "POST",
           headers: authHeader(keyForBoot),
           body: JSON.stringify({
@@ -257,18 +257,18 @@ describe("detection reconciliation — multi-family join lookup", () => {
           })
         })
       );
-      const { order } = (await res.json()) as {
-        order: { id: string; receiveAddress: string };
+      const { invoice } = (await res.json()) as {
+        invoice: { id: string; receiveAddress: string };
       };
 
       // Submit a detected transfer on chain 42161 to the same address — the
-      // family-based matcher should hit this order.
+      // family-based matcher should hit this invoice.
       const ingest = await ingestDetectedTransfer(boot.deps, {
         chainId: 42161,
         txHash: "0x" + "cd".repeat(32),
         logIndex: 0,
         fromAddress: "0x2222222222222222222222222222222222222222",
-        toAddress: order.receiveAddress,
+        toAddress: invoice.receiveAddress,
         token: "USDT",
         amountRaw: "1000000" as AmountRaw,
         blockNumber: 5000,
@@ -276,7 +276,7 @@ describe("detection reconciliation — multi-family join lookup", () => {
         seenAt: new Date()
       });
       expect(ingest.inserted).toBe(true);
-      expect(ingest.orderId).toBe(order.id);
+      expect(ingest.invoiceId).toBe(invoice.id);
     } finally {
       await boot.close();
     }

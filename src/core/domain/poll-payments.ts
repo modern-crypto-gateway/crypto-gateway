@@ -4,12 +4,12 @@ import { findChainAdapter } from "./chain-lookup.js";
 import { ingestDetectedTransfer } from "./payment.service.js";
 
 // Cron-triggered orchestrator:
-//   1. Enumerate active per-family receive addresses across all non-terminal orders
+//   1. Enumerate active per-family receive addresses across all non-terminal invoices
 //   2. For each chainId with a registered DetectionStrategy.poll, select addresses
 //      whose family matches that chain's family and invoke the strategy
 //   3. Hand every returned DetectedTransfer to PaymentService.ingestDetectedTransfer
 //
-// Multi-family compatible: an order with acceptedFamilies=["evm","tron"]
+// Multi-family compatible: an invoice with acceptedFamilies=["evm","tron"]
 // gets its EVM address polled on every EVM chain that has a poll strategy,
 // and its Tron address polled on the Tron chain — all in a single tick.
 
@@ -22,16 +22,16 @@ export interface PollPaymentsResult {
 }
 
 export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
-  // Gather every family+address for orders that are still open. The join
-  // table is the authoritative source — `orders.receive_address` is just
+  // Gather every family+address for invoices that are still open. The join
+  // table is the authoritative source — `invoices.receive_address` is just
   // the primary-family denormalization for legacy single-chain reads.
   const rows = await deps.db
     .prepare(
-      `SELECT DISTINCT ora.family, ora.address
-         FROM orders o
-         JOIN order_receive_addresses ora ON ora.order_id = o.id
-        WHERE o.status IN ('created','partial','detected','confirmed')
-          AND o.expires_at > ?`
+      `SELECT DISTINCT ira.family, ira.address
+         FROM invoices i
+         JOIN invoice_receive_addresses ira ON ira.invoice_id = i.id
+        WHERE i.status IN ('created','partial','detected','confirmed')
+          AND i.expires_at > ?`
     )
     .bind(deps.clock.now().getTime())
     .all<{ family: ChainFamily; address: string }>();

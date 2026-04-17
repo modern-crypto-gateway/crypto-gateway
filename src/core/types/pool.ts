@@ -2,9 +2,9 @@ import { z } from "zod";
 import { ChainFamilySchema, type ChainFamily } from "./chain.js";
 
 // Address-pool schema. Pool rows are shared across all merchants — one
-// family-scoped pool (EVM, Tron, Solana) feeds every order that asks for
-// that family. Reuse on order-terminal means a single pool row can serve
-// thousands of orders across its lifetime; `total_allocations` tracks that.
+// family-scoped pool (EVM, Tron, Solana) feeds every invoice that asks for
+// that family. Reuse on invoice-terminal means a single pool row can serve
+// thousands of invoices across its lifetime; `total_allocations` tracks that.
 
 export const PoolStatusSchema = z.enum(["available", "allocated", "quarantined"]);
 export type PoolStatus = z.infer<typeof PoolStatusSchema>;
@@ -15,7 +15,7 @@ export const PoolAddressSchema = z.object({
   addressIndex: z.number().int().nonnegative(),
   address: z.string().min(1),
   status: PoolStatusSchema,
-  allocatedToOrderId: z.string().nullable(),
+  allocatedToInvoiceId: z.string().nullable(),
   allocatedAt: z.date().nullable(),
   totalAllocations: z.number().int().nonnegative(),
   createdAt: z.date()

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { bootTestApp, createOrderViaApi, type BootedTestApp } from "../helpers/boot.js";
+import { bootTestApp, createInvoiceViaApi, type BootedTestApp } from "../helpers/boot.js";
 
 const MERCHANT_A = "00000000-0000-0000-0000-000000000001";
 const MERCHANT_B = "00000000-0000-0000-0000-000000000002";
@@ -8,7 +8,7 @@ function authHeader(apiKey: string): HeadersInit {
   return { "content-type": "application/json", authorization: `Bearer ${apiKey}` };
 }
 
-describe("per-merchant rate limit on /api/v1/orders", () => {
+describe("per-merchant rate limit on /api/v1/invoices", () => {
   let booted: BootedTestApp;
 
   beforeEach(async () => {
@@ -28,7 +28,7 @@ describe("per-merchant rate limit on /api/v1/orders", () => {
   it("sets x-ratelimit-* headers on allowed responses", async () => {
     const apiKey = booted.apiKeys[MERCHANT_A]!;
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
@@ -44,11 +44,11 @@ describe("per-merchant rate limit on /api/v1/orders", () => {
   it("returns 429 with Retry-After once the per-merchant limit is exhausted", async () => {
     const apiKey = booted.apiKeys[MERCHANT_A]!;
     for (let i = 0; i < 3; i += 1) {
-      const ok = await createOrderViaApi(booted, { merchantId: MERCHANT_A, amountRaw: "1" });
+      const ok = await createInvoiceViaApi(booted, { merchantId: MERCHANT_A, amountRaw: "1" });
       expect(ok.id).toBeTruthy();
     }
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(apiKey),
         body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
@@ -63,11 +63,11 @@ describe("per-merchant rate limit on /api/v1/orders", () => {
 
   it("isolates buckets per merchant (exhausting A does not affect B)", async () => {
     for (let i = 0; i < 3; i += 1) {
-      await createOrderViaApi(booted, { merchantId: MERCHANT_A, amountRaw: "1" });
+      await createInvoiceViaApi(booted, { merchantId: MERCHANT_A, amountRaw: "1" });
     }
     // A's 4th request: 429
     const aFourth = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(booted.apiKeys[MERCHANT_A]!),
         body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
@@ -77,7 +77,7 @@ describe("per-merchant rate limit on /api/v1/orders", () => {
 
     // B's first request: still fine.
     const bFirst = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(booted.apiKeys[MERCHANT_B]!),
         body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
@@ -91,7 +91,7 @@ describe("per-merchant rate limit on /api/v1/orders", () => {
     // Hammer with a bogus key 10x — none of these should count against any real merchant.
     for (let i = 0; i < 10; i += 1) {
       const res = await booted.app.fetch(
-        new Request("http://test.local/api/v1/orders", {
+        new Request("http://test.local/api/v1/invoices", {
           method: "POST",
           headers: authHeader("sk_bogus"),
           body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
@@ -103,7 +103,7 @@ describe("per-merchant rate limit on /api/v1/orders", () => {
     }
     // Merchant A still has full quota.
     const ok = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: authHeader(booted.apiKeys[MERCHANT_A]!),
         body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
@@ -125,8 +125,8 @@ describe("per-IP rate limit on /checkout/:id", () => {
   });
 
   it("throttles repeated checkout lookups from the same IP header", async () => {
-    const order = await createOrderViaApi(booted, { amountRaw: "1" });
-    const url = `http://test.local/checkout/${order.id}`;
+    const invoice = await createInvoiceViaApi(booted, { amountRaw: "1" });
+    const url = `http://test.local/checkout/${invoice.id}`;
     const ip = "203.0.113.5";
 
     const r1 = await booted.app.fetch(new Request(url, { headers: { "x-forwarded-for": ip } }));
@@ -140,8 +140,8 @@ describe("per-IP rate limit on /checkout/:id", () => {
   });
 
   it("different IPs get independent buckets", async () => {
-    const order = await createOrderViaApi(booted, { amountRaw: "1" });
-    const url = `http://test.local/checkout/${order.id}`;
+    const invoice = await createInvoiceViaApi(booted, { amountRaw: "1" });
+    const url = `http://test.local/checkout/${invoice.id}`;
 
     // Exhaust IP 1.
     for (let i = 0; i < 2; i += 1) {
@@ -156,8 +156,8 @@ describe("per-IP rate limit on /checkout/:id", () => {
   });
 
   it("prefers CF-Connecting-IP when present (used on Workers)", async () => {
-    const order = await createOrderViaApi(booted, { amountRaw: "1" });
-    const url = `http://test.local/checkout/${order.id}`;
+    const invoice = await createInvoiceViaApi(booted, { amountRaw: "1" });
+    const url = `http://test.local/checkout/${invoice.id}`;
 
     // Exhaust via cf-connecting-ip header.
     for (let i = 0; i < 2; i += 1) {
@@ -168,8 +168,8 @@ describe("per-IP rate limit on /checkout/:id", () => {
   });
 
   it("extracts the leftmost (client) IP from a multi-entry X-Forwarded-For chain", async () => {
-    const order = await createOrderViaApi(booted, { amountRaw: "1" });
-    const url = `http://test.local/checkout/${order.id}`;
+    const invoice = await createInvoiceViaApi(booted, { amountRaw: "1" });
+    const url = `http://test.local/checkout/${invoice.id}`;
     // Client is 203.0.113.5; the proxies trail.
     const xff = "203.0.113.5, 198.51.100.9, 10.0.0.1";
     for (let i = 0; i < 2; i += 1) {

@@ -4,19 +4,19 @@ import { rpcPollDetection } from "../../adapters/detection/rpc-poll.adapter.js";
 import { ingestDetectedTransfer } from "../../core/domain/payment.service.js";
 import { pollPayments } from "../../core/domain/poll-payments.js";
 import type { DetectedTransfer } from "../../core/types/transaction.js";
-import { bootTestApp, createOrderViaApi, type BootedTestApp } from "../helpers/boot.js";
+import { bootTestApp, createInvoiceViaApi, type BootedTestApp } from "../helpers/boot.js";
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
 
-async function createOrder(
+async function createInvoice(
   booted: BootedTestApp,
   amountRaw: string
 ): Promise<{ id: string; receiveAddress: string }> {
-  return createOrderViaApi(booted, { amountRaw });
+  return createInvoiceViaApi(booted, { amountRaw });
 }
 
-describe("end-to-end: order.detected -> webhook dispatched", () => {
-  it("delivers a webhook to the merchant URL when an order is promoted to detected", async () => {
+describe("end-to-end: invoice.detected -> webhook dispatched", () => {
+  it("delivers a webhook to the merchant URL when an invoice is promoted to detected", async () => {
     const booted = await bootTestApp({
       merchants: [
         {
@@ -28,14 +28,14 @@ describe("end-to-end: order.detected -> webhook dispatched", () => {
       ]
     });
     try {
-      const order = await createOrder(booted, "1000");
+      const invoice = await createInvoice(booted, "1000");
 
       await ingestDetectedTransfer(booted.deps, {
         chainId: 999,
         txHash: "0xhook1",
         logIndex: 0,
         fromAddress: "0x0000000000000000000000000000000000000001",
-        toAddress: order.receiveAddress,
+        toAddress: invoice.receiveAddress,
         token: "DEV",
         amountRaw: "1000",
         blockNumber: 10,
@@ -51,10 +51,10 @@ describe("end-to-end: order.detected -> webhook dispatched", () => {
       const call = calls[0]!;
       expect(call.url).toBe("https://merchant.example.com/hook");
       expect(call.secret).toBe("b".repeat(64));
-      expect(call.idempotencyKey).toBe(`order.detected:${order.id}:detected`);
+      expect(call.idempotencyKey).toBe(`invoice.detected:${invoice.id}:detected`);
       const payload = call.payload as { event: string; data: { id: string; status: string } };
-      expect(payload.event).toBe("order.detected");
-      expect(payload.data.id).toBe(order.id);
+      expect(payload.event).toBe("invoice.detected");
+      expect(payload.data.id).toBe(invoice.id);
       expect(payload.data.status).toBe("detected");
     } finally {
       await booted.close();
@@ -64,13 +64,13 @@ describe("end-to-end: order.detected -> webhook dispatched", () => {
   it("silently skips dispatch when the merchant has no webhook_url", async () => {
     const booted = await bootTestApp();
     try {
-      const order = await createOrder(booted, "1000");
+      const invoice = await createInvoice(booted, "1000");
       await ingestDetectedTransfer(booted.deps, {
         chainId: 999,
         txHash: "0xhook2",
         logIndex: 0,
         fromAddress: "0x0000000000000000000000000000000000000001",
-        toAddress: order.receiveAddress,
+        toAddress: invoice.receiveAddress,
         token: "DEV",
         amountRaw: "1000",
         blockNumber: 10,
@@ -84,7 +84,7 @@ describe("end-to-end: order.detected -> webhook dispatched", () => {
     }
   });
 
-  it("does not fire for internal events (order.created, tx.detected)", async () => {
+  it("does not fire for internal events (invoice.created, tx.detected)", async () => {
     const booted = await bootTestApp({
       merchants: [
         {
@@ -95,20 +95,20 @@ describe("end-to-end: order.detected -> webhook dispatched", () => {
       ]
     });
     try {
-      // Creating an order emits order.created + tx.detected via later ingest,
+      // Creating an invoice emits invoice.created + tx.detected via later ingest,
       // but neither should produce a webhook call.
-      const order = await createOrder(booted, "10");
+      const invoice = await createInvoice(booted, "10");
       await booted.deps.jobs.drain(200);
       expect(booted.webhookDispatcher!.calls).toHaveLength(0);
 
-      // A partial-payment transfer (< requiredAmount) emits order.partial + tx.detected.
-      // Of those, only order.partial is merchant-visible.
+      // A partial-payment transfer (< requiredAmount) emits invoice.partial + tx.detected.
+      // Of those, only invoice.partial is merchant-visible.
       await ingestDetectedTransfer(booted.deps, {
         chainId: 999,
         txHash: "0xhook3",
         logIndex: 0,
         fromAddress: "0x0000000000000000000000000000000000000001",
-        toAddress: order.receiveAddress,
+        toAddress: invoice.receiveAddress,
         token: "DEV",
         amountRaw: "5",
         blockNumber: 10,
@@ -119,7 +119,7 @@ describe("end-to-end: order.detected -> webhook dispatched", () => {
 
       const calls = booted.webhookDispatcher!.calls;
       expect(calls).toHaveLength(1);
-      expect((calls[0]!.payload as { event: string }).event).toBe("order.partial");
+      expect((calls[0]!.payload as { event: string }).event).toBe("invoice.partial");
     } finally {
       await booted.close();
     }
@@ -128,7 +128,7 @@ describe("end-to-end: order.detected -> webhook dispatched", () => {
 
 describe("pollPayments orchestrator", () => {
   it("hands transfers from each chain's DetectionStrategy to ingestDetectedTransfer", async () => {
-    // Shared mutable array the test populates after the order is created.
+    // Shared mutable array the test populates after the invoice is created.
     // The dev adapter captures it by reference, so updates flow through.
     const incoming: DetectedTransfer[] = [];
     const chain = devChainAdapter({ incomingTransfers: incoming });
@@ -138,14 +138,14 @@ describe("pollPayments orchestrator", () => {
       detectionStrategies: { 999: rpcPollDetection() }
     });
     try {
-      const order = await createOrder(booted, "1000");
+      const invoice = await createInvoice(booted, "1000");
 
       incoming.push({
         chainId: 999,
         txHash: "0xpoll1",
         logIndex: 0,
         fromAddress: "0x0000000000000000000000000000000000000001",
-        toAddress: order.receiveAddress,
+        toAddress: invoice.receiveAddress,
         token: "DEV",
         amountRaw: "1000",
         blockNumber: 10,
@@ -169,7 +169,7 @@ describe("pollPayments orchestrator", () => {
     }
   });
 
-  it("returns zero counts when no orders are active", async () => {
+  it("returns zero counts when no invoices are active", async () => {
     const booted = await bootTestApp({
       chains: [devChainAdapter()],
       detectionStrategies: { 999: rpcPollDetection() }
@@ -196,13 +196,13 @@ describe("pollPayments orchestrator", () => {
       detectionStrategies: { 999: rpcPollDetection() }
     });
     try {
-      const order = await createOrder(booted, "1000");
+      const invoice = await createInvoice(booted, "1000");
       incoming.push({
         chainId: 999,
         txHash: "0xpoll-dup",
         logIndex: 0,
         fromAddress: "0x0000000000000000000000000000000000000001",
-        toAddress: order.receiveAddress,
+        toAddress: invoice.receiveAddress,
         token: "DEV",
         amountRaw: "1000",
         blockNumber: 10,

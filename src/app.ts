@@ -12,7 +12,7 @@ import { requestIdMiddleware, type RequestIdVariables } from "./http/middleware/
 import { adminRouter } from "./http/routes/admin.js";
 import { checkoutRouter } from "./http/routes/checkout.js";
 import { internalCronRouter } from "./http/routes/internal-cron.js";
-import { ordersRouter } from "./http/routes/orders.js";
+import { invoicesRouter } from "./http/routes/invoices.js";
 import { payoutsRouter } from "./http/routes/payouts.js";
 import { webhooksIngestRouter } from "./http/routes/webhooks-ingest.js";
 
@@ -31,9 +31,9 @@ export function buildApp(deps: AppDeps): App {
   // Wire event-bus subscribers. Subscriptions stay active for the lifetime of
   // this buildApp call — one set per AppDeps is the contract.
   registerWebhookSubscriber(deps);
-  // Pool release: every order.confirmed/expired/canceled returns its pool
-  // row(s) to 'available' so the address can serve the next order. This is
-  // the whole point of the reuse model — one pool row, N orders, 1 sweep.
+  // Pool release: every invoice.confirmed/expired/canceled returns its pool
+  // row(s) to 'available' so the address can serve the next invoice. This is
+  // the whole point of the reuse model — one pool row, N invoices, 1 sweep.
   registerPoolReleaseHandler(deps);
   // Alchemy subscription tracker is registered only when the deployment has
   // Alchemy configured (deps.alchemy present). It listens for pool.address
@@ -63,7 +63,7 @@ export function buildApp(deps: AppDeps): App {
 
   app.get("/health", (c) => c.json({ status: "ok", phase: 8 }));
 
-  app.route("/api/v1/orders", ordersRouter(deps));
+  app.route("/api/v1/invoices", invoicesRouter(deps));
   app.route("/api/v1/payouts", payoutsRouter(deps));
   app.route("/admin", adminRouter(deps));
   app.route("/checkout", checkoutRouter(deps));
@@ -73,16 +73,16 @@ export function buildApp(deps: AppDeps): App {
   return {
     fetch: (request: Request) => app.fetch(request),
     jobs: {
-      // Payment poller — enumerates active orders, delegates per-chain to the
-      // configured DetectionStrategy, ingests detected transfers. Irrelevant
-      // on push-only deployments (Alchemy Notify) where detectionStrategies
-      // is empty.
+      // Payment poller — enumerates active invoices, delegates per-chain to
+      // the configured DetectionStrategy, ingests detected transfers.
+      // Irrelevant on push-only deployments (Alchemy Notify) where
+      // detectionStrategies is empty.
       pollPayments: async () => {
         await pollPayments(deps);
       },
       // Confirmation sweeper — checks each 'detected' tx against the chain's
-      // current confirmation count, promotes to 'confirmed' past threshold, and
-      // recomputes order status for any order whose txs changed.
+      // current confirmation count, promotes to 'confirmed' past threshold,
+      // and recomputes invoice status for any invoice whose txs changed.
       confirmTransactions: async () => {
         await confirmTransactions(deps);
       },

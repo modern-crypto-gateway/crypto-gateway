@@ -3,25 +3,25 @@ import type { AppDeps } from "../app-deps.js";
 import { ChainFamilySchema, ChainIdSchema, type ChainFamily } from "../types/chain.js";
 import { AmountRawSchema, FiatAmountSchema, FiatCurrencySchema } from "../types/money.js";
 import { MerchantIdSchema } from "../types/merchant.js";
-import type { Order, OrderId, OrderReceiveAddress } from "../types/order.js";
+import type { Invoice, InvoiceId, InvoiceReceiveAddress } from "../types/invoice.js";
 import { TokenSymbolSchema } from "../types/token.js";
 import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
 import { findChainAdapter } from "./chain-lookup.js";
-import { fetchOrderReceiveAddresses, loadOrder, rowToOrder, type OrderRow } from "./mappers.js";
+import { fetchInvoiceReceiveAddresses, loadInvoice, rowToInvoice, type InvoiceRow } from "./mappers.js";
 import { DomainError } from "../errors.js";
-import { allocateForOrder } from "./pool.service.js";
+import { allocateForInvoice } from "./pool.service.js";
 import { snapshotRates, tokensForFamilies } from "./rate-window.js";
 
 // ---- Input validation ----
 
-export const CreateOrderInputSchema = z
+export const CreateInvoiceInputSchema = z
   .object({
     merchantId: MerchantIdSchema,
     chainId: ChainIdSchema,
     token: TokenSymbolSchema,
     // Three mutually-compatible pricing modes:
     //   - `amountUsd`: USD-pegged. Payments in any accepted-family token
-    //     convert via the pinned rate-window snapshot (A2).
+    //     convert via the pinned rate-window snapshot.
     //   - `amountRaw`: exact token amount. Single-token, payer must pay
     //     in that token. Legacy.
     //   - `fiatAmount + fiatCurrency`: single-token, amount derived at
@@ -31,20 +31,20 @@ export const CreateOrderInputSchema = z
     fiatAmount: FiatAmountSchema.optional(),
     fiatCurrency: FiatCurrencySchema.optional(),
     amountRaw: AmountRawSchema.optional(),
-    // Multi-family acceptance. When set, the order gets one receive address
+    // Multi-family acceptance. When set, the invoice gets one receive address
     // per family. Omitted = single-family, derived from `chainId`'s family.
     acceptedFamilies: z.array(ChainFamilySchema).min(1).optional(),
     externalId: z.string().max(256).optional(),
     metadata: z.record(z.unknown()).optional(),
     // Default 30 minutes. Hard ceiling at 24 hours — the scheduler promotes
-    // long-expired orders and merchants who need days-long expiries are doing
-    // something unusual.
+    // long-expired invoices and merchants who need days-long expiries are
+    // doing something unusual.
     expiresInMinutes: z.number().int().min(1).max(60 * 24).default(30)
   })
   .refine(
     (v) => {
       // Exactly one pricing mode. All-three-absent rejected; combinations
-      // rejected so the path the order takes is unambiguous at read time.
+      // rejected so the path the invoice takes is unambiguous at read time.
       const modes =
         (v.amountUsd !== undefined ? 1 : 0) +
         (v.amountRaw !== undefined ? 1 : 0) +
@@ -60,12 +60,12 @@ export const CreateOrderInputSchema = z
     (v) => v.fiatAmount === undefined || v.fiatCurrency !== undefined,
     { message: "`fiatAmount` requires `fiatCurrency`" }
   );
-export type CreateOrderInput = z.infer<typeof CreateOrderInputSchema>;
+export type CreateInvoiceInput = z.infer<typeof CreateInvoiceInputSchema>;
 
 // ---- Operations ----
 
-export async function createOrder(deps: AppDeps, input: unknown): Promise<Order> {
-  const parsed = CreateOrderInputSchema.parse(input);
+export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invoice> {
+  const parsed = CreateInvoiceInputSchema.parse(input);
 
   // 1. Merchant must exist + be active.
   const merchant = await deps.db
@@ -73,10 +73,10 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     .bind(parsed.merchantId)
     .first<{ id: string; active: number }>();
   if (!merchant) {
-    throw new OrderError("MERCHANT_NOT_FOUND", `Merchant not found: ${parsed.merchantId}`);
+    throw new InvoiceError("MERCHANT_NOT_FOUND", `Merchant not found: ${parsed.merchantId}`);
   }
   if (merchant.active !== 1) {
-    throw new OrderError("MERCHANT_INACTIVE", `Merchant is inactive: ${parsed.merchantId}`);
+    throw new InvoiceError("MERCHANT_INACTIVE", `Merchant is inactive: ${parsed.merchantId}`);
   }
 
   // 2. Token must be registered for this chain. For the USD path this is
@@ -85,11 +85,11 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
   //    accepted families regardless.
   const token = findToken(parsed.chainId, parsed.token);
   if (!token) {
-    throw new OrderError("TOKEN_NOT_SUPPORTED", `Token ${parsed.token} not supported on chain ${parsed.chainId}`);
+    throw new InvoiceError("TOKEN_NOT_SUPPORTED", `Token ${parsed.token} not supported on chain ${parsed.chainId}`);
   }
 
   // 3. Compute required raw amount for legacy paths (amountRaw / fiatAmount).
-  //    USD-path orders set `amountUsd` and leave `requiredAmountRaw` as "0"
+  //    USD-path invoices set `amountUsd` and leave `requiredAmountRaw` as "0"
   //    — detection converts payments to USD using the rate-window snapshot
   //    captured in step 6 below.
   let requiredAmountRaw: string;
@@ -112,13 +112,13 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     requiredAmountRaw = "0";
   }
 
-  // 4. Resolve the family set for this order.
+  // 4. Resolve the family set for this invoice.
   //      - `acceptedFamilies` explicit → exactly those families.
   //      - omitted → infer `[familyOf(chainId)]` (single-family legacy).
   //    For each family in the set, validate the requested token is
-  //    registered on at least one of that family's chains — an order for
+  //    registered on at least one of that family's chains — an invoice for
   //    "USDC on Tron family" requires USDC on Tron mainnet (or Nile). If
-  //    none of a family's chains have the token, the order would be
+  //    none of a family's chains have the token, the invoice would be
   //    unfulfillable on that family, so reject at creation time.
   const primaryChainAdapter = findChainAdapter(deps, parsed.chainId);
   const acceptedFamilies: ChainFamily[] =
@@ -126,7 +126,7 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
 
   for (const family of acceptedFamilies) {
     if (!familyHasToken(family, parsed.token)) {
-      throw new OrderError(
+      throw new InvoiceError(
         "TOKEN_NOT_SUPPORTED",
         `Token ${parsed.token} is not registered on any chain in family '${family}'`
       );
@@ -135,32 +135,32 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
 
   // 5. Allocate one pool row per accepted family. The `primary` family
   //    (from chainId) lands first, so its address is what goes into the
-  //    legacy `orders.receive_address` column for back-compat. Order ID
-  //    generated up-front so allocateForOrder can write it into the pool
+  //    legacy `invoices.receive_address` column for back-compat. Invoice ID
+  //    generated up-front so allocateForInvoice can write it into the pool
   //    rows.
   const now = deps.clock.now().getTime();
-  const orderId = globalThis.crypto.randomUUID();
+  const invoiceId = globalThis.crypto.randomUUID();
   const primaryFamily = primaryChainAdapter.family;
   const familyOrder: ChainFamily[] = [
     primaryFamily,
     ...acceptedFamilies.filter((f) => f !== primaryFamily)
   ];
-  const receiveRows: OrderReceiveAddress[] = [];
+  const receiveRows: InvoiceReceiveAddress[] = [];
   let primaryAddress: string | null = null;
   let primaryAddressIndex = 0;
   for (const family of familyOrder) {
     const familyAdapter = deps.chains.find((c) => c.family === family);
     if (!familyAdapter) {
-      throw new OrderError(
+      throw new InvoiceError(
         "TOKEN_NOT_SUPPORTED",
-        `No chain adapter wired for family '${family}'. Order creation requires all accepted families to be configured on the gateway.`
+        `No chain adapter wired for family '${family}'. Invoice creation requires all accepted families to be configured on the gateway.`
       );
     }
-    const allocated = await allocateForOrder(deps, orderId, family);
+    const allocated = await allocateForInvoice(deps, invoiceId, family);
     const canonical = familyAdapter.canonicalizeAddress(allocated.address);
     receiveRows.push({
       family,
-      address: canonical as OrderReceiveAddress["address"],
+      address: canonical as InvoiceReceiveAddress["address"],
       poolAddressId: allocated.id
     });
     if (family === primaryFamily) {
@@ -172,10 +172,10 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     throw new Error("Invariant: primary family allocation missing");
   }
 
-  // 6. For USD-path orders, snapshot the rate window now. Covers every
+  // 6. For USD-path invoices, snapshot the rate window now. Covers every
   //    token registered in the accepted families + the family natives the
   //    oracle can quote. Rates pinned for 10 minutes; detection refreshes
-  //    when it fires past expiry. Legacy orders skip this entirely.
+  //    when it fires past expiry. Legacy invoices skip this entirely.
   let amountUsd: string | null = null;
   let ratesJson: string | null = null;
   let rateWindowExpiresAt: number | null = null;
@@ -186,15 +186,15 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     rateWindowExpiresAt = snapshot.expiresAt;
   }
 
-  // 7. Insert the order row (denormalizes the primary family's address)
+  // 7. Insert the invoice row (denormalizes the primary family's address)
   //    and the per-family join rows in a single batch so a partial write
-  //    can't leave the order unreachable for detection.
+  //    can't leave the invoice unreachable for detection.
   const expiresAt = now + parsed.expiresInMinutes * 60_000;
   const metadataJson = parsed.metadata !== undefined ? JSON.stringify(parsed.metadata) : null;
   const statements = [
     deps.db
       .prepare(
-        `INSERT INTO orders
+        `INSERT INTO invoices
            (id, merchant_id, status, chain_id, token, receive_address, address_index,
             required_amount_raw, received_amount_raw, fiat_amount, fiat_currency, quoted_rate,
             external_id, metadata_json, accepted_families,
@@ -203,7 +203,7 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
          VALUES (?, ?, 'created', ?, ?, ?, ?, ?, '0', ?, ?, ?, ?, ?, ?, ?, '0', '0', ?, ?, ?, ?, ?)`
       )
       .bind(
-        orderId,
+        invoiceId,
         parsed.merchantId,
         parsed.chainId,
         parsed.token,
@@ -226,17 +226,17 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     ...receiveRows.map((rx) =>
       deps.db
         .prepare(
-          `INSERT INTO order_receive_addresses (order_id, family, address, pool_address_id, created_at)
+          `INSERT INTO invoice_receive_addresses (invoice_id, family, address, pool_address_id, created_at)
            VALUES (?, ?, ?, ?, ?)`
         )
-        .bind(orderId, rx.family, rx.address, rx.poolAddressId, now)
+        .bind(invoiceId, rx.family, rx.address, rx.poolAddressId, now)
     )
   ];
   await deps.db.batch(statements);
 
-  const order = rowToOrder(
+  const invoice = rowToInvoice(
     {
-      id: orderId,
+      id: invoiceId,
       merchant_id: parsed.merchantId,
       status: "created",
       chain_id: parsed.chainId,
@@ -264,41 +264,41 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     receiveRows
   );
 
-  await deps.events.publish({ type: "order.created", orderId: order.id, order, at: new Date(now) });
+  await deps.events.publish({ type: "invoice.created", invoiceId: invoice.id, invoice, at: new Date(now) });
 
-  return order;
+  return invoice;
 }
 
-export async function getOrder(deps: AppDeps, orderId: OrderId): Promise<Order | null> {
-  return loadOrder(deps, orderId);
+export async function getInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<Invoice | null> {
+  return loadInvoice(deps, invoiceId);
 }
 
-export async function expireOrder(deps: AppDeps, orderId: OrderId): Promise<Order> {
+export async function expireInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<Invoice> {
   const now = deps.clock.now().getTime();
   const row = await deps.db
     .prepare(
-      `UPDATE orders
+      `UPDATE invoices
          SET status = 'expired', updated_at = ?
        WHERE id = ? AND status IN ('created','partial')
        RETURNING *`
     )
-    .bind(now, orderId)
-    .first<OrderRow>();
+    .bind(now, invoiceId)
+    .first<InvoiceRow>();
   if (!row) {
-    throw new OrderError(
+    throw new InvoiceError(
       "EXPIRE_NOT_ALLOWED",
-      `Order ${orderId} cannot be expired — either it does not exist or it is already in a terminal state`
+      `Invoice ${invoiceId} cannot be expired — either it does not exist or it is already in a terminal state`
     );
   }
-  const addresses = await fetchOrderReceiveAddresses(deps, orderId);
-  const order = rowToOrder(row, addresses);
-  await deps.events.publish({ type: "order.expired", orderId: order.id, order, at: new Date(now) });
-  return order;
+  const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceId);
+  const invoice = rowToInvoice(row, addresses);
+  await deps.events.publish({ type: "invoice.expired", invoiceId: invoice.id, invoice, at: new Date(now) });
+  return invoice;
 }
 
 // Returns true when at least one chain in the family has `token` registered.
-// Used at order creation to reject "USDC on Solana" before Solana SPL tokens
-// are in the registry, for instance.
+// Used at invoice creation to reject "USDC on Solana" before Solana SPL
+// tokens are in the registry, for instance.
 function familyHasToken(family: ChainFamily, token: string): boolean {
   for (const entry of TOKEN_REGISTRY) {
     if (entry.symbol !== token) continue;
@@ -319,7 +319,7 @@ function familyForChainId(chainId: number): ChainFamily | null {
 
 // ---- Typed domain error ----
 
-export type OrderErrorCode =
+export type InvoiceErrorCode =
   | "MERCHANT_NOT_FOUND"
   | "MERCHANT_INACTIVE"
   | "TOKEN_NOT_SUPPORTED"
@@ -330,17 +330,17 @@ export type OrderErrorCode =
 // from a code name. Note: POOL_EXHAUSTED (503) is thrown by pool.service as
 // a PoolExhaustedError; it's a DomainError so renderError handles it
 // uniformly — no need to duplicate the code here.
-const ORDER_ERROR_HTTP_STATUS: Readonly<Record<OrderErrorCode, number>> = {
+const INVOICE_ERROR_HTTP_STATUS: Readonly<Record<InvoiceErrorCode, number>> = {
   MERCHANT_NOT_FOUND: 404,
   MERCHANT_INACTIVE: 403,
   TOKEN_NOT_SUPPORTED: 400,
   EXPIRE_NOT_ALLOWED: 409
 };
 
-export class OrderError extends DomainError {
-  declare readonly code: OrderErrorCode;
-  constructor(code: OrderErrorCode, message: string, details?: Record<string, unknown>) {
-    super(code, message, ORDER_ERROR_HTTP_STATUS[code], details);
-    this.name = "OrderError";
+export class InvoiceError extends DomainError {
+  declare readonly code: InvoiceErrorCode;
+  constructor(code: InvoiceErrorCode, message: string, details?: Record<string, unknown>) {
+    super(code, message, INVOICE_ERROR_HTTP_STATUS[code], details);
+    this.name = "InvoiceError";
   }
 }

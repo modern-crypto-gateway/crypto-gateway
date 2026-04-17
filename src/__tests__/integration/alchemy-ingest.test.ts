@@ -3,7 +3,7 @@ import { custom } from "viem";
 import { alchemyNotifyDetection } from "../../adapters/detection/alchemy-notify.adapter.js";
 import { evmChainAdapter } from "../../adapters/chains/evm/evm-chain.adapter.js";
 import { bytesToHex, hmacSha256 } from "../../adapters/crypto/subtle.js";
-import { bootTestApp, createOrderViaApi, type BootedTestApp } from "../helpers/boot.js";
+import { bootTestApp, createInvoiceViaApi, type BootedTestApp } from "../helpers/boot.js";
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
 const SIGNING_KEY = "test-alchemy-signing-key";
@@ -147,8 +147,8 @@ describe("POST /webhooks/alchemy", () => {
   });
 
   it("acknowledges valid requests with 200 and ingests transfers in the background", async () => {
-    // Create an order so the incoming transfer has something to match.
-    const order = await createOrderViaApi(booted, {
+    // Create an invoice so the incoming transfer has something to match.
+    const invoice = await createInvoiceViaApi(booted, {
       merchantId: MERCHANT_ID,
       chainId: 1,
       token: "USDC",
@@ -158,7 +158,7 @@ describe("POST /webhooks/alchemy", () => {
     const body = buildPayload([
       {
         fromAddress: "0x1111111111111111111111111111111111111111",
-        toAddress: order.receiveAddress,
+        toAddress: invoice.receiveAddress,
         blockNum: "0x1234",
         hash: `0x${"a".repeat(64)}`,
         asset: "USDC",
@@ -180,20 +180,20 @@ describe("POST /webhooks/alchemy", () => {
     await booted.deps.jobs.drain(2_000);
 
     const tx = await booted.deps.db
-      .prepare("SELECT order_id, amount_raw, status FROM transactions WHERE tx_hash = ?")
+      .prepare("SELECT invoice_id, amount_raw, status FROM transactions WHERE tx_hash = ?")
       .bind(`0x${"a".repeat(64)}`)
-      .first<{ order_id: string; amount_raw: string; status: string }>();
+      .first<{ invoice_id: string; amount_raw: string; status: string }>();
     expect(tx).not.toBeNull();
-    expect(tx?.order_id).toBe(order.id);
+    expect(tx?.invoice_id).toBe(invoice.id);
     expect(tx?.amount_raw).toBe("1000000");
 
-    // Order should have progressed to 'detected' (amount met, 1 confirmation
+    // Invoice should have progressed to 'detected' (amount met, 1 confirmation
     // below mainnet's 12-block threshold).
-    const orderRow = await booted.deps.db
-      .prepare("SELECT status FROM orders WHERE id = ?")
-      .bind(order.id)
+    const invoiceRow = await booted.deps.db
+      .prepare("SELECT status FROM invoices WHERE id = ?")
+      .bind(invoice.id)
       .first<{ status: string }>();
-    expect(orderRow?.status).toBe("detected");
+    expect(invoiceRow?.status).toBe("detected");
   });
 
   it("silently drops activities for networks not mapped (unknown Alchemy network)", async () => {

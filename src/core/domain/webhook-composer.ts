@@ -1,11 +1,11 @@
 import type { DomainEvent } from "../events/event-bus.port.js";
-import type { Order } from "../types/order.js";
+import type { Invoice } from "../types/invoice.js";
 import type { Payout } from "../types/payout.js";
 
 // Pure function: DomainEvent -> (merchant-bound webhook payload, idempotency key).
 // Returns `null` for events that are internal and not exposed to merchants
 // (e.g. tx.detected fires during polling and isn't merchant-visible; we only
-// surface order- and payout-level state changes).
+// surface invoice- and payout-level state changes).
 //
 // Rules:
 //   - payload.event:   kebab-case event name merchants see on the wire
@@ -29,49 +29,49 @@ export interface WebhookPayload {
 }
 
 export type WebhookEventName =
-  | "order.partial"
-  | "order.detected"
-  | "order.confirmed"
-  | "order.overpaid"
-  | "order.expired"
-  | "order.canceled"
-  | "order.payment_received"
+  | "invoice.partial"
+  | "invoice.detected"
+  | "invoice.confirmed"
+  | "invoice.overpaid"
+  | "invoice.expired"
+  | "invoice.canceled"
+  | "invoice.payment_received"
   | "payout.submitted"
   | "payout.confirmed"
   | "payout.failed";
 
 export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
   switch (event.type) {
-    case "order.partial":
-    case "order.detected":
-    case "order.confirmed":
-    case "order.overpaid":
-    case "order.expired":
-    case "order.canceled":
+    case "invoice.partial":
+    case "invoice.detected":
+    case "invoice.confirmed":
+    case "invoice.overpaid":
+    case "invoice.expired":
+    case "invoice.canceled":
       return {
-        merchantId: event.order.merchantId,
+        merchantId: event.invoice.merchantId,
         payload: {
           event: event.type,
           timestamp: event.at.toISOString(),
-          data: serializeOrder(event.order)
+          data: serializeInvoice(event.invoice)
         },
-        idempotencyKey: `${event.type}:${event.order.id}:${event.order.status}`
+        idempotencyKey: `${event.type}:${event.invoice.id}:${event.invoice.status}`
       };
 
-    case "order.payment_received":
+    case "invoice.payment_received":
       // Per-payment audit event. Idempotency keys on txHash so merchants
       // de-duplicate retries across redelivery.
       return {
-        merchantId: event.order.merchantId,
+        merchantId: event.invoice.merchantId,
         payload: {
           event: event.type,
           timestamp: event.at.toISOString(),
           data: {
-            order: serializeOrder(event.order),
+            invoice: serializeInvoice(event.invoice),
             payment: event.payment
           }
         },
-        idempotencyKey: `${event.type}:${event.order.id}:${event.payment.txHash}`
+        idempotencyKey: `${event.type}:${event.invoice.id}:${event.payment.txHash}`
       };
 
     case "payout.submitted":
@@ -88,7 +88,7 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
       };
 
     // Internal events — don't expose to merchants.
-    case "order.created":
+    case "invoice.created":
     case "tx.detected":
     case "tx.confirmed":
     case "tx.orphaned":
@@ -99,27 +99,27 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
   }
 }
 
-function serializeOrder(order: Order): Record<string, unknown> {
+function serializeInvoice(invoice: Invoice): Record<string, unknown> {
   return {
-    id: order.id,
-    status: order.status,
-    chainId: order.chainId,
-    token: order.token,
-    receiveAddress: order.receiveAddress,
-    acceptedFamilies: order.acceptedFamilies,
-    receiveAddresses: order.receiveAddresses.map((r) => ({
+    id: invoice.id,
+    status: invoice.status,
+    chainId: invoice.chainId,
+    token: invoice.token,
+    receiveAddress: invoice.receiveAddress,
+    acceptedFamilies: invoice.acceptedFamilies,
+    receiveAddresses: invoice.receiveAddresses.map((r) => ({
       family: r.family,
       address: r.address
     })),
-    requiredAmountRaw: order.requiredAmountRaw,
-    receivedAmountRaw: order.receivedAmountRaw,
-    fiatAmount: order.fiatAmount,
-    fiatCurrency: order.fiatCurrency,
-    externalId: order.externalId,
-    metadata: order.metadata,
-    createdAt: order.createdAt.toISOString(),
-    expiresAt: order.expiresAt.toISOString(),
-    confirmedAt: order.confirmedAt === null ? null : order.confirmedAt.toISOString()
+    requiredAmountRaw: invoice.requiredAmountRaw,
+    receivedAmountRaw: invoice.receivedAmountRaw,
+    fiatAmount: invoice.fiatAmount,
+    fiatCurrency: invoice.fiatCurrency,
+    externalId: invoice.externalId,
+    metadata: invoice.metadata,
+    createdAt: invoice.createdAt.toISOString(),
+    expiresAt: invoice.expiresAt.toISOString(),
+    confirmedAt: invoice.confirmedAt === null ? null : invoice.confirmedAt.toISOString()
   };
 }
 

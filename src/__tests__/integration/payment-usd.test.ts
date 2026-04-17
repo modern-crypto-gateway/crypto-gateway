@@ -39,7 +39,7 @@ async function bootWithAllFamilies(options: { now?: Date; clock?: BootedTestApp[
   });
 }
 
-async function createUsdOrder(
+async function createUsdInvoice(
   booted: BootedTestApp,
   apiKey: string,
   args: { amountUsd: string; acceptedFamilies: string[]; chainId?: number; token?: string }
@@ -49,7 +49,7 @@ async function createUsdOrder(
   receiveAddresses: Array<{ family: string; address: string }>;
 }> {
   const res = await booted.app.fetch(
-    new Request("http://test.local/api/v1/orders", {
+    new Request("http://test.local/api/v1/invoices", {
       method: "POST",
       headers: authHeader(apiKey),
       body: JSON.stringify({
@@ -60,15 +60,15 @@ async function createUsdOrder(
       })
     })
   );
-  if (res.status !== 201) throw new Error(`createUsdOrder: ${res.status} ${await res.text()}`);
+  if (res.status !== 201) throw new Error(`createUsdInvoice: ${res.status} ${await res.text()}`);
   const body = (await res.json()) as {
-    order: {
+    invoice: {
       id: string;
       receiveAddress: string;
       receiveAddresses: Array<{ family: string; address: string }>;
     };
   };
-  return body.order;
+  return body.invoice;
 }
 
 describe("USD-path ingest — single payment", () => {
@@ -85,7 +85,7 @@ describe("USD-path ingest — single payment", () => {
   });
 
   it("confirmed transfer covering the USD target flips status to 'confirmed' and records paid_usd", async () => {
-    const order = await createUsdOrder(booted, apiKey, {
+    const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "100.00",
       acceptedFamilies: ["evm"]
     });
@@ -95,7 +95,7 @@ describe("USD-path ingest — single payment", () => {
       txHash: "0x" + "a1".repeat(32),
       logIndex: 0,
       fromAddress: "0x1111111111111111111111111111111111111111",
-      toAddress: order.receiveAddress,
+      toAddress: invoice.receiveAddress,
       token: "USDC",
       amountRaw: "100000000" as AmountRaw, // 100 USDC @ 6 decimals
       blockNumber: 100,
@@ -103,11 +103,11 @@ describe("USD-path ingest — single payment", () => {
       seenAt: new Date()
     });
     expect(result.inserted).toBe(true);
-    expect(result.orderStatusAfter).toBe("confirmed");
+    expect(result.invoiceStatusAfter).toBe("confirmed");
 
     const row = await booted.deps.db
-      .prepare("SELECT status, paid_usd, overpaid_usd, confirmed_at FROM orders WHERE id = ?")
-      .bind(order.id)
+      .prepare("SELECT status, paid_usd, overpaid_usd, confirmed_at FROM invoices WHERE id = ?")
+      .bind(invoice.id)
       .first<{ status: string; paid_usd: string; overpaid_usd: string; confirmed_at: number | null }>();
     expect(row?.status).toBe("confirmed");
     expect(row?.paid_usd).toBe("100.00");
@@ -116,15 +116,15 @@ describe("USD-path ingest — single payment", () => {
 
     // amount_usd + usd_rate are pinned on the tx row at detection.
     const txRow = await booted.deps.db
-      .prepare("SELECT amount_usd, usd_rate FROM transactions WHERE order_id = ?")
-      .bind(order.id)
+      .prepare("SELECT amount_usd, usd_rate FROM transactions WHERE invoice_id = ?")
+      .bind(invoice.id)
       .first<{ amount_usd: string; usd_rate: string }>();
     expect(txRow?.amount_usd).toBe("100.00");
     expect(txRow?.usd_rate).toBe("1");
   });
 
   it("underpayment transitions to 'partial'; a second transfer completes and confirms", async () => {
-    const order = await createUsdOrder(booted, apiKey, {
+    const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "50.00",
       acceptedFamilies: ["evm"]
     });
@@ -134,38 +134,38 @@ describe("USD-path ingest — single payment", () => {
       txHash: "0x" + "b1".repeat(32),
       logIndex: 0,
       fromAddress: "0x1111111111111111111111111111111111111111",
-      toAddress: order.receiveAddress,
+      toAddress: invoice.receiveAddress,
       token: "USDC",
       amountRaw: "20000000" as AmountRaw,
       blockNumber: 100,
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(r1.orderStatusAfter).toBe("partial");
+    expect(r1.invoiceStatusAfter).toBe("partial");
 
     const r2 = await ingestDetectedTransfer(booted.deps, {
       chainId: 1,
       txHash: "0x" + "b2".repeat(32),
       logIndex: 0,
       fromAddress: "0x1111111111111111111111111111111111111111",
-      toAddress: order.receiveAddress,
+      toAddress: invoice.receiveAddress,
       token: "USDC",
       amountRaw: "30000000" as AmountRaw,
       blockNumber: 101,
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(r2.orderStatusAfter).toBe("confirmed");
+    expect(r2.invoiceStatusAfter).toBe("confirmed");
 
     const row = await booted.deps.db
-      .prepare("SELECT paid_usd FROM orders WHERE id = ?")
-      .bind(order.id)
+      .prepare("SELECT paid_usd FROM invoices WHERE id = ?")
+      .bind(invoice.id)
       .first<{ paid_usd: string }>();
     expect(row?.paid_usd).toBe("50.00");
   });
 
   it("overpayment in a single transfer flips to 'overpaid' with correct delta", async () => {
-    const order = await createUsdOrder(booted, apiKey, {
+    const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "25.00",
       acceptedFamilies: ["evm"]
     });
@@ -175,18 +175,18 @@ describe("USD-path ingest — single payment", () => {
       txHash: "0x" + "c1".repeat(32),
       logIndex: 0,
       fromAddress: "0x1111111111111111111111111111111111111111",
-      toAddress: order.receiveAddress,
+      toAddress: invoice.receiveAddress,
       token: "USDC",
       amountRaw: "40000000" as AmountRaw, // 40 USDC, 15 over target
       blockNumber: 100,
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(result.orderStatusAfter).toBe("overpaid");
+    expect(result.invoiceStatusAfter).toBe("overpaid");
 
     const row = await booted.deps.db
-      .prepare("SELECT status, paid_usd, overpaid_usd, confirmed_at FROM orders WHERE id = ?")
-      .bind(order.id)
+      .prepare("SELECT status, paid_usd, overpaid_usd, confirmed_at FROM invoices WHERE id = ?")
+      .bind(invoice.id)
       .first<{ status: string; paid_usd: string; overpaid_usd: string; confirmed_at: number | null }>();
     expect(row?.status).toBe("overpaid");
     expect(row?.paid_usd).toBe("40.00");
@@ -195,7 +195,7 @@ describe("USD-path ingest — single payment", () => {
   });
 
   it("still-detected (below threshold) transfers DON'T move paid_usd — only confirmed ones do", async () => {
-    const order = await createUsdOrder(booted, apiKey, {
+    const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "30.00",
       acceptedFamilies: ["evm"]
     });
@@ -206,19 +206,19 @@ describe("USD-path ingest — single payment", () => {
       txHash: "0x" + "d1".repeat(32),
       logIndex: 0,
       fromAddress: "0x1111111111111111111111111111111111111111",
-      toAddress: order.receiveAddress,
+      toAddress: invoice.receiveAddress,
       token: "USDC",
       amountRaw: "30000000" as AmountRaw,
       blockNumber: 100,
       confirmations: 0,
       seenAt: new Date()
     });
-    // Order stays on 'created' since nothing is confirmed yet.
-    expect(result.orderStatusAfter).toBe("created");
+    // Invoice stays on 'created' since nothing is confirmed yet.
+    expect(result.invoiceStatusAfter).toBe("created");
 
     const row = await booted.deps.db
-      .prepare("SELECT status, paid_usd FROM orders WHERE id = ?")
-      .bind(order.id)
+      .prepare("SELECT status, paid_usd FROM invoices WHERE id = ?")
+      .bind(invoice.id)
       .first<{ status: string; paid_usd: string }>();
     expect(row?.status).toBe("created");
     expect(row?.paid_usd).toBe("0");
@@ -239,11 +239,11 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
   });
 
   it("aggregates USDC on ETH + USDT on Polygon + USDC on BSC into one invoice", async () => {
-    const order = await createUsdOrder(booted, apiKey, {
+    const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "90.00",
       acceptedFamilies: ["evm"]
     });
-    const evmAddress = order.receiveAddresses.find((r) => r.family === "evm")!.address;
+    const evmAddress = invoice.receiveAddresses.find((r) => r.family === "evm")!.address;
 
     // 30 USDC on Ethereum
     await ingestDetectedTransfer(booted.deps, {
@@ -286,22 +286,22 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
       confirmations: 25,
       seenAt: new Date()
     });
-    expect(last.orderStatusAfter).toBe("confirmed");
+    expect(last.invoiceStatusAfter).toBe("confirmed");
 
     const row = await booted.deps.db
-      .prepare("SELECT status, paid_usd FROM orders WHERE id = ?")
-      .bind(order.id)
+      .prepare("SELECT status, paid_usd FROM invoices WHERE id = ?")
+      .bind(invoice.id)
       .first<{ status: string; paid_usd: string }>();
     expect(row?.status).toBe("confirmed");
     expect(row?.paid_usd).toBe("90.00");
   });
 
   it("values a native-ETH transfer at the pinned rate (2500) and adds to the USD total", async () => {
-    const order = await createUsdOrder(booted, apiKey, {
+    const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "50.00",
       acceptedFamilies: ["evm"]
     });
-    const evmAddress = order.receiveAddresses.find((r) => r.family === "evm")!.address;
+    const evmAddress = invoice.receiveAddresses.find((r) => r.family === "evm")!.address;
 
     // 0.02 ETH = 50 USD at pinned 2500. 18 decimals → 0.02 * 1e18 = 2e16.
     const result = await ingestDetectedTransfer(booted.deps, {
@@ -316,7 +316,7 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(result.orderStatusAfter).toBe("confirmed");
+    expect(result.invoiceStatusAfter).toBe("confirmed");
 
     const txRow = await booted.deps.db
       .prepare("SELECT amount_usd, usd_rate FROM transactions WHERE tx_hash = ?")
@@ -327,11 +327,11 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
   });
 
   it("unpriced tokens are recorded as audit rows but don't contribute to paid_usd", async () => {
-    const order = await createUsdOrder(booted, apiKey, {
+    const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "40.00",
       acceptedFamilies: ["evm"]
     });
-    const evmAddress = order.receiveAddresses.find((r) => r.family === "evm")!.address;
+    const evmAddress = invoice.receiveAddresses.find((r) => r.family === "evm")!.address;
 
     // MYSTERY is not in the registry and not a pegged symbol — static oracle
     // returns undefined for it, so usdValueFor yields null. The tx still writes.
@@ -354,16 +354,16 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
       .first<{ amount_usd: string | null }>();
     expect(txRow?.amount_usd).toBeNull();
 
-    const orderRow = await booted.deps.db
-      .prepare("SELECT paid_usd, status FROM orders WHERE id = ?")
-      .bind(order.id)
+    const invoiceRow = await booted.deps.db
+      .prepare("SELECT paid_usd, status FROM invoices WHERE id = ?")
+      .bind(invoice.id)
       .first<{ paid_usd: string; status: string }>();
-    expect(orderRow?.paid_usd).toBe("0");
-    expect(orderRow?.status).toBe("created");
+    expect(invoiceRow?.paid_usd).toBe("0");
+    expect(invoiceRow?.status).toBe("created");
   });
 });
 
-describe("USD-path ingest — order.payment_received webhook event", () => {
+describe("USD-path ingest — invoice.payment_received webhook event", () => {
   let booted: BootedTestApp;
   let apiKey: string;
 
@@ -376,8 +376,8 @@ describe("USD-path ingest — order.payment_received webhook event", () => {
     await booted.close();
   });
 
-  it("fires order.payment_received on every confirmed contributing transfer", async () => {
-    const order = await createUsdOrder(booted, apiKey, {
+  it("fires invoice.payment_received on every confirmed contributing transfer", async () => {
+    const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "60.00",
       acceptedFamilies: ["evm"]
     });
@@ -388,12 +388,12 @@ describe("USD-path ingest — order.payment_received webhook event", () => {
       amountUsd: string | null;
       status: string;
     }> = [];
-    booted.deps.events.subscribe("order.payment_received", (e) => {
+    booted.deps.events.subscribe("invoice.payment_received", (e) => {
       received.push({
         txHash: e.payment.txHash,
         token: e.payment.token,
         amountUsd: e.payment.amountUsd,
-        status: e.order.status
+        status: e.invoice.status
       });
     });
 
@@ -402,7 +402,7 @@ describe("USD-path ingest — order.payment_received webhook event", () => {
       txHash: "0xpay1",
       logIndex: 0,
       fromAddress: "0x1111111111111111111111111111111111111111",
-      toAddress: order.receiveAddress,
+      toAddress: invoice.receiveAddress,
       token: "USDC",
       amountRaw: "20000000" as AmountRaw,
       blockNumber: 100,
@@ -415,7 +415,7 @@ describe("USD-path ingest — order.payment_received webhook event", () => {
       txHash: "0xpay2",
       logIndex: 0,
       fromAddress: "0x2222222222222222222222222222222222222222",
-      toAddress: order.receiveAddress,
+      toAddress: invoice.receiveAddress,
       token: "USDC",
       amountRaw: "40000000" as AmountRaw,
       blockNumber: 101,
@@ -438,21 +438,21 @@ describe("USD-path ingest — order.payment_received webhook event", () => {
     });
   });
 
-  it("does NOT fire order.payment_received for still-detected (below-threshold) transfers", async () => {
-    const order = await createUsdOrder(booted, apiKey, {
+  it("does NOT fire invoice.payment_received for still-detected (below-threshold) transfers", async () => {
+    const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "25.00",
       acceptedFamilies: ["evm"]
     });
 
     const received: string[] = [];
-    booted.deps.events.subscribe("order.payment_received", (e) => { received.push(e.payment.txHash); });
+    booted.deps.events.subscribe("invoice.payment_received", (e) => { received.push(e.payment.txHash); });
 
     await ingestDetectedTransfer(booted.deps, {
       chainId: 1,
       txHash: "0xunconfirmed",
       logIndex: 0,
       fromAddress: "0x1111111111111111111111111111111111111111",
-      toAddress: order.receiveAddress,
+      toAddress: invoice.receiveAddress,
       token: "USDC",
       amountRaw: "25000000" as AmountRaw,
       blockNumber: 100,
@@ -464,8 +464,8 @@ describe("USD-path ingest — order.payment_received webhook event", () => {
 });
 
 describe("rate-window refresh on detection past expiry", () => {
-  it("refreshes the order's rates when ingest fires past rate_window_expires_at", async () => {
-    // Advancing clock: first use `now` at t0 (order creation + initial rates),
+  it("refreshes the invoice's rates when ingest fires past rate_window_expires_at", async () => {
+    // Advancing clock: first use `now` at t0 (invoice creation + initial rates),
     // then flip to t1 past the 10-minute window to force a refresh.
     const t0 = new Date("2026-04-17T10:00:00Z");
     let currentNow = t0;
@@ -474,14 +474,14 @@ describe("rate-window refresh on detection past expiry", () => {
     const booted = await bootWithAllFamilies({ clock });
     try {
       const apiKey = booted.apiKeys[MERCHANT_ID]!;
-      const order = await createUsdOrder(booted, apiKey, {
+      const invoice = await createUsdInvoice(booted, apiKey, {
         amountUsd: "100.00",
         acceptedFamilies: ["evm"]
       });
 
       const before = await booted.deps.db
-        .prepare("SELECT rate_window_expires_at, rates_json FROM orders WHERE id = ?")
-        .bind(order.id)
+        .prepare("SELECT rate_window_expires_at, rates_json FROM invoices WHERE id = ?")
+        .bind(invoice.id)
         .first<{ rate_window_expires_at: number; rates_json: string }>();
       expect(before?.rate_window_expires_at).toBe(t0.getTime() + RATE_WINDOW_DURATION_MS);
 
@@ -493,7 +493,7 @@ describe("rate-window refresh on detection past expiry", () => {
         txHash: "0xrefresh1",
         logIndex: 0,
         fromAddress: "0x1111111111111111111111111111111111111111",
-        toAddress: order.receiveAddress,
+        toAddress: invoice.receiveAddress,
         token: "USDC",
         amountRaw: "50000000" as AmountRaw,
         blockNumber: 100,
@@ -502,8 +502,8 @@ describe("rate-window refresh on detection past expiry", () => {
       });
 
       const after = await booted.deps.db
-        .prepare("SELECT rate_window_expires_at FROM orders WHERE id = ?")
-        .bind(order.id)
+        .prepare("SELECT rate_window_expires_at FROM invoices WHERE id = ?")
+        .bind(invoice.id)
         .first<{ rate_window_expires_at: number }>();
       // New window starts at the ingest clock, not t0.
       expect(after?.rate_window_expires_at).toBe(currentNow.getTime() + RATE_WINDOW_DURATION_MS);
@@ -521,14 +521,14 @@ describe("rate-window refresh on detection past expiry", () => {
     const booted = await bootWithAllFamilies({ clock });
     try {
       const apiKey = booted.apiKeys[MERCHANT_ID]!;
-      const order = await createUsdOrder(booted, apiKey, {
+      const invoice = await createUsdInvoice(booted, apiKey, {
         amountUsd: "100.00",
         acceptedFamilies: ["evm"]
       });
 
       const before = await booted.deps.db
-        .prepare("SELECT rate_window_expires_at FROM orders WHERE id = ?")
-        .bind(order.id)
+        .prepare("SELECT rate_window_expires_at FROM invoices WHERE id = ?")
+        .bind(invoice.id)
         .first<{ rate_window_expires_at: number }>();
 
       // 2 minutes in — well within the 10-minute window.
@@ -539,7 +539,7 @@ describe("rate-window refresh on detection past expiry", () => {
         txHash: "0xnorefresh",
         logIndex: 0,
         fromAddress: "0x1111111111111111111111111111111111111111",
-        toAddress: order.receiveAddress,
+        toAddress: invoice.receiveAddress,
         token: "USDC",
         amountRaw: "10000000" as AmountRaw,
         blockNumber: 100,
@@ -548,8 +548,8 @@ describe("rate-window refresh on detection past expiry", () => {
       });
 
       const after = await booted.deps.db
-        .prepare("SELECT rate_window_expires_at FROM orders WHERE id = ?")
-        .bind(order.id)
+        .prepare("SELECT rate_window_expires_at FROM invoices WHERE id = ?")
+        .bind(invoice.id)
         .first<{ rate_window_expires_at: number }>();
       expect(after?.rate_window_expires_at).toBe(before?.rate_window_expires_at);
     } finally {

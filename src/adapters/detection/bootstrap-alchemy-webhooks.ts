@@ -20,7 +20,7 @@ import type { AlchemyRegistryStore } from "./alchemy-registry-store.js";
 //     with a chain-family-correct placeholder (EVM: 0x0…0, Solana: base58
 //     all-zeros "11111…"), then IMMEDIATELY remove that placeholder from
 //     the watch list. Real HD-derived receive addresses are added later via
-//     the subscription-sync sweep as orders are placed.
+//     the subscription-sync sweep as invoices are placed.
 //   - WHY the placeholder is removed straight away: the EVM zero address
 //     is the source/sink of every ERC-20 mint/burn — watching it floods
 //     the gateway with thousands of irrelevant events per minute. The

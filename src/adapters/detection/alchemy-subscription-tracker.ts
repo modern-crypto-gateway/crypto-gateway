@@ -10,10 +10,10 @@ import type { AlchemySubscriptionStore } from "./alchemy-subscription-store.js";
 //   pool.address.created     -> one 'add' row per Alchemy-served chain in family
 //   pool.address.quarantined -> one 'remove' row per Alchemy-served chain in family
 //
-// Lifecycle is now tied to the POOL, not individual orders. A pool row
-// reused across 1000 orders stays subscribed the whole time. Orders reaching
-// terminal states do NOT trigger subscription removes — the address is still
-// watchable and might serve the next order.
+// Lifecycle is now tied to the POOL, not individual invoices. A pool row
+// reused across 1000 invoices stays subscribed the whole time. Invoices
+// reaching terminal states do NOT trigger subscription removes — the address
+// is still watchable and might serve the next invoice.
 //
 // Fan-out: one EVM pool address emits `add` for 7 chainIds (ETH/OP/Polygon/
 // Base/Arbitrum/AVAX/BSC). One Solana pool address emits one row for

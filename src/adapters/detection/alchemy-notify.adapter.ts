@@ -147,7 +147,7 @@ export function alchemyNotifyDetection(): DetectionStrategy {
 //
 // The handler is stateless: it returns every credit it finds, even for
 // addresses we don't watch. The downstream ingest path
-// (webhooks-ingest → ingestDetectedTransfer) filters by active-order
+// (webhooks-ingest → ingestDetectedTransfer) filters by active-invoice
 // receive_address, so a permissive parser is correct and cheap.
 function parseSolanaEvent(
   transactions: readonly SolanaWebhookTransaction[],
@@ -367,8 +367,8 @@ function parseActivity(
     }
   }
 
-  // Canonicalize addresses so downstream matching against order.receive_address
-  // works regardless of the casing Alchemy reports.
+  // Canonicalize addresses so downstream matching against
+  // invoice.receive_address works regardless of the casing Alchemy reports.
   let canonicalFrom: string;
   let canonicalTo: string;
   try {

@@ -21,13 +21,13 @@ describe("inlineFetchDispatcher", () => {
     const f = mockFetch(() => new Response(null, { status: 200 }));
     const dispatcher = inlineFetchDispatcher({ fetch: f.fn, maxAttempts: 1, retryBaseMs: 0 });
 
-    const payload = { event: "order.detected", data: { foo: "bar" } };
+    const payload = { event: "invoice.detected", data: { foo: "bar" } };
     const secret = "shared-secret-abc";
     const result = await dispatcher.dispatch({
       url: "https://example.com/hook",
       payload,
       secret,
-      idempotencyKey: "order.detected:abc:detected"
+      idempotencyKey: "invoice.detected:abc:detected"
     });
     expect(result).toEqual({ delivered: true, statusCode: 200 });
 
@@ -35,7 +35,7 @@ describe("inlineFetchDispatcher", () => {
     const call = f.calls[0]!;
     const headers = new Headers(call.init.headers);
     expect(headers.get("content-type")).toBe("application/json");
-    expect(headers.get("x-webhook-idempotency-key")).toBe("order.detected:abc:detected");
+    expect(headers.get("x-webhook-idempotency-key")).toBe("invoice.detected:abc:detected");
     expect(headers.get("x-webhook-attempt")).toBe("1");
 
     // Verify the signature header matches what we'd compute over the raw body.

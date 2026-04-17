@@ -17,11 +17,13 @@ import { composeWebhook } from "./webhook-composer.js";
 
 // Events that reach merchants — matches the union returned by composeWebhook.
 const OUTBOUND_EVENT_TYPES = [
-  "order.partial",
-  "order.detected",
-  "order.confirmed",
-  "order.expired",
-  "order.canceled",
+  "invoice.partial",
+  "invoice.detected",
+  "invoice.confirmed",
+  "invoice.overpaid",
+  "invoice.expired",
+  "invoice.canceled",
+  "invoice.payment_received",
   "payout.submitted",
   "payout.confirmed",
   "payout.failed"

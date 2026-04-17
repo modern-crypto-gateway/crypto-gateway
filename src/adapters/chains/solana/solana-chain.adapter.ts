@@ -78,8 +78,9 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
 
     deriveAddress(seed: string, index: number) {
       // SLIP-0010 ed25519 path: m/44'/501'/{index}'/0' (Phantom convention).
-      // We bind the addressIndex to the account segment so each order gets a
-      // distinct keypair — matches what Phantom / Solflare users are used to.
+      // We bind the addressIndex to the account segment so each invoice gets
+      // a distinct keypair — matches what Phantom / Solflare users are used
+      // to.
       const seedBytes = mnemonicToSeedSync(seed);
       const node = derivePath(seedBytes, `m/44'/501'/${DEFAULT_ACCOUNT_INDEX}'/${index}'`);
       const publicKey = publicKeyFromPrivateKey(node.privateKey);

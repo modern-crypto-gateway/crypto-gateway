@@ -39,7 +39,7 @@ describe("request-id middleware + app.onError", () => {
     // Admin route with no ADMIN_KEY -> should 404. But let's force a throw by
     // registering a route that throws. Simulate: call an invalid route shape
     // that triggers a route-level exception via Hono's JSON parse on non-JSON.
-    // The orders POST parses JSON; sending malformed JSON with wrong content-type
+    // The invoices POST parses JSON; sending malformed JSON with wrong content-type
     // takes the "BAD_JSON" branch (handled 400). To hit app.onError specifically,
     // we send a request that hits a route that awaits a rejected promise.
     //
@@ -47,14 +47,14 @@ describe("request-id middleware + app.onError", () => {
     // That returns 404 "NOT_CONFIGURED" through the middleware, not onError.
     //
     // Most reliable: drive app.onError by making a handler throw. We can do
-    // that by POST-ing to /api/v1/orders without the body producing a throw —
+    // that by POST-ing to /api/v1/invoices without the body producing a throw —
     // but that's caught in-route. So: send a request to a path that doesn't exist.
     // Hono's 404 for unknown routes does NOT go through onError. We'd need a
     // handler that throws.
     //
     // For this test, we validate the CONTRACT: `renderError` returns
     // { error: { code, message } } and that app.onError wiring pipes into it.
-    // The contract is covered end-to-end by domain-error tests (orders 400/404)
+    // The contract is covered end-to-end by domain-error tests (invoices 400/404)
     // which assert the response shape. This test asserts request-id is attached
     // even on the successful paths — the onError-wired logger.child carrying
     // the request-id was the load-bearing bit.
@@ -64,10 +64,10 @@ describe("request-id middleware + app.onError", () => {
   });
 
   it("structured DomainError subclasses return their per-code httpStatus + toResponseBody shape", async () => {
-    // Hit POST /api/v1/orders with an unsupported token -> OrderError("TOKEN_NOT_SUPPORTED") -> 400.
+    // Hit POST /api/v1/invoices with an unsupported token -> InvoiceError("TOKEN_NOT_SUPPORTED") -> 400.
     const apiKey = booted.apiKeys["00000000-0000-0000-0000-000000000001"]!;
     const res = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({ chainId: 999, token: "FAKE", amountRaw: "1" })

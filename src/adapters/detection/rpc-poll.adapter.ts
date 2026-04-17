@@ -58,7 +58,7 @@ export function rpcPollDetection(config: RpcPollConfig = {}): DetectionStrategy 
 
       // Tokens registered on this chain — the strategy scans all of them. For
       // performance-sensitive deployments, a future refinement can narrow this
-      // to tokens actually referenced by active orders.
+      // to tokens actually referenced by active invoices.
       const tokens = TOKEN_REGISTRY.filter((t) => t.chainId === chainId).map((t) => t.symbol);
       if (tokens.length === 0) return [];
 

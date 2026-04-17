@@ -1,6 +1,6 @@
 // Base class for every domain-signalled error. Carries an HTTP status the
 // transport layer can map to 1:1 and a code field merchants can branch on.
-// Subclass (OrderError, PayoutError, ...) to enumerate per-domain codes as a
+// Subclass (InvoiceError, PayoutError, ...) to enumerate per-domain codes as a
 // type-safe union.
 //
 // The point of a shared base class is that the app-level error handler can
@@ -28,7 +28,7 @@ export class DomainError extends Error {
 
 // 503: no available pool addresses for one of the requested families.
 // Actionable for operators — run `POST /admin/pool/initialize` to mint more.
-// The refill path is also async-triggered at order creation when the pool
+// The refill path is also async-triggered at invoice creation when the pool
 // runs low, so in practice this only fires if the initial pool was never
 // seeded or the refill mutex was held through a process death.
 export class PoolExhaustedError extends DomainError {

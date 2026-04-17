@@ -28,15 +28,15 @@ describe("POST /admin/merchants", () => {
     expect(body.merchant.id).toMatch(/^[0-9a-f-]{36}$/);
     expect(body.apiKey).toMatch(/^sk_[0-9a-f]{64}$/);
 
-    // The returned plaintext must successfully authenticate on /api/v1/orders.
-    const orderRes = await booted.app.fetch(
-      new Request("http://test.local/api/v1/orders", {
+    // The returned plaintext must successfully authenticate on /api/v1/invoices.
+    const invoiceRes = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${body.apiKey}` },
         body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
       })
     );
-    expect(orderRes.status).toBe(201);
+    expect(invoiceRes.status).toBe(201);
   });
 
   it("rejects admin requests without the admin key (401)", async () => {

@@ -1,15 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  allocateForOrder,
+  allocateForInvoice,
   getStats,
   initializePool,
   refillFamily,
-  releaseFromOrder
+  releaseFromInvoice
 } from "../../core/domain/pool.service.js";
 import { PoolExhaustedError } from "../../core/errors.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 
-// Pool is family-keyed, shared across merchants, and reused across orders.
+// Pool is family-keyed, shared across merchants, and reused across invoices.
 // These tests lock in the core behaviors: seeding, allocation CAS, release
 // on terminal transitions, and exhaustion semantics.
 
@@ -70,31 +70,31 @@ describe("pool.service — allocate + release", () => {
   });
 
   it("allocates one pool row per call, flipping status to 'allocated'", async () => {
-    const allocated = await allocateForOrder(booted.deps, "order-1", "evm");
+    const allocated = await allocateForInvoice(booted.deps, "invoice-1", "evm");
     expect(allocated.status).toBe("allocated");
-    expect(allocated.allocatedToOrderId).toBe("order-1");
+    expect(allocated.allocatedToInvoiceId).toBe("invoice-1");
     expect(allocated.address).toBeTruthy();
   });
 
   it("returns to 'available' with bumped total_allocations on release", async () => {
-    const allocated = await allocateForOrder(booted.deps, "order-1", "evm");
-    await releaseFromOrder(booted.deps, "order-1");
+    const allocated = await allocateForInvoice(booted.deps, "invoice-1", "evm");
+    await releaseFromInvoice(booted.deps, "invoice-1");
 
     const row = await booted.deps.db
-      .prepare("SELECT status, allocated_to_order_id, total_allocations FROM address_pool WHERE id = ?")
+      .prepare("SELECT status, allocated_to_invoice_id, total_allocations FROM address_pool WHERE id = ?")
       .bind(allocated.id)
-      .first<{ status: string; allocated_to_order_id: string | null; total_allocations: number }>();
+      .first<{ status: string; allocated_to_invoice_id: string | null; total_allocations: number }>();
     expect(row?.status).toBe("available");
-    expect(row?.allocated_to_order_id).toBeNull();
+    expect(row?.allocated_to_invoice_id).toBeNull();
     expect(row?.total_allocations).toBe(1);
   });
 
   it("next allocation prefers the row with the LOWEST total_allocations (fair rotation)", async () => {
     // Allocate + release row A → total_allocations = 1.
-    const a = await allocateForOrder(booted.deps, "order-1", "evm");
-    await releaseFromOrder(booted.deps, "order-1");
+    const a = await allocateForInvoice(booted.deps, "invoice-1", "evm");
+    await releaseFromInvoice(booted.deps, "invoice-1");
     // Fresh allocation should prefer row B or C (total_allocations = 0), not A.
-    const b = await allocateForOrder(booted.deps, "order-2", "evm");
+    const b = await allocateForInvoice(booted.deps, "invoice-2", "evm");
     expect(b.id).not.toBe(a.id);
     expect(b.totalAllocations).toBe(0);
   });
@@ -107,10 +107,10 @@ describe("pool.service — allocate + release", () => {
     // that, then exercise the exhaustion path cleanly.
     await booted.deps.cache.put("pool:refill-lock:evm", "1", { ttlSeconds: 60 });
     try {
-      await allocateForOrder(booted.deps, "order-1", "evm");
-      await allocateForOrder(booted.deps, "order-2", "evm");
-      await allocateForOrder(booted.deps, "order-3", "evm");
-      await expect(allocateForOrder(booted.deps, "order-4", "evm")).rejects.toBeInstanceOf(
+      await allocateForInvoice(booted.deps, "invoice-1", "evm");
+      await allocateForInvoice(booted.deps, "invoice-2", "evm");
+      await allocateForInvoice(booted.deps, "invoice-3", "evm");
+      await expect(allocateForInvoice(booted.deps, "invoice-4", "evm")).rejects.toBeInstanceOf(
         PoolExhaustedError
       );
     } finally {
@@ -118,25 +118,25 @@ describe("pool.service — allocate + release", () => {
     }
   });
 
-  it("releases all rows tied to one orderId (multi-family ready)", async () => {
-    // Simulate future multi-family allocation: two rows tied to same order.
-    const a = await allocateForOrder(booted.deps, "multi-order", "evm");
+  it("releases all rows tied to one invoiceId (multi-family ready)", async () => {
+    // Simulate future multi-family allocation: two rows tied to same invoice.
+    const a = await allocateForInvoice(booted.deps, "multi-invoice", "evm");
     // Manually claim a second row to simulate a separate family allocation
     // (not actually a separate family here since test only has evm, but the
-    // release-by-orderId behavior is family-agnostic). SQLite doesn't
+    // release-by-invoiceId behavior is family-agnostic). SQLite doesn't
     // support UPDATE...LIMIT — subquery picks the next available id.
     await booted.deps.db
       .prepare(
-        `UPDATE address_pool SET status = 'allocated', allocated_to_order_id = ?, allocated_at = ?
+        `UPDATE address_pool SET status = 'allocated', allocated_to_invoice_id = ?, allocated_at = ?
          WHERE id = (SELECT id FROM address_pool WHERE family = 'evm' AND status = 'available' LIMIT 1)`
       )
-      .bind("multi-order", Date.now())
+      .bind("multi-invoice", Date.now())
       .run();
 
-    await releaseFromOrder(booted.deps, "multi-order");
+    await releaseFromInvoice(booted.deps, "multi-invoice");
     const rows = await booted.deps.db
-      .prepare("SELECT COUNT(*) AS cnt FROM address_pool WHERE allocated_to_order_id = ?")
-      .bind("multi-order")
+      .prepare("SELECT COUNT(*) AS cnt FROM address_pool WHERE allocated_to_invoice_id = ?")
+      .bind("multi-invoice")
       .first<{ cnt: number }>();
     expect(rows?.cnt).toBe(0);
     // The explicitly-allocated row `a` is also released.

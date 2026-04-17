@@ -4,16 +4,16 @@ import type { ChainAdapter } from "../ports/chain.port.js";
 import type { ChainFamily } from "../types/chain.js";
 import type { PoolAddress, PoolFamilyStats } from "../types/pool.js";
 
-// Address pool: shared-across-merchants, HD-derived, reused across orders.
+// Address pool: shared-across-merchants, HD-derived, reused across invoices.
 //
 // Lifecycle:
 //   refill   → HD-derive N new addresses, insert as 'available', emit
 //              pool.address.created per row (Alchemy subscription tracker
 //              picks them up and fans out to per-chain webhook registers).
 //   allocate → CAS-update the cheapest available row (lowest total_allocations,
-//              then lowest address_index) to 'allocated', tie to orderId.
-//   release  → on order terminal, flip back to 'available' and bump
-//              total_allocations. The same row can now serve the next order.
+//              then lowest address_index) to 'allocated', tie to invoiceId.
+//   release  → on invoice terminal, flip back to 'available' and bump
+//              total_allocations. The same row can now serve the next invoice.
 //   quarantine → ops action, pull a row out of rotation (not wired in A1.a
 //              but the status exists so the table schema doesn't churn later).
 //
@@ -88,13 +88,13 @@ export async function initializePool(
   return results;
 }
 
-// Allocate one pool row to `orderId` for `family`. Throws PoolExhaustedError
+// Allocate one pool row to `invoiceId` for `family`. Throws PoolExhaustedError
 // when no rows are available after the retry budget. Never triggers a
-// synchronous refill (keeps order-create fast) — the caller schedules a
+// synchronous refill (keeps invoice-create fast) — the caller schedules a
 // background refill via deps.jobs when allocation succeeds near the threshold.
-export async function allocateForOrder(
+export async function allocateForInvoice(
   deps: AppDeps,
-  orderId: string,
+  invoiceId: string,
   family: ChainFamily
 ): Promise<PoolAddress> {
   const now = deps.clock.now().getTime();
@@ -111,9 +111,10 @@ export async function allocateForOrder(
       .first<{ id: string; address: string; address_index: number }>();
 
     if (candidate === null) {
-      // Empty pool — kick off a background refill so the next order creation
-      // has something to allocate, then surface the 503 so this order-create
-      // call fails fast (merchant retries and succeeds once the refill lands).
+      // Empty pool — kick off a background refill so the next invoice
+      // creation has something to allocate, then surface the 503 so this
+      // invoice-create call fails fast (merchant retries and succeeds once
+      // the refill lands).
       scheduleRefill(deps, family);
       throw new PoolExhaustedError(family);
     }
@@ -121,12 +122,12 @@ export async function allocateForOrder(
     const claim = await deps.db
       .prepare(
         `UPDATE address_pool
-           SET status = 'allocated', allocated_to_order_id = ?, allocated_at = ?
+           SET status = 'allocated', allocated_to_invoice_id = ?, allocated_at = ?
          WHERE id = ? AND status = 'available'
          RETURNING id, family, address_index, address, status,
-                   allocated_to_order_id, allocated_at, total_allocations, created_at`
+                   allocated_to_invoice_id, allocated_at, total_allocations, created_at`
       )
-      .bind(orderId, now, candidate.id)
+      .bind(invoiceId, now, candidate.id)
       .first<PoolRow>();
 
     if (claim !== null) {
@@ -146,21 +147,21 @@ export async function allocateForOrder(
   throw new PoolExhaustedError(family);
 }
 
-// Release all pool rows tied to `orderId` back to 'available'. Called when
-// an order reaches a terminal state (confirmed/expired/canceled). Bumps
+// Release all pool rows tied to `invoiceId` back to 'available'. Called when
+// an invoice reaches a terminal state (confirmed/expired/canceled). Bumps
 // total_allocations on each released row so the fair-rotation ordering
 // moves it to the back of the queue.
-export async function releaseFromOrder(deps: AppDeps, orderId: string): Promise<void> {
+export async function releaseFromInvoice(deps: AppDeps, invoiceId: string): Promise<void> {
   await deps.db
     .prepare(
       `UPDATE address_pool
          SET status = 'available',
-             allocated_to_order_id = NULL,
+             allocated_to_invoice_id = NULL,
              allocated_at = NULL,
              total_allocations = total_allocations + 1
-       WHERE allocated_to_order_id = ?`
+       WHERE allocated_to_invoice_id = ?`
     )
-    .bind(orderId)
+    .bind(invoiceId)
     .run();
 }
 
@@ -241,25 +242,25 @@ export async function refillFamily(
   }
 }
 
-// Event-bus subscriber: releases pool rows when the owning order reaches a
+// Event-bus subscriber: releases pool rows when the owning invoice reaches a
 // terminal state. Installed once per buildApp; unsubscriber returned so tests
 // can tear down cleanly.
 export function registerPoolReleaseHandler(deps: AppDeps): () => void {
-  const handler = async (event: { order: { id: string } }): Promise<void> => {
+  const handler = async (event: { invoice: { id: string } }): Promise<void> => {
     try {
-      await releaseFromOrder(deps, event.order.id);
+      await releaseFromInvoice(deps, event.invoice.id);
     } catch (err) {
-      deps.logger.error("pool release failed on order terminal transition", {
-        orderId: event.order.id,
+      deps.logger.error("pool release failed on invoice terminal transition", {
+        invoiceId: event.invoice.id,
         error: err instanceof Error ? err.message : String(err)
       });
     }
   };
 
   const unsubscribers = [
-    deps.events.subscribe("order.confirmed", handler),
-    deps.events.subscribe("order.expired", handler),
-    deps.events.subscribe("order.canceled", handler)
+    deps.events.subscribe("invoice.confirmed", handler),
+    deps.events.subscribe("invoice.expired", handler),
+    deps.events.subscribe("invoice.canceled", handler)
   ];
   return () => {
     for (const u of unsubscribers) u();
@@ -303,7 +304,7 @@ interface PoolRow {
   address_index: number;
   address: string;
   status: "available" | "allocated" | "quarantined";
-  allocated_to_order_id: string | null;
+  allocated_to_invoice_id: string | null;
   allocated_at: number | null;
   total_allocations: number;
   created_at: number;
@@ -316,7 +317,7 @@ function rowToPoolAddress(row: PoolRow): PoolAddress {
     addressIndex: row.address_index,
     address: row.address,
     status: row.status,
-    allocatedToOrderId: row.allocated_to_order_id,
+    allocatedToInvoiceId: row.allocated_to_invoice_id,
     allocatedAt: row.allocated_at !== null ? new Date(row.allocated_at) : null,
     totalAllocations: row.total_allocations,
     createdAt: new Date(row.created_at)

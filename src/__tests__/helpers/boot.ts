@@ -60,7 +60,7 @@ export interface BootTestAppOptions {
   // this true to skip the default bootTestApp seeding.
   skipPoolInit?: boolean;
   // Override the default pool size seeded at boot. Tests that run many
-  // concurrent order creations pre-seed more; throttle tests use 1 or 2.
+  // concurrent invoice creations pre-seed more; throttle tests use 1 or 2.
   poolInitialSize?: number;
   // Subscribable-chains map injected into deps. Tests that exercise the
   // pool → subscription fan-out supply it; most tests leave it undefined.
@@ -83,8 +83,8 @@ export interface BootedTestApp {
   close: () => Promise<void>;
 }
 
-// Helper for tests that post new orders against the authenticated API.
-export async function createOrderViaApi(
+// Helper for tests that post new invoices against the authenticated API.
+export async function createInvoiceViaApi(
   booted: BootedTestApp,
   args: {
     merchantId?: string;
@@ -107,7 +107,7 @@ export async function createOrderViaApi(
   if (args.fiatAmount !== undefined) body["fiatAmount"] = args.fiatAmount;
   if (args.fiatCurrency !== undefined) body["fiatCurrency"] = args.fiatCurrency;
   const res = await booted.app.fetch(
-    new Request("http://test.local/api/v1/orders", {
+    new Request("http://test.local/api/v1/invoices", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -118,10 +118,10 @@ export async function createOrderViaApi(
   );
   if (res.status !== 201) {
     const err = await res.text();
-    throw new Error(`createOrderViaApi: unexpected status ${res.status}: ${err}`);
+    throw new Error(`createInvoiceViaApi: unexpected status ${res.status}: ${err}`);
   }
-  const parsed = (await res.json()) as { order: { id: string; receiveAddress: string; status: string } };
-  return parsed.order;
+  const parsed = (await res.json()) as { invoice: { id: string; receiveAddress: string; status: string } };
+  return parsed.invoice;
 }
 
 // Boots a real `buildApp()` with libSQL :memory: + memory cache + promise-set
@@ -231,7 +231,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
 
   const app = buildApp(deps);
 
-  // Seed the pool so tests that create orders don't hit PoolExhaustedError.
+  // Seed the pool so tests that create invoices don't hit PoolExhaustedError.
   // We derive families from whichever chains are wired into `deps.chains` —
   // the default test setup has only the dev chain (family="evm"), so a
   // small EVM pool suffices. Tests that wire Tron or Solana adapters get

@@ -1,34 +1,34 @@
 import type { ChainFamily } from "../types/chain.js";
-import type { Order, OrderId } from "../types/order.js";
+import type { Invoice, InvoiceId } from "../types/invoice.js";
 import type { Payout, PayoutId } from "../types/payout.js";
 import type { Transaction, TransactionId } from "../types/transaction.js";
 
-// Domain events. Every state transition in order/tx/payout emits exactly one event.
-// Subscribers (webhook composer, reconciliation, audit log) react without the
-// emitting service having to know about them — so adding a new reaction does
-// not touch the state machine.
+// Domain events. Every state transition in invoice/tx/payout emits exactly one
+// event. Subscribers (webhook composer, reconciliation, audit log) react
+// without the emitting service having to know about them — so adding a new
+// reaction does not touch the state machine.
 //
 // Event shapes are intentionally flat JSON-safe objects, not references, so a
 // future queue-backed EventBus (CF Queues / Redis Streams) can serialize them.
 
 export type DomainEvent =
-  | { type: "order.created"; orderId: OrderId; order: Order; at: Date }
-  | { type: "order.partial"; orderId: OrderId; order: Order; at: Date }
-  | { type: "order.detected"; orderId: OrderId; order: Order; at: Date }
-  | { type: "order.confirmed"; orderId: OrderId; order: Order; at: Date }
-  | { type: "order.overpaid"; orderId: OrderId; order: Order; at: Date }
-  | { type: "order.expired"; orderId: OrderId; order: Order; at: Date }
-  | { type: "order.canceled"; orderId: OrderId; order: Order; at: Date }
-  // Fires on EVERY confirmed inbound transfer that contributes to an order,
-  // separate from the order-status transition events above. Gives merchants
+  | { type: "invoice.created"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  | { type: "invoice.partial"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  | { type: "invoice.detected"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  | { type: "invoice.confirmed"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  | { type: "invoice.overpaid"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  | { type: "invoice.expired"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  | { type: "invoice.canceled"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  // Fires on EVERY confirmed inbound transfer that contributes to an invoice,
+  // separate from the invoice-status transition events above. Gives merchants
   // audit-grade per-payment visibility — they can render "USDC 30.00 on
   // Polygon | ETH 0.02 on mainnet | USDT 45.00 on BSC" running totals on
   // their own side. The `payment` block carries the on-chain specifics;
-  // the `order` block is the post-payment order snapshot.
+  // the `invoice` block is the post-payment invoice snapshot.
   | {
-      type: "order.payment_received";
-      orderId: OrderId;
-      order: Order;
+      type: "invoice.payment_received";
+      invoiceId: InvoiceId;
+      invoice: Invoice;
       payment: {
         txHash: string;
         chainId: number;
@@ -61,8 +61,8 @@ export type EventHandler<E extends DomainEvent = DomainEvent> = (event: E) => Pr
 export interface EventBus {
   publish(event: DomainEvent): Promise<void>;
 
-  // Type-narrowed subscription: subscribe("order.confirmed", ...) gets an
-  // Extract<DomainEvent, { type: "order.confirmed" }> typed argument.
+  // Type-narrowed subscription: subscribe("invoice.confirmed", ...) gets an
+  // Extract<DomainEvent, { type: "invoice.confirmed" }> typed argument.
   subscribe<T extends DomainEventType>(
     type: T,
     handler: EventHandler<Extract<DomainEvent, { type: T }>>

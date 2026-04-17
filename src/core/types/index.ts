@@ -3,7 +3,7 @@ export * from "./chain.js";
 export * from "./money.js";
 export * from "./token.js";
 export * from "./merchant.js";
-export * from "./order.js";
+export * from "./invoice.js";
 export * from "./transaction.js";
 export * from "./payout.js";
 export * from "./signer.js";

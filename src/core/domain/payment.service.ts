@@ -1,35 +1,35 @@
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
 import type { ChainFamily } from "../types/chain.js";
-import type { Order, OrderId, OrderStatus } from "../types/order.js";
+import type { Invoice, InvoiceId, InvoiceStatus } from "../types/invoice.js";
 import { DetectedTransferSchema, type TransactionId, type TxStatus } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import {
-  fetchOrderReceiveAddresses,
-  rowToOrder,
+  fetchInvoiceReceiveAddresses,
+  rowToInvoice,
   rowToTransaction,
-  type OrderRow,
+  type InvoiceRow,
   type TxRow
 } from "./mappers.js";
 import { confirmationThreshold } from "./payment-config.js";
 import { addUsd, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
 
 // PaymentService: rules for how detected transfers become transactions, how
-// transactions accumulate into orders, and how confirmation counts promote
+// transactions accumulate into invoices, and how confirmation counts promote
 // through the state machine. Chain-agnostic — every family calls into the same
 // logic via the ChainAdapter port.
 
-// Terminal states: once an order lands here, no further transfers update it.
-const ORDER_TERMINAL_STATES: ReadonlySet<OrderStatus> = new Set<OrderStatus>(["confirmed", "expired", "canceled"]);
+// Terminal states: once an invoice lands here, no further transfers update it.
+const INVOICE_TERMINAL_STATES: ReadonlySet<InvoiceStatus> = new Set<InvoiceStatus>(["confirmed", "expired", "canceled"]);
 
 // ---- Ingest a detected transfer ----
 
 export interface IngestResult {
   inserted: boolean;
   transactionId?: TransactionId;
-  orderId?: OrderId;
-  orderStatusBefore?: OrderStatus;
-  orderStatusAfter?: OrderStatus;
+  invoiceId?: InvoiceId;
+  invoiceStatusBefore?: InvoiceStatus;
+  invoiceStatusAfter?: InvoiceStatus;
 }
 
 export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Promise<IngestResult> {
@@ -39,25 +39,25 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   const canonicalTo = chainAdapter.canonicalizeAddress(transfer.toAddress);
   const canonicalFrom = chainAdapter.canonicalizeAddress(transfer.fromAddress);
 
-  // Match to an order via the receive-addresses join table: family +
+  // Match to an invoice via the receive-addresses join table: family +
   // address pair resolves across all chains in the family. This is how
-  // multi-family orders work — a USDC transfer on Polygon (chainId 137)
-  // matches an order with `family='evm', address='0xABC'` whether the
-  // order's primary chain was Ethereum or Arbitrum or any other EVM chain.
-  // Transfers to addresses the gateway doesn't own still get recorded
-  // with order_id=NULL (orphaned-transfer audit).
+  // multi-family invoices work — a USDC transfer on Polygon (chainId 137)
+  // matches an invoice with `family='evm', address='0xABC'` whether the
+  // invoice's primary chain was Ethereum or Arbitrum or any other EVM
+  // chain. Transfers to addresses the gateway doesn't own still get
+  // recorded with invoice_id=NULL (orphaned-transfer audit).
   const family = chainAdapter.family;
-  const orderRow = await deps.db
+  const invoiceRow = await deps.db
     .prepare(
-      `SELECT o.* FROM orders o
-         JOIN order_receive_addresses ora ON ora.order_id = o.id
-        WHERE ora.address = ? AND ora.family = ?
+      `SELECT i.* FROM invoices i
+         JOIN invoice_receive_addresses ira ON ira.invoice_id = i.id
+        WHERE ira.address = ? AND ira.family = ?
         LIMIT 1`
     )
     .bind(canonicalTo, family)
-    .first<OrderRow>();
+    .first<InvoiceRow>();
 
-  const orderId: string | null = orderRow ? orderRow.id : null;
+  const invoiceId: string | null = invoiceRow ? invoiceRow.id : null;
 
   // Decide initial tx status using the reported confirmation count.
   const threshold = confirmationThreshold(transfer.chainId);
@@ -65,20 +65,20 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   const now = deps.clock.now().getTime();
   const txId = globalThis.crypto.randomUUID();
 
-  // USD conversion for USD-path orders. We pin the rate on the transaction
-  // row at detection time so the order's total is idempotent even if the
-  // rate window later refreshes. Non-USD orders leave these NULL.
+  // USD conversion for USD-path invoices. We pin the rate on the transaction
+  // row at detection time so the invoice's total is idempotent even if the
+  // rate window later refreshes. Non-USD invoices leave these NULL.
   let amountUsd: string | null = null;
   let usdRate: string | null = null;
-  if (orderRow && orderRow.amount_usd !== null) {
-    const acceptedFamilies = parseAcceptedFamilies(orderRow.accepted_families);
+  if (invoiceRow && invoiceRow.amount_usd !== null) {
+    const acceptedFamilies = parseAcceptedFamilies(invoiceRow.accepted_families);
     const pinned = await refreshIfExpired(
       deps,
-      orderRow.id,
-      orderRow.rates_json === null
+      invoiceRow.id,
+      invoiceRow.rates_json === null
         ? null
-        : (JSON.parse(orderRow.rates_json) as Record<string, string>),
-      orderRow.rate_window_expires_at,
+        : (JSON.parse(invoiceRow.rates_json) as Record<string, string>),
+      invoiceRow.rate_window_expires_at,
       acceptedFamilies
     );
     const usd = usdValueFor(transfer.amountRaw, transfer.token, transfer.chainId, pinned);
@@ -96,13 +96,13 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     await deps.db
       .prepare(
         `INSERT INTO transactions
-           (id, order_id, chain_id, tx_hash, log_index, from_address, to_address, token, amount_raw,
+           (id, invoice_id, chain_id, tx_hash, log_index, from_address, to_address, token, amount_raw,
             block_number, confirmations, status, amount_usd, usd_rate, detected_at, confirmed_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         txId,
-        orderId,
+        invoiceId,
         transfer.chainId,
         transfer.txHash,
         transfer.logIndex,
@@ -136,7 +136,7 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
 
   const tx = rowToTransaction({
     id: txId,
-    order_id: orderId,
+    invoice_id: invoiceId,
     chain_id: transfer.chainId,
     tx_hash: transfer.txHash,
     log_index: transfer.logIndex,
@@ -156,32 +156,31 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     await deps.events.publish({ type: "tx.confirmed", txId: tx.id, tx, at: new Date(now) });
   }
 
-  if (!orderRow) {
+  if (!invoiceRow) {
     return { inserted: true, transactionId: tx.id };
   }
 
-  const before = orderRow.status as OrderStatus;
-  const after = await recomputeOrderFromTransactions(deps, orderRow, now);
+  const before = invoiceRow.status as InvoiceStatus;
+  const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, now);
 
-  // Per-payment webhook (A2.b): fires once per confirmed transfer that
-  // contributes to an order. Non-confirmed (still-detected) payments don't
-  // fire yet — merchants only care about money they can count on. On
-  // reorg-revert the tx.orphaned event + subsequent order recompute handle
-  // the reversal.
+  // Per-payment webhook: fires once per confirmed transfer that contributes
+  // to an invoice. Non-confirmed (still-detected) payments don't fire yet —
+  // merchants only care about money they can count on. On reorg-revert the
+  // tx.orphaned event + subsequent invoice recompute handle the reversal.
   if (initialStatus === "confirmed") {
-    const addresses = await fetchOrderReceiveAddresses(deps, orderRow.id);
-    const snapshotOrder = rowToOrder(
+    const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceRow.id);
+    const snapshotInvoice = rowToInvoice(
       {
-        ...orderRow,
+        ...invoiceRow,
         status: after,
         updated_at: now
       },
       addresses
     );
     await deps.events.publish({
-      type: "order.payment_received",
-      orderId: orderRow.id as OrderId,
-      order: snapshotOrder,
+      type: "invoice.payment_received",
+      invoiceId: invoiceRow.id as InvoiceId,
+      invoice: snapshotInvoice,
       payment: {
         txHash: transfer.txHash,
         chainId: transfer.chainId,
@@ -197,14 +196,14 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   return {
     inserted: true,
     transactionId: tx.id,
-    orderId: orderRow.id as OrderId,
-    orderStatusBefore: before,
-    orderStatusAfter: after
+    invoiceId: invoiceRow.id as InvoiceId,
+    invoiceStatusBefore: before,
+    invoiceStatusAfter: after
   };
 }
 
 // Parse the `accepted_families` JSON column. Null (legacy single-family
-// orders) falls back to the primary chain's family, derived from the row.
+// invoices) falls back to the primary chain's family, derived from the row.
 function parseAcceptedFamilies(raw: string | null): readonly ChainFamily[] {
   if (raw === null) return [];
   try {
@@ -224,7 +223,7 @@ export interface ConfirmSweepResult {
   checked: number;
   confirmed: number;
   reverted: number;
-  promotedOrders: number;
+  promotedInvoices: number;
 }
 
 export async function confirmTransactions(deps: AppDeps): Promise<ConfirmSweepResult> {
@@ -234,7 +233,7 @@ export async function confirmTransactions(deps: AppDeps): Promise<ConfirmSweepRe
 
   let confirmed = 0;
   let reverted = 0;
-  const touchedOrderIds = new Set<string>();
+  const touchedInvoiceIds = new Set<string>();
 
   for (const row of pending.results) {
     const chainAdapter = findChainAdapter(deps, row.chain_id);
@@ -257,7 +256,7 @@ export async function confirmTransactions(deps: AppDeps): Promise<ConfirmSweepRe
         block_number: live.blockNumber
       });
       await deps.events.publish({ type: "tx.orphaned", txId: tx.id, tx, at: new Date(now) });
-      if (row.order_id !== null) touchedOrderIds.add(row.order_id);
+      if (row.invoice_id !== null) touchedInvoiceIds.add(row.invoice_id);
       continue;
     }
 
@@ -277,7 +276,7 @@ export async function confirmTransactions(deps: AppDeps): Promise<ConfirmSweepRe
         confirmed_at: now
       });
       await deps.events.publish({ type: "tx.confirmed", txId: tx.id, tx, at: new Date(now) });
-      if (row.order_id !== null) touchedOrderIds.add(row.order_id);
+      if (row.invoice_id !== null) touchedInvoiceIds.add(row.invoice_id);
     } else {
       // Still short of the threshold — just update the confirmation counter
       // so the admin views see progress. No event for an increment-only update.
@@ -288,40 +287,40 @@ export async function confirmTransactions(deps: AppDeps): Promise<ConfirmSweepRe
     }
   }
 
-  let promotedOrders = 0;
-  for (const orderId of touchedOrderIds) {
-    const orderRow = await deps.db
-      .prepare("SELECT * FROM orders WHERE id = ?")
-      .bind(orderId)
-      .first<OrderRow>();
-    if (!orderRow) continue;
-    const before = orderRow.status as OrderStatus;
-    const after = await recomputeOrderFromTransactions(deps, orderRow, deps.clock.now().getTime());
-    if (before !== "confirmed" && after === "confirmed") promotedOrders += 1;
+  let promotedInvoices = 0;
+  for (const invoiceId of touchedInvoiceIds) {
+    const invoiceRow = await deps.db
+      .prepare("SELECT * FROM invoices WHERE id = ?")
+      .bind(invoiceId)
+      .first<InvoiceRow>();
+    if (!invoiceRow) continue;
+    const before = invoiceRow.status as InvoiceStatus;
+    const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, deps.clock.now().getTime());
+    if (before !== "confirmed" && after === "confirmed") promotedInvoices += 1;
   }
 
-  return { checked: pending.results.length, confirmed, reverted, promotedOrders };
+  return { checked: pending.results.length, confirmed, reverted, promotedInvoices };
 }
 
-// ---- Internal: recompute order state from its contributing transactions ----
+// ---- Internal: recompute invoice state from its contributing transactions ----
 
-async function recomputeOrderFromTransactions(
+async function recomputeInvoiceFromTransactions(
   deps: AppDeps,
-  orderRow: OrderRow,
+  invoiceRow: InvoiceRow,
   now: number
-): Promise<OrderStatus> {
-  const before = orderRow.status as OrderStatus;
-  if (ORDER_TERMINAL_STATES.has(before)) {
-    // Terminal orders are frozen. Late transfers still get inserted into
-    // `transactions` (audit), but they don't change the order state.
+): Promise<InvoiceStatus> {
+  const before = invoiceRow.status as InvoiceStatus;
+  if (INVOICE_TERMINAL_STATES.has(before)) {
+    // Terminal invoices are frozen. Late transfers still get inserted into
+    // `transactions` (audit), but they don't change the invoice state.
     return before;
   }
 
-  // USD-path orders aggregate `amount_usd` across contributing txs; legacy
-  // single-token orders keep summing `amount_raw`. Branch early so the two
+  // USD-path invoices aggregate `amount_usd` across contributing txs; legacy
+  // single-token invoices keep summing `amount_raw`. Branch early so the two
   // code paths stay legible.
-  if (orderRow.amount_usd !== null) {
-    return recomputeUsdOrder(deps, orderRow, now);
+  if (invoiceRow.amount_usd !== null) {
+    return recomputeUsdInvoice(deps, invoiceRow, now);
   }
 
   // Sum across contributing txs. We include both 'detected' and 'confirmed'
@@ -329,9 +328,9 @@ async function recomputeOrderFromTransactions(
   // observed, not wait for confirmation. Reverted/orphaned are excluded.
   const contributing = await deps.db
     .prepare(
-      "SELECT amount_raw, status FROM transactions WHERE order_id = ? AND status IN ('detected','confirmed')"
+      "SELECT amount_raw, status FROM transactions WHERE invoice_id = ? AND status IN ('detected','confirmed')"
     )
-    .bind(orderRow.id)
+    .bind(invoiceRow.id)
     .all<{ amount_raw: string; status: string }>();
 
   let total = 0n;
@@ -341,17 +340,18 @@ async function recomputeOrderFromTransactions(
     if (tx.status !== "confirmed") allConfirmed = false;
   }
 
-  const required = BigInt(orderRow.required_amount_raw);
+  const required = BigInt(invoiceRow.required_amount_raw);
 
-  let after: OrderStatus;
+  let after: InvoiceStatus;
   if (total >= required && total > 0n) {
     after = allConfirmed ? "confirmed" : "detected";
   } else if (total > 0n) {
     after = "partial";
   } else {
     // Total is zero — every contributing tx was reverted/orphaned. Re-open the
-    // order so new payments can still credit it (up until `expires_at`). "created"
-    // is the clean structural match: no valid pending inbound transfers.
+    // invoice so new payments can still credit it (up until `expires_at`).
+    // "created" is the clean structural match: no valid pending inbound
+    // transfers.
     after = "created";
   }
 
@@ -359,60 +359,60 @@ async function recomputeOrderFromTransactions(
   if (after !== before) {
     await deps.db
       .prepare(
-        `UPDATE orders
+        `UPDATE invoices
             SET status = ?,
                 received_amount_raw = ?,
                 confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END,
                 updated_at = ?
           WHERE id = ?`
       )
-      .bind(after, total.toString(), after, now, now, orderRow.id)
+      .bind(after, total.toString(), after, now, now, invoiceRow.id)
       .run();
 
-    const addresses = await fetchOrderReceiveAddresses(deps, orderRow.id);
-    const updated = rowToOrder(
+    const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceRow.id);
+    const updated = rowToInvoice(
       {
-        ...orderRow,
+        ...invoiceRow,
         status: after,
         received_amount_raw: total.toString(),
-        confirmed_at: after === "confirmed" ? now : orderRow.confirmed_at,
+        confirmed_at: after === "confirmed" ? now : invoiceRow.confirmed_at,
         updated_at: now
       },
       addresses
     );
-    await deps.events.publish(orderEventFor(after, updated, now));
-  } else if (total.toString() !== orderRow.received_amount_raw) {
+    await deps.events.publish(invoiceEventFor(after, updated, now));
+  } else if (total.toString() !== invoiceRow.received_amount_raw) {
     await deps.db
-      .prepare("UPDATE orders SET received_amount_raw = ?, updated_at = ? WHERE id = ?")
-      .bind(total.toString(), now, orderRow.id)
+      .prepare("UPDATE invoices SET received_amount_raw = ?, updated_at = ? WHERE id = ?")
+      .bind(total.toString(), now, invoiceRow.id)
       .run();
   }
 
   return after;
 }
 
-// USD-path order recompute: sums `amount_usd` across contributing confirmed
+// USD-path invoice recompute: sums `amount_usd` across contributing confirmed
 // transactions, sets status based on paidUsd vs amountUsd, and tracks
 // overpaid delta when paidUsd exceeds the target. Unpriced payments
 // (amount_usd = NULL) are excluded from the USD total — they still exist
 // as audit rows but don't satisfy the invoice.
-async function recomputeUsdOrder(
+async function recomputeUsdInvoice(
   deps: AppDeps,
-  orderRow: OrderRow,
+  invoiceRow: InvoiceRow,
   now: number
-): Promise<OrderStatus> {
-  const before = orderRow.status as OrderStatus;
+): Promise<InvoiceStatus> {
+  const before = invoiceRow.status as InvoiceStatus;
 
   // Only CONFIRMED contributing transactions count toward paid_usd — we
   // can't promise the merchant money that might reorg away. `detected`
-  // transactions show up in the event stream but don't satisfy the order
+  // transactions show up in the event stream but don't satisfy the invoice
   // until they cross the confirmation threshold.
   const contributing = await deps.db
     .prepare(
       `SELECT amount_usd FROM transactions
-        WHERE order_id = ? AND status = 'confirmed' AND amount_usd IS NOT NULL`
+        WHERE invoice_id = ? AND status = 'confirmed' AND amount_usd IS NOT NULL`
     )
-    .bind(orderRow.id)
+    .bind(invoiceRow.id)
     .all<{ amount_usd: string }>();
 
   let paidUsd = "0";
@@ -420,10 +420,10 @@ async function recomputeUsdOrder(
     paidUsd = addUsd(paidUsd, row.amount_usd);
   }
 
-  const amountUsd = orderRow.amount_usd!;
+  const amountUsd = invoiceRow.amount_usd!;
   const cmp = compareUsd(paidUsd, amountUsd);
 
-  let after: OrderStatus;
+  let after: InvoiceStatus;
   let overpaidUsd = "0";
   if (cmp > 0) {
     after = "overpaid";
@@ -434,7 +434,8 @@ async function recomputeUsdOrder(
     after = "partial";
   } else {
     // Nothing confirmed yet. `detected` (still under threshold) payments exist
-    // as transactions but don't move the order off `created` / whatever prior.
+    // as transactions but don't move the invoice off `created` / whatever
+    // prior.
     after = "created";
   }
 
@@ -443,7 +444,7 @@ async function recomputeUsdOrder(
   // confirmed_at + fires the status event.
   await deps.db
     .prepare(
-      `UPDATE orders
+      `UPDATE invoices
           SET status = ?,
               paid_usd = ?,
               overpaid_usd = ?,
@@ -451,48 +452,48 @@ async function recomputeUsdOrder(
               updated_at = ?
         WHERE id = ?`
     )
-    .bind(after, paidUsd, overpaidUsd, after, now, now, orderRow.id)
+    .bind(after, paidUsd, overpaidUsd, after, now, now, invoiceRow.id)
     .run();
 
   if (after !== before) {
-    const addresses = await fetchOrderReceiveAddresses(deps, orderRow.id);
-    const updated = rowToOrder(
+    const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceRow.id);
+    const updated = rowToInvoice(
       {
-        ...orderRow,
+        ...invoiceRow,
         status: after,
         paid_usd: paidUsd,
         overpaid_usd: overpaidUsd,
         confirmed_at:
-          (after === "confirmed" || after === "overpaid") && orderRow.confirmed_at === null
+          (after === "confirmed" || after === "overpaid") && invoiceRow.confirmed_at === null
             ? now
-            : orderRow.confirmed_at,
+            : invoiceRow.confirmed_at,
         updated_at: now
       },
       addresses
     );
-    await deps.events.publish(orderEventFor(after, updated, now));
+    await deps.events.publish(invoiceEventFor(after, updated, now));
   }
 
   return after;
 }
 
-function orderEventFor(status: OrderStatus, order: Order, now: number): DomainEvent {
+function invoiceEventFor(status: InvoiceStatus, invoice: Invoice, now: number): DomainEvent {
   const at = new Date(now);
   switch (status) {
     case "partial":
-      return { type: "order.partial", orderId: order.id, order, at };
+      return { type: "invoice.partial", invoiceId: invoice.id, invoice, at };
     case "detected":
-      return { type: "order.detected", orderId: order.id, order, at };
+      return { type: "invoice.detected", invoiceId: invoice.id, invoice, at };
     case "confirmed":
-      return { type: "order.confirmed", orderId: order.id, order, at };
+      return { type: "invoice.confirmed", invoiceId: invoice.id, invoice, at };
     case "expired":
-      return { type: "order.expired", orderId: order.id, order, at };
+      return { type: "invoice.expired", invoiceId: invoice.id, invoice, at };
     case "canceled":
-      return { type: "order.canceled", orderId: order.id, order, at };
+      return { type: "invoice.canceled", invoiceId: invoice.id, invoice, at };
     case "created":
-      return { type: "order.created", orderId: order.id, order, at };
+      return { type: "invoice.created", invoiceId: invoice.id, invoice, at };
     case "overpaid":
-      return { type: "order.overpaid", orderId: order.id, order, at };
+      return { type: "invoice.overpaid", invoiceId: invoice.id, invoice, at };
   }
 }
 

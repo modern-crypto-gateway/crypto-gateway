@@ -1,13 +1,13 @@
 import type { AppDeps } from "../app-deps.js";
 import type { ChainFamily } from "../types/chain.js";
-import type { Order, OrderId, OrderReceiveAddress, OrderStatus } from "../types/order.js";
+import type { Invoice, InvoiceId, InvoiceReceiveAddress, InvoiceStatus } from "../types/invoice.js";
 import type { Payout, PayoutId, PayoutStatus } from "../types/payout.js";
 import type { Transaction, TransactionId, TxStatus } from "../types/transaction.js";
 
-// DB row <-> domain object conversions. Kept in one place so order.service.ts
+// DB row <-> domain object conversions. Kept in one place so invoice.service.ts
 // and payment.service.ts don't drift on shape.
 
-export interface OrderRow {
+export interface InvoiceRow {
   id: string;
   merchant_id: string;
   status: string;
@@ -22,10 +22,10 @@ export interface OrderRow {
   quoted_rate: string | null;
   external_id: string | null;
   metadata_json: string | null;
-  // A1.b: multi-family accepted set. JSON-encoded ChainFamily[]; null for
-  // legacy single-family orders written pre-migration 0002.
+  // Multi-family accepted set. JSON-encoded ChainFamily[]; null for legacy
+  // single-family invoices written pre-migration 0002.
   accepted_families: string | null;
-  // A2 USD-path columns.
+  // USD-path columns.
   amount_usd: string | null;
   paid_usd: string;
   overpaid_usd: string;
@@ -37,17 +37,17 @@ export interface OrderRow {
   updated_at: number;
 }
 
-// rowToOrder requires the order's receive addresses (from the join table)
-// because multi-family orders have more than one and the Order type encodes
-// that cleanly. Callers that already have the addresses in hand (createOrder
-// path) pass them; callers reading an existing order use `loadOrder` below
-// to bundle both queries.
-export function rowToOrder(row: OrderRow, receiveAddresses: readonly OrderReceiveAddress[]): Order {
+// rowToInvoice requires the invoice's receive addresses (from the join table)
+// because multi-family invoices have more than one and the Invoice type
+// encodes that cleanly. Callers that already have the addresses in hand
+// (createInvoice path) pass them; callers reading an existing invoice use
+// `loadInvoice` below to bundle both queries.
+export function rowToInvoice(row: InvoiceRow, receiveAddresses: readonly InvoiceReceiveAddress[]): Invoice {
   const acceptedFamilies = Array.from(new Set(receiveAddresses.map((r) => r.family)));
   return {
-    id: row.id as OrderId,
-    merchantId: row.merchant_id as Order["merchantId"],
-    status: row.status as OrderStatus,
+    id: row.id as InvoiceId,
+    merchantId: row.merchant_id as Invoice["merchantId"],
+    status: row.status as InvoiceStatus,
     chainId: row.chain_id,
     token: row.token,
     receiveAddress: row.receive_address,
@@ -76,40 +76,40 @@ export function rowToOrder(row: OrderRow, receiveAddresses: readonly OrderReceiv
   };
 }
 
-// Fetch an order's per-family receive addresses from the join table.
-// Used by every order read path that needs a full Order object.
-export async function fetchOrderReceiveAddresses(
+// Fetch an invoice's per-family receive addresses from the join table.
+// Used by every invoice read path that needs a full Invoice object.
+export async function fetchInvoiceReceiveAddresses(
   deps: AppDeps,
-  orderId: string
-): Promise<readonly OrderReceiveAddress[]> {
+  invoiceId: string
+): Promise<readonly InvoiceReceiveAddress[]> {
   const rows = await deps.db
     .prepare(
-      `SELECT family, address, pool_address_id FROM order_receive_addresses
-       WHERE order_id = ?
+      `SELECT family, address, pool_address_id FROM invoice_receive_addresses
+       WHERE invoice_id = ?
        ORDER BY family ASC`
     )
-    .bind(orderId)
+    .bind(invoiceId)
     .all<{ family: ChainFamily; address: string; pool_address_id: string }>();
   return rows.results.map((r) => ({
     family: r.family,
-    address: r.address as OrderReceiveAddress["address"],
+    address: r.address as InvoiceReceiveAddress["address"],
     poolAddressId: r.pool_address_id
   }));
 }
 
-// Loads and hydrates a full Order by id (row + join). Returns null if the
-// order doesn't exist. Two queries — acceptable for single-order reads;
+// Loads and hydrates a full Invoice by id (row + join). Returns null if the
+// invoice doesn't exist. Two queries — acceptable for single-invoice reads;
 // high-volume loops (pollPayments) should batch the join separately.
-export async function loadOrder(deps: AppDeps, orderId: string): Promise<Order | null> {
-  const row = await deps.db.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first<OrderRow>();
+export async function loadInvoice(deps: AppDeps, invoiceId: string): Promise<Invoice | null> {
+  const row = await deps.db.prepare("SELECT * FROM invoices WHERE id = ?").bind(invoiceId).first<InvoiceRow>();
   if (!row) return null;
-  const addresses = await fetchOrderReceiveAddresses(deps, orderId);
-  return rowToOrder(row, addresses);
+  const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceId);
+  return rowToInvoice(row, addresses);
 }
 
 export interface TxRow {
   id: string;
-  order_id: string | null;
+  invoice_id: string | null;
   chain_id: number;
   tx_hash: string;
   log_index: number | null;
@@ -127,7 +127,7 @@ export interface TxRow {
 export function rowToTransaction(row: TxRow): Transaction {
   return {
     id: row.id as TransactionId,
-    orderId: row.order_id === null ? null : (row.order_id as OrderId),
+    invoiceId: row.invoice_id === null ? null : (row.invoice_id as InvoiceId),
     chainId: row.chain_id,
     txHash: row.tx_hash,
     logIndex: row.log_index,

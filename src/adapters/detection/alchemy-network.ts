@@ -58,7 +58,7 @@ export const ALCHEMY_FAMILY_BY_CHAIN_ID: Readonly<Record<number, AlchemyChainFam
 // Placeholder addresses we use to satisfy Alchemy's "≥1 address at webhook
 // creation" rule. Bootstrap removes the placeholder from the watch list
 // immediately after create so we don't drown in mint/burn events — real
-// receive addresses get added via the subscription-sync sweep as orders
+// receive addresses get added via the subscription-sync sweep as invoices
 // are placed.
 //
 // EVM zero address sees ENORMOUS volume on mainnet (every ERC-20 mint/burn

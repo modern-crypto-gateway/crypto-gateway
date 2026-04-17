@@ -1,13 +1,13 @@
 export { findChainAdapter } from "./chain-lookup.js";
 export {
-  createOrder,
-  getOrder,
-  expireOrder,
-  CreateOrderInputSchema,
-  OrderError,
-  type CreateOrderInput,
-  type OrderErrorCode
-} from "./order.service.js";
+  createInvoice,
+  getInvoice,
+  expireInvoice,
+  CreateInvoiceInputSchema,
+  InvoiceError,
+  type CreateInvoiceInput,
+  type InvoiceErrorCode
+} from "./invoice.service.js";
 export {
   ingestDetectedTransfer,
   confirmTransactions,

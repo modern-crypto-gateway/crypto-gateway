@@ -3,9 +3,9 @@ import { initializePool, refillFamily } from "../../core/domain/pool.service.js"
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 
 // Pool-driven Alchemy subscription tracking (post-A1 rewrite). Subscription
-// rows are tied to pool lifecycle — not order lifecycle — so one EVM pool
+// rows are tied to pool lifecycle — not invoice lifecycle — so one EVM pool
 // address is subscribed ONCE (fanned across all Alchemy-served EVM chains)
-// and then reused across thousands of orders without re-enqueueing.
+// and then reused across thousands of invoices without re-enqueueing.
 
 describe("alchemy subscription tracker — pool-driven enqueue", () => {
   let booted: BootedTestApp;

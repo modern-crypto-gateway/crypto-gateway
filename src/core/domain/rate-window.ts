@@ -3,16 +3,16 @@ import type { ChainFamily } from "../types/chain.js";
 import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
 import type { TokenSymbol } from "../types/token.js";
 
-// 10-minute rolling rate window for USD-path orders.
+// 10-minute rolling rate window for USD-path invoices.
 //
-// On order creation we snapshot USD rates for every token the order can
+// On invoice creation we snapshot USD rates for every token the invoice can
 // accept (every registered symbol in every accepted family, deduped) and
 // pin them for 10 minutes. Subsequent payments within that window convert
 // at the pinned rates. When detection happens past expiry, we refresh.
 //
 // This is the "simple with mix" stance from the product debate: merchant
 // bears limited risk (locked-in rate for the current 10-minute slice),
-// customer gets predictable pricing, volatility-induced short-paid orders
+// customer gets predictable pricing, volatility-induced short-paid invoices
 // are caught in the NEXT window rather than silently.
 
 export const RATE_WINDOW_DURATION_MS = 10 * 60 * 1000;
@@ -26,7 +26,7 @@ export interface RateSnapshot {
 
 // Enumerate every distinct token symbol registered on any chain in the
 // supplied families. Input to oracle.getUsdRates — determines the set of
-// tokens whose rates we pin for this order.
+// tokens whose rates we pin for this invoice.
 export function tokensForFamilies(families: readonly ChainFamily[]): readonly TokenSymbol[] {
   const set = new Set<string>();
   for (const entry of TOKEN_REGISTRY) {
@@ -57,7 +57,7 @@ export function tokensForFamilies(families: readonly ChainFamily[]): readonly To
   return Array.from(set) as TokenSymbol[];
 }
 
-// Snapshot the current rates for `tokens`. Used at order creation and at
+// Snapshot the current rates for `tokens`. Used at invoice creation and at
 // rate-window refresh. Missing rates (oracle doesn't recognize the token)
 // are omitted — detection of a payment in an unpriced token will fall
 // back gracefully to "ignore" rather than crash the ingest path.
@@ -73,19 +73,20 @@ export async function snapshotRates(
   };
 }
 
-// If the order's rate window has expired, re-query the oracle and persist a
-// fresh snapshot on the order row. Returns the rates that SHOULD be used for
-// the current detection event. Safe to call on every ingest: when the window
-// is still valid, this is a single in-memory check + DB read (no network).
+// If the invoice's rate window has expired, re-query the oracle and persist a
+// fresh snapshot on the invoice row. Returns the rates that SHOULD be used
+// for the current detection event. Safe to call on every ingest: when the
+// window is still valid, this is a single in-memory check + DB read (no
+// network).
 //
-// Concurrent detections for the same order race here; we accept a small
+// Concurrent detections for the same invoice race here; we accept a small
 // chance of two simultaneous refreshes producing slightly different rates.
 // The last write wins and both writes see consistent subsequent payments.
-// For sub-second precision, callers would need a per-order lock — overkill
+// For sub-second precision, callers would need a per-invoice lock — overkill
 // for a 10-minute window where a 100ms race is invisible.
 export async function refreshIfExpired(
   deps: AppDeps,
-  orderId: string,
+  invoiceId: string,
   currentRates: Readonly<Record<string, string>> | null,
   currentExpiresAt: number | null,
   acceptedFamilies: readonly ChainFamily[]
@@ -97,9 +98,9 @@ export async function refreshIfExpired(
   const snapshot = await snapshotRates(deps, tokensForFamilies(acceptedFamilies));
   await deps.db
     .prepare(
-      "UPDATE orders SET rates_json = ?, rate_window_expires_at = ?, updated_at = ? WHERE id = ?"
+      "UPDATE invoices SET rates_json = ?, rate_window_expires_at = ?, updated_at = ? WHERE id = ?"
     )
-    .bind(JSON.stringify(snapshot.rates), snapshot.expiresAt, now, orderId)
+    .bind(JSON.stringify(snapshot.rates), snapshot.expiresAt, now, invoiceId)
     .run();
   return snapshot.rates;
 }
@@ -126,8 +127,8 @@ export function tokenDecimalsFor(chainId: number, token: string): number | null 
 
 // Compute the USD value of a raw-unit transfer, using a pinned rate. Returns
 // null when the token isn't priceable — caller writes amount_usd = NULL on
-// the transaction row and the order's paid_usd total skips it (the payment
-// still counts toward received_amount_raw for legacy orders, just not USD).
+// the transaction row and the invoice's paid_usd total skips it (the payment
+// still counts toward received_amount_raw for legacy invoices, just not USD).
 //
 // Math: usd = amount_raw / 10^decimals * rate. Done with BigInt to avoid
 // floating-point drift; result is a string to two decimal places (standard
@@ -159,13 +160,38 @@ export function usdValueFor(
   return `${dollars}.${centRemainder.toString().padStart(2, "0")}`;
 }
 
+// Inverse of `usdValueFor`: given a USD target, rate, and token decimals,
+// return the minimum raw-units amount a payer must send to cover the target.
+// Uses CEIL division so floating-point truncation can't leave the payer one
+// unit short; over-send by at most 1 raw unit (sub-cent for stables; dust
+// for natives). The checkout UI calls this to render "send X USDC" values
+// for every accepted token in the invoice's rate snapshot.
+export function payableAmountRaw(
+  amountUsd: string,
+  rate: string,
+  decimals: number
+): string {
+  const RATE_SCALE = 8;
+  const usdCents = scaleDecimal(amountUsd, 2);
+  const rateScaled = scaleDecimal(rate, RATE_SCALE);
+  if (rateScaled === 0n) return "0";
+  // amountRaw = amountUsd * 10^decimals / rate
+  //           = (usdCents / 100) * 10^decimals / (rateScaled / 10^RATE_SCALE)
+  //           = usdCents * 10^(RATE_SCALE + decimals) / (100 * rateScaled)
+  const numerator = usdCents * BigInt(10) ** BigInt(RATE_SCALE + decimals);
+  const denominator = 100n * rateScaled;
+  // Ceil division: (a + b - 1) / b.
+  const amountRaw = (numerator + denominator - 1n) / denominator;
+  return amountRaw.toString();
+}
+
 function scaleDecimal(value: string, decimals: number): bigint {
   const [wholeStr, fracStr = ""] = value.split(".");
   const frac = (fracStr + "0".repeat(decimals)).slice(0, decimals);
   return BigInt(wholeStr ?? "0") * BigInt(10) ** BigInt(decimals) + BigInt(frac || "0");
 }
 
-// Add two decimal-string USD amounts. Used by the order's paid_usd
+// Add two decimal-string USD amounts. Used by the invoice's paid_usd
 // aggregate to avoid floating-point drift across many small partial
 // payments. Returns "D.CC" (cents precision).
 export function addUsd(a: string, b: string): string {
@@ -195,7 +221,7 @@ export function subUsd(a: string, b: string): string {
   return `${dollars}.${cents.toString().padStart(2, "0")}`;
 }
 
-// Local copy of familyForChainId (order.service has one too — keeping a
+// Local copy of familyForChainId (invoice.service has one too — keeping a
 // dependency-free helper here avoids cycles). Both must agree.
 function familyForChainId(chainId: number): ChainFamily | null {
   if (chainId >= 900 && chainId <= 901) return "solana";

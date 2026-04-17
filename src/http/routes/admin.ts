@@ -317,7 +317,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
 
   // Per-family pool utilization snapshot. Operators watch this + an alert
   // on available-count under threshold to catch "address supply running
-  // low" before POOL_EXHAUSTED fires on a live order-create.
+  // low" before POOL_EXHAUSTED fires on a live invoice-create.
   app.get("/pool/stats", async (c) => {
     const stats = await getPoolStats(deps);
     return c.json({ stats }, 200);
