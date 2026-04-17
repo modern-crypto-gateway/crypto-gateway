@@ -17,9 +17,11 @@ reorg recovery) are tracked as known follow-ups.
 ## Architecture at a glance
 
 - **core/** — pure domain. Zero platform imports. Port interfaces + services.
-- **adapters/** — concrete implementations per platform/provider (D1, libSQL,
-  CF-KV, memory cache, wait-until, promise-set, viem-based EVM, TronGrid, Solana
-  SLIP-0010, Alchemy Notify, inline-fetch webhook dispatcher, console logger, …).
+- **adapters/** — concrete implementations per platform/provider (Drizzle over
+  libSQL/Turso, CF-KV, memory cache, wait-until, promise-set, viem-based EVM,
+  TronGrid, Solana SLIP-0010, Alchemy Notify, inline-fetch webhook dispatcher,
+  console logger, …). Turso is the single database target across every
+  runtime; D1 was removed in the 2026-Q1 migration.
 - **http/** — Hono routes + middleware (auth, request-id, rate-limit, errors).
 - **entrypoints/** — one file per runtime. Each constructs `AppDeps` with the
   adapters appropriate to that runtime and calls `buildApp(deps)`.
@@ -44,7 +46,8 @@ npm run dev:node
 ```
 
 Default port `8787`. libSQL data lands in `./local.db` (override with
-`DATABASE_URL=libsql://…` + `DATABASE_TOKEN=…` for Turso).
+`TURSO_URL=libsql://…` + `TURSO_AUTH_TOKEN=…` for Turso; the legacy
+`DATABASE_URL` / `DATABASE_TOKEN` names still work for one release cycle).
 
 A dev merchant is auto-seeded in non-production (`NODE_ENV != production`) with
 id `00000000-0000-0000-0000-000000000001`. Its API key hash has no known
@@ -55,15 +58,23 @@ the merchant API.
 
 ```bash
 cp wrangler.jsonc.example wrangler.jsonc
-# Create bindings + paste the ids into wrangler.jsonc:
-npx wrangler d1 create crypto-gateway-dev
-# Apply every SQL file in migrations/ in order against REMOTE D1 (the one
-# your deployed worker will read). Without --remote, wrangler writes to the
-# local .wrangler sandbox only — fine for `wrangler dev`, invisible to prod.
-for f in migrations/*.sql; do npx wrangler d1 execute crypto-gateway-dev --remote --file="$f"; done
+
+# Create a Turso database and grab its URL + auth token:
+turso db create crypto-gateway-dev
+turso db show crypto-gateway-dev --url      # -> libsql://<db>-<org>.turso.io
+turso db tokens create crypto-gateway-dev   # -> eyJhbGciOi...
+
+# Apply Drizzle migrations CLI-side against the REMOTE Turso DB (Workers has
+# no filesystem at runtime, so the /admin/migrate endpoint 501s — drizzle-kit
+# is the canonical applier for this runtime):
+TURSO_URL="libsql://..." TURSO_AUTH_TOKEN="eyJ..." npx drizzle-kit push
+
+# Create the KV namespace for CacheStore and paste the id into wrangler.jsonc:
 npx wrangler kv namespace create CACHE
 
 # Set secrets (not in wrangler.jsonc — they go to Cloudflare's store):
+npx wrangler secret put TURSO_URL                   # libsql://<db>-<org>.turso.io
+npx wrangler secret put TURSO_AUTH_TOKEN            # token from `turso db tokens create`
 npx wrangler secret put MASTER_SEED                 # BIP39 mnemonic
 npx wrangler secret put ADMIN_KEY                   # random 32+ chars
 npx wrangler secret put SECRETS_ENCRYPTION_KEY      # 64 hex chars (AES-256 master key)
@@ -73,6 +84,11 @@ npx wrangler secret put CRON_SECRET                 # optional
 
 npx wrangler deploy -e dev
 ```
+
+Re-running `drizzle-kit push` after every new `drizzle/migrations/*.sql` file
+keeps the remote DB in sync. Node / Deno entrypoints replay the same folder
+at boot via Drizzle's `migrate()`, so CLI-side push is a Workers/Vercel-Edge
+concern only.
 
 The scheduled cron (`* * * * *`) runs `pollPayments` + `confirmTransactions` +
 `executeReservedPayouts` + `confirmPayouts` via the worker's `scheduled` export.
@@ -112,8 +128,8 @@ for the full list. Highlights:
 | `ALCHEMY_CHAINS`                  | optional        | —          | Comma-separated chainIds to enable via Alchemy (e.g. `1,137`). Defaults to the mainnet set. |
 | `ALCHEMY_NOTIFY_TOKEN`            | required for webhook bootstrap | — | **NOT the same as `ALCHEMY_API_KEY`.** Webhook-management ("Notify") token at the top of [`dashboard.alchemy.com/apps/latest/webhooks`](https://dashboard.alchemy.com/apps/latest/webhooks) → "Auth Token". The JSON-RPC API key will return 401 from this endpoint; they look similar but are distinct strings. Old name `ALCHEMY_AUTH_TOKEN` still works for one release cycle with a deprecation warning. |
 | `GATEWAY_PUBLIC_URL`              | required for webhook bootstrap | — | Public origin of this gateway (e.g. `https://gateway.example.com`). Bootstrap appends per-provider paths like `/webhooks/alchemy`. Env-only to prevent ADMIN_KEY-leak redirect attacks. |
-| `DATABASE_URL`                    | when non-D1     | `file:./local.db` | libSQL URL (Turso or local file)              |
-| `DATABASE_TOKEN`                  | Turso only      | —          | libSQL auth token                                    |
+| `TURSO_URL`                       | prod-ish        | `file:./local.db` | libSQL URL (Turso over HTTPS or local `file:` URL). `DATABASE_URL` still accepted as a legacy alias for one release cycle. |
+| `TURSO_AUTH_TOKEN`                | Turso only      | —          | libSQL auth token. `DATABASE_TOKEN` still accepted as a legacy alias. |
 | `PORT`                            | no              | `8787`     |                                                      |
 | `RATE_LIMIT_MERCHANT_PER_MINUTE`  | no              | `1000`     | Per-merchant cap on `/api/v1/*`                      |
 | `RATE_LIMIT_CHECKOUT_PER_MINUTE`  | no              | `60`       | Per-IP cap on `/checkout/*`                          |
@@ -290,14 +306,14 @@ for Solana) and **immediately removes it from the watch list** via
 mint/burn events on the zero address. Real HD-derived addresses come from
 the address pool (below).
 
-## Multi-family order acceptance
+## Multi-family invoice acceptance
 
-An order can accept payment across multiple chain families. The merchant sets
+An invoice can accept payment across multiple chain families. The merchant sets
 `acceptedFamilies: ["evm", "tron", "solana"]` (any subset) at creation and the
-order is allocated one receive address per family:
+invoice is allocated one receive address per family:
 
 ```bash
-curl -X POST "$GATEWAY_URL/api/v1/orders" \
+curl -X POST "$GATEWAY_URL/api/v1/invoices" \
   -H "Authorization: Bearer $MERCHANT_API_KEY" \
   -d '{
     "chainId": 1,
@@ -311,7 +327,7 @@ Response:
 
 ```json
 {
-  "order": {
+  "invoice": {
     "id": "...",
     "chainId": 1,
     "receiveAddress": "0xABC…",
@@ -327,28 +343,28 @@ Response:
 ```
 
 Detection matches incoming transfers by `(family, address)` via the
-`order_receive_addresses` join, so a USDT transfer on **any** of the 7 EVM
+`invoice_receive_addresses` join, so a USDT transfer on **any** of the 7 EVM
 chains (Ethereum, Polygon, Base, Arbitrum, OP, Avalanche, BSC) against the
-`evm` entry matches this order — an EVM pubkey is identical across all EVM
+`evm` entry matches this invoice — an EVM pubkey is identical across all EVM
 chains. Tron and Solana each get their own canonical address.
 
 Omitting `acceptedFamilies` defaults to `[familyOf(chainId)]` — single-family
-orders keep working without change. In A1.b, the **token** is still scoped
+invoices keep working without change. In A1.b, the **token** is still scoped
 per-chain; A2 introduces USD-pegged amounts and any-token acceptance within
 a family (e.g. pay $100 in USDC, USDT, or native ETH on any EVM chain).
 
 ## Address pool
 
-Incoming-payment addresses aren't HD-derived per-order anymore — they come
+Incoming-payment addresses aren't HD-derived per-invoice anymore — they come
 from a **shared family-scoped pool** that's pre-derived, pre-registered with
-Alchemy, and reused across orders. Pool rules:
+Alchemy, and reused across invoices. Pool rules:
 
 - **One pool per family** (`evm` / `tron` / `solana`). EVM pubkeys are identical
   across all 7 EVM chains we support, so one pool row covers an entire family.
-- **Reuse**. When an order reaches a terminal state (confirmed / expired /
-  canceled) its pool row returns to `available` and serves the next order.
+- **Reuse**. When an invoice reaches a terminal state (confirmed / expired /
+  canceled) its pool row returns to `available` and serves the next invoice.
   This is what makes small-amount payments on expensive chains viable — 100
-  orders share one sweep tx instead of paying gas to sweep 100 dust addresses.
+  invoices share one sweep tx instead of paying gas to sweep 100 dust addresses.
 - **Auto-refill**. Allocation triggers a background refill when available
   count drops below threshold. Operators don't normally interact with the
   pool after initial seeding.
@@ -383,7 +399,7 @@ curl "$GATEWAY_URL/admin/pool/stats" -H "Authorization: Bearer $ADMIN_KEY"
 ```
 
 Alert on `available < 3` per family to catch low-supply before
-`POOL_EXHAUSTED` (503) fires on a live order-create.
+`POOL_EXHAUSTED` (503) fires on a live invoice-create.
 
 ### Address subscription lifecycle (automatic)
 
@@ -393,12 +409,12 @@ calls to the management API.
 
 Event-driven enqueue (via the in-process event bus):
 
-| Domain event      | Enqueued op                            |
-| ----------------- | -------------------------------------- |
-| `order.created`   | `add` row for `(chainId, receiveAddress)` |
-| `order.confirmed` | `remove` row (frees a slot toward Alchemy's 50k-per-webhook cap) |
-| `order.expired`   | `remove` row                           |
-| `order.canceled`  | `remove` row                           |
+| Domain event         | Enqueued op                            |
+| -------------------- | -------------------------------------- |
+| `invoice.created`    | `add` row for `(chainId, receiveAddress)` |
+| `invoice.confirmed`  | `remove` row (frees a slot toward Alchemy's 50k-per-webhook cap) |
+| `invoice.expired`    | `remove` row                           |
+| `invoice.canceled`   | `remove` row                           |
 
 Rows land in `alchemy_address_subscriptions` with `status='pending'`. The
 minute-cadence `scheduledJobs` cron invokes the sweep:
@@ -415,7 +431,7 @@ minute-cadence `scheduledJobs` cron invokes the sweep:
    via direct DB query (`SELECT * FROM alchemy_address_subscriptions WHERE status = 'failed'`).
 
 Chains Alchemy doesn't serve (dev 999, Tron, Solana) are silently skipped at
-enqueue time — their orders never produce subscription rows. Chains with
+enqueue time — their invoices never produce subscription rows. Chains with
 pending rows but no webhook bootstrapped yet are reported as
 `skipped-no-webhook` in the sweep result and are NOT counted toward
 `attempts` — bootstrap + next sweep resolves them.
@@ -423,9 +439,9 @@ pending rows but no webhook bootstrapped yet are reported as
 Improvements over v1's equivalent flow (studied before this was built):
 - **Bounded retries** — v1 retried forever; we cap at 10 so a permanently
   malformed address doesn't look identical to an Alchemy outage.
-- **Automatic deregistration on terminal order states** — v1 let addresses
+- **Automatic deregistration on terminal invoice states** — v1 let addresses
   accumulate toward the 50k-per-webhook cap and required manual cleanup;
-  we enqueue `remove` on `order.confirmed | expired | canceled`.
+  we enqueue `remove` on `invoice.confirmed | expired | canceled`.
 - **Per-chain signing keys in the DB** — v1 shared one env var across every
   chain; that approach could never serve multi-chain correctly. We persist
   per-(chainId, webhookId) rows in `alchemy_webhook_registry`, encrypted via
@@ -463,11 +479,11 @@ A full-coverage Postman setup lives in [`postman/`](postman/):
 - [`crypto-gateway.postman_collection.json`](postman/crypto-gateway.postman_collection.json)
   — every route (admin bootstrap, merchant API, public checkout, Alchemy
   webhook ingest simulator, internal cron) grouped into folders. Per-chain
-  quick-start requests under `Orders / Quick starts` for Ethereum, OP,
+  quick-start requests under `Invoices / Quick starts` for Ethereum, OP,
   Polygon, Base, Arbitrum, Avalanche, BSC, Tron, Solana, and the local dev
   chain. Chained flow: the merchant-create test script writes `apiKey`,
-  `merchantId`, `webhookSecret` into the environment; create-order writes
-  `orderId` + `orderReceiveAddress`; bootstrap writes per-chain signing keys.
+  `merchantId`, `webhookSecret` into the environment; create-invoice writes
+  `invoiceId` + `invoiceReceiveAddress`; bootstrap writes per-chain signing keys.
 - [`crypto-gateway.local.postman_environment.json`](postman/crypto-gateway.local.postman_environment.json)
   — import as an environment. Pre-declares every variable the collection
   reads and writes. Only `adminKey` needs to be filled by hand; everything
@@ -480,22 +496,36 @@ transfer.
 
 ## Database migrations
 
-Migrations live as sortable SQL files in [`migrations/`](migrations/) (e.g.
-`0001_initial.sql`). A `schema_migrations` tracking table records which files
-have been applied, so re-running is idempotent and only adds new files.
+Drizzle Kit owns migrations. The schema is the source-of-truth
+([`src/db/schema.ts`](src/db/schema.ts)); `drizzle-kit generate` diffs the
+schema against the last applied state and emits a new SQL file plus a
+`_journal.json` entry under [`drizzle/migrations/`](drizzle/migrations/).
+Drizzle's `migrate()` tracks applied files in the
+`__drizzle_migrations` table, so re-running is idempotent.
 
-| Runtime        | Applied how                                                               |
-| -------------- | ------------------------------------------------------------------------- |
-| Node           | At boot by `applyMigrations(db, loadMigrationsFromDir(…))` in `node.ts`. |
-| Deno           | At boot, same call in `deno.ts`. Deno supports `node:fs` + `node:url`.    |
-| Cloudflare Workers | CLI-side via wrangler (Workers have no FS at runtime). Run `for f in migrations/*.sql; do npx wrangler d1 execute <db> --remote --file="$f"; done` once per new migration. Add `--remote` or you're writing to the local `.wrangler` sandbox, NOT the D1 your deployed worker reads. |
-| Vercel Edge    | CLI-side against the Turso libSQL endpoint (Edge runtime also has no FS). Point a Node environment at `DATABASE_URL` + `DATABASE_TOKEN` and call `applyMigrations` from a small script, or run each file via the Turso CLI. |
+| Runtime            | Applied how                                                                 |
+| ------------------ | --------------------------------------------------------------------------- |
+| Node               | At boot via `migrate(db, { migrationsFolder })` in `node.ts`.              |
+| Deno               | At boot, same call in `deno.ts` — Deno reads the same `drizzle/migrations/` folder via `node:fs`. |
+| Cloudflare Workers | CLI-side via `TURSO_URL=… TURSO_AUTH_TOKEN=… npx drizzle-kit push` (Workers has no FS at runtime, so the in-process migrator can't run). Re-run after every new migration. |
+| Vercel Edge        | Same CLI-side `drizzle-kit push` against the remote Turso DB — Edge runtime also has no FS. |
 
-Adding a new migration: drop a new `NNNN_description.sql` file into
-`migrations/`. Must be **strictly numerically newer** than all predecessors
-(filename sort is lexicographic), and must be idempotent — D1 and libSQL
-cannot wrap DDL in a rollback, so we only mark the tracking row written
-after the SQL succeeds, meaning a failed partial run can retry.
+The `/admin/migrate` endpoint re-applies `drizzle/migrations/` on Node / Deno
+deployments (the `migrationsFolder` field of `AppDeps` is populated by those
+entrypoints). On Workers / Vercel-Edge the field is absent and the endpoint
+returns 501 — `drizzle-kit push` is the canonical applier there.
+
+Adding a new migration:
+
+```bash
+# 1) edit src/db/schema.ts
+# 2) generate the migration file + journal entry
+npx drizzle-kit generate
+# 3) review drizzle/migrations/NNNN_<name>.sql
+# 4) apply locally (Node/Deno boot will apply on next restart)
+#    or push to remote Turso for Workers/Vercel:
+TURSO_URL="libsql://..." TURSO_AUTH_TOKEN="..." npx drizzle-kit push
+```
 
 ## Development
 
