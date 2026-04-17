@@ -22,6 +22,9 @@ export interface OrderRow {
   quoted_rate: string | null;
   external_id: string | null;
   metadata_json: string | null;
+  // A1.b: multi-family accepted set. JSON-encoded ChainFamily[]; null for
+  // legacy single-family orders written pre-migration 0002.
+  accepted_families: string | null;
   // A2 USD-path columns.
   amount_usd: string | null;
   paid_usd: string;

@@ -113,6 +113,52 @@ describe("composeWebhook", () => {
     expect(composed!.idempotencyKey).toBe(`payout.confirmed:${payout.id}:confirmed`);
   });
 
+  it("maps order.overpaid with overpaidUsd in the snapshot data", () => {
+    const order = fixtureOrder({
+      status: "overpaid",
+      amountUsd: "100.00",
+      paidUsd: "120.00",
+      overpaidUsd: "20.00"
+    });
+    const composed = composeWebhook({
+      type: "order.overpaid",
+      orderId: order.id,
+      order,
+      at: new Date("2026-04-16T10:02:00Z")
+    });
+    expect(composed).not.toBeNull();
+    expect(composed!.payload.event).toBe("order.overpaid");
+    expect(composed!.idempotencyKey).toBe(`order.overpaid:${order.id}:overpaid`);
+  });
+
+  it("maps order.payment_received and keys idempotency on txHash (not status)", () => {
+    const order = fixtureOrder({ status: "partial", paidUsd: "20.00", amountUsd: "50.00" });
+    const composed = composeWebhook({
+      type: "order.payment_received",
+      orderId: order.id,
+      order,
+      payment: {
+        txHash: "0xpayment1",
+        chainId: 1,
+        token: "USDC",
+        amountRaw: "20000000",
+        amountUsd: "20.00",
+        usdRate: "1"
+      },
+      at: new Date("2026-04-16T10:03:00Z")
+    });
+    expect(composed).not.toBeNull();
+    expect(composed!.payload.event).toBe("order.payment_received");
+    expect(composed!.idempotencyKey).toBe(`order.payment_received:${order.id}:0xpayment1`);
+    const data = composed!.payload.data as {
+      order: { status: string };
+      payment: { txHash: string; amountUsd: string | null };
+    };
+    expect(data.order.status).toBe("partial");
+    expect(data.payment.txHash).toBe("0xpayment1");
+    expect(data.payment.amountUsd).toBe("20.00");
+  });
+
   it("serializes dates as ISO strings (no raw Date objects in the payload)", () => {
     const order = fixtureOrder();
     const composed = composeWebhook({

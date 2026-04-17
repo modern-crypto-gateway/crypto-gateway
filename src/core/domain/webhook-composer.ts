@@ -32,8 +32,10 @@ export type WebhookEventName =
   | "order.partial"
   | "order.detected"
   | "order.confirmed"
+  | "order.overpaid"
   | "order.expired"
   | "order.canceled"
+  | "order.payment_received"
   | "payout.submitted"
   | "payout.confirmed"
   | "payout.failed";
@@ -43,6 +45,7 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
     case "order.partial":
     case "order.detected":
     case "order.confirmed":
+    case "order.overpaid":
     case "order.expired":
     case "order.canceled":
       return {
@@ -53,6 +56,22 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
           data: serializeOrder(event.order)
         },
         idempotencyKey: `${event.type}:${event.order.id}:${event.order.status}`
+      };
+
+    case "order.payment_received":
+      // Per-payment audit event. Idempotency keys on txHash so merchants
+      // de-duplicate retries across redelivery.
+      return {
+        merchantId: event.order.merchantId,
+        payload: {
+          event: event.type,
+          timestamp: event.at.toISOString(),
+          data: {
+            order: serializeOrder(event.order),
+            payment: event.payment
+          }
+        },
+        idempotencyKey: `${event.type}:${event.order.id}:${event.payment.txHash}`
       };
 
     case "payout.submitted":

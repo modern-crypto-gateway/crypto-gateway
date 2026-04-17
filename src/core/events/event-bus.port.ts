@@ -16,8 +16,29 @@ export type DomainEvent =
   | { type: "order.partial"; orderId: OrderId; order: Order; at: Date }
   | { type: "order.detected"; orderId: OrderId; order: Order; at: Date }
   | { type: "order.confirmed"; orderId: OrderId; order: Order; at: Date }
+  | { type: "order.overpaid"; orderId: OrderId; order: Order; at: Date }
   | { type: "order.expired"; orderId: OrderId; order: Order; at: Date }
   | { type: "order.canceled"; orderId: OrderId; order: Order; at: Date }
+  // Fires on EVERY confirmed inbound transfer that contributes to an order,
+  // separate from the order-status transition events above. Gives merchants
+  // audit-grade per-payment visibility — they can render "USDC 30.00 on
+  // Polygon | ETH 0.02 on mainnet | USDT 45.00 on BSC" running totals on
+  // their own side. The `payment` block carries the on-chain specifics;
+  // the `order` block is the post-payment order snapshot.
+  | {
+      type: "order.payment_received";
+      orderId: OrderId;
+      order: Order;
+      payment: {
+        txHash: string;
+        chainId: number;
+        token: string;
+        amountRaw: string;
+        amountUsd: string | null;
+        usdRate: string | null;
+      };
+      at: Date;
+    }
   | { type: "tx.detected"; txId: TransactionId; tx: Transaction; at: Date }
   | { type: "tx.confirmed"; txId: TransactionId; tx: Transaction; at: Date }
   | { type: "tx.orphaned"; txId: TransactionId; tx: Transaction; at: Date }

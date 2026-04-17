@@ -1,6 +1,6 @@
 import type { AppDeps } from "../app-deps.js";
 import type { ChainFamily } from "../types/chain.js";
-import { TOKEN_REGISTRY } from "../types/token-registry.js";
+import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
 import type { TokenSymbol } from "../types/token.js";
 
 // 10-minute rolling rate window for USD-path orders.
@@ -71,6 +71,128 @@ export async function snapshotRates(
     rates,
     expiresAt: now + RATE_WINDOW_DURATION_MS
   };
+}
+
+// If the order's rate window has expired, re-query the oracle and persist a
+// fresh snapshot on the order row. Returns the rates that SHOULD be used for
+// the current detection event. Safe to call on every ingest: when the window
+// is still valid, this is a single in-memory check + DB read (no network).
+//
+// Concurrent detections for the same order race here; we accept a small
+// chance of two simultaneous refreshes producing slightly different rates.
+// The last write wins and both writes see consistent subsequent payments.
+// For sub-second precision, callers would need a per-order lock — overkill
+// for a 10-minute window where a 100ms race is invisible.
+export async function refreshIfExpired(
+  deps: AppDeps,
+  orderId: string,
+  currentRates: Readonly<Record<string, string>> | null,
+  currentExpiresAt: number | null,
+  acceptedFamilies: readonly ChainFamily[]
+): Promise<Readonly<Record<string, string>>> {
+  const now = deps.clock.now().getTime();
+  if (currentRates !== null && currentExpiresAt !== null && now < currentExpiresAt) {
+    return currentRates;
+  }
+  const snapshot = await snapshotRates(deps, tokensForFamilies(acceptedFamilies));
+  await deps.db
+    .prepare(
+      "UPDATE orders SET rates_json = ?, rate_window_expires_at = ?, updated_at = ? WHERE id = ?"
+    )
+    .bind(JSON.stringify(snapshot.rates), snapshot.expiresAt, now, orderId)
+    .run();
+  return snapshot.rates;
+}
+
+// Decimals lookup for a (chainId, token) pair. Registry is the source of
+// truth for contract-backed tokens (USDC / USDT); hardcoded natives fill
+// the gap so ETH / BNB / AVAX / MATIC / SOL / TRX transfers can be USD-
+// valued without per-chain adapter queries. Returns null for unknown tokens
+// — detection skips the USD aggregation for those (the payment still lands
+// in `transactions` for audit).
+export function tokenDecimalsFor(chainId: number, token: string): number | null {
+  const registered = findToken(chainId, token as TokenSymbol);
+  if (registered) return registered.decimals;
+  const family = familyForChainId(chainId);
+  if (family === "evm") {
+    if (token === "ETH" || token === "BNB" || token === "MATIC" || token === "AVAX" || token === "POL") {
+      return 18;
+    }
+  }
+  if (family === "solana" && token === "SOL") return 9;
+  if (family === "tron" && token === "TRX") return 6;
+  return null;
+}
+
+// Compute the USD value of a raw-unit transfer, using a pinned rate. Returns
+// null when the token isn't priceable — caller writes amount_usd = NULL on
+// the transaction row and the order's paid_usd total skips it (the payment
+// still counts toward received_amount_raw for legacy orders, just not USD).
+//
+// Math: usd = amount_raw / 10^decimals * rate. Done with BigInt to avoid
+// floating-point drift; result is a string to two decimal places (standard
+// USD precision; downstream totals use BigInt cents internally).
+export function usdValueFor(
+  amountRaw: string,
+  token: string,
+  chainId: number,
+  rates: Readonly<Record<string, string>>
+): string | null {
+  const decimals = tokenDecimalsFor(chainId, token);
+  if (decimals === null) return null;
+  const rate = rates[token];
+  if (rate === undefined) return null;
+
+  // Work in "cents" (×100 USD) via BigInt so we never touch Number for an
+  // amount that might dwarf MAX_SAFE_INTEGER. rate is decimal-string, so
+  // scale it up by 10^8 for 8 decimals of rate precision, then back down.
+  const RATE_SCALE = 8;
+  const rateCents = scaleDecimal(rate, RATE_SCALE);
+  // amountRaw is scaled by 10^decimals; multiply by rate (scaled by RATE_SCALE)
+  // and divide by 10^(decimals + RATE_SCALE) to get whole dollars. Then ×100
+  // for cents.
+  const numerator = BigInt(amountRaw) * rateCents * 100n;
+  const divisor = BigInt(10) ** BigInt(decimals + RATE_SCALE);
+  const cents = numerator / divisor;
+  const dollars = cents / 100n;
+  const centRemainder = cents % 100n;
+  return `${dollars}.${centRemainder.toString().padStart(2, "0")}`;
+}
+
+function scaleDecimal(value: string, decimals: number): bigint {
+  const [wholeStr, fracStr = ""] = value.split(".");
+  const frac = (fracStr + "0".repeat(decimals)).slice(0, decimals);
+  return BigInt(wholeStr ?? "0") * BigInt(10) ** BigInt(decimals) + BigInt(frac || "0");
+}
+
+// Add two decimal-string USD amounts. Used by the order's paid_usd
+// aggregate to avoid floating-point drift across many small partial
+// payments. Returns "D.CC" (cents precision).
+export function addUsd(a: string, b: string): string {
+  const sum = scaleDecimal(a, 2) + scaleDecimal(b, 2);
+  const dollars = sum / 100n;
+  const cents = sum % 100n;
+  return `${dollars}.${cents.toString().padStart(2, "0")}`;
+}
+
+// Compare two decimal-string USD amounts. Returns 1 when a > b, -1 when
+// a < b, 0 otherwise. Used by status transitions (is paid_usd ≥ amount_usd?).
+export function compareUsd(a: string, b: string): number {
+  const av = scaleDecimal(a, 2);
+  const bv = scaleDecimal(b, 2);
+  if (av > bv) return 1;
+  if (av < bv) return -1;
+  return 0;
+}
+
+// a - b in USD. Negative results clamp to "0.00" — caller uses this for
+// overpaid deltas, where negative would be nonsense.
+export function subUsd(a: string, b: string): string {
+  const diff = scaleDecimal(a, 2) - scaleDecimal(b, 2);
+  if (diff <= 0n) return "0.00";
+  const dollars = diff / 100n;
+  const cents = diff % 100n;
+  return `${dollars}.${cents.toString().padStart(2, "0")}`;
 }
 
 // Local copy of familyForChainId (order.service has one too — keeping a

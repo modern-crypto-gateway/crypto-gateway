@@ -250,6 +250,7 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
       quoted_rate: quotedRate,
       external_id: parsed.externalId ?? null,
       metadata_json: metadataJson,
+      accepted_families: JSON.stringify(acceptedFamilies),
       amount_usd: amountUsd,
       paid_usd: "0",
       overpaid_usd: "0",

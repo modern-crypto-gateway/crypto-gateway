@@ -1,5 +1,6 @@
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
+import type { ChainFamily } from "../types/chain.js";
 import type { Order, OrderId, OrderStatus } from "../types/order.js";
 import { DetectedTransferSchema, type TransactionId, type TxStatus } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
@@ -11,6 +12,7 @@ import {
   type TxRow
 } from "./mappers.js";
 import { confirmationThreshold } from "./payment-config.js";
+import { addUsd, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
 
 // PaymentService: rules for how detected transfers become transactions, how
 // transactions accumulate into orders, and how confirmation counts promote
@@ -63,14 +65,40 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   const now = deps.clock.now().getTime();
   const txId = globalThis.crypto.randomUUID();
 
+  // USD conversion for USD-path orders. We pin the rate on the transaction
+  // row at detection time so the order's total is idempotent even if the
+  // rate window later refreshes. Non-USD orders leave these NULL.
+  let amountUsd: string | null = null;
+  let usdRate: string | null = null;
+  if (orderRow && orderRow.amount_usd !== null) {
+    const acceptedFamilies = parseAcceptedFamilies(orderRow.accepted_families);
+    const pinned = await refreshIfExpired(
+      deps,
+      orderRow.id,
+      orderRow.rates_json === null
+        ? null
+        : (JSON.parse(orderRow.rates_json) as Record<string, string>),
+      orderRow.rate_window_expires_at,
+      acceptedFamilies
+    );
+    const usd = usdValueFor(transfer.amountRaw, transfer.token, transfer.chainId, pinned);
+    if (usd !== null) {
+      amountUsd = usd;
+      usdRate = pinned[transfer.token] ?? null;
+    }
+    // usd === null path: token not priced. The transfer still writes to
+    // transactions (audit) but doesn't contribute to paid_usd. Operator
+    // sees it as an "unpriced payment" row and can follow up.
+  }
+
   let insertOk = true;
   try {
     await deps.db
       .prepare(
         `INSERT INTO transactions
            (id, order_id, chain_id, tx_hash, log_index, from_address, to_address, token, amount_raw,
-            block_number, confirmations, status, detected_at, confirmed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            block_number, confirmations, status, amount_usd, usd_rate, detected_at, confirmed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         txId,
@@ -85,6 +113,8 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
         transfer.blockNumber,
         transfer.confirmations,
         initialStatus,
+        amountUsd,
+        usdRate,
         now,
         initialStatus === "confirmed" ? now : null
       )
@@ -133,6 +163,37 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   const before = orderRow.status as OrderStatus;
   const after = await recomputeOrderFromTransactions(deps, orderRow, now);
 
+  // Per-payment webhook (A2.b): fires once per confirmed transfer that
+  // contributes to an order. Non-confirmed (still-detected) payments don't
+  // fire yet — merchants only care about money they can count on. On
+  // reorg-revert the tx.orphaned event + subsequent order recompute handle
+  // the reversal.
+  if (initialStatus === "confirmed") {
+    const addresses = await fetchOrderReceiveAddresses(deps, orderRow.id);
+    const snapshotOrder = rowToOrder(
+      {
+        ...orderRow,
+        status: after,
+        updated_at: now
+      },
+      addresses
+    );
+    await deps.events.publish({
+      type: "order.payment_received",
+      orderId: orderRow.id as OrderId,
+      order: snapshotOrder,
+      payment: {
+        txHash: transfer.txHash,
+        chainId: transfer.chainId,
+        token: transfer.token,
+        amountRaw: transfer.amountRaw,
+        amountUsd,
+        usdRate
+      },
+      at: new Date(now)
+    });
+  }
+
   return {
     inserted: true,
     transactionId: tx.id,
@@ -140,6 +201,21 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     orderStatusBefore: before,
     orderStatusAfter: after
   };
+}
+
+// Parse the `accepted_families` JSON column. Null (legacy single-family
+// orders) falls back to the primary chain's family, derived from the row.
+function parseAcceptedFamilies(raw: string | null): readonly ChainFamily[] {
+  if (raw === null) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) return parsed.filter((x): x is ChainFamily => typeof x === "string");
+  } catch {
+    // Malformed JSON in the column is a bug; fail open (empty set) rather
+    // than crashing the ingest path. A follow-up operator review will catch
+    // the data corruption via logs.
+  }
+  return [];
 }
 
 // ---- Confirmation sweeper (cron-triggered) ----
@@ -241,6 +317,13 @@ async function recomputeOrderFromTransactions(
     return before;
   }
 
+  // USD-path orders aggregate `amount_usd` across contributing txs; legacy
+  // single-token orders keep summing `amount_raw`. Branch early so the two
+  // code paths stay legible.
+  if (orderRow.amount_usd !== null) {
+    return recomputeUsdOrder(deps, orderRow, now);
+  }
+
   // Sum across contributing txs. We include both 'detected' and 'confirmed'
   // because partial-payment progress should update as soon as a transfer is
   // observed, not wait for confirmation. Reverted/orphaned are excluded.
@@ -308,6 +391,91 @@ async function recomputeOrderFromTransactions(
   return after;
 }
 
+// USD-path order recompute: sums `amount_usd` across contributing confirmed
+// transactions, sets status based on paidUsd vs amountUsd, and tracks
+// overpaid delta when paidUsd exceeds the target. Unpriced payments
+// (amount_usd = NULL) are excluded from the USD total — they still exist
+// as audit rows but don't satisfy the invoice.
+async function recomputeUsdOrder(
+  deps: AppDeps,
+  orderRow: OrderRow,
+  now: number
+): Promise<OrderStatus> {
+  const before = orderRow.status as OrderStatus;
+
+  // Only CONFIRMED contributing transactions count toward paid_usd — we
+  // can't promise the merchant money that might reorg away. `detected`
+  // transactions show up in the event stream but don't satisfy the order
+  // until they cross the confirmation threshold.
+  const contributing = await deps.db
+    .prepare(
+      `SELECT amount_usd FROM transactions
+        WHERE order_id = ? AND status = 'confirmed' AND amount_usd IS NOT NULL`
+    )
+    .bind(orderRow.id)
+    .all<{ amount_usd: string }>();
+
+  let paidUsd = "0";
+  for (const row of contributing.results) {
+    paidUsd = addUsd(paidUsd, row.amount_usd);
+  }
+
+  const amountUsd = orderRow.amount_usd!;
+  const cmp = compareUsd(paidUsd, amountUsd);
+
+  let after: OrderStatus;
+  let overpaidUsd = "0";
+  if (cmp > 0) {
+    after = "overpaid";
+    overpaidUsd = subUsd(paidUsd, amountUsd);
+  } else if (cmp === 0) {
+    after = "confirmed";
+  } else if (compareUsd(paidUsd, "0") > 0) {
+    after = "partial";
+  } else {
+    // Nothing confirmed yet. `detected` (still under threshold) payments exist
+    // as transactions but don't move the order off `created` / whatever prior.
+    after = "created";
+  }
+
+  // Always update paid_usd / overpaid_usd (even on same-status) so merchant
+  // UIs see live progress on partial invoices. Status-change also flips
+  // confirmed_at + fires the status event.
+  await deps.db
+    .prepare(
+      `UPDATE orders
+          SET status = ?,
+              paid_usd = ?,
+              overpaid_usd = ?,
+              confirmed_at = CASE WHEN ? IN ('confirmed','overpaid') AND confirmed_at IS NULL THEN ? ELSE confirmed_at END,
+              updated_at = ?
+        WHERE id = ?`
+    )
+    .bind(after, paidUsd, overpaidUsd, after, now, now, orderRow.id)
+    .run();
+
+  if (after !== before) {
+    const addresses = await fetchOrderReceiveAddresses(deps, orderRow.id);
+    const updated = rowToOrder(
+      {
+        ...orderRow,
+        status: after,
+        paid_usd: paidUsd,
+        overpaid_usd: overpaidUsd,
+        confirmed_at:
+          (after === "confirmed" || after === "overpaid") && orderRow.confirmed_at === null
+            ? now
+            : orderRow.confirmed_at,
+        updated_at: now
+      },
+      addresses
+    );
+    await deps.events.publish(orderEventFor(after, updated, now));
+  }
+
+  return after;
+}
+
 function orderEventFor(status: OrderStatus, order: Order, now: number): DomainEvent {
   const at = new Date(now);
   switch (status) {
@@ -323,12 +491,8 @@ function orderEventFor(status: OrderStatus, order: Order, now: number): DomainEv
       return { type: "order.canceled", orderId: order.id, order, at };
     case "created":
       return { type: "order.created", orderId: order.id, order, at };
-    // A2: overpaid is a terminal distinct from confirmed. Detection code in
-    // A2.b emits this; until then the legacy path never produces it. Treat
-    // it as order.confirmed semantically — merchants get the paid event, and
-    // the `overpaidUsd` field on the order body tells them the delta.
     case "overpaid":
-      return { type: "order.confirmed", orderId: order.id, order, at };
+      return { type: "order.overpaid", orderId: order.id, order, at };
   }
 }
 
