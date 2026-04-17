@@ -74,6 +74,8 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
     case "tx.confirmed":
     case "tx.orphaned":
     case "payout.planned":
+    case "pool.address.created":
+    case "pool.address.quarantined":
       return null;
   }
 }

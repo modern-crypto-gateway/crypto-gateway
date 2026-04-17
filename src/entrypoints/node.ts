@@ -21,6 +21,7 @@ import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/al
 import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
 import { alchemyNotifyDetection } from "../adapters/detection/alchemy-notify.adapter.js";
+import { alchemyChainsByFamily } from "../adapters/detection/alchemy-network.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
@@ -95,6 +96,10 @@ async function main(): Promise<void> {
   // ALCHEMY_CHAINS) and enable RPC-poll detection for those chains.
   const chains: ChainAdapter[] = [devChainAdapter()];
   const detectionStrategies: Record<number, DetectionStrategy> = {};
+  // Union of chainIds for the pool's Alchemy subscription fan-out (EVM + Solana).
+  // Collected as entrypoint wires each family so the pool knows, at refill
+  // time, which webhooks to enqueue 'add' rows for.
+  const activeAlchemyChainIds: number[] = [];
   if (config.alchemyApiKey !== undefined) {
     const chainIds = parseAlchemyChainsEnv(config.alchemyChains);
     chains.push(
@@ -105,6 +110,7 @@ async function main(): Promise<void> {
     );
     for (const chainId of chainIds) {
       detectionStrategies[chainId] = rpcPollDetection();
+      activeAlchemyChainIds.push(chainId);
     }
     logger.info("Alchemy EVM chains wired", { chainIds });
   }
@@ -141,8 +147,10 @@ async function main(): Promise<void> {
   if (config.solanaRpcUrl !== undefined) solanaWiringInput.rpcUrl = config.solanaRpcUrl;
   if (config.alchemyApiKey !== undefined) solanaWiringInput.alchemyApiKey = config.alchemyApiKey;
   const solanaWiring = wireSolana(solanaWiringInput);
-  if (solanaWiring.chainAdapter) {
+  if (solanaWiring.chainAdapter && solanaWiring.chainId !== undefined) {
     chains.push(solanaWiring.chainAdapter);
+    // Pool's Alchemy fan-out covers Solana too (webhook-based detection).
+    activeAlchemyChainIds.push(solanaWiring.chainId);
   }
 
   // Secrets-at-rest cipher. In prod/staging `SECRETS_ENCRYPTION_KEY` is
@@ -201,7 +209,8 @@ async function main(): Promise<void> {
     // enable /webhooks/alchemy end-to-end without touching this file.
     pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },
-    ...(alchemy !== undefined ? { alchemy } : {})
+    ...(alchemy !== undefined ? { alchemy } : {}),
+    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds)
   };
 
   const app = buildApp(deps);

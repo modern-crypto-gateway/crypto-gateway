@@ -36,7 +36,10 @@ describe("rpcPollDetection — minIntervalMs throttle", () => {
     const fakeNow = { t: 1_700_000_000_000 };
     const booted = await bootTestApp({
       chains: [spyChainAdapter(scan)],
-      clock: { now: () => new Date(fakeNow.t) }
+      clock: { now: () => new Date(fakeNow.t) },
+      // Stub chain adapter's deriveAddress throws; skip pool seeding so
+      // bootTestApp's top-up pass doesn't trip on the stub.
+      skipPoolInit: true
     });
     try {
       const strategy = rpcPollDetection({ minIntervalMs: 60_000 });
@@ -66,7 +69,10 @@ describe("rpcPollDetection — minIntervalMs throttle", () => {
     const fakeNow = { t: 1_700_000_000_000 };
     const booted = await bootTestApp({
       chains: [spyChainAdapter(scan)],
-      clock: { now: () => new Date(fakeNow.t) }
+      clock: { now: () => new Date(fakeNow.t) },
+      // Stub chain adapter's deriveAddress throws; skip pool seeding so
+      // bootTestApp's top-up pass doesn't trip on the stub.
+      skipPoolInit: true
     });
     try {
       const strategy = rpcPollDetection();

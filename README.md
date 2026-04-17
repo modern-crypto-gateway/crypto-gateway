@@ -238,8 +238,59 @@ curl -X POST "$GATEWAY_URL/admin/bootstrap/alchemy-webhooks" \
 ```
 
 Alchemy requires at least one address at webhook creation time; the bootstrap
-seeds the zero address as a placeholder. Real HD-derived addresses are
-registered **automatically** via the subscription-sync lifecycle below.
+seeds a per-family placeholder (hex zero for EVM, a derived ed25519 pubkey
+for Solana) and **immediately removes it from the watch list** via
+`/update-webhook-addresses` — so the gateway doesn't get flooded with
+mint/burn events on the zero address. Real HD-derived addresses come from
+the address pool (below).
+
+## Address pool
+
+Incoming-payment addresses aren't HD-derived per-order anymore — they come
+from a **shared family-scoped pool** that's pre-derived, pre-registered with
+Alchemy, and reused across orders. Pool rules:
+
+- **One pool per family** (`evm` / `tron` / `solana`). EVM pubkeys are identical
+  across all 7 EVM chains we support, so one pool row covers an entire family.
+- **Reuse**. When an order reaches a terminal state (confirmed / expired /
+  canceled) its pool row returns to `available` and serves the next order.
+  This is what makes small-amount payments on expensive chains viable — 100
+  orders share one sweep tx instead of paying gas to sweep 100 dust addresses.
+- **Auto-refill**. Allocation triggers a background refill when available
+  count drops below threshold. Operators don't normally interact with the
+  pool after initial seeding.
+- **Fair rotation**. Allocation picks the row with the lowest
+  `total_allocations` first, so reuse spreads evenly rather than pounding
+  one address while others sit idle.
+
+### Seed the pool
+
+Run once per deployment:
+
+```bash
+curl -X POST "$GATEWAY_URL/admin/pool/initialize" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"families": ["evm", "tron", "solana"], "initialSize": 5}'
+```
+
+Families whose chain adapter isn't wired on the gateway are reported as
+`skipped-no-adapter` (e.g., Solana absent without `ALCHEMY_API_KEY` or
+`SOLANA_RPC_URL`). Idempotent: re-running only tops up families below
+`initialSize`.
+
+### Check utilization
+
+```bash
+curl "$GATEWAY_URL/admin/pool/stats" -H "Authorization: Bearer $ADMIN_KEY"
+# { "stats": [
+#   { "family": "evm", "available": 3, "allocated": 2, "total": 5, ... },
+#   ...
+# ]}
+```
+
+Alert on `available < 3` per family to catch low-supply before
+`POOL_EXHAUSTED` (503) fires on a live order-create.
 
 ### Address subscription lifecycle (automatic)
 

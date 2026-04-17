@@ -41,6 +41,15 @@ export function memoryCacheAdapter(): CacheStore {
       store.set(key, { value, expiresAt });
     },
 
+    async putIfAbsent(key, value, opts) {
+      // Same-process atomicity: Map operations are synchronous, so
+      // check + set runs with no interleaving from other awaited code.
+      if (readFresh(key) !== null) return false;
+      const expiresAt = opts?.ttlSeconds !== undefined ? Date.now() + opts.ttlSeconds * 1000 : null;
+      store.set(key, { value, expiresAt });
+      return true;
+    },
+
     async putJSON<T>(key: string, value: T, opts?: { ttlSeconds?: number }) {
       const expiresAt = opts?.ttlSeconds !== undefined ? Date.now() + opts.ttlSeconds * 1000 : null;
       store.set(key, { value: JSON.stringify(value), expiresAt });

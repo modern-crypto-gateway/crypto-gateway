@@ -6,6 +6,7 @@ import type { JobRunner } from "./ports/jobs.port.ts";
 import type { Logger } from "./ports/logger.port.ts";
 import type { PriceOracle } from "./ports/price-oracle.port.ts";
 import type { RateLimiter } from "./ports/rate-limit.port.ts";
+import type { ChainFamily } from "./types/chain.js";
 import type { SecretsCipher } from "./ports/secrets-cipher.port.ts";
 import type { SecretsProvider } from "./ports/secrets.port.ts";
 import type { SignerStore } from "./ports/signer-store.port.ts";
@@ -64,6 +65,13 @@ export interface AppDeps {
   readonly alchemy?: {
     syncAddresses: () => Promise<unknown>;
   };
+
+  // Per-family list of chainIds to subscribe on when a new pool address is
+  // created. Consumed by `registerAlchemySubscriptionTracker`. The entrypoint
+  // derives this from its Alchemy chain configuration (ALCHEMY_CHAINS env).
+  // Absent for deployments without Alchemy — the tracker then enqueues
+  // nothing (correctly, since there's nowhere to sync it to).
+  readonly alchemySubscribableChainsByFamily?: Readonly<Partial<Record<ChainFamily, readonly number[]>>>;
 }
 
 // Per-surface rate-limit caps. Populated from AppConfig by the entrypoint so

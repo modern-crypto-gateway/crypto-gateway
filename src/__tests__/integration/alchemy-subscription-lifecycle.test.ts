@@ -1,161 +1,91 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  dbAlchemySubscriptionStore,
-  type AlchemySubscriptionStore
-} from "../../adapters/detection/alchemy-subscription-store.js";
-import { bootTestApp, createOrderViaApi, type BootedTestApp } from "../helpers/boot.js";
+import { initializePool, refillFamily } from "../../core/domain/pool.service.js";
+import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 
-// Integration tests that exercise the full lifecycle end-to-end:
-//   1. Operator configures Alchemy (we pass a stub syncAddresses to deps.alchemy
-//      — that's enough for the tracker to register; the sweep isn't what we're
-//      testing here).
-//   2. Order created → tracker fires on order.created → subscription row inserted
-//      with action='add', status='pending'.
-//   3. Order reaches terminal state → tracker fires on order.*→ row with action='remove'.
+// Pool-driven Alchemy subscription tracking (post-A1 rewrite). Subscription
+// rows are tied to pool lifecycle — not order lifecycle — so one EVM pool
+// address is subscribed ONCE (fanned across all Alchemy-served EVM chains)
+// and then reused across thousands of orders without re-enqueueing.
 
-const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
-
-async function boot(): Promise<BootedTestApp> {
-  return bootTestApp({
-    // Seed alchemy in deps so the tracker gets registered inside buildApp.
-    // The syncAddresses stub never gets called in these tests — the tracker
-    // writes rows; the sweep would run them (separate test).
-    alchemy: { syncAddresses: async () => undefined }
-  });
-}
-
-describe("alchemy subscription tracker — event-driven enqueue", () => {
+describe("alchemy subscription tracker — pool-driven enqueue", () => {
   let booted: BootedTestApp;
-  let subs: AlchemySubscriptionStore;
 
   beforeEach(async () => {
-    booted = await boot();
-    subs = dbAlchemySubscriptionStore(booted.deps.db);
+    booted = await bootTestApp({
+      // Skip the default bootTestApp pool-seed so we control it precisely
+      // below and can assert exact row counts.
+      skipPoolInit: true,
+      alchemy: { syncAddresses: async () => undefined },
+      alchemySubscribableChainsByFamily: {
+        evm: [1, 137],
+        solana: [900]
+      }
+    });
   });
 
   afterEach(async () => {
     await booted.close();
   });
 
-  it("does NOT enqueue a row when the order's chain isn't served by Alchemy", async () => {
-    // Default dev chain 999 isn't in ALCHEMY_NETWORK_BY_CHAIN_ID → skipped.
-    const order = await createOrderViaApi(booted, { amountRaw: "1" });
-    await booted.deps.jobs.drain(200);
+  it("emits one 'add' row per Alchemy-served chain when a new EVM pool address is created", async () => {
+    // Initialize the EVM pool with 2 addresses. Expected fan-out: 2 addresses
+    // × 2 configured EVM chains (1, 137) = 4 subscription rows.
+    await initializePool(booted.deps, { families: ["evm"], initialSize: 2 });
+    await booted.deps.jobs.drain(500);
 
-    const rows = await subs.findByAddress(999, order.receiveAddress);
-    expect(rows).toEqual([]);
+    const rowsForChain1 = await booted.deps.db
+      .prepare(
+        "SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions WHERE chain_id = 1 AND action = 'add'"
+      )
+      .first<{ cnt: number }>();
+    const rowsForChain137 = await booted.deps.db
+      .prepare(
+        "SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions WHERE chain_id = 137 AND action = 'add'"
+      )
+      .first<{ cnt: number }>();
+    expect(rowsForChain1?.cnt).toBe(2);
+    expect(rowsForChain137?.cnt).toBe(2);
   });
 
-  it("enqueues an 'add' row on order.created for Alchemy-supported chains", async () => {
-    // Directly publish an event for a supported chain (chainId=1 is ETH_MAINNET
-    // in ALCHEMY_NETWORK_BY_CHAIN_ID). This avoids needing the full EVM adapter
-    // wiring just to drive the tracker.
-    const fakeOrder = {
-      id: "00000000-0000-0000-0000-000000000aaa",
-      merchantId: MERCHANT_ID,
-      status: "created",
-      chainId: 1,
-      token: "USDC",
-      receiveAddress: "0xReceiveAddr111111111111111111111111111111",
-      addressIndex: 0,
-      requiredAmountRaw: "1000000",
-      receivedAmountRaw: "0",
-      fiatAmount: null,
-      fiatCurrency: null,
-      quotedRate: null,
-      externalId: null,
-      metadata: null,
-      createdAt: new Date(),
-      expiresAt: new Date(Date.now() + 60_000),
-      confirmedAt: null,
-      updatedAt: new Date()
-    };
-    await booted.deps.events.publish({
-      type: "order.created",
-      orderId: fakeOrder.id as never,
-      order: fakeOrder as never,
-      at: new Date()
-    });
-    await booted.deps.jobs.drain(200);
+  it("does NOT enqueue Solana rows when only EVM family was added", async () => {
+    // The tracker fans out per family. An EVM pool refill shouldn't produce
+    // Solana subscription rows.
+    await initializePool(booted.deps, { families: ["evm"], initialSize: 1 });
+    await booted.deps.jobs.drain(500);
 
-    const rows = await subs.findByAddress(1, fakeOrder.receiveAddress);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ action: "add", status: "pending", attempts: 0 });
+    const rowsForSolana = await booted.deps.db
+      .prepare(
+        "SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions WHERE chain_id = 900"
+      )
+      .first<{ cnt: number }>();
+    expect(rowsForSolana?.cnt).toBe(0);
   });
 
-  it("enqueues a 'remove' row on each terminal order transition", async () => {
-    const receiveAddress = "0xTerminalAddr2222222222222222222222222222";
-    const baseOrder = {
-      id: "00000000-0000-0000-0000-00000000bbbb",
-      merchantId: MERCHANT_ID,
-      chainId: 1,
-      token: "USDC",
-      receiveAddress,
-      addressIndex: 0,
-      requiredAmountRaw: "1",
-      receivedAmountRaw: "0",
-      fiatAmount: null,
-      fiatCurrency: null,
-      quotedRate: null,
-      externalId: null,
-      metadata: null,
-      createdAt: new Date(),
-      expiresAt: new Date(Date.now() + 60_000),
-      confirmedAt: null,
-      updatedAt: new Date()
-    };
-
-    // Fire one event per terminal type; each should produce its own 'remove' row.
-    for (const type of ["order.confirmed", "order.expired", "order.canceled"] as const) {
-      await booted.deps.events.publish({
-        type,
-        orderId: baseOrder.id as never,
-        order: { ...baseOrder, status: type.slice("order.".length) } as never,
-        at: new Date()
-      });
-    }
-    await booted.deps.jobs.drain(200);
-
-    const rows = await subs.findByAddress(1, receiveAddress);
-    // 3 removes, one per event.
-    expect(rows.filter((r) => r.action === "remove")).toHaveLength(3);
-  });
-
-  it("tracker is inactive when deps.alchemy is not configured (no rows written)", async () => {
-    const noAlchemy = await bootTestApp({});
+  it("emits nothing when alchemySubscribableChainsByFamily is absent (alchemy not configured)", async () => {
+    const noAlchemy = await bootTestApp({ skipPoolInit: true });
     try {
-      const subsNoAlch = dbAlchemySubscriptionStore(noAlchemy.deps.db);
-      await noAlchemy.deps.events.publish({
-        type: "order.created",
-        orderId: "x" as never,
-        order: {
-          id: "x",
-          merchantId: MERCHANT_ID,
-          status: "created",
-          chainId: 1,
-          token: "USDC",
-          receiveAddress: "0xShouldNotAppear33333333333333333333333333",
-          addressIndex: 0,
-          requiredAmountRaw: "1",
-          receivedAmountRaw: "0",
-          fiatAmount: null,
-          fiatCurrency: null,
-          quotedRate: null,
-          externalId: null,
-          metadata: null,
-          createdAt: new Date(),
-          expiresAt: new Date(Date.now() + 60_000),
-          confirmedAt: null,
-          updatedAt: new Date()
-        } as never,
-        at: new Date()
-      });
-      await noAlchemy.deps.jobs.drain(200);
-      const rows = await subsNoAlch.findByAddress(1, "0xShouldNotAppear33333333333333333333333333");
-      expect(rows).toEqual([]);
+      await refillFamily(noAlchemy.deps, "evm", 1);
+      await noAlchemy.deps.jobs.drain(500);
+      const rows = await noAlchemy.deps.db
+        .prepare("SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions")
+        .first<{ cnt: number }>();
+      expect(rows?.cnt).toBe(0);
     } finally {
       await noAlchemy.close();
     }
+  });
+
+  it("does NOT enqueue subscription rows for chains outside the configured set", async () => {
+    // tracker's alchemyChainsByFamily only has chains 1 and 137 for EVM.
+    // A pool.address.created event doesn't magically subscribe the address
+    // on chain 10, 8453, etc. — only what's configured.
+    await initializePool(booted.deps, { families: ["evm"], initialSize: 1 });
+    await booted.deps.jobs.drain(500);
+
+    const rowsForChain10 = await booted.deps.db
+      .prepare("SELECT COUNT(*) as cnt FROM alchemy_address_subscriptions WHERE chain_id = 10")
+      .first<{ cnt: number }>();
+    expect(rowsForChain10?.cnt).toBe(0);
   });
 });
 

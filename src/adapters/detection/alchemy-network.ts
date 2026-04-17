@@ -79,6 +79,23 @@ export const ALCHEMY_PLACEHOLDER_ADDRESS_BY_FAMILY: Readonly<Record<AlchemyChain
   solana: computeSolanaPlaceholder()
 };
 
+// Invert ALCHEMY_FAMILY_BY_CHAIN_ID + filter by an active-chains allowlist.
+// Used by entrypoints to build `deps.alchemySubscribableChainsByFamily` from
+// their configured ALCHEMY_CHAINS set. Unknown chainIds (not on Alchemy) are
+// dropped rather than throwing — operators who point ALCHEMY_CHAINS at a
+// non-Alchemy chain get a no-op for that chain, which is the right behavior.
+export function alchemyChainsByFamily(
+  activeChainIds: readonly number[]
+): Readonly<Record<AlchemyChainFamily, readonly number[]>> {
+  const out: Record<AlchemyChainFamily, number[]> = { evm: [], solana: [] };
+  for (const chainId of activeChainIds) {
+    const family = ALCHEMY_FAMILY_BY_CHAIN_ID[chainId];
+    if (family === undefined) continue;
+    out[family].push(chainId);
+  }
+  return out;
+}
+
 function computeSolanaPlaceholder(): string {
   // sha256(namespace-string) → ed25519 private key → on-curve pubkey.
   // The resulting address is a stable constant across deployments.

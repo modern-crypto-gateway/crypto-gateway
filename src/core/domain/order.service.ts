@@ -9,6 +9,7 @@ import { findToken } from "../types/token-registry.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { rowToOrder, type OrderRow } from "./mappers.js";
 import { DomainError } from "../errors.js";
+import { allocateForOrder } from "./pool.service.js";
 
 // ---- Input validation ----
 
@@ -75,32 +76,22 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     quotedRate = conversion.rate;
   }
 
-  // 4. Atomically allocate the next HD index for this chain.
+  // 4. Allocate a receive address from the pool for this chain's family.
+  //    The pool was initialized via POST /admin/pool/initialize; allocation
+  //    CAS-claims the cheapest-by-reuse available row, and triggers a
+  //    background refill if the pool's low. Legacy per-order HD derivation
+  //    is gone — all addresses come from the shared pool now, which gives
+  //    us reuse (critical for high-gas chains like ETH) + pre-registration
+  //    with Alchemy webhooks at pool-generation time.
   const now = deps.clock.now().getTime();
-  const counterRow = await deps.db
-    .prepare(
-      `INSERT INTO address_index_counters (chain_id, next_index, updated_at)
-       VALUES (?, 1, ?)
-       ON CONFLICT(chain_id) DO UPDATE
-         SET next_index = next_index + 1, updated_at = excluded.updated_at
-       RETURNING next_index - 1 AS allocated_index`
-    )
-    .bind(parsed.chainId, now)
-    .first<{ allocated_index: number }>();
-  if (!counterRow) {
-    throw new OrderError("ADDRESS_ALLOCATION_FAILED", "Failed to allocate receive address index");
-  }
-  const addressIndex = counterRow.allocated_index;
-
-  // 5. Derive and canonicalize the receive address.
-  const chainAdapter = findChainAdapter(deps, parsed.chainId);
-  const seed = deps.secrets.getRequired("MASTER_SEED");
-  const { address } = chainAdapter.deriveAddress(seed, addressIndex);
-  const receiveAddress = chainAdapter.canonicalizeAddress(address);
-
-  // 6. Insert the order. One statement, no transaction needed — counter was
-  //    already bumped atomically above.
   const orderId = globalThis.crypto.randomUUID();
+  const chainAdapter = findChainAdapter(deps, parsed.chainId);
+  const allocated = await allocateForOrder(deps, orderId, chainAdapter.family);
+  const receiveAddress = chainAdapter.canonicalizeAddress(allocated.address);
+
+  // 5. Insert the order. Denormalize the pool allocation onto the order row
+  //    for back-compat with detection code that looks at orders.receive_address
+  //    directly (multi-family lookups in A1.b will use order_receive_addresses).
   const expiresAt = now + parsed.expiresInMinutes * 60_000;
   await deps.db
     .prepare(
@@ -116,7 +107,7 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
       parsed.chainId,
       parsed.token,
       receiveAddress,
-      addressIndex,
+      allocated.addressIndex,
       requiredAmountRaw,
       parsed.fiatAmount ?? null,
       parsed.fiatCurrency ?? null,
@@ -129,6 +120,16 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     )
     .run();
 
+  // Record the allocation in the join table. Single-family in A1.a; A1.b
+  // populates this with multiple rows for multi-family orders.
+  await deps.db
+    .prepare(
+      `INSERT INTO order_receive_addresses (order_id, family, address, pool_address_id, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .bind(orderId, chainAdapter.family, receiveAddress, allocated.id, now)
+    .run();
+
   const order = rowToOrder({
     id: orderId,
     merchant_id: parsed.merchantId,
@@ -136,7 +137,7 @@ export async function createOrder(deps: AppDeps, input: unknown): Promise<Order>
     chain_id: parsed.chainId,
     token: parsed.token,
     receive_address: receiveAddress,
-    address_index: addressIndex,
+    address_index: allocated.addressIndex,
     required_amount_raw: requiredAmountRaw,
     received_amount_raw: "0",
     fiat_amount: parsed.fiatAmount ?? null,
@@ -191,17 +192,17 @@ export type OrderErrorCode =
   | "MERCHANT_NOT_FOUND"
   | "MERCHANT_INACTIVE"
   | "TOKEN_NOT_SUPPORTED"
-  | "ADDRESS_ALLOCATION_FAILED"
   | "EXPIRE_NOT_ALLOWED";
 
 // HTTP status per code lives here (next to the codes themselves) rather than
 // in the route's handleError — routes shouldn't reverse-engineer semantics
-// from a code name.
+// from a code name. Note: POOL_EXHAUSTED (503) is thrown by pool.service as
+// a PoolExhaustedError; it's a DomainError so renderError handles it
+// uniformly — no need to duplicate the code here.
 const ORDER_ERROR_HTTP_STATUS: Readonly<Record<OrderErrorCode, number>> = {
   MERCHANT_NOT_FOUND: 404,
   MERCHANT_INACTIVE: 403,
   TOKEN_NOT_SUPPORTED: 400,
-  ADDRESS_ALLOCATION_FAILED: 500,
   EXPIRE_NOT_ALLOWED: 409
 };
 

@@ -38,6 +38,21 @@ export function cfKvAdapter(kv: KVNamespace): CacheStore {
       await kv.put(key, JSON.stringify(value), putOpts);
     },
 
+    async putIfAbsent(key, value, opts) {
+      // KV has no CAS. Best-effort: check, then write. Race window ≈ KV's
+      // propagation latency (~30s-1min). Callers relying on this for
+      // mutual exclusion should treat it as advisory and be idempotent
+      // downstream — the pool-refill path, for instance, relies on the
+      // DB's UNIQUE(family, address_index) constraint to reject dupes if
+      // two racers both pass the putIfAbsent check.
+      const existing = await kv.get(key);
+      if (existing !== null) return false;
+      const putOpts: { expirationTtl?: number } = {};
+      if (opts?.ttlSeconds !== undefined) putOpts.expirationTtl = Math.max(60, opts.ttlSeconds);
+      await kv.put(key, value, putOpts);
+      return true;
+    },
+
     async delete(key) {
       await kv.delete(key);
     },

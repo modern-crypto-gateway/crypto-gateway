@@ -6,6 +6,7 @@ import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/al
 import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
 import { alchemyNotifyDetection } from "../adapters/detection/alchemy-notify.adapter.js";
+import { alchemyChainsByFamily } from "../adapters/detection/alchemy-network.js";
 import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
@@ -70,6 +71,7 @@ async function main(): Promise<void> {
 
   const chains = [devChainAdapter()];
   const detectionStrategies: Record<number, ReturnType<typeof rpcPollDetection>> = {};
+  const activeAlchemyChainIds: number[] = [];
   const alchemyApiKey = secrets.getOptional("ALCHEMY_API_KEY");
   if (alchemyApiKey !== undefined) {
     const chainIds = parseAlchemyChainsEnv(secrets.getOptional("ALCHEMY_CHAINS"));
@@ -78,6 +80,7 @@ async function main(): Promise<void> {
     );
     for (const chainId of chainIds) {
       detectionStrategies[chainId] = rpcPollDetection();
+      activeAlchemyChainIds.push(chainId);
     }
     logger.info("Alchemy EVM chains wired", { chainIds });
   }
@@ -118,8 +121,9 @@ async function main(): Promise<void> {
   if (solanaRpcUrl !== undefined) solanaWiringInput.rpcUrl = solanaRpcUrl;
   if (alchemyApiKey !== undefined) solanaWiringInput.alchemyApiKey = alchemyApiKey;
   const solanaWiring = wireSolana(solanaWiringInput);
-  if (solanaWiring.chainAdapter) {
+  if (solanaWiring.chainAdapter && solanaWiring.chainId !== undefined) {
     chains.push(solanaWiring.chainAdapter);
+    activeAlchemyChainIds.push(solanaWiring.chainId);
   }
 
   const secretsEncryptionKey = secrets.getOptional("SECRETS_ENCRYPTION_KEY");
@@ -165,7 +169,8 @@ async function main(): Promise<void> {
     detectionStrategies,
     pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
     clock: { now: () => new Date() },
-    ...(alchemy !== undefined ? { alchemy } : {})
+    ...(alchemy !== undefined ? { alchemy } : {}),
+    alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds)
   };
 
   const app = buildApp(deps);

@@ -25,3 +25,20 @@ export class DomainError extends Error {
       : { error: { code: this.code, message: this.message } };
   }
 }
+
+// 503: no available pool addresses for one of the requested families.
+// Actionable for operators — run `POST /admin/pool/initialize` to mint more.
+// The refill path is also async-triggered at order creation when the pool
+// runs low, so in practice this only fires if the initial pool was never
+// seeded or the refill mutex was held through a process death.
+export class PoolExhaustedError extends DomainError {
+  constructor(family: string) {
+    super(
+      "POOL_EXHAUSTED",
+      `No available pool addresses for family '${family}'. Run POST /admin/pool/initialize to mint more.`,
+      503,
+      { family, hint: "POST /admin/pool/initialize" }
+    );
+    this.name = "PoolExhaustedError";
+  }
+}

@@ -1,3 +1,4 @@
+import type { ChainFamily } from "../types/chain.js";
 import type { Order, OrderId } from "../types/order.js";
 import type { Payout, PayoutId } from "../types/payout.js";
 import type { Transaction, TransactionId } from "../types/transaction.js";
@@ -23,7 +24,14 @@ export type DomainEvent =
   | { type: "payout.planned"; payoutId: PayoutId; payout: Payout; at: Date }
   | { type: "payout.submitted"; payoutId: PayoutId; payout: Payout; at: Date }
   | { type: "payout.confirmed"; payoutId: PayoutId; payout: Payout; at: Date }
-  | { type: "payout.failed"; payoutId: PayoutId; payout: Payout; at: Date };
+  | { type: "payout.failed"; payoutId: PayoutId; payout: Payout; at: Date }
+  // Pool-address lifecycle. Fired by pool.service when an HD-derived address
+  // joins the pool (refill) or gets pulled out of rotation. The Alchemy
+  // subscription tracker listens for these and enqueues per-chain
+  // subscription rows — so one evm-family pool address fans out to all the
+  // EVM chainIds we're watching via Alchemy.
+  | { type: "pool.address.created"; poolAddressId: string; family: ChainFamily; address: string; addressIndex: number; at: Date }
+  | { type: "pool.address.quarantined"; poolAddressId: string; family: ChainFamily; address: string; at: Date };
 
 export type DomainEventType = DomainEvent["type"];
 

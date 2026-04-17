@@ -96,6 +96,52 @@
           ]
         },
         {
+          "name": "3a. Initialize address pool",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/pool/initialize",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "pool", "initialize"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"families\": [\"evm\", \"tron\", \"solana\"],\n  \"initialSize\": 5\n}"
+            },
+            "description": "Seeds the address pool. Creates N HD-derived addresses per family (evm/tron/solana), marks them 'available', fires `pool.address.created` events that the Alchemy subscription tracker fans out to per-chain webhook registrations.\n\nIdempotent: re-running tops up families below target size. Families whose chain adapter isn't wired on the gateway are reported as `skipped-no-adapter`.\n\nSubsequent order creations allocate from this pool. When the available count drops below the refill threshold, a background refill fires automatically — but the initial seed is explicit so operators see the pool filling up before traffic arrives."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('results per family', () => pm.expect(body.results).to.be.an('array'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3b. Pool stats",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/pool/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "pool", "stats"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Per-family pool snapshot: available / allocated / quarantined / total + highest address_index. Watch this with an alert on available-count under threshold to catch low-supply before POOL_EXHAUSTED fires on a live order-create."
+          }
+        },
+        {
           "name": "3. Register fee wallet (dev chain)",
           "request": {
             "method": "POST",

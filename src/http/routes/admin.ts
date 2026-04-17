@@ -3,7 +3,8 @@ import { z } from "zod";
 import type { AppDeps } from "../../core/app-deps.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import { registerFeeWallet } from "../../core/domain/payout.service.js";
-import type { ChainFamily } from "../../core/types/chain.js";
+import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
+import { ChainFamilySchema, type ChainFamily } from "../../core/types/chain.js";
 import { sha256Hex, bytesToHex, getRandomValues } from "../../adapters/crypto/subtle.js";
 import { parseAlchemyChainsEnv } from "../../adapters/chains/evm/alchemy-rpc.js";
 import {
@@ -298,8 +299,37 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     }
   });
 
+  // Seed (or top up) the address pool. Idempotent: families already at or
+  // above `initialSize` are returned as 'already-sufficient' with zero
+  // additions. Families without a wired chain adapter in deps.chains are
+  // 'skipped-no-adapter'. The endpoint is safe to call repeatedly and is
+  // also the recovery path when the pool exhausts in prod.
+  app.post("/pool/initialize", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as unknown;
+    try {
+      const parsed = InitializePoolSchema.parse(body ?? {});
+      const results = await initializePool(deps, parsed);
+      return c.json({ results }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Per-family pool utilization snapshot. Operators watch this + an alert
+  // on available-count under threshold to catch "address supply running
+  // low" before POOL_EXHAUSTED fires on a live order-create.
+  app.get("/pool/stats", async (c) => {
+    const stats = await getPoolStats(deps);
+    return c.json({ stats }, 200);
+  });
+
   return app;
 }
+
+const InitializePoolSchema = z.object({
+  families: z.array(ChainFamilySchema).min(1).default(["evm", "tron", "solana"] as const),
+  initialSize: z.number().int().min(1).max(500).default(5)
+});
 
 function bytesToRandomHex(numBytes: number): string {
   const bytes = new Uint8Array(numBytes);

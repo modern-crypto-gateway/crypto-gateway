@@ -3,6 +3,7 @@ import type { AppDeps } from "./core/app-deps.js";
 import { confirmTransactions } from "./core/domain/payment.service.js";
 import { confirmPayouts, executeReservedPayouts } from "./core/domain/payout.service.js";
 import { pollPayments } from "./core/domain/poll-payments.js";
+import { registerPoolReleaseHandler } from "./core/domain/pool.service.js";
 import { registerWebhookSubscriber } from "./core/domain/webhook-subscriber.js";
 import { dbAlchemySubscriptionStore } from "./adapters/detection/alchemy-subscription-store.js";
 import { registerAlchemySubscriptionTracker } from "./adapters/detection/alchemy-subscription-tracker.js";
@@ -30,15 +31,21 @@ export function buildApp(deps: AppDeps): App {
   // Wire event-bus subscribers. Subscriptions stay active for the lifetime of
   // this buildApp call — one set per AppDeps is the contract.
   registerWebhookSubscriber(deps);
+  // Pool release: every order.confirmed/expired/canceled returns its pool
+  // row(s) to 'available' so the address can serve the next order. This is
+  // the whole point of the reuse model — one pool row, N orders, 1 sweep.
+  registerPoolReleaseHandler(deps);
   // Alchemy subscription tracker is registered only when the deployment has
-  // Alchemy configured (deps.alchemy present). Orders created on chains
-  // Alchemy doesn't serve are silently skipped inside the tracker.
+  // Alchemy configured (deps.alchemy present). It listens for pool.address
+  // events and enqueues per-chain subscription rows; chains not in the
+  // deployment's active set get skipped.
   if (deps.alchemy !== undefined) {
     registerAlchemySubscriptionTracker({
       events: deps.events,
       store: dbAlchemySubscriptionStore(deps.db),
       logger: deps.logger,
-      clock: deps.clock
+      clock: deps.clock,
+      alchemyChainsByFamily: deps.alchemySubscribableChainsByFamily ?? {}
     });
   }
 

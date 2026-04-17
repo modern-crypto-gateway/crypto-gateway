@@ -1,46 +1,57 @@
+import type { ChainFamily } from "../../core/types/chain.js";
 import type { EventBus } from "../../core/events/event-bus.port.js";
 import type { Logger } from "../../core/ports/logger.port.js";
-import { ALCHEMY_NETWORK_BY_CHAIN_ID } from "./alchemy-network.js";
+import { ALCHEMY_FAMILY_BY_CHAIN_ID } from "./alchemy-network.js";
 import type { AlchemySubscriptionStore } from "./alchemy-subscription-store.js";
 
-// Event-bus subscriber that translates domain events into Alchemy address-
-// subscription queue rows:
+// Event-bus subscriber that translates POOL events into per-chain Alchemy
+// address-subscription queue rows:
 //
-//   order.created   -> insert (chainId, receiveAddress, action='add')
-//   order.confirmed -> insert (chainId, receiveAddress, action='remove')
-//   order.expired   -> insert (chainId, receiveAddress, action='remove')
-//   order.canceled  -> insert (chainId, receiveAddress, action='remove')
+//   pool.address.created     -> one 'add' row per Alchemy-served chain in family
+//   pool.address.quarantined -> one 'remove' row per Alchemy-served chain in family
 //
-// Chains Alchemy doesn't serve (dev chain 999, Tron, Solana) are skipped —
-// they never get queued, so the sweep never sees them. That's why the tracker
-// is coupled to Alchemy's supported-networks map, not general.
+// Lifecycle is now tied to the POOL, not individual orders. A pool row
+// reused across 1000 orders stays subscribed the whole time. Orders reaching
+// terminal states do NOT trigger subscription removes — the address is still
+// watchable and might serve the next order.
 //
-// We do NOT wait for the webhook registry to have a row before enqueueing.
-// If an operator creates orders before bootstrapping the webhook, the rows
-// just sit pending — the sweep picks them up once bootstrap runs. That's
-// kinder than failing the order.
+// Fan-out: one EVM pool address emits `add` for 7 chainIds (ETH/OP/Polygon/
+// Base/Arbitrum/AVAX/BSC). One Solana pool address emits one row for
+// chainId 900. Tron family emits zero rows (Alchemy doesn't do Tron webhooks).
+//
+// `alchemyChainsByFamily` is supplied by the entrypoint and reflects the
+// active `ALCHEMY_CHAINS` env slice — an operator running only ETH+Polygon
+// would pass `{ evm: [1, 137], solana: [900] }`, so that's the only fan-out
+// the tracker performs.
 
 export interface AlchemySubscriptionTrackerConfig {
   events: EventBus;
   store: AlchemySubscriptionStore;
   logger: Logger;
   clock: { now(): Date };
+  // Per-family list of chainIds to subscribe when a pool address arrives.
+  // Typically derived from the operator's active Alchemy chain set.
+  alchemyChainsByFamily: Readonly<Partial<Record<ChainFamily, readonly number[]>>>;
 }
 
 export function registerAlchemySubscriptionTracker(
   config: AlchemySubscriptionTrackerConfig
 ): () => void {
-  const { events, store, logger, clock } = config;
+  const { events, store, logger, clock, alchemyChainsByFamily } = config;
 
-  const enqueue = async (chainId: number, address: string, action: "add" | "remove"): Promise<void> => {
-    if (ALCHEMY_NETWORK_BY_CHAIN_ID[chainId] === undefined) return; // Chain not handled by Alchemy
+  const enqueue = async (
+    chainId: number,
+    address: string,
+    action: "add" | "remove"
+  ): Promise<void> => {
+    // Extra defensive — only enqueue for chains Alchemy actually serves.
+    // The caller supplies the chain list, but we double-check so a
+    // misconfigured deployment can't produce ingest rows for chains Alchemy
+    // rejects at sync time.
+    if (ALCHEMY_FAMILY_BY_CHAIN_ID[chainId] === undefined) return;
     try {
       await store.insertPending({ chainId, address, action, now: clock.now().getTime() });
     } catch (err) {
-      // Never rethrow out of the subscriber — the event bus handles errors,
-      // and we don't want a DB hiccup here to fail order-create or terminal
-      // transitions. Failing subscriptions are visible via the store's status
-      // counts + admin listing (Phase 10+).
       logger.error("alchemy subscription enqueue failed", {
         chainId,
         address,
@@ -51,17 +62,17 @@ export function registerAlchemySubscriptionTracker(
   };
 
   const unsubscribers = [
-    events.subscribe("order.created", (event) => {
-      void enqueue(event.order.chainId, event.order.receiveAddress, "add");
+    events.subscribe("pool.address.created", async (event) => {
+      const chains = alchemyChainsByFamily[event.family] ?? [];
+      for (const chainId of chains) {
+        await enqueue(chainId, event.address, "add");
+      }
     }),
-    events.subscribe("order.confirmed", (event) => {
-      void enqueue(event.order.chainId, event.order.receiveAddress, "remove");
-    }),
-    events.subscribe("order.expired", (event) => {
-      void enqueue(event.order.chainId, event.order.receiveAddress, "remove");
-    }),
-    events.subscribe("order.canceled", (event) => {
-      void enqueue(event.order.chainId, event.order.receiveAddress, "remove");
+    events.subscribe("pool.address.quarantined", async (event) => {
+      const chains = alchemyChainsByFamily[event.family] ?? [];
+      for (const chainId of chains) {
+        await enqueue(chainId, event.address, "remove");
+      }
     })
   ];
 

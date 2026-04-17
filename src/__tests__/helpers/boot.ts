@@ -5,6 +5,7 @@ import { libsqlAdapter } from "../../adapters/db/libsql.adapter.js";
 import { loadMigrationsFromDir } from "../../adapters/db/fs-migration-loader.js";
 import { applyMigrations } from "../../adapters/db/migration-runner.js";
 import { devCipher } from "../../adapters/crypto/secrets-cipher.js";
+import { initializePool } from "../../core/domain/pool.service.js";
 import { promiseSetJobs } from "../../adapters/jobs/promise-set.adapter.js";
 import { staticPegPriceOracle } from "../../adapters/price-oracle/static-peg.adapter.js";
 import { memorySignerStore } from "../../adapters/signer-store/memory.adapter.js";
@@ -23,7 +24,10 @@ export interface BootTestAppOptions {
   // need to advance time across multiple calls (throttle windows, reservation
   // sweeps) without rebooting the app.
   clock?: AppDeps["clock"];
-  // Overrides merged into the secrets provider. `MASTER_SEED` defaults to "test-seed".
+  // Overrides merged into the secrets provider. `MASTER_SEED` defaults to
+  // the standard Hardhat/Anvil test mnemonic — a real BIP39 phrase, which
+  // is required for Solana/Tron/EVM HD derivation to produce addresses.
+  // (`@scure/bip39.mnemonicToSeedSync` validates the wordlist.)
   secretsOverrides?: Record<string, string>;
   // Chain adapters to register. Defaults to a single dev adapter on chainId 999.
   chains?: AppDeps["chains"];
@@ -48,10 +52,19 @@ export interface BootTestAppOptions {
   // tests never trip them; rate-limit-specific tests pass small numbers here.
   rateLimits?: Partial<RateLimitConfig>;
   // When provided, wires the Alchemy subscription tracker (subscribes to
-  // order events, writes rows to alchemy_address_subscriptions) and exposes
-  // the caller-supplied sync function as `deps.alchemy.syncAddresses`.
+  // pool.address events, writes rows to alchemy_address_subscriptions) and
+  // exposes the caller-supplied sync function as `deps.alchemy.syncAddresses`.
   // Most tests leave this undefined so the Alchemy path is silent.
   alchemy?: AppDeps["alchemy"];
+  // Tests that want an empty pool (exhaustion behavior, refill tests) set
+  // this true to skip the default bootTestApp seeding.
+  skipPoolInit?: boolean;
+  // Override the default pool size seeded at boot. Tests that run many
+  // concurrent order creations pre-seed more; throttle tests use 1 or 2.
+  poolInitialSize?: number;
+  // Subscribable-chains map injected into deps. Tests that exercise the
+  // pool → subscription fan-out supply it; most tests leave it undefined.
+  alchemySubscribableChainsByFamily?: AppDeps["alchemySubscribableChainsByFamily"];
 }
 
 export interface BootedTestApp {
@@ -158,7 +171,15 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
       .run();
   }
 
-  const secretsOverrides: Record<string, string> = { MASTER_SEED: "test-seed", ...(options.secretsOverrides ?? {}) };
+  const secretsOverrides: Record<string, string> = {
+    // Standard Hardhat/Anvil test mnemonic — a real BIP39 phrase. HD
+    // derivation for all three families (evm/tron/solana) validates the
+    // mnemonic via @scure/bip39 at refill time, so the prior "test-seed"
+    // placeholder broke pool init on Solana/Tron. This value is public
+    // and safe for tests (used by every Ethereum dev tool).
+    MASTER_SEED: "test test test test test test test test test test test junk",
+    ...(options.secretsOverrides ?? {})
+  };
   const secrets: SecretsProvider = {
     getRequired(key) {
       const v = secretsOverrides[key];
@@ -202,10 +223,28 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     detectionStrategies: options.detectionStrategies ?? {},
     pushStrategies: options.pushStrategies ?? {},
     clock: options.clock ?? { now: () => options.now ?? new Date() },
-    ...(options.alchemy !== undefined ? { alchemy: options.alchemy } : {})
+    ...(options.alchemy !== undefined ? { alchemy: options.alchemy } : {}),
+    ...(options.alchemySubscribableChainsByFamily !== undefined
+      ? { alchemySubscribableChainsByFamily: options.alchemySubscribableChainsByFamily }
+      : {})
   };
 
   const app = buildApp(deps);
+
+  // Seed the pool so tests that create orders don't hit PoolExhaustedError.
+  // We derive families from whichever chains are wired into `deps.chains` —
+  // the default test setup has only the dev chain (family="evm"), so a
+  // small EVM pool suffices. Tests that wire Tron or Solana adapters get
+  // those families seeded too.
+  if (options.skipPoolInit !== true) {
+    const families = Array.from(new Set(deps.chains.map((c) => c.family)));
+    await initializePool(deps, {
+      families: families.filter(
+        (f): f is "evm" | "tron" | "solana" => f === "evm" || f === "tron" || f === "solana"
+      ),
+      initialSize: options.poolInitialSize ?? 10
+    });
+  }
 
   const booted: BootedTestApp = {
     app,
