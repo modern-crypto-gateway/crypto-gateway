@@ -1,5 +1,5 @@
 import type { ExecutionContext, KVNamespace, RateLimit, ScheduledController } from "@cloudflare/workers-types";
-import { buildApp } from "../app.js";
+import { buildApp, registerEventSubscribers } from "../app.js";
 import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
 import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
@@ -366,6 +366,12 @@ export default {
       await reportBootFailure(err, env);
       return;
     }
+    // Subscribers are registered by buildApp on the fetch path; the scheduled
+    // path skips buildApp entirely (no Hono needed) but MUST still wire them,
+    // otherwise webhook events published by the cron sweepers (invoice.partial,
+    // invoice.confirmed, invoice.payment_received, payout.*) reach an empty
+    // bus and never insert into webhook_deliveries.
+    registerEventSubscribers(deps);
     const result = await runScheduledJobs(deps);
     for (const [name, outcome] of Object.entries(result)) {
       if (outcome && !outcome.ok) {

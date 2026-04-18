@@ -26,11 +26,12 @@ export interface App {
   jobs: Readonly<Record<string, () => Promise<void>>>;
 }
 
-export function buildApp(deps: AppDeps): App {
-  const app = new Hono<{ Variables: RequestIdVariables }>();
-
-  // Wire event-bus subscribers. Subscriptions stay active for the lifetime of
-  // this buildApp call — one set per AppDeps is the contract.
+// Wires every domain-event subscriber on `deps.events`. MUST be called for
+// any AppDeps that will publish events — including cron-only entrypoints
+// that bypass `buildApp` (Workers `scheduled` handler). Without this the
+// in-memory bus has zero listeners and every published webhook event is
+// silently dropped on the floor.
+export function registerEventSubscribers(deps: AppDeps): void {
   registerWebhookSubscriber(deps);
   // Pool release: every invoice.confirmed/expired/canceled returns its pool
   // row(s) to 'available' so the address can serve the next invoice. This is
@@ -49,6 +50,14 @@ export function buildApp(deps: AppDeps): App {
       alchemyChainsByFamily: deps.alchemySubscribableChainsByFamily ?? {}
     });
   }
+}
+
+export function buildApp(deps: AppDeps): App {
+  const app = new Hono<{ Variables: RequestIdVariables }>();
+
+  // Wire event-bus subscribers. Subscriptions stay active for the lifetime of
+  // this buildApp call — one set per AppDeps is the contract.
+  registerEventSubscribers(deps);
 
   // Security headers sit above everything else so error responses and 404s
   // get them too. Header-only — adds no per-request work beyond Map writes.

@@ -391,4 +391,79 @@ describe("pollPayments orchestrator", () => {
       await booted.close();
     }
   });
+
+  // Regression: prior to wiring registerEventSubscribers into the Workers
+  // `scheduled` handler, events published from inside `confirmTransactions`
+  // (and any other cron sweeper) reached an empty bus and never inserted
+  // into webhook_deliveries — operators saw `invoice.transfer_detected`
+  // (fired from the HTTP-ingest path, which goes through buildApp) but no
+  // `invoice.confirmed` or `invoice.payment_received`. This test exercises
+  // the same shape: ingest at conf=0, then promote via the cron sweeper,
+  // and assert BOTH the per-status webhook AND the per-transfer-confirmed
+  // webhook fire.
+  it("dispatches invoice.confirmed AND invoice.payment_received when the cron sweeper promotes a tx", async () => {
+    const { confirmTransactions } = await import("../../core/domain/payment.service.js");
+    const confirmations = new Map<
+      string,
+      { blockNumber: number | null; confirmations: number; reverted: boolean }
+    >();
+    const booted = await bootTestApp({
+      merchants: [
+        {
+          id: MERCHANT_ID,
+          webhookUrl: "https://merchant.example.com/hook",
+          webhookSecret: "c".repeat(64)
+        }
+      ],
+      chains: [devChainAdapter({ confirmationStatuses: confirmations })]
+    });
+    try {
+      const invoice = await createInvoice(booted, "1000");
+
+      await ingestDetectedTransfer(booted.deps, {
+        chainId: 999,
+        txHash: "0xpromote",
+        logIndex: 0,
+        fromAddress: "0x0000000000000000000000000000000000000001",
+        toAddress: invoice.receiveAddress,
+        token: "DEV",
+        amountRaw: "1000",
+        blockNumber: 100,
+        confirmations: 0,
+        seenAt: new Date()
+      });
+      await booted.deps.jobs.drain(1_000);
+
+      // After ingest: invoice.detected (per-status) + invoice.transfer_detected
+      // (per-transfer) — the existing happy path.
+      const initialEvents = booted.webhookDispatcher!.calls.map(
+        (c) => (c.payload as { event: string }).event
+      );
+      expect(initialEvents.sort()).toEqual(["invoice.detected", "invoice.transfer_detected"]);
+
+      // Now mark the tx confirmed on-chain and run the cron sweeper. THIS is
+      // the path that was silently dropping events on Workers `scheduled`.
+      confirmations.set("0xpromote", { blockNumber: 110, confirmations: 5, reverted: false });
+      await confirmTransactions(booted.deps);
+      await booted.deps.jobs.drain(1_000);
+
+      const allEvents = booted.webhookDispatcher!.calls.map(
+        (c) => (c.payload as { event: string }).event
+      );
+      // Promotion should add invoice.confirmed + invoice.payment_received.
+      expect(allEvents).toContain("invoice.confirmed");
+      expect(allEvents).toContain("invoice.payment_received");
+
+      const confirmedCall = booted.webhookDispatcher!.calls.find(
+        (c) => (c.payload as { event: string }).event === "invoice.confirmed"
+      )!;
+      expect(confirmedCall.idempotencyKey).toBe(`invoice.confirmed:${invoice.id}:confirmed`);
+      const receivedCall = booted.webhookDispatcher!.calls.find(
+        (c) => (c.payload as { event: string }).event === "invoice.payment_received"
+      )!;
+      expect(receivedCall.idempotencyKey).toBe(`invoice.payment_received:${invoice.id}:0xpromote`);
+    } finally {
+      await booted.close();
+    }
+  });
 });
