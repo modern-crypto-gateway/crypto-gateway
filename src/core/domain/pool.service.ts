@@ -1,10 +1,10 @@
-import { and, asc, count, eq, max, sql } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNull, lt, max, notInArray, or, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { PoolExhaustedError } from "../errors.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import type { ChainFamily } from "../types/chain.js";
 import type { PoolAddress, PoolFamilyStats } from "../types/pool.js";
-import { addressPool } from "../../db/schema.js";
+import { addressPool, invoices } from "../../db/schema.js";
 
 // Address pool: shared-across-merchants, HD-derived, reused across invoices.
 //
@@ -177,6 +177,92 @@ export async function releaseFromInvoice(deps: AppDeps, invoiceId: string): Prom
       lastReleasedAt: now
     })
     .where(eq(addressPool.allocatedToInvoiceId, invoiceId));
+}
+
+// Grace period before an `allocated` row is treated as orphaned. Long enough
+// for the in-flight create-invoice flow to finish (allocate → snapshot rates
+// → encrypt → batch insert ≈ <1s typical, <5s worst case on a cold connection)
+// without racing the reconciler. A row whose allocated_at is younger than this
+// is left alone even if its invoice row isn't visible yet — the writer might
+// just not have committed.
+const ORPHAN_GRACE_MS = 60 * 1000;
+
+// How many in-flight invoice IDs to inline into the NOT IN clause for the
+// orphan-check. The reconciler's WHERE matches `allocated` rows whose
+// `allocated_to_invoice_id` is NULL, points to a missing invoice row, or
+// points to an invoice in a terminal state. We list active invoice IDs
+// instead of joining because Turso/SQLite handles a small IN-list cheaply
+// and it lets the WHERE be a single, transparent UPDATE.
+const RECONCILE_ACTIVE_INVOICE_FETCH_LIMIT = 10_000;
+
+export interface ReconcileOrphanedAllocationsResult {
+  released: number;
+}
+
+// Defense-in-depth sweeper for the address pool. The event-bus release path
+// (registerPoolReleaseHandler below) is the primary mechanism for returning
+// allocated rows to rotation, but it depends on:
+//   1. The compensating release in invoice.service catching every create
+//      failure (we widened it; still possible for an exotic path to escape).
+//   2. The invoice.expired / .confirmed / .canceled events actually being
+//      published and delivered to the in-memory subscriber (process crash
+//      between publish and subscriber callback drops the release).
+// This job runs on the cron tick and releases any 'allocated' row that is
+// almost certainly leaked: no invoice_id, an invoice_id with no matching
+// invoice row, or an invoice already in a terminal state. It only releases
+// rows older than ORPHAN_GRACE_MS to avoid racing in-flight invoice creates.
+export async function reconcileOrphanedAllocations(
+  deps: AppDeps
+): Promise<ReconcileOrphanedAllocationsResult> {
+  const now = deps.clock.now().getTime();
+  const cutoff = now - ORPHAN_GRACE_MS;
+
+  // Snapshot active invoice IDs (any non-terminal status). We exclude these
+  // from the release set; everything else with status='allocated' past the
+  // grace window is fair game.
+  const activeRows = await deps.db
+    .select({ id: invoices.id })
+    .from(invoices)
+    .where(inArray(invoices.status, ["created", "partial", "detected"]))
+    .limit(RECONCILE_ACTIVE_INVOICE_FETCH_LIMIT);
+  const activeIds = activeRows.map((r) => r.id);
+
+  // Three releasable cases (combined with OR):
+  //   - allocated_to_invoice_id IS NULL                (broken state)
+  //   - allocated_to_invoice_id NOT IN (active ids)    (terminal or missing)
+  //   - allocated_at older than grace                  (always required)
+  // The grace clause guards against releasing a row whose invoice row is
+  // mid-insert: even if the allocated_to_invoice_id isn't found in `invoices`
+  // yet, it might be 200ms from being committed.
+  const orphanIdMatch =
+    activeIds.length === 0
+      ? // No active invoices at all → every non-NULL invoice_id is releasable
+        // (its invoice is terminal or gone).
+        sql`1=1`
+      : notInArray(addressPool.allocatedToInvoiceId, activeIds);
+
+  const updated = await deps.db
+    .update(addressPool)
+    .set({
+      status: "available",
+      allocatedToInvoiceId: null,
+      allocatedAt: null,
+      totalAllocations: sql`${addressPool.totalAllocations} + 1`,
+      lastReleasedAt: now
+    })
+    .where(
+      and(
+        eq(addressPool.status, "allocated"),
+        lt(addressPool.allocatedAt, cutoff),
+        or(isNull(addressPool.allocatedToInvoiceId), orphanIdMatch)
+      )
+    )
+    .returning({ id: addressPool.id });
+
+  if (updated.length > 0) {
+    deps.logger.warn("pool reconciled orphaned allocations", { released: updated.length });
+  }
+  return { released: updated.length };
 }
 
 // Re-claim the pool addresses previously held by `invoiceId` after a reorg

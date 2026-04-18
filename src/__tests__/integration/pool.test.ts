@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { and, asc, eq, sql } from "drizzle-orm";
-import { addressPool } from "../../db/schema.js";
+import { addressPool, invoices } from "../../db/schema.js";
 import {
   allocateForInvoice,
   getStats,
   initializePool,
+  reconcileOrphanedAllocations,
   refillFamily,
   releaseFromInvoice
 } from "../../core/domain/pool.service.js";
@@ -199,5 +200,131 @@ describe("pool.service — refill", () => {
       .from(addressPool)
       .where(eq(addressPool.family, "evm"));
     expect(Number(rows?.cnt)).toBe(0);
+  });
+});
+
+describe("pool.service — reconcileOrphanedAllocations", () => {
+  let booted: BootedTestApp;
+  beforeEach(async () => {
+    booted = await bootTestApp({ poolInitialSize: 6 });
+  });
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  // Helper: insert a minimal invoice row with the given status. Avoids going
+  // through createInvoice (which would itself touch the pool). All required
+  // columns are filled with placeholder values that satisfy NOT NULL/CHECK
+  // constraints — only `id` and `status` matter for the reconciler.
+  async function insertInvoiceRow(id: string, status: "created" | "expired"): Promise<void> {
+    const t = Date.now();
+    await booted.deps.db.insert(invoices).values({
+      id,
+      merchantId: "00000000-0000-0000-0000-000000000001",
+      status,
+      chainId: 999,
+      token: "DEV",
+      receiveAddress: "placeholder",
+      addressIndex: 0,
+      requiredAmountRaw: "0",
+      receivedAmountRaw: "0",
+      acceptedFamilies: JSON.stringify(["evm"]),
+      paidUsd: "0",
+      overpaidUsd: "0",
+      paymentToleranceUnderBps: 0,
+      paymentToleranceOverBps: 0,
+      createdAt: t,
+      expiresAt: t + 60_000,
+      updatedAt: t
+    });
+  }
+
+  // Helper: backdate the allocated_at on a pool row past the grace window so
+  // the reconciler treats it as old enough to release. Default grace is 60s.
+  async function ageAllocation(poolRowId: string): Promise<void> {
+    await booted.deps.db
+      .update(addressPool)
+      .set({ allocatedAt: Date.now() - 5 * 60 * 1000 })
+      .where(eq(addressPool.id, poolRowId));
+  }
+
+  it("releases rows whose invoice_id has no matching invoice row (failed insert)", async () => {
+    // Allocate but never insert an invoice → orphan. Backdate so it's past grace.
+    const orphaned = await allocateForInvoice(booted.deps, "ghost-invoice", "evm");
+    await ageAllocation(orphaned.id);
+
+    const result = await reconcileOrphanedAllocations(booted.deps);
+    expect(result.released).toBe(1);
+
+    const [row] = await booted.deps.db
+      .select({ status: addressPool.status, invoiceId: addressPool.allocatedToInvoiceId })
+      .from(addressPool)
+      .where(eq(addressPool.id, orphaned.id))
+      .limit(1);
+    expect(row?.status).toBe("available");
+    expect(row?.invoiceId).toBeNull();
+  });
+
+  it("releases rows whose invoice is in a terminal state (event-bus release missed)", async () => {
+    const a = await allocateForInvoice(booted.deps, "terminal-invoice", "evm");
+    await insertInvoiceRow("terminal-invoice", "expired");
+    await ageAllocation(a.id);
+
+    const result = await reconcileOrphanedAllocations(booted.deps);
+    expect(result.released).toBe(1);
+
+    const [row] = await booted.deps.db
+      .select({ status: addressPool.status })
+      .from(addressPool)
+      .where(eq(addressPool.id, a.id))
+      .limit(1);
+    expect(row?.status).toBe("available");
+  });
+
+  it("does NOT release rows tied to an active (non-terminal) invoice", async () => {
+    const a = await allocateForInvoice(booted.deps, "active-invoice", "evm");
+    await insertInvoiceRow("active-invoice", "created");
+    await ageAllocation(a.id);
+
+    const result = await reconcileOrphanedAllocations(booted.deps);
+    expect(result.released).toBe(0);
+
+    const [row] = await booted.deps.db
+      .select({ status: addressPool.status })
+      .from(addressPool)
+      .where(eq(addressPool.id, a.id))
+      .limit(1);
+    expect(row?.status).toBe("allocated");
+  });
+
+  it("respects the grace window — recently-allocated orphans are left alone", async () => {
+    // Orphan, but allocated_at is fresh (default `Date.now()`). Reconciler
+    // must skip it so an in-flight create-invoice flow isn't raced.
+    await allocateForInvoice(booted.deps, "in-flight-invoice", "evm");
+
+    const result = await reconcileOrphanedAllocations(booted.deps);
+    expect(result.released).toBe(0);
+  });
+
+  it("releases when allocated_to_invoice_id is NULL but status is 'allocated' (broken state)", async () => {
+    // Reach into the table to create the broken state directly — no API path
+    // produces this, but historical data sometimes has it.
+    const [available] = await booted.deps.db
+      .select({ id: addressPool.id })
+      .from(addressPool)
+      .where(and(eq(addressPool.family, "evm"), eq(addressPool.status, "available")))
+      .limit(1);
+    if (!available) throw new Error("test setup: no available row");
+    await booted.deps.db
+      .update(addressPool)
+      .set({
+        status: "allocated",
+        allocatedToInvoiceId: null,
+        allocatedAt: Date.now() - 5 * 60 * 1000
+      })
+      .where(eq(addressPool.id, available.id));
+
+    const result = await reconcileOrphanedAllocations(booted.deps);
+    expect(result.released).toBe(1);
   });
 });

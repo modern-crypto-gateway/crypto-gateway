@@ -190,110 +190,125 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
   const receiveRows: InvoiceReceiveAddress[] = [];
   let primaryAddress: string | null = null;
   let primaryAddressIndex = 0;
-  for (const family of familyOrder) {
-    const familyAdapter = deps.chains.find((c) => c.family === family);
-    if (!familyAdapter) {
-      throw new InvoiceError(
-        "TOKEN_NOT_SUPPORTED",
-        `No chain adapter wired for family '${family}'. Invoice creation requires all accepted families to be configured on the gateway.`
-      );
-    }
-    const allocated = await allocateForInvoice(deps, invoiceId, family);
-    const canonical = familyAdapter.canonicalizeAddress(allocated.address);
-    receiveRows.push({
-      family,
-      address: canonical as InvoiceReceiveAddress["address"],
-      poolAddressId: allocated.id
-    });
-    if (family === primaryFamily) {
-      primaryAddress = canonical;
-      primaryAddressIndex = allocated.addressIndex;
-    }
-  }
-  if (primaryAddress === null) {
-    throw new Error("Invariant: primary family allocation missing");
-  }
-
-  // 6. For USD-path invoices, snapshot the rate window now. Covers every
-  //    token registered in the accepted families + the family natives the
-  //    oracle can quote. Rates pinned for 10 minutes; detection refreshes
-  //    when it fires past expiry. Legacy invoices skip this entirely.
-  let amountUsd: string | null = null;
-  let ratesJson: string | null = null;
-  let rateWindowExpiresAt: number | null = null;
-  if (parsed.amountUsd !== undefined) {
-    amountUsd = parsed.amountUsd;
-    const snapshot = await snapshotRates(deps, tokensForFamilies(acceptedFamilies));
-    ratesJson = JSON.stringify(snapshot.rates);
-    rateWindowExpiresAt = snapshot.expiresAt;
-  }
-
-  // 6b. Encrypt the per-invoice webhook secret if one was provided. Stored
-  //     ciphertext only; plaintext lives only in the request body and the
-  //     decrypt-then-HMAC stack frame at dispatch time. The pair (URL +
-  //     secret) is enforced by the input schema's refine — both NULL means
-  //     fall back to the merchant default.
-  const webhookSecretCiphertext =
-    parsed.webhookSecret !== undefined
-      ? await deps.secretsCipher.encrypt(parsed.webhookSecret)
-      : null;
-
-  // 7. Insert the invoice row (denormalizes the primary family's address)
-  //    and the per-family join rows in a single batch so a partial write
-  //    can't leave the invoice unreachable for detection.
-  const expiresAt = now + parsed.expiresInMinutes * 60_000;
-  const metadataJson = parsed.metadata !== undefined ? JSON.stringify(parsed.metadata) : null;
-  const invoiceInsert = {
-    id: invoiceId,
-    merchantId: parsed.merchantId,
-    status: "created" as const,
-    chainId: parsed.chainId,
-    token: parsed.token,
-    receiveAddress: primaryAddress,
-    addressIndex: primaryAddressIndex,
-    requiredAmountRaw: requiredAmountRaw,
-    receivedAmountRaw: "0",
-    fiatAmount: parsed.fiatAmount ?? null,
-    fiatCurrency: parsed.fiatCurrency ?? null,
-    quotedRate: quotedRate,
-    externalId: parsed.externalId ?? null,
-    metadataJson: metadataJson,
-    acceptedFamilies: JSON.stringify(acceptedFamilies),
-    amountUsd: amountUsd,
-    paidUsd: "0",
-    overpaidUsd: "0",
-    rateWindowExpiresAt: rateWindowExpiresAt,
-    ratesJson: ratesJson,
-    webhookUrl: parsed.webhookUrl ?? null,
-    webhookSecretCiphertext: webhookSecretCiphertext,
-    paymentToleranceUnderBps:
-      parsed.paymentToleranceUnderBps ?? merchant.paymentToleranceUnderBps,
-    paymentToleranceOverBps:
-      parsed.paymentToleranceOverBps ?? merchant.paymentToleranceOverBps,
-    createdAt: now,
-    expiresAt: expiresAt,
-    confirmedAt: null,
-    updatedAt: now
-  };
-  const invoiceInsertStmt = deps.db.insert(invoices).values(invoiceInsert);
-  const rxInsertStmts = receiveRows.map((rx) =>
-    deps.db.insert(invoiceReceiveAddresses).values({
-      invoiceId,
-      family: rx.family,
-      address: rx.address,
-      poolAddressId: rx.poolAddressId,
-      createdAt: now
-    })
-  );
+  // Single try wraps allocation, rate snapshot, secret encryption, and batch
+  // insert. ANY throw between the first allocateForInvoice and the batch
+  // insert would otherwise orphan pool rows (we saw real orphans in prod when
+  // the batch insert hit a unique violation; the same leak existed for
+  // snapshotRates / secretsCipher.encrypt failures and partial multi-family
+  // allocation failures, which the previous narrower try did not cover).
+  // The compensating release is idempotent: releaseFromInvoice updates rows
+  // by allocatedToInvoiceId, so partial allocations (e.g. 2 of 3 families)
+  // get released the same way as full ones.
   try {
+    for (const family of familyOrder) {
+      const familyAdapter = deps.chains.find((c) => c.family === family);
+      if (!familyAdapter) {
+        throw new InvoiceError(
+          "TOKEN_NOT_SUPPORTED",
+          `No chain adapter wired for family '${family}'. Invoice creation requires all accepted families to be configured on the gateway.`
+        );
+      }
+      const allocated = await allocateForInvoice(deps, invoiceId, family);
+      const canonical = familyAdapter.canonicalizeAddress(allocated.address);
+      receiveRows.push({
+        family,
+        address: canonical as InvoiceReceiveAddress["address"],
+        poolAddressId: allocated.id
+      });
+      if (family === primaryFamily) {
+        primaryAddress = canonical;
+        primaryAddressIndex = allocated.addressIndex;
+      }
+    }
+    if (primaryAddress === null) {
+      throw new Error("Invariant: primary family allocation missing");
+    }
+
+    // 6. For USD-path invoices, snapshot the rate window now. Covers every
+    //    token registered in the accepted families + the family natives the
+    //    oracle can quote. Rates pinned for 10 minutes; detection refreshes
+    //    when it fires past expiry. Legacy invoices skip this entirely.
+    let amountUsd: string | null = null;
+    let ratesJson: string | null = null;
+    let rateWindowExpiresAt: number | null = null;
+    if (parsed.amountUsd !== undefined) {
+      amountUsd = parsed.amountUsd;
+      const snapshot = await snapshotRates(deps, tokensForFamilies(acceptedFamilies));
+      ratesJson = JSON.stringify(snapshot.rates);
+      rateWindowExpiresAt = snapshot.expiresAt;
+    }
+
+    // 6b. Encrypt the per-invoice webhook secret if one was provided. Stored
+    //     ciphertext only; plaintext lives only in the request body and the
+    //     decrypt-then-HMAC stack frame at dispatch time. The pair (URL +
+    //     secret) is enforced by the input schema's refine — both NULL means
+    //     fall back to the merchant default.
+    const webhookSecretCiphertext =
+      parsed.webhookSecret !== undefined
+        ? await deps.secretsCipher.encrypt(parsed.webhookSecret)
+        : null;
+
+    // 7. Insert the invoice row (denormalizes the primary family's address)
+    //    and the per-family join rows in a single batch so a partial write
+    //    can't leave the invoice unreachable for detection.
+    const expiresAt = now + parsed.expiresInMinutes * 60_000;
+    const metadataJson = parsed.metadata !== undefined ? JSON.stringify(parsed.metadata) : null;
+    const invoiceInsert = {
+      id: invoiceId,
+      merchantId: parsed.merchantId,
+      status: "created" as const,
+      chainId: parsed.chainId,
+      token: parsed.token,
+      receiveAddress: primaryAddress,
+      addressIndex: primaryAddressIndex,
+      requiredAmountRaw: requiredAmountRaw,
+      receivedAmountRaw: "0",
+      fiatAmount: parsed.fiatAmount ?? null,
+      fiatCurrency: parsed.fiatCurrency ?? null,
+      quotedRate: quotedRate,
+      externalId: parsed.externalId ?? null,
+      metadataJson: metadataJson,
+      acceptedFamilies: JSON.stringify(acceptedFamilies),
+      amountUsd: amountUsd,
+      paidUsd: "0",
+      overpaidUsd: "0",
+      rateWindowExpiresAt: rateWindowExpiresAt,
+      ratesJson: ratesJson,
+      webhookUrl: parsed.webhookUrl ?? null,
+      webhookSecretCiphertext: webhookSecretCiphertext,
+      paymentToleranceUnderBps:
+        parsed.paymentToleranceUnderBps ?? merchant.paymentToleranceUnderBps,
+      paymentToleranceOverBps:
+        parsed.paymentToleranceOverBps ?? merchant.paymentToleranceOverBps,
+      createdAt: now,
+      expiresAt: expiresAt,
+      confirmedAt: null,
+      updatedAt: now
+    };
+    const invoiceInsertStmt = deps.db.insert(invoices).values(invoiceInsert);
+    const rxInsertStmts = receiveRows.map((rx) =>
+      deps.db.insert(invoiceReceiveAddresses).values({
+        invoiceId,
+        family: rx.family,
+        address: rx.address,
+        poolAddressId: rx.poolAddressId,
+        createdAt: now
+      })
+    );
     await deps.db.batch([invoiceInsertStmt, ...rxInsertStmts] as [
       typeof invoiceInsertStmt,
       ...typeof rxInsertStmts
     ]);
+
+    const invoice = drizzleRowToInvoice(invoiceInsert, receiveRows);
+
+    await deps.events.publish({ type: "invoice.created", invoiceId: invoice.id, invoice, at: new Date(now) });
+
+    return invoice;
   } catch (err) {
-    // Pool addresses were already flipped to 'allocated' against this brand-
-    // new invoiceId; without the invoice row they'd leak. Release them on
-    // any insert failure before either returning the duplicate or rethrowing.
+    // Compensating release: any throw above leaves zero or more pool rows
+    // tagged with this invoiceId but no matching invoice row. Release them
+    // before returning the duplicate or rethrowing.
     await releaseFromInvoice(deps, invoiceId);
 
     // Race with the step-1b idempotency check: another concurrent create
@@ -308,12 +323,6 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
     }
     throw err;
   }
-
-  const invoice = drizzleRowToInvoice(invoiceInsert, receiveRows);
-
-  await deps.events.publish({ type: "invoice.created", invoiceId: invoice.id, invoice, at: new Date(now) });
-
-  return invoice;
 }
 
 // Lookup helper for the idempotency path: hydrates a full Invoice (including

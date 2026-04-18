@@ -7,6 +7,7 @@ import {
   sweepStuckFeeWalletReservations
 } from "./payout.service.js";
 import { pollPayments } from "./poll-payments.js";
+import { reconcileOrphanedAllocations } from "./pool.service.js";
 import { sweepWebhookDeliveries } from "./webhook-subscriber.js";
 
 // Runs every scheduled job in sequence. Shared between the Workers `scheduled`
@@ -33,6 +34,7 @@ export interface ScheduledJobsResult {
   confirmPayouts: JobOutcome;
   sweepStuckFeeWalletReservations: JobOutcome;
   sweepExpiredInvoices: JobOutcome;
+  reconcileOrphanedAllocations: JobOutcome;
   sweepWebhookDeliveries: JobOutcome;
   // Present only when Alchemy is configured for this deployment
   // (`deps.alchemy` set). Absent otherwise — callers should not treat the
@@ -57,6 +59,12 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     // picked up in the same tick. (Initial dispatch still happens via
     // dispatchEvent; the sweeper is the safety net.)
     sweepExpiredInvoices: await run(() => sweepExpiredInvoices(deps)),
+    // Defense-in-depth pool sweep: runs AFTER sweepExpiredInvoices so any
+    // address whose invoice was just flipped to 'expired' but didn't release
+    // via the event bus (process crash between event publish and subscriber
+    // callback) gets caught here on the same tick. Honors a grace window so
+    // an in-flight create-invoice flow isn't raced.
+    reconcileOrphanedAllocations: await run(() => reconcileOrphanedAllocations(deps)),
     sweepWebhookDeliveries: await run(() => sweepWebhookDeliveries(deps))
   };
   if (deps.alchemy !== undefined) {
