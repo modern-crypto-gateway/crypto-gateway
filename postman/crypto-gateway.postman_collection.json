@@ -96,7 +96,7 @@
           ]
         },
         {
-          "name": "2b. Update merchant payment tolerance",
+          "name": "2b. Update merchant (name, webhook URL, tolerances, cooldown)",
           "request": {
             "method": "PATCH",
             "url": { "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}", "host": ["{{baseUrl}}"], "path": ["admin", "merchants", "{{merchantId}}"] },
@@ -106,9 +106,9 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"paymentToleranceUnderBps\": 50,\n  \"paymentToleranceOverBps\": 100,\n  \"addressCooldownSeconds\": 300\n}"
+              "raw": "{\n  \"name\": \"Postman Test Merchant (renamed)\",\n  \"paymentToleranceUnderBps\": 50,\n  \"paymentToleranceOverBps\": 100,\n  \"addressCooldownSeconds\": 300\n}"
             },
-            "description": "Updates the merchant's mutable defaults (basis points, 1 bp = 0.01 %).\n\n- `paymentToleranceUnderBps`: a paid USD amount within `bps` of the target closes the invoice as `confirmed` instead of `partial`. 50 = 0.5 %.\n- `paymentToleranceOverBps`: a paid USD amount within `bps` over the target closes as `confirmed` instead of `overpaid`. 100 = 1 %.\n- `addressCooldownSeconds`: parks a released pool address for N seconds so late payments still credit the original invoice. 300 = 5 min; 0 disables. Capped at 7 days (604800s).\n\nApplies to invoices created / releases that happen **after** this PATCH; already-stamped cooldown deadlines and existing invoice tolerance snapshots are unaffected. Webhook URL/secret are intentionally NOT mutable here — changing them mid-flight orphans pending outbox rows enqueued under the old key."
+            "description": "Mutates any combination of `name`, `webhookUrl`, `paymentToleranceUnderBps`, `paymentToleranceOverBps`, `addressCooldownSeconds`. All optional; body must contain ≥1 field.\n\n- `name`: display label, free-form up to 128 chars.\n- `webhookUrl`: outbound receiver. SSRF-guarded (private / loopback / metadata hosts rejected). **First-time set** — if the merchant was created without a URL, this PATCH mints a fresh HMAC secret and returns the plaintext once in `webhookSecret` (same contract as create). **Changing an existing URL** does NOT rotate the secret; the signed-HMAC contract stays stable. To rotate the secret itself, use `2h. Rotate webhook secret`.\n- `paymentToleranceUnderBps`: paid USD within `bps` of target closes as `confirmed` instead of `partial`. 50 = 0.5 %.\n- `paymentToleranceOverBps`: paid USD within `bps` over target closes as `confirmed` instead of `overpaid`. 100 = 1 %.\n- `addressCooldownSeconds`: parks a released pool address for N seconds so late payments still credit the original invoice. 300 = 5 min; 0 disables. Capped at 7 days (604800s).\n\nTolerance / cooldown changes apply to invoices created / releases that happen **after** this PATCH; already-stamped cooldown deadlines and existing invoice tolerance snapshots are unaffected."
           },
           "event": [
             {
@@ -229,6 +229,38 @@
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
             "description": "Sets `active=true`. Idempotent."
           }
+        },
+        {
+          "name": "2h. Rotate webhook secret",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}/rotate-webhook-secret",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants", "{{merchantId}}", "rotate-webhook-secret"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Issues a fresh plaintext HMAC signing secret. Required when the old secret has leaked (or the merchant lost it — `POST /admin/merchants` only returns the plaintext once). The test script overwrites `webhookSecret` in the environment.\n\n**Coordinated rotation required.** Outbox rows dispatched AFTER this call — including any queued before the rotation — will be signed with the NEW secret. The merchant's verifier must hold the new value when those deliveries arrive, or they'll 401 and land in `webhook_deliveries.status='dead'`. Sequence: announce → rotate here → hand the new plaintext to the merchant → they update their verifier. Any dead rows can be replayed via `/admin/webhook-deliveries/:id/replay` once the merchant confirms.\n\n400 if the merchant has no `webhookUrl` — use `2b. Update merchant` to set the URL first (first-time set mints a fresh secret automatically)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns new plaintext webhookSecret', () => {",
+                  "  pm.expect(body.webhookSecret).to.match(/^[0-9a-f]{64}$/);",
+                  "});",
+                  "if (body.webhookSecret) {",
+                  "  pm.environment.set('webhookSecret', body.webhookSecret);",
+                  "  console.log('rotated webhookSecret');",
+                  "}"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "3a. Initialize address pool",

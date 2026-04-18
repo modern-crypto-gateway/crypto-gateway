@@ -410,12 +410,19 @@ paths:
         "404": { description: Merchant not found }
     patch:
       tags: [admin]
-      summary: Update a merchant's mutable defaults
+      summary: Update a merchant
       description: |
-        Scoped to `paymentToleranceUnderBps`, `paymentToleranceOverBps`, and
-        `addressCooldownSeconds`. Webhook URL/secret stay create-only on
-        purpose — changing them mid-flight orphans pending outbox rows that
-        were enqueued under the old key.
+        Mutates `name`, `webhookUrl`, and/or the three tuning defaults.
+        `active` has its own endpoints (`/deactivate`, `/activate`); the API
+        key rotates via `/rotate-key`; the webhook secret rotates via
+        `/rotate-webhook-secret`.
+
+        Special first-time `webhookUrl` case: if the merchant was created
+        without a webhook URL and this PATCH sets one, the gateway mints a
+        fresh HMAC secret, stores it encrypted, and returns the plaintext in
+        `webhookSecret` — same one-shot contract as the create endpoint.
+        Subsequent URL changes do NOT rotate the secret (signed-HMAC contract
+        stays stable; the merchant just receives on a different URL).
 
         Tolerance changes apply to invoices created **after** the PATCH;
         existing invoices keep the snapshot they were issued with. Cooldown
@@ -436,6 +443,8 @@ paths:
               type: object
               minProperties: 1
               properties:
+                name: { type: string, minLength: 1, maxLength: 128 }
+                webhookUrl: { type: string, format: uri }
                 paymentToleranceUnderBps:
                   type: integer
                   minimum: 0
@@ -467,6 +476,10 @@ paths:
                       paymentToleranceOverBps: { type: integer }
                       addressCooldownSeconds: { type: integer }
                       updatedAt: { type: string, format: date-time }
+                  webhookSecret:
+                    type: string
+                    description: Plaintext webhook secret; present ONLY when this PATCH set a `webhookUrl` on a merchant that didn't previously have one. Shown once.
+                    pattern: "^[0-9a-f]{64}$"
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Merchant not found }
@@ -506,6 +519,63 @@ paths:
                     type: string
                     description: Plaintext API key. Shown once; store it immediately.
                     pattern: "^sk_[0-9a-f]{64}$"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+
+  /admin/merchants/{id}/rotate-webhook-secret:
+    post:
+      tags: [admin]
+      summary: Rotate a merchant's webhook HMAC signing secret
+      description: |
+        Generates a fresh 32-byte hex plaintext, encrypts at rest, and
+        returns the plaintext once so the operator can hand it to the
+        merchant.
+
+        **Coordinated-rotation caveat.** Outbox rows dispatched AFTER this
+        call — including any queued before the rotation — are signed with
+        the NEW secret (the dispatcher reads merchant state at send time).
+        The merchant's verifier must hold the new secret when those arrive
+        or they'll 401 and land in `webhook_deliveries.status='dead'`.
+        Sequence it: announce → rotate → hand secret off → merchant updates.
+        Failed retries can be replayed via
+        `POST /admin/webhook-deliveries/{id}/replay` once the merchant
+        confirms.
+
+        Requires the merchant to have a `webhookUrl` configured. For
+        first-time webhook setup, set the URL via `PATCH /admin/merchants/{id}`
+        instead — that flow mints a fresh secret automatically.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Webhook secret rotated; new plaintext returned once
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      webhookUrl: { type: string, format: uri }
+                      active: { type: boolean }
+                      updatedAt: { type: string, format: date-time }
+                  webhookSecret:
+                    type: string
+                    description: Plaintext HMAC secret. Shown once; deliver to the merchant securely.
+                    pattern: "^[0-9a-f]{64}$"
+        "400":
+          description: Merchant has no `webhookUrl` — nothing to sign for
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Merchant not found }
 

@@ -65,17 +65,15 @@ const CreateMerchantSchema = z.object({
 
 const UpdateMerchantSchema = z
   .object({
+    name: z.string().min(1).max(128).optional(),
+    webhookUrl: z.string().url().optional(),
     paymentToleranceUnderBps: z.number().int().min(0).max(2000).optional(),
     paymentToleranceOverBps: z.number().int().min(0).max(2000).optional(),
     addressCooldownSeconds: z.number().int().min(0).max(MAX_ADDRESS_COOLDOWN_SECONDS).optional()
   })
-  .refine(
-    (v) =>
-      v.paymentToleranceUnderBps !== undefined ||
-      v.paymentToleranceOverBps !== undefined ||
-      v.addressCooldownSeconds !== undefined,
-    { message: "PATCH body must contain at least one updatable field" }
-  );
+  .refine((v) => Object.values(v).some((x) => x !== undefined), {
+    message: "PATCH body must contain at least one updatable field"
+  });
 
 const RegisterFeeWalletSchema = z.object({
   chainId: z.number().int().positive(),
@@ -250,11 +248,19 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     }
   });
 
-  // PATCH a merchant's tunable defaults. Currently scoped to the payment-
-  // tolerance pair — the only field that's safe to mutate from the admin
-  // surface without coordinated key rotation. Webhook URL/secret stay
-  // create-only on purpose: changing them mid-flight orphans pending
-  // outbox rows that were enqueued under the old key.
+  // PATCH a merchant. Mutable fields:
+  //   - name, webhookUrl, paymentToleranceUnder/OverBps, addressCooldownSeconds
+  // NOT mutable here:
+  //   - `active` → use /deactivate + /activate
+  //   - `apiKey` → use /rotate-key
+  //   - `webhookSecret` → use /rotate-webhook-secret (coordinated rotation, plaintext returned once)
+  //
+  // Special case: a merchant created without a webhookUrl has no
+  // webhook_secret_ciphertext. If this PATCH sets the URL for the first time
+  // we mint a secret, store its ciphertext, and return the plaintext in the
+  // response (same one-shot contract as POST /admin/merchants). Changing an
+  // already-set URL does NOT rotate the secret — outbound signed-HMAC
+  // contracts stay stable; the merchant just receives on a different URL.
   app.patch("/merchants/:id", async (c) => {
     const id = c.req.param("id");
     const body = (await c.req.json().catch(() => null)) as unknown;
@@ -263,13 +269,52 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     }
     try {
       const parsed = UpdateMerchantSchema.parse(body);
+
+      if (parsed.webhookUrl !== undefined) {
+        const envName = deps.secrets.getOptional("NODE_ENV");
+        const allowHttp = envName === "development" || envName === "test";
+        const safety = assertWebhookUrlSafe(parsed.webhookUrl, { allowHttp });
+        if (!safety.ok) {
+          return c.json(
+            {
+              error: {
+                code: "INVALID_WEBHOOK_URL",
+                message: `Webhook URL rejected: ${safety.detail ?? safety.reason}`
+              }
+            },
+            400
+          );
+        }
+      }
+
+      // We need to know whether the merchant already has a webhook secret
+      // before deciding whether to mint one on a first-time URL set.
+      const [existing] = await deps.db
+        .select({
+          webhookUrl: merchants.webhookUrl,
+          webhookSecretCiphertext: merchants.webhookSecretCiphertext
+        })
+        .from(merchants)
+        .where(eq(merchants.id, id))
+        .limit(1);
+      if (!existing) {
+        return c.json(
+          { error: { code: "MERCHANT_NOT_FOUND", message: `Merchant not found: ${id}` } },
+          404
+        );
+      }
+
       const now = deps.clock.now().getTime();
       const patch: Partial<{
+        name: string;
+        webhookUrl: string;
+        webhookSecretCiphertext: string;
         paymentToleranceUnderBps: number;
         paymentToleranceOverBps: number;
         addressCooldownSeconds: number;
         updatedAt: number;
       }> = { updatedAt: now };
+      if (parsed.name !== undefined) patch.name = parsed.name;
       if (parsed.paymentToleranceUnderBps !== undefined) {
         patch.paymentToleranceUnderBps = parsed.paymentToleranceUnderBps;
       }
@@ -279,6 +324,16 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       if (parsed.addressCooldownSeconds !== undefined) {
         patch.addressCooldownSeconds = parsed.addressCooldownSeconds;
       }
+
+      let mintedWebhookSecret: string | null = null;
+      if (parsed.webhookUrl !== undefined) {
+        patch.webhookUrl = parsed.webhookUrl;
+        if (existing.webhookSecretCiphertext === null) {
+          mintedWebhookSecret = bytesToRandomHex(32);
+          patch.webhookSecretCiphertext = await deps.secretsCipher.encrypt(mintedWebhookSecret);
+        }
+      }
+
       const [row] = await deps.db
         .update(merchants)
         .set(patch)
@@ -301,7 +356,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
             paymentToleranceOverBps: row.paymentToleranceOverBps,
             addressCooldownSeconds: row.addressCooldownSeconds,
             updatedAt: new Date(row.updatedAt).toISOString()
-          }
+          },
+          ...(mintedWebhookSecret !== null ? { webhookSecret: mintedWebhookSecret } : {})
         },
         200
       );
@@ -441,6 +497,84 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
             updatedAt: new Date(row.updatedAt).toISOString()
           },
           apiKey
+        },
+        200
+      );
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Rotate a merchant's webhook HMAC signing secret. Generates a fresh 32-byte
+  // hex plaintext, encrypts at rest via `secretsCipher`, returns the plaintext
+  // once so the operator can hand it to the merchant for their verifier.
+  //
+  // Coordinated-rotation caveat: pending outbox rows (status='pending') that
+  // were enqueued BEFORE this call will be dispatched signed with the NEW
+  // secret because the dispatcher reads merchant state at send time. The
+  // merchant's verifier must already hold the new secret when those deliveries
+  // arrive, or they'll 401 and end up in dead-letter. Sequence it:
+  //   1) announce the rotation window to the merchant,
+  //   2) call this endpoint,
+  //   3) deliver the plaintext through a secure channel,
+  //   4) merchant updates their HMAC secret.
+  // Any in-flight retries that span steps 2-4 will fail HMAC and go to
+  // webhook_deliveries.status='dead'; replay via /admin/webhook-deliveries/:id/replay
+  // after the merchant confirms the new secret is live.
+  //
+  // Requires the merchant to have a webhookUrl configured — rotating a secret
+  // for a merchant with no receiver is meaningless.
+  app.post("/merchants/:id/rotate-webhook-secret", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const [existing] = await deps.db
+        .select({ webhookUrl: merchants.webhookUrl })
+        .from(merchants)
+        .where(eq(merchants.id, id))
+        .limit(1);
+      if (!existing) {
+        return c.json(
+          { error: { code: "MERCHANT_NOT_FOUND", message: `Merchant not found: ${id}` } },
+          404
+        );
+      }
+      if (existing.webhookUrl === null) {
+        return c.json(
+          {
+            error: {
+              code: "NO_WEBHOOK_URL",
+              message:
+                "Merchant has no webhookUrl configured. PATCH /admin/merchants/:id with a webhookUrl first — the first-time set returns a freshly minted plaintext secret."
+            }
+          },
+          400
+        );
+      }
+      const webhookSecret = bytesToRandomHex(32);
+      const webhookSecretCiphertext = await deps.secretsCipher.encrypt(webhookSecret);
+      const now = deps.clock.now().getTime();
+      const [row] = await deps.db
+        .update(merchants)
+        .set({ webhookSecretCiphertext, updatedAt: now })
+        .where(eq(merchants.id, id))
+        .returning();
+      if (!row) {
+        return c.json(
+          { error: { code: "MERCHANT_NOT_FOUND", message: `Merchant not found: ${id}` } },
+          404
+        );
+      }
+      deps.logger.info("admin rotated merchant webhook secret", { merchantId: id });
+      return c.json(
+        {
+          merchant: {
+            id: row.id,
+            name: row.name,
+            webhookUrl: row.webhookUrl,
+            active: row.active === 1,
+            updatedAt: new Date(row.updatedAt).toISOString()
+          },
+          webhookSecret
         },
         200
       );

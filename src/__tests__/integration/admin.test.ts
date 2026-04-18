@@ -287,6 +287,161 @@ describe("GET /admin/merchants/:id", () => {
   });
 });
 
+describe("PATCH /admin/merchants/:id", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  it("updates name", async () => {
+    const { id } = await createMerchant(booted, { name: "Original" });
+    const res = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ name: "Renamed" })
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { merchant: { name: string } };
+    expect(body.merchant.name).toBe("Renamed");
+  });
+
+  it("sets webhookUrl on a merchant created without one and mints a secret", async () => {
+    const { id } = await createMerchant(booted, { name: "NoHook" });
+    const res = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ webhookUrl: "https://merchant.test/hook" })
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      merchant: { webhookUrl: string | null };
+      webhookSecret?: string;
+    };
+    expect(body.merchant.webhookUrl).toBe("https://merchant.test/hook");
+    expect(body.webhookSecret).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("changing webhookUrl on a merchant that already had one does NOT mint a new secret", async () => {
+    const { id } = await createMerchant(booted, {
+      name: "Hooked",
+      webhookUrl: "https://old.test/hook"
+    });
+    const res = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ webhookUrl: "https://new.test/hook" })
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      merchant: { webhookUrl: string | null };
+      webhookSecret?: string;
+    };
+    expect(body.merchant.webhookUrl).toBe("https://new.test/hook");
+    expect(body.webhookSecret).toBeUndefined();
+  });
+
+  it("rejects an SSRF-unsafe webhookUrl", async () => {
+    const { id } = await createMerchant(booted, { name: "AboutToFail" });
+    const res = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ webhookUrl: "http://169.254.169.254/latest/meta-data/" })
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("INVALID_WEBHOOK_URL");
+  });
+
+  it("rejects empty body (no updatable fields)", async () => {
+    const { id } = await createMerchant(booted, { name: "Stable" });
+    const res = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({})
+      })
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("POST /admin/merchants/:id/rotate-webhook-secret", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  it("rotates the secret and returns the new plaintext once", async () => {
+    // Create with a webhookUrl so a secret exists to rotate.
+    const createRes = await booted.app.fetch(
+      new Request("http://test.local/admin/merchants", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ name: "Hooked", webhookUrl: "https://merchant.test/hook" })
+      })
+    );
+    const createBody = (await createRes.json()) as {
+      merchant: { id: string };
+      webhookSecret: string;
+    };
+    const oldSecret = createBody.webhookSecret;
+    expect(oldSecret).toMatch(/^[0-9a-f]{64}$/);
+
+    const res = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${createBody.merchant.id}/rotate-webhook-secret`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { webhookSecret: string; merchant: { webhookUrl: string | null } };
+    expect(body.webhookSecret).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.webhookSecret).not.toBe(oldSecret);
+    expect(body.merchant.webhookUrl).toBe("https://merchant.test/hook");
+  });
+
+  it("returns 400 when the merchant has no webhookUrl", async () => {
+    const { id } = await createMerchant(booted, { name: "NoHook" });
+    const res = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${id}/rotate-webhook-secret`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("NO_WEBHOOK_URL");
+  });
+
+  it("returns 404 for an unknown id", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/merchants/00000000-0000-0000-0000-000000000000/rotate-webhook-secret", {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
 describe("POST /admin/merchants/:id/rotate-key", () => {
   let booted: BootedTestApp;
 
