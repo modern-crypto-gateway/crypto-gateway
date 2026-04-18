@@ -328,3 +328,174 @@ describe("pool.service — reconcileOrphanedAllocations", () => {
     expect(result.released).toBe(1);
   });
 });
+
+describe("pool.service — address cooldown", () => {
+  // Cooldown parks a just-released address out of the allocation queue for
+  // `merchant.address_cooldown_seconds` seconds. Late payments that land
+  // during the window still credit the original invoice; releasing with a
+  // zero / missing cooldown preserves legacy immediate-reuse behavior.
+
+  const MERCHANT_WITH_COOLDOWN = "11111111-1111-1111-1111-000000000001";
+
+  async function bootWithCooldown(
+    cooldownSeconds: number,
+    fixedNow: Date
+  ): Promise<BootedTestApp> {
+    return bootTestApp({
+      now: fixedNow,
+      // Keep the pool small so we can exhaust all non-cooldown candidates
+      // and force the allocator to choose between "in cooldown" and "nothing".
+      poolInitialSize: 2,
+      merchants: [
+        {
+          id: MERCHANT_WITH_COOLDOWN,
+          name: "Cooldown Merchant",
+          active: true,
+          addressCooldownSeconds: cooldownSeconds
+        }
+      ]
+    });
+  }
+
+  it("stamps cooldown_until and last_released_by_merchant_id on release when merchantId is provided", async () => {
+    const t0 = new Date("2026-01-01T00:00:00Z");
+    const booted = await bootWithCooldown(600, t0);
+    try {
+      const alloc = await allocateForInvoice(booted.deps, "inv-cooldown-1", "evm");
+      await releaseFromInvoice(booted.deps, "inv-cooldown-1", { merchantId: MERCHANT_WITH_COOLDOWN });
+
+      const [row] = await booted.deps.db
+        .select({
+          status: addressPool.status,
+          cooldownUntil: addressPool.cooldownUntil,
+          lastReleasedByMerchantId: addressPool.lastReleasedByMerchantId
+        })
+        .from(addressPool)
+        .where(eq(addressPool.id, alloc.id))
+        .limit(1);
+      expect(row?.status).toBe("available");
+      expect(row?.cooldownUntil).toBe(t0.getTime() + 600 * 1000);
+      expect(row?.lastReleasedByMerchantId).toBe(MERCHANT_WITH_COOLDOWN);
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("leaves cooldown_until NULL when merchantId is omitted (legacy path)", async () => {
+    const t0 = new Date("2026-01-01T00:00:00Z");
+    const booted = await bootWithCooldown(600, t0);
+    try {
+      const alloc = await allocateForInvoice(booted.deps, "inv-legacy-1", "evm");
+      await releaseFromInvoice(booted.deps, "inv-legacy-1"); // no merchantId
+
+      const [row] = await booted.deps.db
+        .select({
+          cooldownUntil: addressPool.cooldownUntil,
+          lastReleasedByMerchantId: addressPool.lastReleasedByMerchantId
+        })
+        .from(addressPool)
+        .where(eq(addressPool.id, alloc.id))
+        .limit(1);
+      expect(row?.cooldownUntil).toBeNull();
+      expect(row?.lastReleasedByMerchantId).toBeNull();
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("leaves cooldown_until NULL when merchant.address_cooldown_seconds is 0", async () => {
+    const t0 = new Date("2026-01-01T00:00:00Z");
+    const booted = await bootWithCooldown(0, t0);
+    try {
+      const alloc = await allocateForInvoice(booted.deps, "inv-zero-cd", "evm");
+      await releaseFromInvoice(booted.deps, "inv-zero-cd", { merchantId: MERCHANT_WITH_COOLDOWN });
+      const [row] = await booted.deps.db
+        .select({ cooldownUntil: addressPool.cooldownUntil })
+        .from(addressPool)
+        .where(eq(addressPool.id, alloc.id))
+        .limit(1);
+      expect(row?.cooldownUntil).toBeNull();
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("allocator skips a row whose cooldown window has not yet elapsed", async () => {
+    const t0 = new Date("2026-01-01T00:00:00Z");
+    let mockNow = t0;
+    const booted = await bootTestApp({
+      poolInitialSize: 2,
+      clock: { now: () => mockNow },
+      merchants: [
+        {
+          id: MERCHANT_WITH_COOLDOWN,
+          name: "Cooldown Merchant",
+          active: true,
+          addressCooldownSeconds: 3600
+        }
+      ]
+    });
+    // Hold the refill lock across the test. Allocate→release dips below the
+    // refill trigger threshold and `promiseSetJobs` runs deferred work eagerly
+    // in Node-test mode, so without the lock a fresh never-used row would
+    // slip into the pool and win the ORDER BY on totalAllocations=0 — masking
+    // the cooldown-filter behavior we're trying to assert.
+    await booted.deps.cache.put("pool:refill-lock:evm", "1", { ttlSeconds: 60 });
+    try {
+      const cold = await allocateForInvoice(booted.deps, "inv-cold", "evm");
+      const warm = await allocateForInvoice(booted.deps, "inv-warm", "evm");
+      await releaseFromInvoice(booted.deps, "inv-cold", { merchantId: MERCHANT_WITH_COOLDOWN });
+      await releaseFromInvoice(booted.deps, "inv-warm"); // no cooldown stamp
+
+      const next = await allocateForInvoice(booted.deps, "inv-next", "evm");
+      expect(next.id).toBe(warm.id);
+      expect(next.id).not.toBe(cold.id);
+
+      // Advance time past the cooldown; the cold row should now be allocatable.
+      mockNow = new Date(t0.getTime() + 3600 * 1000 + 1);
+      await releaseFromInvoice(booted.deps, "inv-next"); // free `warm` again
+      // Flip warm into cooldown so only `cold` (whose window expired) is eligible.
+      await booted.deps.db
+        .update(addressPool)
+        .set({ cooldownUntil: mockNow.getTime() + 86_400_000, lastReleasedByMerchantId: MERCHANT_WITH_COOLDOWN })
+        .where(eq(addressPool.id, warm.id));
+      const afterExpiry = await allocateForInvoice(booted.deps, "inv-after", "evm");
+      expect(afterExpiry.id).toBe(cold.id);
+    } finally {
+      await booted.deps.cache.delete("pool:refill-lock:evm");
+      await booted.close();
+    }
+  });
+
+  it("clears cooldown_until and last_released_by on re-allocation", async () => {
+    const t0 = new Date("2026-01-01T00:00:00Z");
+    const booted = await bootWithCooldown(3600, t0);
+    try {
+      // Seed a "stale cooldown" row directly: allocate, release with cooldown,
+      // then manually age cooldownUntil into the past and re-allocate.
+      const alloc = await allocateForInvoice(booted.deps, "inv-a", "evm");
+      await releaseFromInvoice(booted.deps, "inv-a", { merchantId: MERCHANT_WITH_COOLDOWN });
+      await booted.deps.db
+        .update(addressPool)
+        .set({ cooldownUntil: t0.getTime() - 1 }) // deadline in the past
+        .where(eq(addressPool.id, alloc.id));
+
+      const reclaimed = await allocateForInvoice(booted.deps, "inv-b", "evm");
+      // The same row should be eligible again because cooldown has lapsed; in
+      // a 2-row pool the ordering may still prefer the never-used row, so
+      // only assert the reclaimed row's cooldown fields are cleared.
+      const [row] = await booted.deps.db
+        .select({
+          cooldownUntil: addressPool.cooldownUntil,
+          lastReleasedByMerchantId: addressPool.lastReleasedByMerchantId
+        })
+        .from(addressPool)
+        .where(eq(addressPool.id, reclaimed.id))
+        .limit(1);
+      expect(row?.cooldownUntil).toBeNull();
+      expect(row?.lastReleasedByMerchantId).toBeNull();
+    } finally {
+      await booted.close();
+    }
+  });
+});

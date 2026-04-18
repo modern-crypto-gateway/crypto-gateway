@@ -1,10 +1,10 @@
-import { and, asc, count, eq, inArray, isNull, lt, max, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNull, lt, lte, max, notInArray, or, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { PoolExhaustedError } from "../errors.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import type { ChainFamily } from "../types/chain.js";
 import type { PoolAddress, PoolFamilyStats } from "../types/pool.js";
-import { addressPool, invoices } from "../../db/schema.js";
+import { addressPool, invoices, merchants } from "../../db/schema.js";
 
 // Address pool: shared-across-merchants, HD-derived, reused across invoices.
 //
@@ -109,7 +109,15 @@ export async function allocateForInvoice(
         addressIndex: addressPool.addressIndex
       })
       .from(addressPool)
-      .where(and(eq(addressPool.family, family), eq(addressPool.status, "available")))
+      .where(
+        and(
+          eq(addressPool.family, family),
+          eq(addressPool.status, "available"),
+          // Cooldown filter: skip rows whose previous owner asked us to park
+          // them. NULL or past deadlines are immediately eligible.
+          or(isNull(addressPool.cooldownUntil), lte(addressPool.cooldownUntil, now))
+        )
+      )
       // Ordering rationale:
       //   1. totalAllocations ASC — never-used rows (count=0) win first.
       //   2. lastReleasedAt ASC NULLS FIRST — among rows with equal use count,
@@ -140,7 +148,15 @@ export async function allocateForInvoice(
 
     const [claim] = await deps.db
       .update(addressPool)
-      .set({ status: "allocated", allocatedToInvoiceId: invoiceId, allocatedAt: now })
+      .set({
+        status: "allocated",
+        allocatedToInvoiceId: invoiceId,
+        allocatedAt: now,
+        // Clear release-side metadata so the next release re-stamps it
+        // with the new owner's cooldown window.
+        cooldownUntil: null,
+        lastReleasedByMerchantId: null
+      })
       .where(and(eq(addressPool.id, candidate.id), eq(addressPool.status, "available")))
       .returning();
 
@@ -163,10 +179,19 @@ export async function allocateForInvoice(
 
 // Release all pool rows tied to `invoiceId` back to 'available'. Called when
 // an invoice reaches a terminal state (confirmed/expired/canceled). Bumps
-// total_allocations on each released row so the fair-rotation ordering
-// moves it to the back of the queue.
-export async function releaseFromInvoice(deps: AppDeps, invoiceId: string): Promise<void> {
+// total_allocations on each released row so the fair-rotation ordering moves
+// it to the back of the queue. When `merchantId` is provided, the merchant's
+// `address_cooldown_seconds` is read and stamped onto each released row as
+// `cooldown_until = now + cooldown_seconds * 1000`, alongside
+// `last_released_by_merchant_id`. Late payments arriving during the cooldown
+// land as orphans tied (by inference) to that merchant for admin attribution.
+export async function releaseFromInvoice(
+  deps: AppDeps,
+  invoiceId: string,
+  options: { merchantId?: string } = {}
+): Promise<void> {
   const now = deps.clock.now().getTime();
+  const cooldownUntil = await resolveCooldownUntil(deps, options.merchantId, now);
   await deps.db
     .update(addressPool)
     .set({
@@ -174,9 +199,30 @@ export async function releaseFromInvoice(deps: AppDeps, invoiceId: string): Prom
       allocatedToInvoiceId: null,
       allocatedAt: null,
       totalAllocations: sql`${addressPool.totalAllocations} + 1`,
-      lastReleasedAt: now
+      lastReleasedAt: now,
+      cooldownUntil,
+      lastReleasedByMerchantId: options.merchantId ?? null
     })
     .where(eq(addressPool.allocatedToInvoiceId, invoiceId));
+}
+
+// Lookup `merchant.address_cooldown_seconds` and project to an absolute
+// deadline. Returns null when no merchant context is supplied (test paths,
+// compensating-release pre-commit) or when the merchant disables cooldown.
+async function resolveCooldownUntil(
+  deps: AppDeps,
+  merchantId: string | undefined,
+  now: number
+): Promise<number | null> {
+  if (!merchantId) return null;
+  const [row] = await deps.db
+    .select({ seconds: merchants.addressCooldownSeconds })
+    .from(merchants)
+    .where(eq(merchants.id, merchantId))
+    .limit(1);
+  const seconds = row?.seconds ?? 0;
+  if (seconds <= 0) return null;
+  return now + seconds * 1000;
 }
 
 // Grace period before an `allocated` row is treated as orphaned. Long enough
@@ -248,7 +294,12 @@ export async function reconcileOrphanedAllocations(
       allocatedToInvoiceId: null,
       allocatedAt: null,
       totalAllocations: sql`${addressPool.totalAllocations} + 1`,
-      lastReleasedAt: now
+      lastReleasedAt: now,
+      // The reconciler doesn't have invoice→merchant context here; releasing
+      // without a cooldown stamp matches existing behavior, and merchants
+      // who depend on cooldown still get it on the normal event-bus path.
+      cooldownUntil: null,
+      lastReleasedByMerchantId: null
     })
     .where(
       and(
@@ -289,7 +340,13 @@ export async function reacquireForInvoice(
   for (const address of addresses) {
     const updated = await deps.db
       .update(addressPool)
-      .set({ status: "allocated", allocatedToInvoiceId: invoiceId, allocatedAt: now })
+      .set({
+        status: "allocated",
+        allocatedToInvoiceId: invoiceId,
+        allocatedAt: now,
+        cooldownUntil: null,
+        lastReleasedByMerchantId: null
+      })
       .where(and(eq(addressPool.address, address), eq(addressPool.status, "available")))
       .returning({ id: addressPool.id });
     if (updated.length > 0) {
@@ -396,9 +453,9 @@ export async function refillFamily(
 // terminal state. Installed once per buildApp; unsubscriber returned so tests
 // can tear down cleanly.
 export function registerPoolReleaseHandler(deps: AppDeps): () => void {
-  const handler = async (event: { invoice: { id: string } }): Promise<void> => {
+  const handler = async (event: { invoice: { id: string; merchantId: string } }): Promise<void> => {
     try {
-      await releaseFromInvoice(deps, event.invoice.id);
+      await releaseFromInvoice(deps, event.invoice.id, { merchantId: event.invoice.merchantId });
     } catch (err) {
       deps.logger.error("pool release failed on invoice terminal transition", {
         invoiceId: event.invoice.id,

@@ -52,6 +52,7 @@ export interface BootTestAppOptions {
     webhookSecret?: string;
     paymentToleranceUnderBps?: number;
     paymentToleranceOverBps?: number;
+    addressCooldownSeconds?: number;
   }>;
   // Rate-limit overrides. Defaults are set high enough that existing integration
   // tests never trip them; rate-limit-specific tests pass small numbers here.
@@ -185,6 +186,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
       active: m.active === false ? 0 : 1,
       paymentToleranceUnderBps: m.paymentToleranceUnderBps ?? 0,
       paymentToleranceOverBps: m.paymentToleranceOverBps ?? 0,
+      addressCooldownSeconds: m.addressCooldownSeconds ?? 0,
       createdAt: seedNow,
       updatedAt: seedNow
     });

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
 import type { ChainFamily } from "../types/chain.js";
@@ -15,7 +15,7 @@ import {
 import { confirmationThreshold } from "./payment-config.js";
 import { reacquireForInvoice } from "./pool.service.js";
 import { addUsd, applyBps, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
-import { invoices, invoiceReceiveAddresses, transactions } from "../../db/schema.js";
+import { addressPool, invoices, invoiceReceiveAddresses, transactions } from "../../db/schema.js";
 
 type InvoiceRow = typeof invoices.$inferSelect;
 
@@ -55,22 +55,55 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   // multi-family invoices work — a USDC transfer on Polygon (chainId 137)
   // matches an invoice with `family='evm', address='0xABC'` whether the
   // invoice's primary chain was Ethereum or Arbitrum or any other EVM
-  // chain. Transfers to addresses the gateway doesn't own still get
-  // recorded with invoice_id=NULL (orphaned-transfer audit).
+  // chain.
+  //
+  // Ordering rationale: an address can have been tied to multiple invoices
+  // across time (pool reuse). Prefer the currently-active invoice (created /
+  // partial / detected); if none, prefer the most-recent terminal one so
+  // cooldown-bounded late-payment attribution lands on the right merchant.
+  // A terminal match only stands when the pool row is still in cooldown —
+  // past that, we treat the transfer as an orphan (invoiceId=NULL,
+  // status='orphaned') so it doesn't auto-credit an expired invoice whose
+  // merchant may no longer own the address.
   const family = chainAdapter.family;
-  const [matched] = await deps.db
+  const candidates = await deps.db
     .select({ invoice: invoices })
     .from(invoices)
     .innerJoin(invoiceReceiveAddresses, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
     .where(and(eq(invoiceReceiveAddresses.address, canonicalTo), eq(invoiceReceiveAddresses.family, family)))
+    .orderBy(
+      // Non-terminal invoices first. SQLite has no boolean sort so we materialize
+      // a CASE expression and ASC-sort it.
+      sql`CASE WHEN ${invoices.status} IN ('created','partial','detected','confirmed','overpaid') THEN 0 ELSE 1 END`,
+      desc(invoices.createdAt)
+    )
     .limit(1);
-  const invoiceRow: InvoiceRow | null = matched ? matched.invoice : null;
+  const topCandidate: InvoiceRow | null = candidates[0] ? candidates[0].invoice : null;
+
+  // Cooldown-aware attribution: if the top candidate is a terminal invoice
+  // (expired / canceled), we only credit it when the pool row for this
+  // address is still inside its cooldown window. Otherwise the transfer
+  // records as an orphan for admin reconciliation.
+  let invoiceRow: InvoiceRow | null = topCandidate;
+  if (topCandidate !== null && ADMIN_TERMINAL_STATES.has(topCandidate.status as InvoiceStatus)) {
+    const inCooldown = await isAddressInCooldown(deps, family, canonicalTo);
+    if (!inCooldown) invoiceRow = null;
+  }
 
   const invoiceId: string | null = invoiceRow ? invoiceRow.id : null;
+  // Orphaned transfers land with invoice_id NULL and status='orphaned' so
+  // the admin queue (via idx_transactions_orphans_open) surfaces them for
+  // attribution or dismissal. Matched transfers follow the normal
+  // detected → confirmed lifecycle.
+  const isOrphanRow = invoiceRow === null;
 
-  // Decide initial tx status using the reported confirmation count.
+  // Decide initial tx status using the reported confirmation count. Orphaned
+  // transfers (no invoice match under cooldown rules) bypass the detected →
+  // confirmed track entirely and land as 'orphaned' for admin attribution.
   const threshold = confirmationThreshold(transfer.chainId, deps.confirmationThresholds);
-  const initialStatus: TxStatus = transfer.confirmations >= threshold ? "confirmed" : "detected";
+  const initialStatus: TxStatus = isOrphanRow
+    ? "orphaned"
+    : (transfer.confirmations >= threshold ? "confirmed" : "detected");
   const now = deps.clock.now().getTime();
   const txId = globalThis.crypto.randomUUID();
 
@@ -138,9 +171,15 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
 
   const tx = drizzleRowToTransaction(txInsert as typeof transactions.$inferSelect);
 
-  await deps.events.publish({ type: "tx.detected", txId: tx.id, tx, at: new Date(now) });
-  if (initialStatus === "confirmed") {
-    await deps.events.publish({ type: "tx.confirmed", txId: tx.id, tx, at: new Date(now) });
+  // Orphans are admin-private: no tx.detected / tx.confirmed fan-out, no
+  // invoice-level webhooks. The row is written (with invoice_id=NULL and
+  // status='orphaned') so the admin queue can surface it for attribution or
+  // dismissal; until then, no merchant signal fires.
+  if (!isOrphanRow) {
+    await deps.events.publish({ type: "tx.detected", txId: tx.id, tx, at: new Date(now) });
+    if (initialStatus === "confirmed") {
+      await deps.events.publish({ type: "tx.confirmed", txId: tx.id, tx, at: new Date(now) });
+    }
   }
 
   if (!invoiceRow) {
@@ -211,6 +250,28 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     invoiceStatusBefore: before,
     invoiceStatusAfter: after
   };
+}
+
+// True iff the pool row for (family, address) is still in its cooldown
+// window. Used by the ingest matcher to decide whether a transfer should
+// credit a recently-terminal invoice (cooldown active) or land as an orphan
+// (cooldown elapsed / no pool row). Absence of a pool row (e.g. fee wallets,
+// externally-owned addresses) returns false — those aren't owned by the
+// cooldown lifecycle.
+async function isAddressInCooldown(
+  deps: AppDeps,
+  family: ChainFamily,
+  address: string
+): Promise<boolean> {
+  const now = deps.clock.now().getTime();
+  const [row] = await deps.db
+    .select({ cooldownUntil: addressPool.cooldownUntil })
+    .from(addressPool)
+    .where(and(eq(addressPool.family, family), eq(addressPool.address, address)))
+    .limit(1);
+  if (!row) return false;
+  if (row.cooldownUntil === null) return false;
+  return row.cooldownUntil > now;
 }
 
 // Parse the `accepted_families` JSON column. Null (legacy single-family
@@ -518,13 +579,24 @@ export async function recheckConfirmedTransactionsForReorg(
 
 // ---- Internal: recompute invoice state from its contributing transactions ----
 
-async function recomputeInvoiceFromTransactions(
+export interface RecomputeOptions {
+  // Admin-driven override: when true, the recompute is allowed to leave the
+  // ADMIN_TERMINAL_STATES set (expired / canceled) IF the contributing txs
+  // total clears the invoice's confirm bar (with bps tolerance). Partial
+  // credits against a terminal invoice are refused — the invoice stays
+  // expired / canceled. Called from the admin "attribute orphan" route
+  // after it re-points a transaction row at the target invoice.
+  viaAdminOverride?: boolean;
+}
+
+export async function recomputeInvoiceFromTransactions(
   deps: AppDeps,
   invoiceRow: InvoiceRow,
-  now: number
+  now: number,
+  options: RecomputeOptions = {}
 ): Promise<InvoiceStatus> {
   const before = invoiceRow.status as InvoiceStatus;
-  if (ADMIN_TERMINAL_STATES.has(before)) {
+  if (ADMIN_TERMINAL_STATES.has(before) && !options.viaAdminOverride) {
     // `expired` / `canceled` are frozen. Late transfers still get inserted
     // into `transactions` (audit), but they don't change the invoice state.
     // `confirmed` / `overpaid` invoices fall through — if a reorg orphaned a
@@ -536,7 +608,7 @@ async function recomputeInvoiceFromTransactions(
   // single-token invoices keep summing `amount_raw`. Branch early so the two
   // code paths stay legible.
   if (invoiceRow.amountUsd !== null) {
-    return recomputeUsdInvoice(deps, invoiceRow, now);
+    return recomputeUsdInvoice(deps, invoiceRow, now, options);
   }
 
   // Sum across contributing txs. We include both 'detected' and 'confirmed'
@@ -572,6 +644,18 @@ async function recomputeInvoiceFromTransactions(
     // "created" is the clean structural match: no valid pending inbound
     // transfers.
     after = "created";
+  }
+
+  // Admin override against a terminal invoice: only full-amount credits can
+  // lift the invoice out of expired / canceled. Partial credits stay parked
+  // — the merchant's decision to expire/cancel stands when the payment
+  // doesn't clear the bar.
+  if (
+    options.viaAdminOverride &&
+    ADMIN_TERMINAL_STATES.has(before) &&
+    after !== "confirmed"
+  ) {
+    after = before;
   }
 
   // Persist: always update received_amount_raw; update status only when changed.
@@ -671,7 +755,8 @@ async function recomputeInvoiceFromTransactions(
 async function recomputeUsdInvoice(
   deps: AppDeps,
   invoiceRow: InvoiceRow,
-  now: number
+  now: number,
+  options: RecomputeOptions = {}
 ): Promise<InvoiceStatus> {
   const before = invoiceRow.status as InvoiceStatus;
 
@@ -719,6 +804,19 @@ async function recomputeUsdInvoice(
     // as transactions but don't move the invoice off `created` / whatever
     // prior.
     after = "created";
+  }
+
+  // Admin override against a terminal invoice: only credits that clear the
+  // confirm bar (confirmed or overpaid) flip the invoice out of expired /
+  // canceled. `partial` / `created` leave the merchant's prior decision in
+  // place.
+  if (
+    options.viaAdminOverride &&
+    ADMIN_TERMINAL_STATES.has(before) &&
+    after !== "confirmed" &&
+    after !== "overpaid"
+  ) {
+    after = before;
   }
 
   // Always update paid_usd / overpaid_usd (even on same-status) so merchant

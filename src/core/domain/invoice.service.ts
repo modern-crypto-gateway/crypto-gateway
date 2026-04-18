@@ -308,8 +308,11 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
   } catch (err) {
     // Compensating release: any throw above leaves zero or more pool rows
     // tagged with this invoiceId but no matching invoice row. Release them
-    // before returning the duplicate or rethrowing.
-    await releaseFromInvoice(deps, invoiceId);
+    // before returning the duplicate or rethrowing. Pass merchantId so the
+    // cooldown stamp matches what a successful release would write — a
+    // late payment that arrives despite the failed create still parks the
+    // address for this merchant rather than handing it to the next caller.
+    await releaseFromInvoice(deps, invoiceId, { merchantId: parsed.merchantId });
 
     // Race with the step-1b idempotency check: another concurrent create
     // beat us to the unique index. Return the winner's invoice — same

@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { eq } from "drizzle-orm";
+import { and, asc, desc, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
 import type { AppDeps } from "../../core/app-deps.js";
 import {
@@ -10,7 +10,14 @@ import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import { registerFeeWallet } from "../../core/domain/payout.service.js";
 import { feeWalletIndex } from "../../adapters/signer-store/hd.adapter.js";
 import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
+import {
+  ingestDetectedTransfer,
+  recomputeInvoiceFromTransactions
+} from "../../core/domain/payment.service.js";
+import { confirmationThreshold } from "../../core/domain/payment-config.js";
 import { ChainFamilySchema, type ChainFamily, type ChainId } from "../../core/types/chain.js";
+import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
+import type { TokenSymbol } from "../../core/types/token.js";
 import { sha256Hex, bytesToHex, getRandomValues } from "../../adapters/crypto/subtle.js";
 import { parseAlchemyChainsEnv } from "../../adapters/chains/evm/alchemy-rpc.js";
 import {
@@ -22,7 +29,7 @@ import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registr
 import { readAlchemyNotifyToken } from "../../adapters/detection/alchemy-token.js";
 import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
 import { migrate as drizzleMigrate } from "drizzle-orm/libsql/migrator";
-import { merchants } from "../../db/schema.js";
+import { invoices, merchants, transactions } from "../../db/schema.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
@@ -30,6 +37,11 @@ import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
 // Operator-only surface. All routes require the shared admin key; the rest of
 // the gateway authenticates merchants via their own API key. Keep this
 // intentionally narrow — every endpoint here is a sharp edge.
+
+// Maximum cooldown an operator can configure: 7 days. Long enough to cover
+// any realistic late-payment window for a long-tail customer; short enough
+// to bound how long an address can be parked from the pool's perspective.
+const MAX_ADDRESS_COOLDOWN_SECONDS = 7 * 24 * 60 * 60;
 
 const CreateMerchantSchema = z.object({
   name: z.string().min(1).max(128),
@@ -42,18 +54,26 @@ const CreateMerchantSchema = z.object({
   //   over:  paid_usd ≤ amount_usd × (1 + over /10_000) closes as confirmed
   // Capped at 2000 bps (20%); omit either to default to 0 (strict).
   paymentToleranceUnderBps: z.number().int().min(0).max(2000).optional(),
-  paymentToleranceOverBps: z.number().int().min(0).max(2000).optional()
+  paymentToleranceOverBps: z.number().int().min(0).max(2000).optional(),
+  // Address-pool cooldown in seconds. After an invoice reaches a terminal
+  // state, the pool address it held cannot be re-allocated to a different
+  // invoice for this many seconds. Late payments arriving during the
+  // cooldown still credit the original invoice via the orphan + admin-
+  // attribute path. 0 (default) preserves legacy immediate-reuse behavior.
+  addressCooldownSeconds: z.number().int().min(0).max(MAX_ADDRESS_COOLDOWN_SECONDS).optional()
 });
 
 const UpdateMerchantSchema = z
   .object({
     paymentToleranceUnderBps: z.number().int().min(0).max(2000).optional(),
-    paymentToleranceOverBps: z.number().int().min(0).max(2000).optional()
+    paymentToleranceOverBps: z.number().int().min(0).max(2000).optional(),
+    addressCooldownSeconds: z.number().int().min(0).max(MAX_ADDRESS_COOLDOWN_SECONDS).optional()
   })
   .refine(
     (v) =>
       v.paymentToleranceUnderBps !== undefined ||
-      v.paymentToleranceOverBps !== undefined,
+      v.paymentToleranceOverBps !== undefined ||
+      v.addressCooldownSeconds !== undefined,
     { message: "PATCH body must contain at least one updatable field" }
   );
 
@@ -96,6 +116,28 @@ const RegisterSigningKeySchema = z.object({
   // Must match GATEWAY_PUBLIC_URL/webhooks/alchemy in practice. Stored for
   // operator visibility (registry list endpoints, debugging).
   webhookUrl: z.string().url()
+});
+
+const AttributeOrphanSchema = z.object({
+  invoiceId: z.string().uuid()
+});
+
+// Free-text reason capped at 512 chars — enough for "customer refund issued
+// out-of-band, see ticket #123" without letting the admin queue become a
+// log-dump target.
+const DismissOrphanSchema = z.object({
+  reason: z.string().min(1).max(512)
+});
+
+// Audit a single address against the chain: re-runs the scan, diffs against
+// transactions already stored, and ingests the missing rows through the
+// normal ingest path (so orphan / cooldown rules apply identically).
+// sinceMs defaults to 30 days back — generous enough for operator forensic
+// work; the adapter still clamps to its own per-chain max scan window.
+const AuditAddressSchema = z.object({
+  chainId: z.number().int().positive(),
+  address: z.string().min(1).max(128),
+  sinceMs: z.number().int().min(0).optional()
 });
 
 // Router options allow tests to inject a fake Alchemy admin client without
@@ -169,6 +211,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
 
       const paymentToleranceUnderBps = parsed.paymentToleranceUnderBps ?? 0;
       const paymentToleranceOverBps = parsed.paymentToleranceOverBps ?? 0;
+      const addressCooldownSeconds = parsed.addressCooldownSeconds ?? 0;
       await deps.db.insert(merchants).values({
         id,
         name: parsed.name,
@@ -178,6 +221,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         active: 1,
         paymentToleranceUnderBps,
         paymentToleranceOverBps,
+        addressCooldownSeconds,
         createdAt: now,
         updatedAt: now
       });
@@ -191,6 +235,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
             active: true,
             paymentToleranceUnderBps,
             paymentToleranceOverBps,
+            addressCooldownSeconds,
             createdAt: new Date(now).toISOString()
           },
           // Plaintext API key returned once — never recoverable after this response.
@@ -222,6 +267,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       const patch: Partial<{
         paymentToleranceUnderBps: number;
         paymentToleranceOverBps: number;
+        addressCooldownSeconds: number;
         updatedAt: number;
       }> = { updatedAt: now };
       if (parsed.paymentToleranceUnderBps !== undefined) {
@@ -229,6 +275,9 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       }
       if (parsed.paymentToleranceOverBps !== undefined) {
         patch.paymentToleranceOverBps = parsed.paymentToleranceOverBps;
+      }
+      if (parsed.addressCooldownSeconds !== undefined) {
+        patch.addressCooldownSeconds = parsed.addressCooldownSeconds;
       }
       const [row] = await deps.db
         .update(merchants)
@@ -250,6 +299,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
             active: row.active === 1,
             paymentToleranceUnderBps: row.paymentToleranceUnderBps,
             paymentToleranceOverBps: row.paymentToleranceOverBps,
+            addressCooldownSeconds: row.addressCooldownSeconds,
             updatedAt: new Date(row.updatedAt).toISOString()
           }
         },
@@ -544,6 +594,321 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     }
     deps.logger.info("webhook delivery replay queued", { deliveryId: id });
     return c.json({ replayed: { id, nextAttemptAt: now } }, 200);
+  });
+
+  // Orphan transaction queue. An "orphan" is a confirmed/detected transfer
+  // that landed on an address with no active invoice claim (and outside any
+  // cooldown window). The ingest path writes these as `status='orphaned'`,
+  // `invoice_id=NULL` so admins can either:
+  //   - attribute the row to a specific invoice (re-points invoice_id, then
+  //     recomputes the invoice with viaAdminOverride so even an expired /
+  //     canceled invoice can flip to confirmed when the credit clears its
+  //     bar), or
+  //   - dismiss the row with a free-text reason (audit trail; the tx still
+  //     exists, the partial index just hides it from the queue).
+  //
+  // The list query is backed by `idx_transactions_orphans_open`
+  // (chain_id, detected_at) WHERE invoice_id IS NULL AND dismissed_at IS NULL.
+  app.get("/orphan-transactions", async (c) => {
+    const chainIdParam = c.req.query("chainId");
+    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "50"), 1), 500);
+    const offset = Math.max(Number(c.req.query("offset") ?? "0"), 0);
+
+    const filters = [isNull(transactions.invoiceId), isNull(transactions.dismissedAt)];
+    if (chainIdParam !== undefined) {
+      const n = Number(chainIdParam);
+      if (!Number.isFinite(n) || n <= 0) {
+        return c.json(
+          { error: { code: "BAD_CHAIN_ID", message: "chainId must be a positive integer" } },
+          400
+        );
+      }
+      filters.push(eq(transactions.chainId, n));
+    }
+
+    const rows = await deps.db
+      .select()
+      .from(transactions)
+      .where(and(...filters))
+      .orderBy(desc(transactions.detectedAt), asc(transactions.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json(
+      {
+        orphans: rows.map((row) => ({
+          id: row.id,
+          chainId: row.chainId,
+          txHash: row.txHash,
+          logIndex: row.logIndex,
+          fromAddress: row.fromAddress,
+          toAddress: row.toAddress,
+          token: row.token,
+          amountRaw: row.amountRaw,
+          amountUsd: row.amountUsd,
+          usdRate: row.usdRate,
+          blockNumber: row.blockNumber,
+          confirmations: row.confirmations,
+          status: row.status,
+          detectedAt: new Date(row.detectedAt).toISOString()
+        }))
+      },
+      200
+    );
+  });
+
+  app.post("/orphan-transactions/:id/attribute", async (c) => {
+    const id = c.req.param("id");
+    const body = (await c.req.json().catch(() => null)) as unknown;
+    if (body === null) {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const parsed = AttributeOrphanSchema.parse(body);
+      const now = deps.clock.now().getTime();
+
+      const [orphan] = await deps.db
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, id))
+        .limit(1);
+      if (!orphan) {
+        return c.json(
+          { error: { code: "ORPHAN_NOT_FOUND", message: `No transaction with id ${id}` } },
+          404
+        );
+      }
+      if (orphan.invoiceId !== null) {
+        return c.json(
+          {
+            error: {
+              code: "NOT_ORPHAN",
+              message: "Transaction already attributed to an invoice; cannot re-attribute."
+            }
+          },
+          409
+        );
+      }
+      if (orphan.dismissedAt !== null) {
+        return c.json(
+          {
+            error: {
+              code: "ORPHAN_DISMISSED",
+              message: "Transaction was previously dismissed; un-dismiss before attributing."
+            }
+          },
+          409
+        );
+      }
+
+      const [invoiceRow] = await deps.db
+        .select()
+        .from(invoices)
+        .where(eq(invoices.id, parsed.invoiceId))
+        .limit(1);
+      if (!invoiceRow) {
+        return c.json(
+          { error: { code: "INVOICE_NOT_FOUND", message: `No invoice with id ${parsed.invoiceId}` } },
+          404
+        );
+      }
+
+      // Promote orphan → detected/confirmed based on its existing confirmation
+      // count vs the chain's threshold. Skips the per-tx event publish: the
+      // recompute below fires the invoice-level lifecycle event, which is the
+      // only signal merchants need for an admin-driven credit.
+      const threshold = confirmationThreshold(orphan.chainId, deps.confirmationThresholds);
+      const newStatus = orphan.confirmations >= threshold ? "confirmed" : "detected";
+      const confirmedAt = newStatus === "confirmed" ? (orphan.confirmedAt ?? now) : orphan.confirmedAt;
+
+      await deps.db
+        .update(transactions)
+        .set({
+          invoiceId: parsed.invoiceId,
+          status: newStatus,
+          confirmedAt
+        })
+        .where(eq(transactions.id, id));
+
+      const before = invoiceRow.status;
+      const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, now, {
+        viaAdminOverride: true
+      });
+
+      deps.logger.info("orphan attributed by admin", {
+        txId: id,
+        invoiceId: parsed.invoiceId,
+        merchantId: invoiceRow.merchantId,
+        before,
+        after
+      });
+
+      return c.json(
+        {
+          attribution: {
+            txId: id,
+            invoiceId: parsed.invoiceId,
+            invoiceStatusBefore: before,
+            invoiceStatusAfter: after
+          }
+        },
+        200
+      );
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  app.post("/orphan-transactions/:id/dismiss", async (c) => {
+    const id = c.req.param("id");
+    const body = (await c.req.json().catch(() => null)) as unknown;
+    if (body === null) {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const parsed = DismissOrphanSchema.parse(body);
+      const now = deps.clock.now().getTime();
+
+      const [orphan] = await deps.db
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, id))
+        .limit(1);
+      if (!orphan) {
+        return c.json(
+          { error: { code: "ORPHAN_NOT_FOUND", message: `No transaction with id ${id}` } },
+          404
+        );
+      }
+      if (orphan.invoiceId !== null) {
+        return c.json(
+          {
+            error: {
+              code: "NOT_ORPHAN",
+              message: "Transaction is attributed to an invoice; dismiss only applies to orphans."
+            }
+          },
+          409
+        );
+      }
+      if (orphan.dismissedAt !== null) {
+        return c.json(
+          {
+            error: {
+              code: "ALREADY_DISMISSED",
+              message: "Orphan was already dismissed."
+            }
+          },
+          409
+        );
+      }
+
+      await deps.db
+        .update(transactions)
+        .set({ dismissedAt: now, dismissReason: parsed.reason })
+        .where(eq(transactions.id, id));
+
+      deps.logger.info("orphan dismissed by admin", {
+        txId: id,
+        chainId: orphan.chainId,
+        reason: parsed.reason
+      });
+
+      return c.json(
+        {
+          dismissal: {
+            txId: id,
+            dismissedAt: new Date(now).toISOString(),
+            reason: parsed.reason
+          }
+        },
+        200
+      );
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Manual on-chain backfill for a specific address. Calls the chain
+  // adapter's scanIncoming for this (address, token-set) over the requested
+  // window, diffs the results against what's already in `transactions`, and
+  // ingests the missing rows via ingestDetectedTransfer — so normal orphan /
+  // cooldown / invoice-match rules apply identically to push-ingested rows.
+  //
+  // Operator use: "merchant complained a payment never showed up; verify the
+  // gateway saw everything that actually hit their receive address". The
+  // endpoint is idempotent — already-stored txs are silently skipped via the
+  // UNIQUE (chain_id, tx_hash, log_index) constraint.
+  app.post("/audit-address", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as unknown;
+    if (body === null) {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const parsed = AuditAddressSchema.parse(body);
+      const chainAdapter = findChainAdapter(deps, parsed.chainId);
+      const canonical = chainAdapter.canonicalizeAddress(parsed.address);
+
+      // Default lookback: 30 days. Long enough for forensic work on a
+      // customer complaint that took a few weeks to surface; the adapter's
+      // own per-chain max-scan window still clamps the final range.
+      const sinceMs = parsed.sinceMs ?? deps.clock.now().getTime() - 30 * 24 * 60 * 60 * 1000;
+
+      // Every known token on this chain + the native symbol. Tokens not
+      // held by the address produce zero-hit scans (cheap for EVM's
+      // per-contract log query, free for Tron/Solana's address-scoped APIs).
+      const registeredTokens = TOKEN_REGISTRY.filter((t) => t.chainId === parsed.chainId).map(
+        (t) => t.symbol
+      );
+      const nativeSymbol = chainAdapter.nativeSymbol(parsed.chainId as ChainId);
+      const tokens = Array.from(new Set<TokenSymbol>([...registeredTokens, nativeSymbol]));
+
+      const transfers = await chainAdapter.scanIncoming({
+        chainId: parsed.chainId as ChainId,
+        addresses: [canonical],
+        tokens,
+        sinceMs
+      });
+
+      let inserted = 0;
+      let alreadyPresent = 0;
+      const insertedTxIds: string[] = [];
+      for (const transfer of transfers) {
+        const result = await ingestDetectedTransfer(deps, transfer);
+        if (result.inserted) {
+          inserted += 1;
+          if (result.transactionId !== undefined) insertedTxIds.push(result.transactionId);
+        } else {
+          alreadyPresent += 1;
+        }
+      }
+
+      deps.logger.info("audit-address completed", {
+        chainId: parsed.chainId,
+        address: canonical,
+        sinceMs,
+        scanned: transfers.length,
+        inserted,
+        alreadyPresent
+      });
+
+      return c.json(
+        {
+          audit: {
+            chainId: parsed.chainId,
+            address: canonical,
+            sinceMs,
+            scanned: transfers.length,
+            inserted,
+            alreadyPresent,
+            insertedTxIds
+          }
+        },
+        200
+      );
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
   });
 
   // Runtime migration apply. Node/Deno already run migrations at boot — this

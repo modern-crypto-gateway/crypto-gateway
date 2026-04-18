@@ -66,9 +66,9 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Postman Test Merchant\",\n  \"webhookUrl\": \"https://merchant.example.com/crypto-gateway/webhook\",\n  \"paymentToleranceUnderBps\": 0,\n  \"paymentToleranceOverBps\": 0\n}"
+              "raw": "{\n  \"name\": \"Postman Test Merchant\",\n  \"webhookUrl\": \"https://merchant.example.com/crypto-gateway/webhook\",\n  \"paymentToleranceUnderBps\": 0,\n  \"paymentToleranceOverBps\": 0,\n  \"addressCooldownSeconds\": 0\n}"
             },
-            "description": "Creates a merchant and returns the plaintext `apiKey` (saved into env) + plaintext `webhookSecret` (saved into env). Neither is recoverable afterward — Postman stores them in the environment so downstream requests chain automatically.\n\n`paymentToleranceUnderBps` / `paymentToleranceOverBps` set the merchant's default invoice payment tolerance in basis points (1 bp = 0.01 %; capped at 2000). `0 / 0` is strict — every cent must match. Per-invoice overrides on `POST /api/v1/invoices` win when set. Tweak via `PATCH /admin/merchants/:id` later."
+            "description": "Creates a merchant and returns the plaintext `apiKey` (saved into env) + plaintext `webhookSecret` (saved into env). Neither is recoverable afterward — Postman stores them in the environment so downstream requests chain automatically.\n\n`paymentToleranceUnderBps` / `paymentToleranceOverBps` set the merchant's default invoice payment tolerance in basis points (1 bp = 0.01 %; capped at 2000). `0 / 0` is strict — every cent must match. Per-invoice overrides on `POST /api/v1/invoices` win when set. Tweak via `PATCH /admin/merchants/:id` later.\n\n`addressCooldownSeconds` parks a just-released pool address for N seconds so late payments can still credit the original invoice. `0` (default) preserves legacy immediate-reuse. Capped at 7 days (604800s)."
           },
           "event": [
             {
@@ -106,9 +106,9 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"paymentToleranceUnderBps\": 50,\n  \"paymentToleranceOverBps\": 100\n}"
+              "raw": "{\n  \"paymentToleranceUnderBps\": 50,\n  \"paymentToleranceOverBps\": 100,\n  \"addressCooldownSeconds\": 300\n}"
             },
-            "description": "Updates the merchant's payment-tolerance defaults (basis points, 1 bp = 0.01 %).\n\n- `paymentToleranceUnderBps`: a paid USD amount within `bps` of the target closes the invoice as `confirmed` instead of `partial`. 50 = 0.5 %.\n- `paymentToleranceOverBps`: a paid USD amount within `bps` over the target closes as `confirmed` instead of `overpaid`. 100 = 1 %.\n\nApplies to invoices created **after** this PATCH; existing invoices keep the snapshot they were issued with. Webhook URL/secret are intentionally NOT mutable here — changing them mid-flight orphans pending outbox rows enqueued under the old key."
+            "description": "Updates the merchant's mutable defaults (basis points, 1 bp = 0.01 %).\n\n- `paymentToleranceUnderBps`: a paid USD amount within `bps` of the target closes the invoice as `confirmed` instead of `partial`. 50 = 0.5 %.\n- `paymentToleranceOverBps`: a paid USD amount within `bps` over the target closes as `confirmed` instead of `overpaid`. 100 = 1 %.\n- `addressCooldownSeconds`: parks a released pool address for N seconds so late payments still credit the original invoice. 300 = 5 min; 0 disables. Capped at 7 days (604800s).\n\nApplies to invoices created / releases that happen **after** this PATCH; already-stamped cooldown deadlines and existing invoice tolerance snapshots are unaffected. Webhook URL/secret are intentionally NOT mutable here — changing them mid-flight orphans pending outbox rows enqueued under the old key."
           },
           "event": [
             {
@@ -121,6 +121,7 @@
                   "pm.test('echoes new tolerances', () => {",
                   "  pm.expect(body.merchant.paymentToleranceUnderBps).to.equal(50);",
                   "  pm.expect(body.merchant.paymentToleranceOverBps).to.equal(100);",
+                  "  pm.expect(body.merchant.addressCooldownSeconds).to.equal(300);",
                   "});"
                 ]
               }
@@ -879,6 +880,155 @@
                   "pm.test('200 OK', () => pm.response.to.have.status(200));",
                   "const body = pm.response.json();",
                   "pm.test('replayed echoes id', () => pm.expect(body.replayed).to.have.property('id'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Admin / Orphans & Audit",
+      "description": "Reconciliation surface for transfers that couldn't be auto-attributed. Orphans are on-chain transfers on addresses with no active invoice and no active cooldown — ingest writes them with `invoice_id=NULL`, `status='orphaned'`, and NO merchant-facing webhooks fire. Operators either attribute them to a specific invoice (normal or terminal — the `viaAdminOverride` path lets expired/canceled invoices flip to `confirmed`/`overpaid` when the credit clears the bar) or dismiss them with a reason. Audit-address closes the loop for 'merchant says they never got X': it re-scans on-chain history for an address and ingests anything missing.",
+      "item": [
+        {
+          "name": "List open orphans",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/orphan-transactions?limit=50&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "orphan-transactions"],
+              "query": [
+                { "key": "chainId", "value": "", "disabled": true, "description": "Optional: narrow to one chain" },
+                { "key": "limit", "value": "50" },
+                { "key": "offset", "value": "0" }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Returns open orphans (invoice_id IS NULL AND dismissed_at IS NULL), ordered by `detectedAt DESC`. Backed by a partial index so the queue stays cheap regardless of total tx volume."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('orphans array', () => pm.expect(body.orphans).to.be.an('array'));",
+                  "const first = (body.orphans || [])[0];",
+                  "if (first && first.id) {",
+                  "  pm.environment.set('orphanTxId', first.id);",
+                  "  console.log('saved orphanTxId =', first.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Attribute orphan to an invoice",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/orphan-transactions/{{orphanTxId}}/attribute",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "orphan-transactions", "{{orphanTxId}}", "attribute"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceId\": \"{{invoiceId}}\"\n}"
+            },
+            "description": "Re-points the orphan's `invoice_id` at `invoiceId`, promotes the tx from `orphaned` to `detected`/`confirmed` based on its confirmation count, and runs `recomputeInvoiceFromTransactions` with `viaAdminOverride=true`.\n\nThe override lets an `expired` / `canceled` invoice flip to `confirmed` (or `overpaid` on USD-path) when the attributed credit clears the confirm bar. Partial credits against a terminal invoice stay parked — the merchant's decision stands if the payment doesn't cover the invoice.\n\nReturns 404 if the orphan/invoice is unknown, 409 if the tx is already attributed or dismissed."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('attribution echoes ids + statuses', () => {",
+                  "  pm.expect(body.attribution).to.have.property('txId');",
+                  "  pm.expect(body.attribution).to.have.property('invoiceStatusBefore');",
+                  "  pm.expect(body.attribution).to.have.property('invoiceStatusAfter');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Dismiss orphan",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/orphan-transactions/{{orphanTxId}}/dismiss",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "orphan-transactions", "{{orphanTxId}}", "dismiss"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"customer refunded out-of-band, see ticket #123\"\n}"
+            },
+            "description": "Stamps `dismissed_at` + `dismiss_reason`. The tx row stays in the `transactions` table for audit, but the partial index drops it from the open-orphans queue.\n\n409 if the tx is attributed to an invoice (not an orphan) or already dismissed."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('dismissal echoes reason', () => pm.expect(body.dismissal).to.have.property('reason'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Audit an address",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/audit-address",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "audit-address"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 1,\n  \"address\": \"0x0000000000000000000000000000000000000000\",\n  \"sinceMs\": 0\n}"
+            },
+            "description": "Re-runs the chain adapter's `scanIncoming` for every registered token on `chainId` (plus the native symbol), diffs against `transactions`, and ingests missing rows through the normal ingest path (so orphan / cooldown / invoice-match rules apply identically).\n\nUse when a merchant reports a missing payment. Idempotent — already-stored txs are silently skipped via the UNIQUE `(chain_id, tx_hash, log_index)` constraint.\n\n`sinceMs` defaults to `now - 30 days` if omitted; the adapter's own max-scan window further clamps the range."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('audit echoes counts', () => {",
+                  "  pm.expect(body.audit).to.have.property('scanned');",
+                  "  pm.expect(body.audit).to.have.property('inserted');",
+                  "  pm.expect(body.audit).to.have.property('alreadyPresent');",
+                  "});"
                 ]
               }
             }

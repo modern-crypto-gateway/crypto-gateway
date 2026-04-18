@@ -52,6 +52,12 @@ export const merchants = sqliteTable(
     //          (e.g. 100 bps = 1%; pay 101% → confirmed instead of overpaid)
     paymentToleranceUnderBps: integer("payment_tolerance_under_bps").notNull().default(0),
     paymentToleranceOverBps: integer("payment_tolerance_over_bps").notNull().default(0),
+    // Seconds an address remains parked after release (invoice expired/canceled/
+    // confirmed) before pool allocation may re-hand it to another invoice. Late
+    // payments arriving during the cooldown still credit the original invoice
+    // (orphan + admin-attribute path); after cooldown expires, late payments
+    // become orphans available for reconciliation. 0 = no cooldown (legacy).
+    addressCooldownSeconds: integer("address_cooldown_seconds").notNull().default(0),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull()
   },
@@ -165,7 +171,14 @@ export const transactions = sqliteTable(
     detectedAt: integer("detected_at").notNull(),
     confirmedAt: integer("confirmed_at"),
     amountUsd: text("amount_usd"),
-    usdRate: text("usd_rate")
+    usdRate: text("usd_rate"),
+    // Admin-side dismissal of an orphaned transfer (invoice_id IS NULL row that
+    // an operator decided not to credit — e.g. confirmed customer error or
+    // unrelated address reuse). Both columns set together; the partial-index on
+    // open orphans excludes dismissed rows so the admin queue stays clean while
+    // the underlying tx record stays in place for audit.
+    dismissedAt: integer("dismissed_at"),
+    dismissReason: text("dismiss_reason")
   },
   (t) => [
     // Two partial unique indexes together cover the same identity rule as the
@@ -181,6 +194,11 @@ export const transactions = sqliteTable(
       .where(sql`${t.logIndex} IS NULL`),
     index("idx_transactions_invoice").on(t.invoiceId),
     index("idx_transactions_status").on(t.status, t.chainId),
+    // Open orphans (no invoice attribution, not yet dismissed). Powers the
+    // admin orphan queue scoped by chain and ordered by detection time.
+    index("idx_transactions_orphans_open")
+      .on(t.chainId, t.detectedAt)
+      .where(sql`${t.invoiceId} IS NULL AND ${t.dismissedAt} IS NULL`),
     check(
       "transactions_status_check",
       sql`${t.status} IN ('detected','confirmed','reverted','orphaned')`
@@ -320,11 +338,26 @@ export const addressPool = sqliteTable(
     // expired invoice still lands on the address that was tied to that
     // invoice rather than on a freshly-reused one.
     lastReleasedAt: integer("last_released_at"),
+    // Cooldown deadline (epoch ms). When set and > now, allocation must skip
+    // this row even if it would otherwise win the fairness ordering. Computed
+    // at release time as `now + merchant.address_cooldown_seconds * 1000`. NULL
+    // (or past) means immediately reusable. Stored on the row to avoid a JOIN
+    // against merchants in the hot allocator path.
+    cooldownUntil: integer("cooldown_until"),
+    // Merchant whose invoice last released this row. Carried alongside
+    // `cooldownUntil` so admin reconciliation knows which merchant a late
+    // payment likely belongs to during the cooldown window. Cleared on next
+    // allocation.
+    lastReleasedByMerchantId: text("last_released_by_merchant_id"),
     createdAt: integer("created_at").notNull()
   },
   (t) => [
     uniqueIndex("uq_address_pool_family_index").on(t.family, t.addressIndex),
     uniqueIndex("uq_address_pool_family_address").on(t.family, t.address),
+    // Allocation candidate index. Pairs with the cooldown filter in the
+    // allocator (`cooldown_until IS NULL OR cooldown_until <= now`); we don't
+    // index `cooldownUntil` itself because its selectivity is low and the
+    // status='available' prefix already narrows aggressively.
     index("idx_address_pool_available").on(
       t.family,
       t.status,

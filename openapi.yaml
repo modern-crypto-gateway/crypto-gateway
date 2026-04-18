@@ -309,6 +309,18 @@ paths:
                     A paid USD amount ≤ `amountUsd × (1 + bps/10_000)` closes
                     the invoice as `confirmed` (not `overpaid`). Example: `100`
                     = 1 % — paying 101 USD on a 100 USD invoice confirms.
+                addressCooldownSeconds:
+                  type: integer
+                  minimum: 0
+                  maximum: 604800
+                  default: 0
+                  description: |
+                    Address-pool cooldown in seconds. After an invoice reaches a
+                    terminal state, the pool address it held cannot be re-allocated
+                    to a different invoice for this many seconds. Late payments
+                    arriving during the cooldown still credit the original invoice
+                    via the orphan + admin-attribute path. `0` (default) preserves
+                    legacy immediate-reuse behavior. Capped at 7 days (604800s).
       responses:
         "201":
           description: Merchant created
@@ -326,6 +338,7 @@ paths:
                       active: { type: boolean }
                       paymentToleranceUnderBps: { type: integer, minimum: 0, maximum: 2000 }
                       paymentToleranceOverBps: { type: integer, minimum: 0, maximum: 2000 }
+                      addressCooldownSeconds: { type: integer, minimum: 0, maximum: 604800 }
                       createdAt: { type: string, format: date-time }
                   apiKey:
                     type: string
@@ -341,14 +354,17 @@ paths:
   /admin/merchants/{id}:
     patch:
       tags: [admin]
-      summary: Update a merchant's payment-tolerance defaults
+      summary: Update a merchant's mutable defaults
       description: |
-        Currently scoped to `paymentToleranceUnderBps` and `paymentToleranceOverBps`.
-        Webhook URL/secret stay create-only on purpose — changing them mid-flight
-        orphans pending outbox rows that were enqueued under the old key.
+        Scoped to `paymentToleranceUnderBps`, `paymentToleranceOverBps`, and
+        `addressCooldownSeconds`. Webhook URL/secret stay create-only on
+        purpose — changing them mid-flight orphans pending outbox rows that
+        were enqueued under the old key.
 
-        Tolerance changes apply to invoices created **after** the PATCH; existing
-        invoices keep the snapshot they were issued with.
+        Tolerance changes apply to invoices created **after** the PATCH;
+        existing invoices keep the snapshot they were issued with. Cooldown
+        changes apply to releases that happen **after** the PATCH; already-
+        stamped `cooldownUntil` deadlines are unaffected.
       security:
         - AdminKey: []
       parameters:
@@ -372,6 +388,10 @@ paths:
                   type: integer
                   minimum: 0
                   maximum: 2000
+                addressCooldownSeconds:
+                  type: integer
+                  minimum: 0
+                  maximum: 604800
       responses:
         "200":
           description: Merchant updated
@@ -389,6 +409,7 @@ paths:
                       active: { type: boolean }
                       paymentToleranceUnderBps: { type: integer }
                       paymentToleranceOverBps: { type: integer }
+                      addressCooldownSeconds: { type: integer }
                       updatedAt: { type: string, format: date-time }
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -747,6 +768,213 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/orphan-transactions:
+    get:
+      tags: [admin]
+      summary: List open orphan transactions
+      description: |
+        Orphans are detected on-chain transfers that could not be attributed
+        to an active invoice at ingest time — typically payments on an
+        address whose invoice has already expired / been canceled and whose
+        pool cooldown window has elapsed.
+
+        The list is backed by a partial index over `(chain_id, detected_at)`
+        WHERE `invoice_id IS NULL AND dismissed_at IS NULL`, so the queue
+        stays cheap even with millions of historical tx rows. Dismissed rows
+        are hidden but remain in `transactions` for audit.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: chainId
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - in: query
+          name: offset
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Open orphan queue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orphans:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        chainId: { type: integer }
+                        txHash: { type: string }
+                        logIndex: { type: [integer, "null"] }
+                        fromAddress: { type: string }
+                        toAddress: { type: string }
+                        token: { type: string }
+                        amountRaw: { type: string }
+                        amountUsd: { type: [string, "null"] }
+                        usdRate: { type: [string, "null"] }
+                        blockNumber: { type: [integer, "null"] }
+                        confirmations: { type: integer }
+                        status: { type: string, enum: [orphaned] }
+                        detectedAt: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/orphan-transactions/{id}/attribute:
+    post:
+      tags: [admin]
+      summary: Attribute an orphan transaction to an invoice
+      description: |
+        Re-points an orphan's `invoice_id` at the target invoice, promotes
+        its tx status (`orphaned` → `detected`/`confirmed` based on
+        confirmation count vs chain threshold), and runs
+        `recomputeInvoiceFromTransactions` with `viaAdminOverride=true`.
+
+        The override allows a terminal invoice (`expired` / `canceled`) to
+        flip to `confirmed` or `overpaid` when the attributed tx clears the
+        confirm bar. Partial credits against a terminal invoice stay parked
+        — the merchant's prior decision stands if the payment doesn't cover
+        the invoice.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invoiceId]
+              properties:
+                invoiceId: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Orphan attributed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attribution:
+                    type: object
+                    properties:
+                      txId: { type: string }
+                      invoiceId: { type: string, format: uuid }
+                      invoiceStatusBefore: { type: string }
+                      invoiceStatusAfter: { type: string }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Transaction or invoice not found }
+        "409": { description: Transaction is not an open orphan (already attributed or dismissed) }
+
+  /admin/orphan-transactions/{id}/dismiss:
+    post:
+      tags: [admin]
+      summary: Dismiss an orphan transaction
+      description: |
+        Marks an orphan as reviewed-and-ignored by stamping `dismissed_at`
+        and `dismiss_reason`. The row stays in `transactions` for audit but
+        drops out of the open-orphans queue via the partial index.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 512 }
+      responses:
+        "200":
+          description: Orphan dismissed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dismissal:
+                    type: object
+                    properties:
+                      txId: { type: string }
+                      dismissedAt: { type: string, format: date-time }
+                      reason: { type: string }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Transaction not found }
+        "409": { description: Transaction is attributed or already dismissed }
+
+  /admin/audit-address:
+    post:
+      tags: [admin]
+      summary: Audit an address by diffing on-chain history against stored transactions
+      description: |
+        Queries the chain adapter's `scanIncoming` for every registered token
+        on `chainId` (plus the native symbol), diffs results against
+        `transactions`, and ingests missing rows through the normal ingest
+        path. Idempotent — already-stored txs are silently skipped via the
+        UNIQUE `(chain_id, tx_hash, log_index)` constraint.
+
+        Use when a merchant reports a missing payment: operator runs audit
+        against the invoice's receive address, and any newly-discovered
+        transfer either credits the invoice (if it's still active) or lands
+        as an orphan for attribution / dismissal.
+
+        `sinceMs` defaults to 30 days before the current server time; the
+        adapter's own max-scan window still clamps the final range.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chainId, address]
+              properties:
+                chainId: { type: integer, minimum: 1 }
+                address: { type: string, minLength: 1, maxLength: 128 }
+                sinceMs: { type: integer, minimum: 0, description: "Epoch ms lower bound; defaults to now - 30 days" }
+      responses:
+        "200":
+          description: Audit complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  audit:
+                    type: object
+                    properties:
+                      chainId: { type: integer }
+                      address: { type: string }
+                      sinceMs: { type: integer }
+                      scanned: { type: integer, description: "Total transfers returned by the chain adapter" }
+                      inserted: { type: integer, description: "Newly-added tx rows" }
+                      alreadyPresent: { type: integer, description: "Rows skipped (already in transactions)" }
+                      insertedTxIds:
+                        type: array
+                        items: { type: string }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
   /admin/balances:
     get:
