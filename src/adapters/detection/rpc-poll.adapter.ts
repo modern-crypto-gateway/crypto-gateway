@@ -1,6 +1,7 @@
 import type { AppDeps } from "../../core/app-deps.js";
 import type { DetectionStrategy } from "../../core/ports/detection.port.ts";
 import type { Address, ChainId } from "../../core/types/chain.js";
+import type { TokenSymbol } from "../../core/types/token.js";
 import type { DetectedTransfer } from "../../core/types/transaction.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
@@ -38,8 +39,17 @@ export function rpcPollDetection(config: RpcPollConfig = {}): DetectionStrategy 
   const minIntervalMs = config.minIntervalMs;
 
   return {
-    async poll(deps: AppDeps, chainId: ChainId, addresses: readonly Address[]): Promise<readonly DetectedTransfer[]> {
+    async poll(
+      deps: AppDeps,
+      chainId: ChainId,
+      addresses: readonly Address[],
+      tokens?: readonly TokenSymbol[]
+    ): Promise<readonly DetectedTransfer[]> {
       if (addresses.length === 0) return [];
+      // Caller passed an explicit empty filter — no active invoice on this
+      // chain wants any token. Bail before touching the provider; this is the
+      // hot path that previously scanned the full registry every tick.
+      if (tokens !== undefined && tokens.length === 0) return [];
       const chainAdapter = findChainAdapter(deps, chainId);
 
       const cacheKey = `${prefix}${chainId}`;
@@ -56,13 +66,19 @@ export function rpcPollDetection(config: RpcPollConfig = {}): DetectionStrategy 
         return [];
       }
 
-      // Tokens registered on this chain — the strategy scans all of them. For
-      // performance-sensitive deployments, a future refinement can narrow this
-      // to tokens actually referenced by active invoices.
-      const tokens = TOKEN_REGISTRY.filter((t) => t.chainId === chainId).map((t) => t.symbol);
-      if (tokens.length === 0) return [];
+      // Resolve token list. Caller-supplied wins (filtered to tokens registered
+      // on this chain so an unknown symbol doesn't blow up scanIncoming);
+      // when caller passes nothing, fall back to scanning every token in the
+      // registry for this chain (legacy behaviour, used by tests + callers
+      // that can't compute the active-invoice set).
+      const registryForChain = TOKEN_REGISTRY.filter((t) => t.chainId === chainId).map((t) => t.symbol);
+      const scanTokens =
+        tokens === undefined
+          ? registryForChain
+          : registryForChain.filter((sym) => tokens.includes(sym));
+      if (scanTokens.length === 0) return [];
 
-      const transfers = await chainAdapter.scanIncoming({ chainId, addresses, tokens, sinceMs });
+      const transfers = await chainAdapter.scanIncoming({ chainId, addresses, tokens: scanTokens, sinceMs });
 
       // Advance the checkpoint to `now` regardless of how many transfers the
       // scan returned. A transient provider outage just surfaces as 0 hits;

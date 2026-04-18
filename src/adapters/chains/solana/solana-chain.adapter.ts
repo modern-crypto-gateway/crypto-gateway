@@ -42,6 +42,13 @@ const SIGNATURE_FEE_LAMPORTS = 5_000n;
 // Phantom-compatible derivation path: m/44'/501'/{account}'/0'.
 const DEFAULT_ACCOUNT_INDEX = 0;
 
+// TTL for the per-chain getSlot() cache used inside getConfirmationStatus.
+// One cron tick fans out one signature-status + slot query per active
+// confirming tx; the slot is identical across all txs in the same tick, so
+// coalesce. Solana slots are ~400ms, so 10s is at most 25 slots stale —
+// well within the finalized vs current-slot bookkeeping we actually need.
+const SLOT_CACHE_TTL_MS = 10_000;
+
 export interface SolanaChainConfig {
   chainIds?: readonly number[];
   // Per-chain RPC configuration. Required unless `clients` is provided (tests).
@@ -72,6 +79,16 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
     const client = solanaRpcClient(rpcCfg);
     clientCache.set(chainId, client);
     return client;
+  }
+
+  const slotCache = new Map<number, { value: number; fetchedAt: number }>();
+  async function getCachedSlot(chainId: number, client: SolanaRpcClient): Promise<number> {
+    const now = Date.now();
+    const entry = slotCache.get(chainId);
+    if (entry && now - entry.fetchedAt < SLOT_CACHE_TTL_MS) return entry.value;
+    const slot = await client.getSlot().catch(() => 0);
+    slotCache.set(chainId, { value: slot, fetchedAt: now });
+    return slot;
   }
 
   return {
@@ -185,7 +202,7 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       const client = getClient(chainId);
       const [statuses, currentSlot] = await Promise.all([
         client.getSignatureStatuses([txHash]),
-        client.getSlot().catch(() => 0)
+        getCachedSlot(chainId, client)
       ]);
       const status = statuses[0];
       if (!status) {

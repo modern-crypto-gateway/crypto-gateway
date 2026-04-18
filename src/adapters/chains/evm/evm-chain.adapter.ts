@@ -67,6 +67,13 @@ export interface EvmChainConfig {
   maxScanBlocks?: number;
 }
 
+// TTL for the per-chain latest-block-number cache used inside
+// getConfirmationStatus. A single cron tick fans out one receipt+block-height
+// query per active confirming tx; the block height is identical for every tx
+// on the same chain in that tick, so we only need to fetch it once. ~10s
+// covers tick coalescing without going stale (mainnet block ~12s).
+const BLOCK_HEIGHT_CACHE_TTL_MS = 10_000;
+
 export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
   const accountIndex = config.accountIndex ?? DEFAULT_ACCOUNT_INDEX;
   const maxScanBlocks = config.maxScanBlocks ?? DEFAULT_MAX_SCAN_BLOCKS;
@@ -83,6 +90,16 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
     const client = createPublicClient({ transport }) as PublicClient;
     clientCache.set(chainId, client);
     return client;
+  }
+
+  const blockHeightCache = new Map<number, { value: bigint; fetchedAt: number }>();
+  async function getCachedBlockNumber(chainId: number, client: PublicClient): Promise<bigint> {
+    const now = Date.now();
+    const entry = blockHeightCache.get(chainId);
+    if (entry && now - entry.fetchedAt < BLOCK_HEIGHT_CACHE_TTL_MS) return entry.value;
+    const latest = await client.getBlockNumber();
+    blockHeightCache.set(chainId, { value: latest, fetchedAt: now });
+    return latest;
   }
 
   return {
@@ -194,7 +211,7 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       const client = getClient(chainId);
       const [receipt, latest] = await Promise.all([
         client.getTransactionReceipt({ hash: txHash as Hex }).catch(() => null),
-        client.getBlockNumber()
+        getCachedBlockNumber(chainId, client)
       ]);
       if (!receipt) {
         // Not yet mined or unknown — report zero confirmations, not reverted.

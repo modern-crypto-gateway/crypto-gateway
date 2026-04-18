@@ -37,6 +37,12 @@ const MAX_EXPECTED_TRANSFER_ENERGY = 150_000;
 const DEFAULT_ACCOUNT_INDEX = 0;
 const DEFAULT_CHANGE_INDEX = 0;
 
+// TTL for the per-chain latest-block cache used inside getConfirmationStatus.
+// One cron tick fans out one info+nowblock query per active confirming tx;
+// nowblock is identical for every tx in that tick, so coalesce calls within
+// ~10s. Tron block time is ~3s, so this is at most one stale-by-3-blocks read.
+const NOW_BLOCK_CACHE_TTL_MS = 10_000;
+
 export interface TronChainConfig {
   // Which chainIds this adapter serves. Defaults to Tron mainnet only.
   chainIds?: readonly number[];
@@ -79,6 +85,17 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
     const client = tronGridBackend(cfg);
     clientCache.set(chainId, client);
     return client;
+  }
+
+  const nowBlockCache = new Map<number, { value: number; fetchedAt: number }>();
+  async function getCachedNowBlock(chainId: number, client: TronRpcBackend): Promise<number> {
+    const now = Date.now();
+    const entry = nowBlockCache.get(chainId);
+    if (entry && now - entry.fetchedAt < NOW_BLOCK_CACHE_TTL_MS) return entry.value;
+    const block = await client.getNowBlock();
+    const number = block.block_header.raw_data.number;
+    nowBlockCache.set(chainId, { value: number, fetchedAt: now });
+    return number;
   }
 
   return {
@@ -176,8 +193,10 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
 
     async getConfirmationStatus(chainId: ChainId, txHash: TxHash) {
       const client = getClient(chainId);
-      const [info, now] = await Promise.all([client.getTransactionInfo(txHash), client.getNowBlock()]);
-      const latest = now.block_header.raw_data.number;
+      const [info, latest] = await Promise.all([
+        client.getTransactionInfo(txHash),
+        getCachedNowBlock(chainId, client)
+      ]);
       if (!info || info.blockNumber === undefined) {
         return { blockNumber: null, confirmations: 0, reverted: false };
       }

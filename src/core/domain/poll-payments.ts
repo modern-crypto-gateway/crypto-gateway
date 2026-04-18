@@ -1,6 +1,7 @@
 import { and, eq, gt, inArray } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainFamily, ChainId } from "../types/chain.js";
+import type { TokenSymbol } from "../types/token.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { ingestDetectedTransfer } from "./payment.service.js";
 import { invoices, invoiceReceiveAddresses } from "../../db/schema.js";
@@ -24,11 +25,18 @@ export interface PollPaymentsResult {
 }
 
 export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
-  // Gather every family+address for invoices that are still open. The join
-  // table is the authoritative source — `invoices.receive_address` is just
-  // the primary-family denormalization for legacy single-chain reads.
+  // Gather every family+address for invoices that are still open, plus each
+  // invoice's `token` and `ratesJson` so we can derive the *minimum* set of
+  // tokens worth polling per family. The join table is the authoritative
+  // source — `invoices.receive_address` is just the primary-family
+  // denormalization for legacy single-chain reads.
   const rows = await deps.db
-    .selectDistinct({ family: invoiceReceiveAddresses.family, address: invoiceReceiveAddresses.address })
+    .select({
+      family: invoiceReceiveAddresses.family,
+      address: invoiceReceiveAddresses.address,
+      token: invoices.token,
+      ratesJson: invoices.ratesJson
+    })
     .from(invoices)
     .innerJoin(invoiceReceiveAddresses, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
     .where(
@@ -38,16 +46,44 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
       )
     );
 
-  // Group addresses by family once, up front. Each chainId's poll picks
-  // the addresses matching its family.
-  const addressesByFamily = new Map<ChainFamily, string[]>();
+  // Group addresses + relevant tokens by family. Address lists are deduped
+  // (same address can appear via multiple invoices); token sets capture
+  // both legacy single-token invoices (via `token`) and USD-pegged invoices
+  // (every key in `ratesJson` — the symbols the merchant told the customer
+  // they'd accept). The poll strategy uses `tokensByFamily` to skip RPC
+  // calls for tokens nobody is currently watching; an EVM chain that has
+  // USDT/USDC/DAI registered but only one active USDC invoice produces 1
+  // getLogs call per tick instead of 3.
+  const addressesByFamily = new Map<ChainFamily, Set<string>>();
+  const tokensByFamily = new Map<ChainFamily, Set<TokenSymbol>>();
   for (const row of rows) {
-    let list = addressesByFamily.get(row.family as ChainFamily);
-    if (!list) {
-      list = [];
-      addressesByFamily.set(row.family as ChainFamily, list);
+    const family = row.family as ChainFamily;
+    let addrSet = addressesByFamily.get(family);
+    if (!addrSet) {
+      addrSet = new Set();
+      addressesByFamily.set(family, addrSet);
     }
-    list.push(row.address);
+    addrSet.add(row.address);
+
+    let tokSet = tokensByFamily.get(family);
+    if (!tokSet) {
+      tokSet = new Set();
+      tokensByFamily.set(family, tokSet);
+    }
+    tokSet.add(row.token as TokenSymbol);
+    if (row.ratesJson !== null) {
+      try {
+        const parsed = JSON.parse(row.ratesJson) as Record<string, string>;
+        for (const sym of Object.keys(parsed)) {
+          tokSet.add(sym as TokenSymbol);
+        }
+      } catch {
+        // Malformed ratesJson is a data-shape bug, not a polling concern —
+        // ignore here so a single bad row can't shut off detection. The
+        // payment-attribution path will surface the same row's issue
+        // separately if it tries to use the rates.
+      }
+    }
   }
 
   let chainsPolled = 0;
@@ -72,13 +108,16 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
       // drift where detectionStrategies references an unwired chainId.)
       continue;
     }
-    const addresses = addressesByFamily.get(family) ?? [];
-    if (addresses.length === 0) continue;
+    const addrSet = addressesByFamily.get(family);
+    if (!addrSet || addrSet.size === 0) continue;
+    const addresses = Array.from(addrSet);
+    const tokenSet = tokensByFamily.get(family) ?? new Set<TokenSymbol>();
+    const tokens = Array.from(tokenSet);
 
     chainsPolled += 1;
     addressesWatched += addresses.length;
 
-    const transfers = await strategy.poll(deps, chainIdNumber as ChainId, addresses);
+    const transfers = await strategy.poll(deps, chainIdNumber as ChainId, addresses, tokens);
     transfersFound += transfers.length;
 
     for (const transfer of transfers) {

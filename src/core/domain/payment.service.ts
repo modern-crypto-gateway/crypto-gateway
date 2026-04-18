@@ -385,6 +385,16 @@ const DEFAULT_REORG_RECHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
 // busiest realistic load and still leave RPC budget for live detection.
 const REORG_RECHECK_BATCH_SIZE = 200;
 
+// Throttle interval for recheckConfirmedTransactionsForReorg. The cron fires
+// every minute but a tx that was confirmed yesterday does not need to be
+// re-verified that often — a 10-minute cadence is still well inside any
+// realistic reorg-detection window (Ethereum finalizes in ~13 min,
+// Polygon's 256-block threshold finalizes in ~9 min) while cutting RPC
+// spend by 10x on confirmed-tx rechecks. Override via opts.intervalMs (set
+// to 0 in tests to disable throttling).
+const DEFAULT_REORG_RECHECK_INTERVAL_MS = 10 * 60 * 1000;
+const REORG_RECHECK_THROTTLE_CACHE_KEY = "reorg-recheck:last-run";
+
 export interface ReorgRecheckResult {
   checked: number;
   demoted: number;
@@ -403,10 +413,28 @@ export interface ReorgRecheckResult {
 // entirely surfaces as `reverted=true` or `blockNumber=null` next tick.
 export async function recheckConfirmedTransactionsForReorg(
   deps: AppDeps,
-  opts: { windowMs?: number; limit?: number } = {}
+  opts: { windowMs?: number; limit?: number; intervalMs?: number } = {}
 ): Promise<ReorgRecheckResult> {
   const windowMs = opts.windowMs ?? DEFAULT_REORG_RECHECK_WINDOW_MS;
   const limit = opts.limit ?? REORG_RECHECK_BATCH_SIZE;
+  const intervalMs = opts.intervalMs ?? DEFAULT_REORG_RECHECK_INTERVAL_MS;
+
+  // Throttle: at the 1-min cron cadence we do not need to re-verify
+  // every confirmed tx every tick. A presence-only cache key with TTL =
+  // intervalMs gates execution; a missing key (cold cache or TTL expired)
+  // means "go", and we re-set the key. KV's eventual consistency may let
+  // two ticks both see "missing" inside a small window — that's fine, the
+  // recheck is idempotent.
+  if (intervalMs > 0) {
+    const last = await deps.cache.get(REORG_RECHECK_THROTTLE_CACHE_KEY);
+    if (last !== null) {
+      return { checked: 0, demoted: 0, invoicesTouched: 0 };
+    }
+    await deps.cache.put(REORG_RECHECK_THROTTLE_CACHE_KEY, "1", {
+      ttlSeconds: Math.max(60, Math.floor(intervalMs / 1000))
+    });
+  }
+
   const now = deps.clock.now().getTime();
   const cutoff = now - windowMs;
 

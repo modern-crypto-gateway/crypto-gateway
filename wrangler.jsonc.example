@@ -65,11 +65,20 @@
   "compatibility_date": "2026-03-14",
   "compatibility_flags": ["nodejs_compat"],
 
-  // Scheduled cron — runs every minute. The worker entrypoint's `scheduled`
+  // Scheduled cron — runs every 2 minutes. The worker entrypoint's `scheduled`
   // handler invokes pollPayments + confirmTransactions + executeReservedPayouts
   // + confirmPayouts in sequence. Runtime stays alive via waitUntil.
+  //
+  // Why 2 minutes (not 1)? Each tick fans out one RPC call per active
+  // (invoice address × token) plus one per confirming tx — on a paid Alchemy
+  // plan that's ~110k requests/day for just a handful of invoices when the
+  // cron runs every minute. Halving the cron rate halves polling load with
+  // negligible UX impact (most chains finalize in 30-90s, well under our
+  // confirmation thresholds, so users don't notice a 60s vs 120s detection
+  // gap). For lower-latency detection, prefer push-based webhook adapters
+  // (alchemy-notify) over reducing this interval.
   "triggers": {
-    "crons": ["* * * * *"]
+    "crons": ["*/2 * * * *"]
   },
 
   // No d1_databases binding — Turso replaces D1 as of 2026-Q1. The
