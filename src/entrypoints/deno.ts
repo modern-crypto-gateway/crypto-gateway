@@ -26,6 +26,7 @@ import { hdSignerStore } from "../adapters/signer-store/hd.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import type { AppDeps } from "../core/app-deps.js";
+import type { ChainAdapter } from "../core/ports/chain.port.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
 import { runScheduledJobs } from "../core/domain/scheduled-jobs.js";
 import { parseFinalityOverridesEnv } from "../core/domain/payment-config.js";
@@ -89,7 +90,11 @@ async function main(): Promise<void> {
   const cache = memoryCacheAdapter();
   const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
 
-  const chains = [devChainAdapter()];
+  // Dev adapter only outside production (it synthesizes chainId=999/DEV
+  // which shouldn't surface on /admin/balances in prod).
+  const denoNodeEnv = secrets.getOptional("NODE_ENV");
+  const denoIsProd = denoNodeEnv === "production" || denoNodeEnv === "staging";
+  const chains: ChainAdapter[] = denoIsProd ? [] : [devChainAdapter()];
   const detectionStrategies: Record<number, ReturnType<typeof rpcPollDetection>> = {};
   const activeAlchemyChainIds: number[] = [];
   const alchemyApiKey = secrets.getOptional("ALCHEMY_API_KEY");

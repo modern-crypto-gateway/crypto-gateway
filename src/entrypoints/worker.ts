@@ -27,6 +27,7 @@ import { hdSignerStore } from "../adapters/signer-store/hd.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import type { AppDeps } from "../core/app-deps.js";
+import type { ChainAdapter } from "../core/ports/chain.port.js";
 import { runScheduledJobs } from "../core/domain/scheduled-jobs.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
 import { parseFinalityOverridesEnv } from "../core/domain/payment-config.js";
@@ -113,9 +114,13 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     });
   }
 
-  // Same Alchemy-optional pattern as the Node entrypoint: dev adapter always,
-  // real EVM + RPC-poll detection when ALCHEMY_API_KEY is set.
-  const chains = [devChainAdapter()];
+  // Same Alchemy-optional pattern as the Node entrypoint: dev adapter
+  // only outside production (it would surface DEV/chainId=999 on
+  // /admin/balances otherwise), real EVM + RPC-poll detection when
+  // ALCHEMY_API_KEY is set.
+  const workerNodeEnv = typeof env["NODE_ENV"] === "string" ? env["NODE_ENV"] : undefined;
+  const workerIsProd = workerNodeEnv === "production" || workerNodeEnv === "staging";
+  const chains: ChainAdapter[] = workerIsProd ? [] : [devChainAdapter()];
   const detectionStrategies: Record<number, ReturnType<typeof rpcPollDetection>> = {};
   const activeAlchemyChainIds: number[] = [];
   const alchemyApiKey = typeof env["ALCHEMY_API_KEY"] === "string" ? env["ALCHEMY_API_KEY"] : undefined;

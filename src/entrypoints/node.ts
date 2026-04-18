@@ -106,11 +106,13 @@ async function main(): Promise<void> {
   // has no TTL floor of its own, so sub-minute windows work correctly here.
   const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
 
-  // Chain adapters + their matching detection strategies. The dev adapter is
-  // always present (cheap, no network). When ALCHEMY_API_KEY is set we also
-  // wire a real EVM adapter across the mainnet chain set (overridable via
-  // ALCHEMY_CHAINS) and enable RPC-poll detection for those chains.
-  const chains: ChainAdapter[] = [devChainAdapter()];
+  // Chain adapters + their matching detection strategies. The dev adapter
+  // is wired only outside production — it synthesizes a "DEV" token on
+  // chainId=999 so tests and local dev have a deterministic adapter, but
+  // surfacing it in prod would pollute /admin/balances and misclassify
+  // chainId 999 as a real chain. Real-chain adapters (EVM / Tron / Solana)
+  // are gated on their respective provider creds further down.
+  const chains: ChainAdapter[] = production ? [] : [devChainAdapter()];
   const detectionStrategies: Record<number, DetectionStrategy> = {};
   // Union of chainIds for the pool's Alchemy subscription fan-out (EVM + Solana).
   // Collected as entrypoint wires each family so the pool knows, at refill

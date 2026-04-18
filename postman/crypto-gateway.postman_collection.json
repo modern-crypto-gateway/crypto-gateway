@@ -1038,10 +1038,10 @@
     },
     {
       "name": "Admin / Balances",
-      "description": "Operator-only treasury view. Walks every pool address + registered fee wallet on every wired chain, asks the chain adapter for ALL token balances in one bulk call, and rolls up USD totals at every level (token → address → chain → family → grand total).\n\nBacked by a 60-second cache keyed on the query string, so a dashboard auto-refresh can't melt the RPC budget. Each response carries `cached: true|false` so the UI can show staleness. Per-chain rows include an `errors` count — non-zero means some addresses couldn't be reached and the totals are partial.\n\nCost shape: an EVM family with N pool addresses across C chains issues N×C bulk calls (one `alchemy_getTokenBalances` + one `eth_getBalance` each). Tron and Solana are one call per address per chain.",
+      "description": "Operator-only treasury view. Returns per-address + per-chain + per-family token balances with USD totals, shaped token → address → chain → family → grand total. The top-level `source` field tells you which math produced the numbers.\n\n**Mode `source=\"db\"` (default, fast)**\n- Pool address balance = SUM(confirmed `transactions.amountRaw` to that address).\n- Fee wallet balance = SUM(confirmed credits) − SUM(confirmed `payouts` from that source), clamped at 0.\n- No RPC traffic; ~50ms regardless of pool size.\n- Addresses with no recorded activity are omitted.\n- Caveat: off-system movements are invisible (external fee-wallet topups, dust sent to unsubscribed addresses). Use `?live=true` for reconciliation.\n\n**Mode `source=\"rpc\"` (opts-in via `?live=true`)**\n- Fans out one `getAccountBalances` call per (address, chainId) pair across every wired adapter. Authoritative but 15–30s cold.\n- Use for post-topup audit. Not for dashboard auto-refresh.\n\n**Caching**: keyed by mode + query string. DB mode TTL = 5s; RPC mode TTL = 60s. `db` and `rpc` entries do not share a slot. Each response carries `cached: true|false`.",
       "item": [
         {
-          "name": "Snapshot — all families, all addresses",
+          "name": "Snapshot — DB-derived (default, fast)",
           "request": {
             "method": "GET",
             "url": {
@@ -1050,7 +1050,7 @@
               "path": ["admin", "balances"]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "Full sweep across every family and every chain wired into the gateway. Returns `{ snapshot, cached }`. Run once to populate the cache; subsequent identical calls within 60 s come back as `cached: true`."
+            "description": "Default mode: balances derived from the `transactions` + `payouts` tables — no RPC traffic. ~50ms. Response `snapshot.source === \"db\"`. Addresses with no recorded activity are omitted. Use this for dashboards."
           },
           "event": [
             {
@@ -1060,10 +1060,44 @@
                 "exec": [
                   "pm.test('200 OK', () => pm.response.to.have.status(200));",
                   "const body = pm.response.json();",
+                  "pm.test('source is db by default', () => {",
+                  "  pm.expect(body.snapshot.source).to.equal('db');",
+                  "});",
                   "pm.test('has snapshot.families + cached flag', () => {",
                   "  pm.expect(body).to.have.property('cached');",
                   "  pm.expect(body.snapshot).to.have.property('families');",
                   "  pm.expect(body.snapshot).to.have.property('totalUsd');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Snapshot — live RPC reconciliation (?live=true)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?live=true",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [
+                { "key": "live", "value": "true", "description": "Forces a live on-chain snapshot. Expensive — 15–30s typical for a full mainnet pool." }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Opts into the authoritative RPC path: fans out one `getAccountBalances` call per (address, chainId) pair to every wired chain adapter. Response `snapshot.source === \"rpc\"`. Use for post-topup reconciliation or audit — never bind to dashboard auto-refresh. Cached 60s."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('source is rpc', () => {",
+                  "  pm.expect(body.snapshot.source).to.equal('rpc');",
                   "});"
                 ]
               }

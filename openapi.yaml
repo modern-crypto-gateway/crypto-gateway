@@ -979,39 +979,51 @@ paths:
   /admin/balances:
     get:
       tags: [admin]
-      summary: Snapshot every gateway-owned address with token + USD totals
+      summary: Snapshot gateway-owned address balances (DB-derived by default)
       description: |
-        Walks every pool address and registered fee wallet, asks each chain
-        adapter for ALL token balances in one bulk call (Alchemy
-        `alchemy_getTokenBalances` for EVM, Solana
-        `getTokenAccountsByOwner` + `getBalance`, TronGrid
-        `/v1/accounts/{addr}` for Tron), then prices everything via the
-        oracle and rolls up:
+        Returns per-address + per-chain + per-family token balances with USD
+        totals, shaped as:
 
           token → address → chain → family → grand total
 
-        Each level carries its own `totalUsd`. Per-chain rows include an
-        `errors` count — addresses we tried but couldn't reach (bad RPC,
-        missing adapter); use it to detect partial snapshots.
+        Each level carries its own `totalUsd`. The top-level `source` field
+        tells the caller which math produced the numbers: `"db"` or `"rpc"`.
 
-        Pricing: USD rates are fetched once per snapshot via
+        ### Mode — `source="db"` (default, fast)
+
+        Computes balances from recorded activity only — no RPC traffic:
+
+          * pool address balance = SUM(`transactions.amountRaw` WHERE
+            `toAddress = addr` AND `status = 'confirmed'`)
+          * fee wallet balance = SUM(confirmed transactions in) −
+            SUM(confirmed `payouts.amountRaw` FROM `sourceAddress = addr`),
+            clamped at 0.
+
+        Returns in ~50ms regardless of pool size. Addresses with no
+        recorded activity are omitted. **Caveat:** off-system movements
+        are invisible (external fee-wallet topups, dust sent to
+        unsubscribed pool addresses). Use `?live=true` when reconciling.
+
+        ### Mode — `source="rpc"` (opts-in via `?live=true`)
+
+        Asks every wired chain adapter for the live on-chain balance of
+        every (address, chainId) pair. Authoritative but expensive:
+        typical 15–30s cold for a full mainnet pool. Use for post-topup
+        reconciliation or audit; do not bind to dashboard auto-refresh.
+
+        Pricing (both modes): USD rates are fetched once per snapshot via
         `priceOracle.getUsdRates([...symbols])`. Tokens the oracle can't
-        price get `usdRate=null` and `usd="0.00"` so callers can distinguish
-        "really zero" from "couldn't price".
+        price get `usdRate=null` and `usd="0.00"` so callers can
+        distinguish "really zero" from "couldn't price".
 
         ### Caching
 
-        Cached for **60 seconds** in CacheStore, keyed by query string
-        (`family`, `chainId`, `kind`, `address`) so a narrow lookup
-        doesn't share a slot with the full sweep. The response includes
-        `cached: true|false` so dashboards can show staleness.
-
-        ### Cost shape
-
-        For an EVM family with `N` pool addresses across `C` configured
-        EVM chains: `N×C` calls to `getAccountBalances`, each one bulk
-        endpoint plus one native-balance call. Tron and Solana are one
-        call per address per chain.
+        Keyed by mode + query string (`family`, `chainId`, `kind`,
+        `address`). DB mode uses a 5s TTL (it's cheap to recompute);
+        RPC mode uses 60s (dashboard refresh would otherwise hammer the
+        provider). `db` and `rpc` entries do not share a slot. The
+        response includes `cached: true|false` so dashboards can show
+        staleness.
       security:
         - AdminKey: []
       parameters:
@@ -1031,9 +1043,15 @@ paths:
           name: address
           schema: { type: string }
           description: Spot-check one address without paying the full sweep cost.
+        - in: query
+          name: live
+          schema: { type: string, enum: ["true", "1"] }
+          description: |
+            Flip to `true` or `1` to force a live RPC snapshot
+            (`source="rpc"`). Omit for the fast DB-derived default.
       responses:
         "200":
-          description: Snapshot computed (or served from the 60s cache)
+          description: Snapshot computed (or served from cache)
           content:
             application/json:
               schema:
@@ -1043,7 +1061,7 @@ paths:
                   snapshot: { $ref: "#/components/schemas/BalanceSnapshot" }
                   cached:
                     type: boolean
-                    description: True when this response came from the in-memory cache instead of a fresh sweep.
+                    description: True when this response came from the in-memory cache instead of a fresh compute.
         "400":
           description: Invalid query parameter (BAD_FAMILY, BAD_CHAIN_ID, BAD_KIND)
           content:
@@ -1471,9 +1489,16 @@ components:
 
     BalanceSnapshot:
       type: object
-      required: [generatedAt, totalUsd, families]
+      required: [generatedAt, source, totalUsd, families]
       properties:
         generatedAt: { type: string, format: date-time }
+        source:
+          type: string
+          enum: [db, rpc]
+          description: |
+            Where the numbers came from. `db` = derived from recorded
+            transactions/payouts (fast default). `rpc` = live chain
+            snapshot (opts-in via `?live=true`).
         totalUsd:
           type: string
           description: Grand total USD across every family in the snapshot, fixed to 2 decimal places.

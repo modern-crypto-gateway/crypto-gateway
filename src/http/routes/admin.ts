@@ -956,6 +956,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       const chainIdParam = c.req.query("chainId");
       const kindParam = c.req.query("kind");
       const addressParam = c.req.query("address");
+      const liveParam = c.req.query("live");
 
       const opts: Parameters<typeof computeBalanceSnapshot>[1] = {};
       if (familyParam !== undefined) {
@@ -981,18 +982,25 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       if (addressParam !== undefined) {
         opts.address = addressParam;
       }
+      if (liveParam === "true" || liveParam === "1") {
+        opts.live = true;
+      }
 
-      const cacheKey = "admin:balances:" +
+      // Cache key includes the mode so db-derived and rpc results don't
+      // clobber each other.
+      const mode = opts.live === true ? "rpc" : "db";
+      const cacheKey = "admin:balances:" + mode + ":" +
         [opts.family ?? "*", opts.chainId ?? "*", opts.kind ?? "*", opts.address ?? "*"].join(":");
       const cached = await deps.cache.getJSON<BalanceSnapshot>(cacheKey);
       if (cached !== null) {
         return c.json({ snapshot: cached, cached: true }, 200);
       }
       const snapshot = await computeBalanceSnapshot(deps, opts);
-      // 60s TTL: long enough that a dashboard refresh-every-30s rides the
-      // cache, short enough that an operator who just funded a wallet sees
-      // it within the next minute.
-      await deps.cache.putJSON(cacheKey, snapshot, { ttlSeconds: 60 });
+      // TTL is mode-dependent: rpc snapshots are expensive so 60s guards
+      // against dashboard refresh hammering; db snapshots are ~50ms so a
+      // short 5s TTL keeps numbers fresh without re-querying per request.
+      const ttlSeconds = opts.live === true ? 60 : 5;
+      await deps.cache.putJSON(cacheKey, snapshot, { ttlSeconds });
       return c.json({ snapshot, cached: false }, 200);
     } catch (err) {
       return renderError(c, err, deps.logger);
