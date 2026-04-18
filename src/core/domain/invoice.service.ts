@@ -1,18 +1,20 @@
 import { z } from "zod";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainFamilySchema, ChainIdSchema, type ChainFamily } from "../types/chain.js";
-import { AmountRawSchema, FiatAmountSchema, FiatCurrencySchema } from "../types/money.js";
+import { chainSlug } from "../types/chain-registry.js";
+import { AmountRawSchema, FiatAmountSchema, FiatCurrencySchema, formatRawAmount } from "../types/money.js";
 import { MerchantIdSchema } from "../types/merchant.js";
 import type { Invoice, InvoiceId, InvoiceReceiveAddress } from "../types/invoice.js";
 import { TokenSymbolSchema } from "../types/token.js";
 import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
+import type { Transaction } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
-import { drizzleRowToInvoice, fetchInvoiceReceiveAddresses, loadInvoice } from "./mappers.js";
+import { drizzleRowToInvoice, drizzleRowToTransaction, fetchInvoiceReceiveAddresses, loadInvoice } from "./mappers.js";
 import { DomainError } from "../errors.js";
 import { allocateForInvoice } from "./pool.service.js";
-import { snapshotRates, tokensForFamilies } from "./rate-window.js";
-import { invoices, invoiceReceiveAddresses, merchants } from "../../db/schema.js";
+import { addUsd, snapshotRates, subUsd, tokenDecimalsFor, tokensForFamilies } from "./rate-window.js";
+import { invoices, invoiceReceiveAddresses, merchants, transactions } from "../../db/schema.js";
 
 // ---- Input validation ----
 
@@ -244,6 +246,146 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
 
 export async function getInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<Invoice | null> {
   return loadInvoice(deps, invoiceId);
+}
+
+// Per-transaction view returned in the invoice GET breakdown. Strictly a
+// projection of the `transactions` row enriched with derived fields
+// (decimal-formatted amount, chain slug). All statuses are returned —
+// merchant UIs can filter; debugging needs `reverted` / `orphaned` rows.
+export interface InvoiceTransactionDetail {
+  id: string;
+  txHash: string;
+  logIndex: number | null;
+  chainId: number;
+  // Short slug like "ethereum" / "tron" / "solana"; null when the chainId is
+  // not in the static registry (defensive — every wired chain should be).
+  chain: string | null;
+  token: string;
+  fromAddress: string;
+  toAddress: string;
+  // Raw on-chain integer string (e.g. "1000000" for 1 USDC). Stable, never lossy.
+  amountRaw: string;
+  // Human-readable decimal (e.g. "1" / "0.04"). Convenience for UIs that
+  // would otherwise repeat the BigInt math; loses no information vs amountRaw.
+  amount: string;
+  // USD valuation pinned at detection time. null on legacy single-token
+  // invoices and on rows the oracle couldn't price.
+  amountUsd: string | null;
+  usdRate: string | null;
+  status: Transaction["status"];
+  confirmations: number;
+  blockNumber: number | null;
+  detectedAt: string;
+  confirmedAt: string | null;
+}
+
+// USD-axis breakdown for USD-path invoices. All fields null on legacy
+// single-token invoices (the merchant works in raw token units there;
+// `requiredAmountRaw` / `receivedAmountRaw` already carry that info).
+export interface InvoiceAmountsBreakdown {
+  requiredUsd: string | null;
+  // Sum of `amountUsd` across CONFIRMED contributing transactions. Mirrors
+  // what `recomputeUsdInvoice` writes into `paid_usd`, recomputed on read so
+  // GET reflects the truth even if a future bug skips a recompute call.
+  confirmedUsd: string | null;
+  // Sum across `detected` transactions — money seen on chain but not yet
+  // past the confirmation threshold. Useful for "X waiting to confirm" UI.
+  confirmingUsd: string | null;
+  // max(requiredUsd - confirmedUsd, 0). What the payer still owes.
+  remainingUsd: string | null;
+  // max(confirmedUsd - requiredUsd, 0). What was paid above target.
+  overpaidUsd: string | null;
+}
+
+export interface InvoiceDetails {
+  invoice: Invoice;
+  amounts: InvoiceAmountsBreakdown;
+  transactions: readonly InvoiceTransactionDetail[];
+}
+
+// Hydrated GET surface: invoice + USD breakdown + every transaction tied to
+// the invoice (all statuses). One extra query vs. plain getInvoice. Merchants
+// use this for the "show me everything about this invoice" panel; debugging
+// uses it to see reverted / orphaned rows that paid_usd intentionally hides.
+export async function getInvoiceDetails(
+  deps: AppDeps,
+  invoiceId: InvoiceId
+): Promise<InvoiceDetails | null> {
+  const invoice = await loadInvoice(deps, invoiceId);
+  if (!invoice) return null;
+
+  const txRows = await deps.db
+    .select()
+    .from(transactions)
+    .where(eq(transactions.invoiceId, invoiceId))
+    .orderBy(asc(transactions.detectedAt));
+  const txs = txRows.map(drizzleRowToTransaction);
+
+  const txDetails: InvoiceTransactionDetail[] = txs.map((tx) => {
+    const decimals = tokenDecimalsFor(tx.chainId, tx.token);
+    return {
+      id: tx.id,
+      txHash: tx.txHash,
+      logIndex: tx.logIndex,
+      chainId: tx.chainId,
+      chain: chainSlug(tx.chainId),
+      token: tx.token,
+      fromAddress: tx.fromAddress,
+      toAddress: tx.toAddress,
+      amountRaw: tx.amountRaw,
+      // decimals null only when the chainId/token pair isn't recognised at
+      // all — extremely unusual since detection itself uses tokenDecimalsFor.
+      // Falling back to amountRaw keeps the field populated for debugging.
+      amount: decimals === null ? tx.amountRaw : formatRawAmount(tx.amountRaw, decimals),
+      amountUsd: tx.amountUsd,
+      usdRate: tx.usdRate,
+      status: tx.status,
+      confirmations: tx.confirmations,
+      blockNumber: tx.blockNumber,
+      detectedAt: tx.detectedAt.toISOString(),
+      confirmedAt: tx.confirmedAt === null ? null : tx.confirmedAt.toISOString()
+    };
+  });
+
+  const amounts = computeAmountsBreakdown(invoice, txs);
+
+  return { invoice, amounts, transactions: txDetails };
+}
+
+// Recompute the USD-axis amounts from the stored transactions. We read
+// rather than trusting `invoice.paidUsd` so the GET breakdown is always
+// internally consistent with the transactions array shown beside it; the
+// stored column stays the authoritative state-machine input.
+function computeAmountsBreakdown(
+  invoice: Invoice,
+  txs: readonly Transaction[]
+): InvoiceAmountsBreakdown {
+  if (invoice.amountUsd === null) {
+    return {
+      requiredUsd: null,
+      confirmedUsd: null,
+      confirmingUsd: null,
+      remainingUsd: null,
+      overpaidUsd: null
+    };
+  }
+  let confirmedUsd = "0.00";
+  let confirmingUsd = "0.00";
+  for (const tx of txs) {
+    if (tx.amountUsd === null) continue;
+    if (tx.status === "confirmed") confirmedUsd = addUsd(confirmedUsd, tx.amountUsd);
+    else if (tx.status === "detected") confirmingUsd = addUsd(confirmingUsd, tx.amountUsd);
+    // reverted / orphaned: excluded — they never count toward owed/overpaid.
+  }
+  const remainingUsd = subUsd(invoice.amountUsd, confirmedUsd);
+  const overpaidUsd = subUsd(confirmedUsd, invoice.amountUsd);
+  return {
+    requiredUsd: invoice.amountUsd,
+    confirmedUsd,
+    confirmingUsd,
+    remainingUsd,
+    overpaidUsd
+  };
 }
 
 export async function expireInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<Invoice> {

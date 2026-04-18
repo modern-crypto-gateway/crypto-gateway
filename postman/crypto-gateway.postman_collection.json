@@ -279,7 +279,7 @@
           ]
         },
         {
-          "name": "Get invoice",
+          "name": "Get invoice (with USD breakdown + transactions)",
           "request": {
             "method": "GET",
             "url": {
@@ -287,7 +287,8 @@
               "host": ["{{baseUrl}}"],
               "path": ["api", "v1", "invoices", "{{invoiceId}}"]
             },
-            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }]
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
+            "description": "Returns:\n\n```json\n{\n  \"invoice\": { ... },\n  \"amounts\": {\n    \"requiredUsd\": \"100.00\",\n    \"confirmedUsd\": \"60.00\",\n    \"confirmingUsd\": \"25.00\",\n    \"remainingUsd\": \"40.00\",\n    \"overpaidUsd\": \"0.00\"\n  },\n  \"transactions\": [\n    { \"chain\": \"ethereum\", \"chainId\": 1, \"token\": \"USDC\", \"amount\": \"60\", \"amountUsd\": \"60.00\", \"status\": \"confirmed\", \"txHash\": \"0x...\", \"fromAddress\": \"0x...\", \"toAddress\": \"0x...\", \"detectedAt\": \"...\", \"confirmedAt\": \"...\" },\n    { \"chain\": \"polygon\", \"chainId\": 137, \"token\": \"USDC\", \"amount\": \"25\", \"amountUsd\": \"25.00\", \"status\": \"detected\", ... }\n  ]\n}\n```\n\n- `amounts.*` is null for legacy single-token invoices (use `requiredAmountRaw` / `receivedAmountRaw` on the invoice itself there).\n- `transactions` includes ALL statuses: `detected` / `confirmed` / `reverted` / `orphaned` — handy for debugging when received/paid look stuck."
           },
           "event": [
             {
@@ -295,7 +296,12 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('has amounts + transactions blocks', () => {",
+                  "  pm.expect(body).to.have.property('amounts');",
+                  "  pm.expect(body).to.have.property('transactions');",
+                  "});"
                 ]
               }
             }
@@ -477,6 +483,20 @@
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDT\",\n  \"amountRaw\": \"1000000\",\n  \"acceptedFamilies\": [\"evm\", \"tron\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
                 "description": "Subset of families. Two receive addresses returned — payer can pay USDT on any of the 7 EVM chains OR on Tron mainnet. Same invoice satisfies whichever chain gets the payment first."
+              },
+              "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
+            },
+            {
+              "name": "Universal USD invoice ($25, all families, any token)",
+              "request": {
+                "method": "POST",
+                "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" },
+                  { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+                ],
+                "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDC\",\n  \"amountUsd\": \"25.00\",\n  \"acceptedFamilies\": [\"evm\", \"tron\", \"solana\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
+                "description": "USD-pegged invoice payable from ANY supported chain in ANY token the gateway can price. Difference vs. `Multi-family — USDT`:\n\n- `amountUsd` instead of `amountRaw` — invoice tracks the $25 target across whichever token/chain pays.\n- Rates are pinned at creation for 10 minutes (the rate window). Pay with USDC on Polygon, ETH on Ethereum, USDT on Tron, SOL on Solana — all convert via the pinned snapshot.\n- `chainId` + `token` are the *primary* family (used for the legacy `receiveAddress`). Real acceptance is everything in `acceptedFamilies`.\n\nResponse contains `acceptedFamilies`, `receiveAddresses[]`, `amountUsd`, `paidUsd`, `rates`, and `rateWindowExpiresAt`. Follow up with `Get invoice` to see the live USD breakdown + per-tx detail (including any reverted/detected rows).\n\nThe checkout page (`GET /checkout/:id`) renders one row per (chain, token) combination via the `payableTokens` field — pre-computed minimum amounts ready to pay."
               },
               "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },

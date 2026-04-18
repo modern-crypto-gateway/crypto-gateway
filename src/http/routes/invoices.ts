@@ -1,6 +1,12 @@
 import { Hono } from "hono";
 import type { AppDeps } from "../../core/app-deps.js";
-import { createInvoice, expireInvoice, getInvoice } from "../../core/domain/invoice.service.js";
+import {
+  createInvoice,
+  expireInvoice,
+  getInvoice,
+  getInvoiceDetails,
+  type InvoiceDetails
+} from "../../core/domain/invoice.service.js";
 import { InvoiceIdSchema, type Invoice, type InvoiceId } from "../../core/types/invoice.js";
 import { renderError } from "../middleware/error-handler.js";
 import { rateLimit } from "../middleware/rate-limit.js";
@@ -58,11 +64,11 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
       // distinguish malformed vs missing ids and enumerate the keyspace.
       return c.json({ error: { code: "NOT_FOUND" } }, 404);
     }
-    const invoice = await getInvoice(deps, id);
-    if (!invoice || invoice.merchantId !== c.get("merchantId")) {
+    const details = await getInvoiceDetails(deps, id);
+    if (!details || details.invoice.merchantId !== c.get("merchantId")) {
       return c.json({ error: { code: "NOT_FOUND", message: `Invoice ${id} not found` } }, 404);
     }
-    return c.json({ invoice: serializeInvoice(invoice) });
+    return c.json(serializeInvoiceDetails(details));
   });
 
   app.post("/:id/expire", async (c) => {
@@ -102,6 +108,19 @@ function serializeInvoice(invoice: Invoice): Record<string, unknown> {
     createdAt: invoice.createdAt.toISOString(),
     expiresAt: invoice.expiresAt.toISOString(),
     confirmedAt: invoice.confirmedAt === null ? null : invoice.confirmedAt.toISOString(),
-    updatedAt: invoice.updatedAt.toISOString()
+    updatedAt: invoice.updatedAt.toISOString(),
+    rateWindowExpiresAt:
+      invoice.rateWindowExpiresAt === null ? null : invoice.rateWindowExpiresAt.toISOString()
+  };
+}
+
+// Wraps the invoice serializer with the USD breakdown + per-tx detail. Used
+// only by GET /:id — POST and POST /expire return the bare invoice (no
+// transactions yet, so the breakdown would be empty/zero noise).
+function serializeInvoiceDetails(details: InvoiceDetails): Record<string, unknown> {
+  return {
+    invoice: serializeInvoice(details.invoice),
+    amounts: details.amounts,
+    transactions: details.transactions
   };
 }

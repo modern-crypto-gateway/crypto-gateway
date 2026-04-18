@@ -120,17 +120,21 @@ paths:
       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
     get:
       tags: [invoices]
-      summary: Fetch an invoice
+      summary: Fetch an invoice with USD breakdown and per-transaction detail
+      description: |
+        Returns the invoice along with two extra blocks not surfaced on POST
+        responses:
+          - `amounts` — USD-axis recomputation (required / confirmed /
+            confirming / remaining / overpaid). All-null on legacy
+            single-token invoices.
+          - `transactions` — every on-chain row tied to this invoice (all
+            statuses, including `reverted` and `orphaned` for debugging).
       responses:
         "200":
           description: Invoice found
           content:
             application/json:
-              schema:
-                type: object
-                required: [invoice]
-                properties:
-                  invoice: { $ref: "#/components/schemas/Invoice" }
+              schema: { $ref: "#/components/schemas/InvoiceDetails" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
@@ -779,10 +783,32 @@ components:
     CreateInvoiceInput:
       type: object
       description: |
-        Either `amountRaw` OR (`fiatAmount` + `fiatCurrency`) must be provided.
+        Provide EXACTLY ONE pricing mode:
+          - `amountUsd` — USD-pegged. Pair with `acceptedFamilies` to make the
+            invoice payable from any family/token the gateway supports. Rates
+            are pinned for 10 minutes at creation.
+          - `amountRaw` — legacy single-token. Payer must pay in `token` on
+            `chainId`, exact amount.
+          - `fiatAmount` + `fiatCurrency` — legacy fiat-quoted. Converted to
+            a token amount at creation via the price oracle.
       properties:
         chainId: { type: integer }
         token: { type: string, pattern: "^[A-Z0-9]+$" }
+        amountUsd:
+          type: string
+          pattern: "^\\d+(\\.\\d{1,8})?$"
+          description: |
+            USD-pegged target. Combined with `acceptedFamilies` lets the same
+            invoice be settled in USDC, USDT, ETH, SOL, TRX, etc. across every
+            wired chain.
+        acceptedFamilies:
+          type: array
+          items: { type: string, enum: [evm, tron, solana] }
+          minItems: 1
+          description: |
+            Families the invoice will accept payment from. Each family gets one
+            allocated receive address. Omit for single-family (derived from
+            `chainId`'s family).
         amountRaw:
           type: string
           pattern: "^\\d+$"
@@ -814,22 +840,118 @@ components:
         merchantId: { type: string, format: uuid }
         status:
           type: string
-          enum: [created, partial, detected, confirmed, expired, canceled]
+          enum: [created, partial, detected, confirmed, overpaid, expired, canceled]
         chainId: { type: integer }
         token: { type: string }
         receiveAddress: { type: string }
         addressIndex: { type: integer }
+        acceptedFamilies:
+          type: array
+          items: { type: string, enum: [evm, tron, solana] }
+        receiveAddresses:
+          type: array
+          description: One entry per accepted family. The checkout UI renders all of them.
+          items:
+            type: object
+            properties:
+              family: { type: string, enum: [evm, tron, solana] }
+              address: { type: string }
         requiredAmountRaw: { type: string }
         receivedAmountRaw: { type: string }
         fiatAmount: { type: [string, "null"] }
         fiatCurrency: { type: [string, "null"] }
         quotedRate: { type: [string, "null"] }
+        amountUsd:
+          type: [string, "null"]
+          description: USD target. Non-null only on USD-path invoices.
+        paidUsd:
+          type: [string, "null"]
+          description: Sum of confirmed transactions' USD value. Non-null on USD-path invoices.
+        overpaidUsd:
+          type: [string, "null"]
+          description: max(paidUsd - amountUsd, 0). Non-null on USD-path invoices.
+        rates:
+          type: [object, "null"]
+          additionalProperties: { type: string }
+          description: |
+            Pinned USD-per-token rates for this invoice's window (USD-path only).
+            Keys are token symbols, values are decimal strings.
+        rateWindowExpiresAt:
+          type: [string, "null"]
+          format: date-time
         externalId: { type: [string, "null"] }
         metadata: { type: [object, "null"] }
         createdAt: { type: string, format: date-time }
         expiresAt: { type: string, format: date-time }
         confirmedAt: { type: [string, "null"], format: date-time }
         updatedAt: { type: string, format: date-time }
+
+    InvoiceAmountsBreakdown:
+      type: object
+      description: |
+        USD-axis breakdown of an invoice's progress. All fields null on legacy
+        single-token invoices (use `requiredAmountRaw` / `receivedAmountRaw`
+        on the invoice itself for those).
+      properties:
+        requiredUsd: { type: [string, "null"] }
+        confirmedUsd:
+          type: [string, "null"]
+          description: Sum of CONFIRMED contributing transactions' USD values.
+        confirmingUsd:
+          type: [string, "null"]
+          description: Sum of DETECTED-but-not-yet-confirmed transactions' USD values.
+        remainingUsd:
+          type: [string, "null"]
+          description: max(requiredUsd - confirmedUsd, 0).
+        overpaidUsd:
+          type: [string, "null"]
+          description: max(confirmedUsd - requiredUsd, 0).
+
+    InvoiceTransaction:
+      type: object
+      description: |
+        One on-chain payment tied to the invoice. All statuses (`detected`,
+        `confirmed`, `reverted`, `orphaned`) are returned so debugging can
+        see rows that no longer count toward the invoice total.
+      properties:
+        id: { type: string, format: uuid }
+        txHash: { type: string }
+        logIndex: { type: [integer, "null"] }
+        chainId: { type: integer }
+        chain:
+          type: [string, "null"]
+          description: Short slug like `ethereum`, `polygon`, `tron`, `solana`. Null if chainId is unknown to the registry.
+        token: { type: string }
+        fromAddress: { type: string }
+        toAddress: { type: string }
+        amountRaw:
+          type: string
+          description: Raw integer string in the token's smallest units.
+        amount:
+          type: string
+          description: Human-readable decimal (e.g. `"1"`, `"0.04"`). Convenience for UIs.
+        amountUsd:
+          type: [string, "null"]
+          description: USD valuation pinned at detection time.
+        usdRate: { type: [string, "null"] }
+        status:
+          type: string
+          enum: [detected, confirmed, reverted, orphaned]
+        confirmations: { type: integer }
+        blockNumber: { type: [integer, "null"] }
+        detectedAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+
+    InvoiceDetails:
+      type: object
+      description: Hydrated GET response — invoice plus USD breakdown plus per-tx detail.
+      required: [invoice, amounts, transactions]
+      properties:
+        invoice: { $ref: "#/components/schemas/Invoice" }
+        amounts: { $ref: "#/components/schemas/InvoiceAmountsBreakdown" }
+        transactions:
+          type: array
+          items: { $ref: "#/components/schemas/InvoiceTransaction" }
 
     PublicInvoice:
       type: object

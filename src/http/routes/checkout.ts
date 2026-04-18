@@ -4,6 +4,7 @@ import { getInvoice } from "../../core/domain/invoice.service.js";
 import { payableAmountRaw, tokenDecimalsFor } from "../../core/domain/rate-window.js";
 import { InvoiceIdSchema, type Invoice, type InvoiceId } from "../../core/types/invoice.js";
 import type { ChainFamily } from "../../core/types/chain.js";
+import { formatRawAmount } from "../../core/types/money.js";
 import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
 import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
 
@@ -171,7 +172,7 @@ function computePayableTokens(deps: AppDeps, invoice: Invoice): readonly Payable
           token,
           decimals,
           amountRawMinimum,
-          amountDisplay: rawToDisplay(amountRawMinimum, decimals),
+          amountDisplay: formatRawAmount(amountRawMinimum, decimals),
           rate,
           address
         });
@@ -190,16 +191,3 @@ function computePayableTokens(deps: AppDeps, invoice: Invoice): readonly Payable
   return out;
 }
 
-// Convert a raw-units BigInt-string to a human-readable decimal string,
-// stripping trailing zeros in the fractional part. Leaves whole-number
-// values like "100" without a decimal point.
-function rawToDisplay(amountRaw: string, decimals: number): string {
-  const n = BigInt(amountRaw);
-  if (decimals === 0) return n.toString();
-  const divisor = BigInt(10) ** BigInt(decimals);
-  const whole = n / divisor;
-  const frac = n % divisor;
-  if (frac === 0n) return whole.toString();
-  const fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "");
-  return fracStr === "" ? whole.toString() : `${whole}.${fracStr}`;
-}

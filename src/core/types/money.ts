@@ -20,3 +20,18 @@ export const RateSchema = z.object({
   at: z.date()
 });
 export type Rate = z.infer<typeof RateSchema>;
+
+// Convert a raw-units BigInt-string to a human-readable decimal string,
+// stripping trailing zeros in the fractional part. Used by API responses
+// and the checkout page so on-chain amounts display naturally without
+// losing precision (BigInt math, no float drift).
+export function formatRawAmount(amountRaw: string, decimals: number): string {
+  const n = BigInt(amountRaw);
+  if (decimals === 0) return n.toString();
+  const divisor = BigInt(10) ** BigInt(decimals);
+  const whole = n / divisor;
+  const frac = n % divisor;
+  if (frac === 0n) return whole.toString();
+  const fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "");
+  return fracStr === "" ? whole.toString() : `${whole}.${fracStr}`;
+}

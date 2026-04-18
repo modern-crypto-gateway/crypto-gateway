@@ -97,7 +97,9 @@ export function drizzleRowToTransaction(row: typeof transactions.$inferSelect): 
     confirmations: row.confirmations,
     status: row.status as TxStatus,
     detectedAt: new Date(row.detectedAt),
-    confirmedAt: row.confirmedAt === null ? null : new Date(row.confirmedAt)
+    confirmedAt: row.confirmedAt === null ? null : new Date(row.confirmedAt),
+    amountUsd: row.amountUsd,
+    usdRate: row.usdRate
   };
 }
 

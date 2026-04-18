@@ -37,7 +37,15 @@ export const TransactionSchema = z.object({
   status: TxStatusSchema,
 
   detectedAt: z.date(),
-  confirmedAt: z.date().nullable()
+  confirmedAt: z.date().nullable(),
+
+  // USD valuation captured when the payment was first priced (oracle quote at
+  // detection time). Both null on legacy single-token invoices and on rows
+  // the oracle couldn't price. Stored — not derived on read — so the GET
+  // breakdown reflects the same rate the invoice was credited at, even if
+  // the live oracle has since moved.
+  amountUsd: z.string().regex(/^\d+(\.\d+)?$/).nullable(),
+  usdRate: z.string().regex(/^\d+(\.\d+)?$/).nullable()
 });
 export type Transaction = z.infer<typeof TransactionSchema> & { id: TransactionId };
 
