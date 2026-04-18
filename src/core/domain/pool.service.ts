@@ -110,7 +110,23 @@ export async function allocateForInvoice(
       })
       .from(addressPool)
       .where(and(eq(addressPool.family, family), eq(addressPool.status, "available")))
-      .orderBy(asc(addressPool.totalAllocations), asc(addressPool.addressIndex))
+      // Ordering rationale:
+      //   1. totalAllocations ASC — never-used rows (count=0) win first.
+      //   2. lastReleasedAt ASC NULLS FIRST — among rows with equal use count,
+      //      longest-dormant wins; just-released rows go to the back. This
+      //      gives a late payment to a recently expired invoice the longest
+      //      possible window to land on the address that was tied to it
+      //      rather than on a freshly-reused one. SQLite's default ASC
+      //      ordering already places NULLs first, so the never-used (NULL
+      //      lastReleasedAt) rows naturally win the tie inside the count=0
+      //      bucket too.
+      //   3. addressIndex ASC — deterministic final tiebreak, oldest derivation
+      //      first.
+      .orderBy(
+        asc(addressPool.totalAllocations),
+        asc(addressPool.lastReleasedAt),
+        asc(addressPool.addressIndex)
+      )
       .limit(1);
 
     if (!candidate) {
@@ -150,13 +166,15 @@ export async function allocateForInvoice(
 // total_allocations on each released row so the fair-rotation ordering
 // moves it to the back of the queue.
 export async function releaseFromInvoice(deps: AppDeps, invoiceId: string): Promise<void> {
+  const now = deps.clock.now().getTime();
   await deps.db
     .update(addressPool)
     .set({
       status: "available",
       allocatedToInvoiceId: null,
       allocatedAt: null,
-      totalAllocations: sql`${addressPool.totalAllocations} + 1`
+      totalAllocations: sql`${addressPool.totalAllocations} + 1`,
+      lastReleasedAt: now
     })
     .where(eq(addressPool.allocatedToInvoiceId, invoiceId));
 }

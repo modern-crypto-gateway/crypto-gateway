@@ -1,4 +1,5 @@
 import type { AppDeps } from "../app-deps.js";
+import { sweepExpiredInvoices } from "./invoice.service.js";
 import { confirmTransactions, recheckConfirmedTransactionsForReorg } from "./payment.service.js";
 import {
   confirmPayouts,
@@ -31,6 +32,7 @@ export interface ScheduledJobsResult {
   executeReservedPayouts: JobOutcome;
   confirmPayouts: JobOutcome;
   sweepStuckFeeWalletReservations: JobOutcome;
+  sweepExpiredInvoices: JobOutcome;
   sweepWebhookDeliveries: JobOutcome;
   // Present only when Alchemy is configured for this deployment
   // (`deps.alchemy` set). Absent otherwise — callers should not treat the
@@ -50,6 +52,11 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     executeReservedPayouts: await run(() => executeReservedPayouts(deps)),
     confirmPayouts: await run(() => confirmPayouts(deps)),
     sweepStuckFeeWalletReservations: await run(() => sweepStuckFeeWalletReservations(deps)),
+    // Expire-then-deliver: must run BEFORE sweepWebhookDeliveries so the
+    // invoice.expired events published here insert webhook rows that get
+    // picked up in the same tick. (Initial dispatch still happens via
+    // dispatchEvent; the sweeper is the safety net.)
+    sweepExpiredInvoices: await run(() => sweepExpiredInvoices(deps)),
     sweepWebhookDeliveries: await run(() => sweepWebhookDeliveries(deps))
   };
   if (deps.alchemy !== undefined) {

@@ -313,12 +313,25 @@ export const addressPool = sqliteTable(
     // Lifetime reuse counter. Allocation picks MIN(totalAllocations) first so
     // the same address doesn't get re-handed-out disproportionately.
     totalAllocations: integer("total_allocations").notNull().default(0),
+    // Set when the row last transitioned allocated → available. Allocation
+    // tie-breaks MIN(totalAllocations) by ASC NULLS FIRST on this column so
+    // never-used rows win, then the longest-dormant rows, with a just-released
+    // row going to the back of the queue. Goal: a late payment to a recently
+    // expired invoice still lands on the address that was tied to that
+    // invoice rather than on a freshly-reused one.
+    lastReleasedAt: integer("last_released_at"),
     createdAt: integer("created_at").notNull()
   },
   (t) => [
     uniqueIndex("uq_address_pool_family_index").on(t.family, t.addressIndex),
     uniqueIndex("uq_address_pool_family_address").on(t.family, t.address),
-    index("idx_address_pool_available").on(t.family, t.status, t.totalAllocations, t.addressIndex),
+    index("idx_address_pool_available").on(
+      t.family,
+      t.status,
+      t.totalAllocations,
+      t.lastReleasedAt,
+      t.addressIndex
+    ),
     index("idx_address_pool_allocated").on(t.allocatedToInvoiceId),
     check("address_pool_family_check", sql`${t.family} IN ('evm','tron','solana')`),
     check(

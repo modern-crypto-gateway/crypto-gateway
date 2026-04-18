@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, lte } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainFamilySchema, ChainIdSchema, type ChainFamily } from "../types/chain.js";
 import { chainSlug } from "../types/chain-registry.js";
@@ -495,6 +495,45 @@ export async function expireInvoice(deps: AppDeps, invoiceId: InvoiceId): Promis
   const invoice = drizzleRowToInvoice(row, addresses);
   await deps.events.publish({ type: "invoice.expired", invoiceId: invoice.id, invoice, at: new Date(now) });
   return invoice;
+}
+
+export interface SweepExpiredInvoicesResult {
+  expired: number;
+}
+
+// Cron-driven expiration sweeper. Transitions every `created`/`partial` row
+// past its expiresAt to `expired`, then publishes invoice.expired per row so
+// downstream subscribers (pool release, webhook dispatch) fire. Without this,
+// expired invoices sit in `partial` forever — payment polling skips them
+// (poll-payments.ts gates on expiresAt > now), but their pool addresses never
+// return to rotation and the merchant never receives the lifecycle webhook.
+export async function sweepExpiredInvoices(deps: AppDeps): Promise<SweepExpiredInvoicesResult> {
+  const now = deps.clock.now().getTime();
+  const updated = await deps.db
+    .update(invoices)
+    .set({ status: "expired", updatedAt: now })
+    .where(and(inArray(invoices.status, ["created", "partial"]), lte(invoices.expiresAt, now)))
+    .returning();
+  if (updated.length === 0) return { expired: 0 };
+
+  for (const row of updated) {
+    try {
+      const addresses = await fetchInvoiceReceiveAddresses(deps, row.id);
+      const invoice = drizzleRowToInvoice(row, addresses);
+      await deps.events.publish({
+        type: "invoice.expired",
+        invoiceId: invoice.id,
+        invoice,
+        at: new Date(now)
+      });
+    } catch (err) {
+      deps.logger.error("invoice.expired publish failed during sweep", {
+        invoiceId: row.id,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
+  return { expired: updated.length };
 }
 
 // Returns true when at least one chain in the family has `token` registered.

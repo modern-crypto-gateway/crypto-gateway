@@ -62,6 +62,16 @@ const BACKOFF_MS: readonly number[] = [
   6 * 60 * 60 * 1000 // 6 hr
 ];
 
+// Grace window applied to a newly-inserted row's nextAttemptAt so the
+// `sweepWebhookDeliveries` cron job can't race the initial dispatch. Without
+// it, the sweeper SELECTs `pending` rows where `nextAttemptAt <= now` and
+// picks up the just-inserted row before its initial dispatch has finished —
+// then both call attemptDelivery (no atomic claim) and the merchant gets the
+// same payload twice. 20s comfortably covers any realistic dispatch RTT;
+// if the initial attempt actually crashes mid-flight, the sweeper still picks
+// it up after the grace window so the safety net is preserved.
+const INITIAL_DISPATCH_GRACE_MS = 20 * 1000;
+
 export function registerWebhookSubscriber(deps: AppDeps): () => void {
   const unsubscribers = OUTBOUND_EVENT_TYPES.map((type) =>
     deps.events.subscribe(type, (event) => {
@@ -114,7 +124,7 @@ async function dispatchEvent(deps: AppDeps, event: DomainEvent): Promise<void> {
     // take effect mid-flight without any per-row plumbing.
     resourceType: composed.resource.type,
     resourceId: composed.resource.id,
-    nextAttemptAt: now,
+    nextAttemptAt: now + INITIAL_DISPATCH_GRACE_MS,
     now
   });
 
