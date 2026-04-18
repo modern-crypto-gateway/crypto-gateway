@@ -143,20 +143,40 @@ function serializeInvoice(invoice: Invoice): Record<string, unknown> {
     chainId: invoice.chainId,
     token: invoice.token,
     receiveAddress: invoice.receiveAddress,
+    addressIndex: invoice.addressIndex,
     acceptedFamilies: invoice.acceptedFamilies,
     receiveAddresses: invoice.receiveAddresses.map((r) => ({
       family: r.family,
       address: r.address
     })),
+    // Legacy single-token amounts. Populated for non-USD invoices; "0" /
+    // null on USD-pegged invoices where amount lives in `amountUsd` /
+    // `paidUsd` / `overpaidUsd` below.
     requiredAmountRaw: invoice.requiredAmountRaw,
     receivedAmountRaw: invoice.receivedAmountRaw,
     fiatAmount: invoice.fiatAmount,
     fiatCurrency: invoice.fiatCurrency,
+    quotedRate: invoice.quotedRate,
+    // USD-path amounts. amountUsd is the target the merchant set; paidUsd is
+    // the running confirmed total; overpaidUsd is the excess once the target
+    // is exceeded. All three are decimal strings to preserve precision.
+    amountUsd: invoice.amountUsd,
+    paidUsd: invoice.paidUsd,
+    overpaidUsd: invoice.overpaidUsd,
+    // Pinned rate snapshot for the current window. Useful for partial /
+    // detected events so the merchant can show the customer "X token left to
+    // pay" without re-pricing on their side. Both null on legacy invoices.
+    rateWindowExpiresAt:
+      invoice.rateWindowExpiresAt === null ? null : invoice.rateWindowExpiresAt.toISOString(),
+    rates: invoice.rates,
+    paymentToleranceUnderBps: invoice.paymentToleranceUnderBps,
+    paymentToleranceOverBps: invoice.paymentToleranceOverBps,
     externalId: invoice.externalId,
     metadata: invoice.metadata,
     createdAt: invoice.createdAt.toISOString(),
     expiresAt: invoice.expiresAt.toISOString(),
-    confirmedAt: invoice.confirmedAt === null ? null : invoice.confirmedAt.toISOString()
+    confirmedAt: invoice.confirmedAt === null ? null : invoice.confirmedAt.toISOString(),
+    updatedAt: invoice.updatedAt.toISOString()
   };
 }
 
