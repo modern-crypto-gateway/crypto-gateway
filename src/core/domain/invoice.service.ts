@@ -4,7 +4,7 @@ import type { AppDeps } from "../app-deps.js";
 import { ChainFamilySchema, ChainIdSchema, type ChainFamily } from "../types/chain.js";
 import { chainSlug } from "../types/chain-registry.js";
 import { AmountRawSchema, FiatAmountSchema, FiatCurrencySchema, formatRawAmount } from "../types/money.js";
-import { MerchantIdSchema } from "../types/merchant.js";
+import { MerchantIdSchema, PaymentToleranceBpsSchema } from "../types/merchant.js";
 import type { Invoice, InvoiceId, InvoiceReceiveAddress } from "../types/invoice.js";
 import { TokenSymbolSchema } from "../types/token.js";
 import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
@@ -47,6 +47,11 @@ export const CreateInvoiceInputSchema = z
     // back to the merchant-account webhook.
     webhookUrl: z.string().url().optional(),
     webhookSecret: z.string().min(16).max(512).optional(),
+    // Per-invoice payment tolerance override in basis points. Either or both
+    // optional; omit to inherit the merchant default (snapshotted at create
+    // time). See merchants.payment_tolerance_*_bps for the math semantics.
+    paymentToleranceUnderBps: PaymentToleranceBpsSchema.optional(),
+    paymentToleranceOverBps: PaymentToleranceBpsSchema.optional(),
     // Default 30 minutes. Hard ceiling at 24 hours — the scheduler promotes
     // long-expired invoices and merchants who need days-long expiries are
     // doing something unusual.
@@ -87,7 +92,12 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
 
   // 1. Merchant must exist + be active.
   const [merchant] = await deps.db
-    .select({ id: merchants.id, active: merchants.active })
+    .select({
+      id: merchants.id,
+      active: merchants.active,
+      paymentToleranceUnderBps: merchants.paymentToleranceUnderBps,
+      paymentToleranceOverBps: merchants.paymentToleranceOverBps
+    })
     .from(merchants)
     .where(eq(merchants.id, parsed.merchantId))
     .limit(1);
@@ -256,6 +266,10 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
     ratesJson: ratesJson,
     webhookUrl: parsed.webhookUrl ?? null,
     webhookSecretCiphertext: webhookSecretCiphertext,
+    paymentToleranceUnderBps:
+      parsed.paymentToleranceUnderBps ?? merchant.paymentToleranceUnderBps,
+    paymentToleranceOverBps:
+      parsed.paymentToleranceOverBps ?? merchant.paymentToleranceOverBps,
     createdAt: now,
     expiresAt: expiresAt,
     confirmedAt: null,

@@ -215,6 +215,30 @@ export function compareUsd(a: string, b: string): number {
   return 0;
 }
 
+// Apply a basis-point delta to a USD decimal string. `bps` ≥ 0; sign chosen
+// by `direction`. Example: `applyBps("100.00", 100, "down")` → "99.00";
+// `applyBps("100.00", 100, "up")` → "101.00". We compute the delta at 4
+// decimals of precision (so sub-cent bps math doesn't vanish on small
+// invoices like $1.00 + 33 bps) and then floor the final amount to cents.
+// USD always rounds down at the cent boundary, so `down` deductions round
+// the threshold further from the invoice amount (more lenient under-tol)
+// and `up` additions round the threshold closer to the amount (stricter
+// over-tol). Both keep the merchant from chasing fractional-cent errors.
+export function applyBps(amount: string, bps: number, direction: "up" | "down"): string {
+  const TENTHS = 10_000n; // 4 decimals of precision
+  const scaled = scaleDecimal(amount, 4);
+  if (bps === 0) return scaleToCents(scaled / 100n);
+  const delta = (scaled * BigInt(bps)) / TENTHS;
+  const next = direction === "down" ? scaled - delta : scaled + delta;
+  return scaleToCents((next < 0n ? 0n : next) / 100n);
+}
+
+function scaleToCents(cents: bigint): string {
+  const dollars = cents / 100n;
+  const c = cents % 100n;
+  return `${dollars}.${c.toString().padStart(2, "0")}`;
+}
+
 // a - b in USD. Negative results clamp to "0.00" — caller uses this for
 // overpaid deltas, where negative would be nonsense.
 export function subUsd(a: string, b: string): string {

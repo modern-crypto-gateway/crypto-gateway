@@ -66,9 +66,9 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Postman Test Merchant\",\n  \"webhookUrl\": \"https://merchant.example.com/crypto-gateway/webhook\"\n}"
+              "raw": "{\n  \"name\": \"Postman Test Merchant\",\n  \"webhookUrl\": \"https://merchant.example.com/crypto-gateway/webhook\",\n  \"paymentToleranceUnderBps\": 0,\n  \"paymentToleranceOverBps\": 0\n}"
             },
-            "description": "Creates a merchant and returns the plaintext `apiKey` (saved into env) + plaintext `webhookSecret` (saved into env). Neither is recoverable afterward — Postman stores them in the environment so downstream requests chain automatically."
+            "description": "Creates a merchant and returns the plaintext `apiKey` (saved into env) + plaintext `webhookSecret` (saved into env). Neither is recoverable afterward — Postman stores them in the environment so downstream requests chain automatically.\n\n`paymentToleranceUnderBps` / `paymentToleranceOverBps` set the merchant's default invoice payment tolerance in basis points (1 bp = 0.01 %; capped at 2000). `0 / 0` is strict — every cent must match. Per-invoice overrides on `POST /api/v1/invoices` win when set. Tweak via `PATCH /admin/merchants/:id` later."
           },
           "event": [
             {
@@ -90,6 +90,38 @@
                   "  pm.environment.set('webhookSecret', body.webhookSecret);",
                   "  console.log('saved webhookSecret (length ' + body.webhookSecret.length + ')');",
                   "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2b. Update merchant payment tolerance",
+          "request": {
+            "method": "PATCH",
+            "url": { "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}", "host": ["{{baseUrl}}"], "path": ["admin", "merchants", "{{merchantId}}"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"paymentToleranceUnderBps\": 50,\n  \"paymentToleranceOverBps\": 100\n}"
+            },
+            "description": "Updates the merchant's payment-tolerance defaults (basis points, 1 bp = 0.01 %).\n\n- `paymentToleranceUnderBps`: a paid USD amount within `bps` of the target closes the invoice as `confirmed` instead of `partial`. 50 = 0.5 %.\n- `paymentToleranceOverBps`: a paid USD amount within `bps` over the target closes as `confirmed` instead of `overpaid`. 100 = 1 %.\n\nApplies to invoices created **after** this PATCH; existing invoices keep the snapshot they were issued with. Webhook URL/secret are intentionally NOT mutable here — changing them mid-flight orphans pending outbox rows enqueued under the old key."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('echoes new tolerances', () => {",
+                  "  pm.expect(body.merchant.paymentToleranceUnderBps).to.equal(50);",
+                  "  pm.expect(body.merchant.paymentToleranceOverBps).to.equal(100);",
+                  "});"
                 ]
               }
             }
@@ -303,6 +335,38 @@
                   "const body = pm.response.json();",
                   "pm.test('echoes webhookUrl', () => pm.expect(body.invoice.webhookUrl).to.eql('https://merchant.example.com/per-invoice/hook'));",
                   "pm.test('does not echo webhookSecret', () => pm.expect(body.invoice).to.not.have.property('webhookSecret'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create invoice (with payment tolerance override)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountUsd\": \"2.00\",\n  \"acceptedFamilies\": [\"evm\"],\n  \"externalId\": \"{{runExternalId}}-tol\",\n  \"paymentToleranceUnderBps\": 50,\n  \"paymentToleranceOverBps\": 100\n}"
+            },
+            "description": "Per-invoice payment tolerance override. `paymentToleranceUnderBps: 50` (0.5 %) means a 1.99 USD payment against a 2.00 USD invoice closes as `confirmed` instead of `partial`. `paymentToleranceOverBps: 100` (1 %) means a 2.02 USD payment closes as `confirmed` instead of `overpaid`. Each is capped at 2000 bps (20 %); omit either to inherit the merchant default. Snapshotted at create time — a later `PATCH /admin/merchants/:id` does not retroactively reshape this invoice."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('echoes tolerance fields', () => {",
+                  "  pm.expect(body.invoice.paymentToleranceUnderBps).to.equal(50);",
+                  "  pm.expect(body.invoice.paymentToleranceOverBps).to.equal(100);",
+                  "});"
                 ]
               }
             }

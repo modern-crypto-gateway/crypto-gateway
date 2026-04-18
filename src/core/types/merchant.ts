@@ -4,6 +4,10 @@ import type { Brand } from "./branded.js";
 export const MerchantIdSchema = z.string().uuid();
 export type MerchantId = Brand<z.infer<typeof MerchantIdSchema>, "MerchantId">;
 
+// Basis points for payment tolerance. 1 bp = 0.01%; 100 bps = 1%; 10_000 = 100%.
+// Hard-capped at 2000 bps (20%) — see PaymentToleranceBpsSchema callers.
+export const PaymentToleranceBpsSchema = z.number().int().min(0).max(2000);
+
 export const MerchantSchema = z.object({
   id: MerchantIdSchema,
   name: z.string().min(1).max(128),
@@ -18,6 +22,13 @@ export const MerchantSchema = z.object({
   // rather than coercing, because every query site reads it as a number and
   // comparing against 1 is clearer than flipping to boolean midway.
   active: z.number().int().min(0).max(1),
+  // Default invoice payment tolerance, basis points. 0 = strict (legacy).
+  // Hard-capped at 2000 bps (20%) — any larger value almost certainly
+  // indicates a misconfigured merchant rather than a real business need,
+  // and an overly loose tolerance closes invoices that effectively went
+  // unpaid.
+  paymentToleranceUnderBps: PaymentToleranceBpsSchema,
+  paymentToleranceOverBps: PaymentToleranceBpsSchema,
   createdAt: z.date(),
   updatedAt: z.date()
 });

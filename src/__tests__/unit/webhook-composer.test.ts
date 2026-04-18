@@ -34,6 +34,8 @@ function fixtureInvoice(overrides: Partial<Invoice> = {}): Invoice {
     externalId: "cart-42",
     metadata: { source: "test" },
     webhookUrl: null,
+    paymentToleranceUnderBps: 0,
+    paymentToleranceOverBps: 0,
     createdAt: new Date("2026-04-16T10:00:00Z"),
     expiresAt: new Date("2026-04-16T10:30:00Z"),
     confirmedAt: null,

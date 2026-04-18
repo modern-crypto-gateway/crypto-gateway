@@ -99,6 +99,12 @@ export const InvoiceSchema = z.object({
   // falls back to the merchant-account webhook.
   webhookUrl: z.string().url().nullable(),
 
+  // Payment tolerance, basis points. Snapshotted at create time from the
+  // input override (if provided) or the merchant default. Always populated
+  // (no inheritance at read-time).
+  paymentToleranceUnderBps: z.number().int().min(0).max(2000),
+  paymentToleranceOverBps: z.number().int().min(0).max(2000),
+
   createdAt: z.date(),
   expiresAt: z.date(),
   confirmedAt: z.date().nullable(),

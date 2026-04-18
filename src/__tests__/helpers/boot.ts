@@ -50,6 +50,8 @@ export interface BootTestAppOptions {
     active?: boolean;
     webhookUrl?: string;
     webhookSecret?: string;
+    paymentToleranceUnderBps?: number;
+    paymentToleranceOverBps?: number;
   }>;
   // Rate-limit overrides. Defaults are set high enough that existing integration
   // tests never trip them; rate-limit-specific tests pass small numbers here.
@@ -99,6 +101,8 @@ export async function createInvoiceViaApi(
     fiatCurrency?: string;
     webhookUrl?: string;
     webhookSecret?: string;
+    paymentToleranceUnderBps?: number;
+    paymentToleranceOverBps?: number;
   }
 ): Promise<{ id: string; receiveAddress: string; status: string; [k: string]: unknown }> {
   const merchantId = args.merchantId ?? "00000000-0000-0000-0000-000000000001";
@@ -113,6 +117,10 @@ export async function createInvoiceViaApi(
   if (args.fiatCurrency !== undefined) body["fiatCurrency"] = args.fiatCurrency;
   if (args.webhookUrl !== undefined) body["webhookUrl"] = args.webhookUrl;
   if (args.webhookSecret !== undefined) body["webhookSecret"] = args.webhookSecret;
+  if (args.paymentToleranceUnderBps !== undefined)
+    body["paymentToleranceUnderBps"] = args.paymentToleranceUnderBps;
+  if (args.paymentToleranceOverBps !== undefined)
+    body["paymentToleranceOverBps"] = args.paymentToleranceOverBps;
   const res = await booted.app.fetch(
     new Request("http://test.local/api/v1/invoices", {
       method: "POST",
@@ -175,6 +183,8 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
       webhookUrl: m.webhookUrl ?? null,
       webhookSecretCiphertext,
       active: m.active === false ? 0 : 1,
+      paymentToleranceUnderBps: m.paymentToleranceUnderBps ?? 0,
+      paymentToleranceOverBps: m.paymentToleranceOverBps ?? 0,
       createdAt: seedNow,
       updatedAt: seedNow
     });

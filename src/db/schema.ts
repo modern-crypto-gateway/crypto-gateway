@@ -44,6 +44,14 @@ export const merchants = sqliteTable(
     webhookUrl: text("webhook_url"),
     webhookSecretCiphertext: text("webhook_secret_ciphertext"),
     active: integer("active").notNull().default(1),
+    // Default payment tolerance in basis points (1 bp = 0.01%). Applied when
+    // an invoice doesn't carry its own override.
+    //   under: paid_usd >= amount_usd * (1 - under/10_000) → confirmed
+    //          (e.g. 100 bps = 1%; pay 99% → confirmed instead of partial)
+    //   over:  paid_usd <= amount_usd * (1 + over /10_000) → confirmed
+    //          (e.g. 100 bps = 1%; pay 101% → confirmed instead of overpaid)
+    paymentToleranceUnderBps: integer("payment_tolerance_under_bps").notNull().default(0),
+    paymentToleranceOverBps: integer("payment_tolerance_over_bps").notNull().default(0),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull()
   },
@@ -95,6 +103,14 @@ export const invoices = sqliteTable(
     // wrong endpoint).
     webhookUrl: text("webhook_url"),
     webhookSecretCiphertext: text("webhook_secret_ciphertext"),
+
+    // Per-invoice payment tolerance in basis points. Snapshotted from the
+    // merchant defaults at create time (or from per-invoice override input);
+    // a later change to the merchant default does not retroactively reshape
+    // already-issued invoices. See merchants.payment_tolerance_*_bps for the
+    // status-transition semantics.
+    paymentToleranceUnderBps: integer("payment_tolerance_under_bps").notNull().default(0),
+    paymentToleranceOverBps: integer("payment_tolerance_over_bps").notNull().default(0),
 
     createdAt: integer("created_at").notNull(),
     expiresAt: integer("expires_at").notNull(),

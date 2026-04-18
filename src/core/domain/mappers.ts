@@ -40,6 +40,8 @@ export function drizzleRowToInvoice(
     externalId: row.externalId,
     metadata: row.metadataJson === null ? null : (JSON.parse(row.metadataJson) as Record<string, unknown>),
     webhookUrl: row.webhookUrl,
+    paymentToleranceUnderBps: row.paymentToleranceUnderBps,
+    paymentToleranceOverBps: row.paymentToleranceOverBps,
     createdAt: new Date(row.createdAt),
     expiresAt: new Date(row.expiresAt),
     confirmedAt: row.confirmedAt === null ? null : new Date(row.confirmedAt),

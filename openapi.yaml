@@ -284,6 +284,26 @@ paths:
                   type: string
                   description: Optional hex-encoded 32-byte HMAC signing secret. Generated if omitted.
                   pattern: "^[0-9a-f]{64}$"
+                paymentToleranceUnderBps:
+                  type: integer
+                  minimum: 0
+                  maximum: 2000
+                  default: 0
+                  description: |
+                    Default invoice under-payment tolerance in basis points.
+                    A paid USD amount ≥ `amountUsd × (1 − bps/10_000)` closes
+                    the invoice as `confirmed`. Example: `100` = 1 % — paying
+                    99 USD on a 100 USD invoice still confirms.
+                paymentToleranceOverBps:
+                  type: integer
+                  minimum: 0
+                  maximum: 2000
+                  default: 0
+                  description: |
+                    Default invoice over-payment tolerance in basis points.
+                    A paid USD amount ≤ `amountUsd × (1 + bps/10_000)` closes
+                    the invoice as `confirmed` (not `overpaid`). Example: `100`
+                    = 1 % — paying 101 USD on a 100 USD invoice confirms.
       responses:
         "201":
           description: Merchant created
@@ -299,6 +319,8 @@ paths:
                       name: { type: string }
                       webhookUrl: { type: [string, "null"] }
                       active: { type: boolean }
+                      paymentToleranceUnderBps: { type: integer, minimum: 0, maximum: 2000 }
+                      paymentToleranceOverBps: { type: integer, minimum: 0, maximum: 2000 }
                       createdAt: { type: string, format: date-time }
                   apiKey:
                     type: string
@@ -310,6 +332,62 @@ paths:
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
+
+  /admin/merchants/{id}:
+    patch:
+      tags: [admin]
+      summary: Update a merchant's payment-tolerance defaults
+      description: |
+        Currently scoped to `paymentToleranceUnderBps` and `paymentToleranceOverBps`.
+        Webhook URL/secret stay create-only on purpose — changing them mid-flight
+        orphans pending outbox rows that were enqueued under the old key.
+
+        Tolerance changes apply to invoices created **after** the PATCH; existing
+        invoices keep the snapshot they were issued with.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                paymentToleranceUnderBps:
+                  type: integer
+                  minimum: 0
+                  maximum: 2000
+                paymentToleranceOverBps:
+                  type: integer
+                  minimum: 0
+                  maximum: 2000
+      responses:
+        "200":
+          description: Merchant updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      webhookUrl: { type: [string, "null"] }
+                      active: { type: boolean }
+                      paymentToleranceUnderBps: { type: integer }
+                      paymentToleranceOverBps: { type: integer }
+                      updatedAt: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
 
   /admin/bootstrap/alchemy-webhooks:
     post:
@@ -848,6 +926,21 @@ components:
           description: |
             HMAC secret paired with `webhookUrl`. Encrypted at rest and never
             echoed back. Required if `webhookUrl` is set.
+        paymentToleranceUnderBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Per-invoice under-payment tolerance override in basis points. Omit
+            to inherit the merchant default (snapshotted at create time). See
+            `POST /admin/merchants` for the math semantics.
+        paymentToleranceOverBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Per-invoice over-payment tolerance override in basis points. Omit
+            to inherit the merchant default.
       required: [chainId, token]
 
     Invoice:
@@ -905,6 +998,20 @@ components:
             Per-invoice webhook URL override (echo-only). Null when the
             invoice falls back to the merchant-account webhook. The matching
             secret is write-only and never returned.
+        paymentToleranceUnderBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Effective under-payment tolerance for this invoice in basis points
+            (snapshot of merchant default or per-invoice override at create time).
+        paymentToleranceOverBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Effective over-payment tolerance for this invoice in basis points
+            (snapshot of merchant default or per-invoice override at create time).
         createdAt: { type: string, format: date-time }
         expiresAt: { type: string, format: date-time }
         confirmedAt: { type: [string, "null"], format: date-time }

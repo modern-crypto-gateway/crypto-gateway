@@ -14,7 +14,7 @@ import {
 } from "./mappers.js";
 import { confirmationThreshold } from "./payment-config.js";
 import { reacquireForInvoice } from "./pool.service.js";
-import { addUsd, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
+import { addUsd, applyBps, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
 import { invoices, invoiceReceiveAddresses, transactions } from "../../db/schema.js";
 
 type InvoiceRow = typeof invoices.$inferSelect;
@@ -610,14 +610,21 @@ async function recomputeUsdInvoice(
   }
 
   const amountUsd = invoiceRow.amountUsd!;
-  const cmp = compareUsd(paidUsd, amountUsd);
+  // Per-invoice tolerance bands. Snapshotted at create time so the merchant
+  // changing their default mid-flight doesn't retroactively close partials.
+  //   confirmThreshold = amountUsd × (1 − under/10_000)  — paid_usd at-or-above this closes confirmed
+  //   overpaidThreshold = amountUsd × (1 + over /10_000) — paid_usd above this closes overpaid
+  // overpaidUsd remains the *raw* delta (paid − amount) so merchant accounting
+  // still sees the true overshoot regardless of where the threshold sits.
+  const confirmThreshold = applyBps(amountUsd, invoiceRow.paymentToleranceUnderBps, "down");
+  const overpaidThreshold = applyBps(amountUsd, invoiceRow.paymentToleranceOverBps, "up");
 
   let after: InvoiceStatus;
   let overpaidUsd = "0";
-  if (cmp > 0) {
+  if (compareUsd(paidUsd, overpaidThreshold) > 0) {
     after = "overpaid";
     overpaidUsd = subUsd(paidUsd, amountUsd);
-  } else if (cmp === 0) {
+  } else if (compareUsd(paidUsd, confirmThreshold) >= 0 && compareUsd(paidUsd, "0") > 0) {
     after = "confirmed";
   } else if (compareUsd(paidUsd, "0") > 0) {
     after = "partial";

@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { eq } from "drizzle-orm";
 import { z } from "zod";
 import type { AppDeps } from "../../core/app-deps.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
@@ -31,8 +32,26 @@ const CreateMerchantSchema = z.object({
   webhookUrl: z.string().url().optional(),
   // If present, a 64-hex-char plaintext signing secret for outbound webhooks.
   // Omit to generate a fresh one; the plaintext is returned once in the response.
-  webhookSecret: z.string().length(64).regex(/^[0-9a-f]+$/).optional()
+  webhookSecret: z.string().length(64).regex(/^[0-9a-f]+$/).optional(),
+  // Default invoice payment tolerance in basis points. 1 bp = 0.01%.
+  //   under: paid_usd ≥ amount_usd × (1 − under/10_000) closes as confirmed
+  //   over:  paid_usd ≤ amount_usd × (1 + over /10_000) closes as confirmed
+  // Capped at 2000 bps (20%); omit either to default to 0 (strict).
+  paymentToleranceUnderBps: z.number().int().min(0).max(2000).optional(),
+  paymentToleranceOverBps: z.number().int().min(0).max(2000).optional()
 });
+
+const UpdateMerchantSchema = z
+  .object({
+    paymentToleranceUnderBps: z.number().int().min(0).max(2000).optional(),
+    paymentToleranceOverBps: z.number().int().min(0).max(2000).optional()
+  })
+  .refine(
+    (v) =>
+      v.paymentToleranceUnderBps !== undefined ||
+      v.paymentToleranceOverBps !== undefined,
+    { message: "PATCH body must contain at least one updatable field" }
+  );
 
 const RegisterFeeWalletSchema = z.object({
   chainId: z.number().int().positive(),
@@ -144,6 +163,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         ? await deps.secretsCipher.encrypt(webhookSecret)
         : null;
 
+      const paymentToleranceUnderBps = parsed.paymentToleranceUnderBps ?? 0;
+      const paymentToleranceOverBps = parsed.paymentToleranceOverBps ?? 0;
       await deps.db.insert(merchants).values({
         id,
         name: parsed.name,
@@ -151,6 +172,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         webhookUrl: parsed.webhookUrl ?? null,
         webhookSecretCiphertext,
         active: 1,
+        paymentToleranceUnderBps,
+        paymentToleranceOverBps,
         createdAt: now,
         updatedAt: now
       });
@@ -162,6 +185,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
             name: parsed.name,
             webhookUrl: parsed.webhookUrl ?? null,
             active: true,
+            paymentToleranceUnderBps,
+            paymentToleranceOverBps,
             createdAt: new Date(now).toISOString()
           },
           // Plaintext API key returned once — never recoverable after this response.
@@ -170,6 +195,61 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
           ...(parsed.webhookUrl ? { webhookSecret } : {})
         },
         201
+      );
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // PATCH a merchant's tunable defaults. Currently scoped to the payment-
+  // tolerance pair — the only field that's safe to mutate from the admin
+  // surface without coordinated key rotation. Webhook URL/secret stay
+  // create-only on purpose: changing them mid-flight orphans pending
+  // outbox rows that were enqueued under the old key.
+  app.patch("/merchants/:id", async (c) => {
+    const id = c.req.param("id");
+    const body = (await c.req.json().catch(() => null)) as unknown;
+    if (body === null) {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const parsed = UpdateMerchantSchema.parse(body);
+      const now = deps.clock.now().getTime();
+      const patch: Partial<{
+        paymentToleranceUnderBps: number;
+        paymentToleranceOverBps: number;
+        updatedAt: number;
+      }> = { updatedAt: now };
+      if (parsed.paymentToleranceUnderBps !== undefined) {
+        patch.paymentToleranceUnderBps = parsed.paymentToleranceUnderBps;
+      }
+      if (parsed.paymentToleranceOverBps !== undefined) {
+        patch.paymentToleranceOverBps = parsed.paymentToleranceOverBps;
+      }
+      const [row] = await deps.db
+        .update(merchants)
+        .set(patch)
+        .where(eq(merchants.id, id))
+        .returning();
+      if (!row) {
+        return c.json(
+          { error: { code: "MERCHANT_NOT_FOUND", message: `Merchant not found: ${id}` } },
+          404
+        );
+      }
+      return c.json(
+        {
+          merchant: {
+            id: row.id,
+            name: row.name,
+            webhookUrl: row.webhookUrl,
+            active: row.active === 1,
+            paymentToleranceUnderBps: row.paymentToleranceUnderBps,
+            paymentToleranceOverBps: row.paymentToleranceOverBps,
+            updatedAt: new Date(row.updatedAt).toISOString()
+          }
+        },
+        200
       );
     } catch (err) {
       return renderError(c, err, deps.logger);

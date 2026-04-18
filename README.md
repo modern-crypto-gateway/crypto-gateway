@@ -509,6 +509,42 @@ silently drops the second one.
   without the other is a 400) — mismatched URL/secret would silently break HMAC
   verification on the merchant side.
 
+## Payment tolerance (slippage)
+
+Real-world rate jitter, exchange spreads, and dust rounding mean the USD value
+of a payment rarely lands exactly on the invoice target. The gateway lets each
+merchant configure a two-sided tolerance band, expressed in basis points
+(1 bp = 0.01 %, capped at 2000 bps = 20 %):
+
+| Knob                       | Status logic                                                          | Example (1 % = 100 bps)                                |
+| -------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------ |
+| `paymentToleranceUnderBps` | `paid_usd ≥ amount_usd × (1 − bps/10_000)` → **confirmed**            | invoice 100 USD, paid 99 USD → confirmed (not partial) |
+| `paymentToleranceOverBps`  | `paid_usd ≤ amount_usd × (1 + bps/10_000)` → **confirmed** (not over) | invoice 100 USD, paid 101 USD → confirmed (not overpaid) |
+
+Defaults: `0 / 0` (strict — every cent matters; matches pre-tolerance behavior).
+
+Configuration:
+
+- **Per-merchant default**: set `paymentToleranceUnderBps` / `paymentToleranceOverBps`
+  in the body of `POST /admin/merchants`, or update later via
+  `PATCH /admin/merchants/:id`.
+- **Per-invoice override**: pass either field on `POST /api/v1/invoices` to
+  override the merchant default for that one invoice. The effective values are
+  snapshotted onto the invoice row at create time, so a later change to the
+  merchant default does **not** retroactively reshape already-issued invoices.
+
+`overpaidUsd` always carries the **raw** delta (`paid_usd − amount_usd`),
+regardless of where the over-tolerance threshold sits. This keeps merchant
+accounting honest: a 1 % over-tolerance closes the invoice as `confirmed`,
+but the books still see the 1 USD overshoot if you want to surface it.
+
+Tradeoffs to flag in your merchant settings UI:
+
+- A nonzero **under-tolerance** creates an accounting gap (invoice closes for
+  the full amount; cashflow is short by the slippage).
+- A nonzero **over-tolerance** suppresses the `invoice.overpaid` webhook for
+  payments inside the band — they fire `invoice.confirmed` instead.
+
 ## API reference
 
 Full spec: [`openapi.yaml`](openapi.yaml). Import into Postman, Bruno, or Insomnia
