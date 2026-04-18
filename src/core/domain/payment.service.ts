@@ -150,20 +150,44 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   const before = invoiceRow.status as InvoiceStatus;
   const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, now);
 
-  // Per-payment webhook: fires once per confirmed transfer that contributes
-  // to an invoice. Non-confirmed (still-detected) payments don't fire yet —
-  // merchants only care about money they can count on. On reorg-revert the
-  // tx.orphaned event + subsequent invoice recompute handle the reversal.
-  if (initialStatus === "confirmed") {
-    const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceRow.id);
-    const snapshotInvoice = drizzleRowToInvoice(
-      {
-        ...invoiceRow,
-        status: after,
-        updatedAt: now
+  // Per-transfer webhooks. Two flavors so merchants can drive both
+  // "incoming, awaiting confirmations" UX and "money in the bank" UX:
+  //   - invoice.transfer_detected — fires the first time a transfer is
+  //     observed against an invoice, while it's still in `detected`
+  //     (pre-confirmation). Carries `confirmations` so the merchant can
+  //     show progress.
+  //   - invoice.payment_received — fires once per CONFIRMED transfer
+  //     that contributes to an invoice. This is the audit-grade signal:
+  //     the chain has crossed the threshold and the money is durable.
+  // On reorg-revert the tx.orphaned event + subsequent invoice recompute
+  // handle the reversal of a previously-confirmed transfer.
+  const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceRow.id);
+  const snapshotInvoice = drizzleRowToInvoice(
+    {
+      ...invoiceRow,
+      status: after,
+      updatedAt: now
+    },
+    addresses
+  );
+  if (initialStatus === "detected") {
+    await deps.events.publish({
+      type: "invoice.transfer_detected",
+      invoiceId: invoiceRow.id as InvoiceId,
+      invoice: snapshotInvoice,
+      payment: {
+        txHash: transfer.txHash,
+        chainId: transfer.chainId,
+        token: transfer.token,
+        amountRaw: transfer.amountRaw,
+        amountUsd,
+        usdRate,
+        confirmations: transfer.confirmations
       },
-      addresses
-    );
+      at: new Date(now)
+    });
+  }
+  if (initialStatus === "confirmed") {
     await deps.events.publish({
       type: "invoice.payment_received",
       invoiceId: invoiceRow.id as InvoiceId,
@@ -237,6 +261,11 @@ export async function confirmTransactions(
   let confirmed = 0;
   let reverted = 0;
   const touchedInvoiceIds = new Set<string>();
+  // Rows we promoted detected→confirmed in this sweep — used after the
+  // per-invoice recompute below to fire the per-transfer "money confirmed"
+  // webhook for poll-only chains. Push-ingest already fires this from
+  // ingestDetectedTransfer; the cron-promoted path is the missing twin.
+  const promotedTxRows: typeof pending = [];
 
   for (const row of pending) {
     const chainAdapter = findChainAdapter(deps, row.chainId);
@@ -280,7 +309,10 @@ export async function confirmTransactions(
         confirmedAt: now
       });
       await deps.events.publish({ type: "tx.confirmed", txId: tx.id, tx, at: new Date(now) });
-      if (row.invoiceId !== null) touchedInvoiceIds.add(row.invoiceId);
+      if (row.invoiceId !== null) {
+        touchedInvoiceIds.add(row.invoiceId);
+        promotedTxRows.push(row);
+      }
     } else {
       // Still short of the threshold — just update the confirmation counter
       // so the admin views see progress. No event for an increment-only update.
@@ -303,10 +335,36 @@ export async function confirmTransactions(
       .select()
       .from(invoices)
       .where(inArray(invoices.id, ids));
+    const invoicesById = new Map(invoiceRows.map((r) => [r.id, r] as const));
     for (const invoiceRow of invoiceRows) {
       const before = invoiceRow.status as InvoiceStatus;
       const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, deps.clock.now().getTime());
       if (before !== "confirmed" && after === "confirmed") promotedInvoices += 1;
+    }
+    // Per-transfer "transfer confirmed" webhook for the polled path. Push-
+    // ingest already fires `invoice.payment_received` from ingestDetectedTransfer
+    // when a transfer arrives confirmed; this is the cron-promoted twin so
+    // merchants on poll-only chains see the same per-payment audit signal.
+    for (const promotedRow of promotedTxRows) {
+      if (promotedRow.invoiceId === null) continue;
+      const invoiceRow = invoicesById.get(promotedRow.invoiceId);
+      if (!invoiceRow) continue;
+      const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceRow.id);
+      const snapshotInvoice = drizzleRowToInvoice(invoiceRow, addresses);
+      await deps.events.publish({
+        type: "invoice.payment_received",
+        invoiceId: invoiceRow.id as InvoiceId,
+        invoice: snapshotInvoice,
+        payment: {
+          txHash: promotedRow.txHash,
+          chainId: promotedRow.chainId,
+          token: promotedRow.token,
+          amountRaw: promotedRow.amountRaw,
+          amountUsd: promotedRow.amountUsd,
+          usdRate: promotedRow.usdRate
+        },
+        at: new Date(deps.clock.now().getTime())
+      });
     }
   }
 

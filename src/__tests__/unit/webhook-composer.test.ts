@@ -163,6 +163,69 @@ describe("composeWebhook", () => {
     expect(data.payment.amountUsd).toBe("20.00");
   });
 
+  it("maps invoice.transfer_detected with confirmations in payment data and a per-tx idempotency key", () => {
+    const invoice = fixtureInvoice({ status: "created", paidUsd: "0.00", amountUsd: "50.00" });
+    const composed = composeWebhook({
+      type: "invoice.transfer_detected",
+      invoiceId: invoice.id,
+      invoice,
+      payment: {
+        txHash: "0xpending",
+        chainId: 1,
+        token: "USDC",
+        amountRaw: "20000000",
+        amountUsd: "20.00",
+        usdRate: "1",
+        confirmations: 1
+      },
+      at: new Date("2026-04-16T10:04:00Z")
+    });
+    expect(composed).not.toBeNull();
+    expect(composed!.payload.event).toBe("invoice.transfer_detected");
+    expect(composed!.idempotencyKey).toBe(`invoice.transfer_detected:${invoice.id}:0xpending`);
+    const data = composed!.payload.data as {
+      invoice: { status: string };
+      payment: { txHash: string; confirmations: number };
+    };
+    expect(data.payment.confirmations).toBe(1);
+    expect(data.payment.txHash).toBe("0xpending");
+  });
+
+  it("transfer_detected and payment_received for the same tx hash produce DISTINCT idempotency keys", () => {
+    // Same invoice, same tx, different stages → two separate webhook rows.
+    const invoice = fixtureInvoice({ status: "partial" });
+    const detected = composeWebhook({
+      type: "invoice.transfer_detected",
+      invoiceId: invoice.id,
+      invoice,
+      payment: {
+        txHash: "0xshared",
+        chainId: 1,
+        token: "USDC",
+        amountRaw: "1",
+        amountUsd: null,
+        usdRate: null,
+        confirmations: 0
+      },
+      at: new Date("2026-04-16T10:00:00Z")
+    });
+    const confirmed = composeWebhook({
+      type: "invoice.payment_received",
+      invoiceId: invoice.id,
+      invoice,
+      payment: {
+        txHash: "0xshared",
+        chainId: 1,
+        token: "USDC",
+        amountRaw: "1",
+        amountUsd: null,
+        usdRate: null
+      },
+      at: new Date("2026-04-16T10:05:00Z")
+    });
+    expect(detected!.idempotencyKey).not.toBe(confirmed!.idempotencyKey);
+  });
+
   it("serializes dates as ISO strings (no raw Date objects in the payload)", () => {
     const invoice = fixtureInvoice();
     const composed = composeWebhook({

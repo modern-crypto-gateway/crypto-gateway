@@ -509,6 +509,66 @@ silently drops the second one.
   without the other is a 400) — mismatched URL/secret would silently break HMAC
   verification on the merchant side.
 
+## Outbound webhook events
+
+Every event below is delivered as `POST {webhookUrl}` with body
+`{ event, timestamp, data }`, signed by `X-Webhook-Signature`
+(HMAC-SHA256 of the raw body), and carries an `X-Webhook-Idempotency-Key`
+that is stable across retries — merchants should de-dup on it.
+
+URL/secret resolution per event: **per-resource override → merchant default
+→ silently skipped** (a `warn` log fires when no destination is configured
+so operators can grep `"webhook event skipped — no target resolved"`).
+
+### Invoice lifecycle (one row per status transition)
+
+| Event                | Fires when                                                                                  | Idempotency key shape                              |
+| -------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| `invoice.partial`    | First confirmed payment lands but USD total is still under `amountUsd × (1 − underBps)`     | `invoice.partial:{invoiceId}:partial`              |
+| `invoice.detected`   | A pending transfer covers the required amount (legacy single-token path)                    | `invoice.detected:{invoiceId}:detected`            |
+| `invoice.confirmed`  | USD total clears the under-tolerance threshold                                              | `invoice.confirmed:{invoiceId}:confirmed`          |
+| `invoice.overpaid`   | USD total exceeds `amountUsd × (1 + overBps)`                                               | `invoice.overpaid:{invoiceId}:overpaid`            |
+| `invoice.expired`    | `expiresAt` elapses (cron sweeper) or `POST /invoices/{id}/expire` is called                | `invoice.expired:{invoiceId}:expired`              |
+| `invoice.canceled`   | Merchant cancels via API                                                                    | `invoice.canceled:{invoiceId}:canceled`            |
+| `invoice.demoted`    | Reorg un-confirms a previously-confirmed invoice; carries `previousStatus` + pool-recapture counts | `invoice.demoted:{invoiceId}:{prev}:{new}`  |
+
+### Per-transfer audit (one row per on-chain tx, per stage)
+
+These give merchants deep visibility into partial-payment scenarios — every
+incoming transfer surfaces twice (once when first observed, once when
+confirmed), with `confirmations` and a `payment` block alongside the invoice
+snapshot.
+
+| Event                         | Fires when                                                          | Idempotency key shape                                        |
+| ----------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `invoice.transfer_detected`   | First sighting of a pending transfer (push or poll). `data.payment.confirmations` will be `0` for push-detected, `n` for poll-detected | `invoice.transfer_detected:{invoiceId}:{txHash}` |
+| `invoice.payment_received`    | Same transfer reaches the configured confirmation threshold          | `invoice.payment_received:{invoiceId}:{txHash}`              |
+
+The event type is part of the idempotency key — a transfer that's first
+detected and later confirmed produces TWO distinct webhook rows (not a
+collision), so merchants can show "transfer pending" and "transfer
+confirmed" UI states separately. For a partial payment scenario, expect
+N pairs of `transfer_detected` + `payment_received` plus one or more
+`invoice.partial` and finally `invoice.confirmed` once the USD total
+crosses the threshold.
+
+### Payout lifecycle
+
+| Event              | Fires when                                                          | Idempotency key shape                  |
+| ------------------ | ------------------------------------------------------------------- | -------------------------------------- |
+| `payout.submitted` | Signed tx broadcasted; `txHash` populated                            | `payout.submitted:{payoutId}:submitted` |
+| `payout.confirmed` | Broadcasted tx reached confirmation threshold                       | `payout.confirmed:{payoutId}:confirmed` |
+| `payout.failed`    | Broadcast or confirmation failed terminally; `lastError` populated  | `payout.failed:{payoutId}:failed`      |
+
+### Retry schedule
+
+Each delivery is attempted up to **5 outer rounds** with exponential
+backoff, and each round makes up to **4 inline HTTP attempts** (so up to
+20 raw POSTs before a row is marked `dead`). Dead deliveries land in the
+operator queue at `GET /admin/webhook-deliveries?status=dead` and can be
+manually replayed via `POST /admin/webhook-deliveries/{id}/replay` once
+the merchant endpoint is healthy again.
+
 ## Payment tolerance (slippage)
 
 Real-world rate jitter, exchange spreads, and dust rounding mean the USD value

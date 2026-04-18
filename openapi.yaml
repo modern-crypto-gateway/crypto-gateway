@@ -636,6 +636,34 @@ paths:
         intervention (merchant-side fix, then POST the replay endpoint).
         `pending` shows rows still queued for retry; `delivered` shows
         successful deliveries (mostly useful for audit).
+
+        ### Outbound event types (`eventType` field)
+
+        Invoice lifecycle (one row per status transition, idempotency key
+        `{event}:{invoiceId}:{status}`):
+          - `invoice.partial`, `invoice.detected`, `invoice.confirmed`,
+            `invoice.overpaid`, `invoice.expired`, `invoice.canceled`
+          - `invoice.demoted` — reorg un-confirmation; key includes
+            `{previousStatus}:{newStatus}` instead of one status
+
+        Per-transfer audit (one row per on-chain tx per stage; key
+        `{event}:{invoiceId}:{txHash}` so detect→confirm produces TWO
+        distinct rows for the same tx):
+          - `invoice.transfer_detected` — first sighting of a pending
+            transfer (push or poll). `data.payment.confirmations` is `0`
+            for push-detected, `n` for poll-detected.
+          - `invoice.payment_received` — same transfer reached the
+            confirmation threshold.
+
+        Payout lifecycle:
+          - `payout.submitted`, `payout.confirmed`, `payout.failed`
+
+        URL/secret resolution: per-resource override → merchant default
+        → silently skipped (with a `warn` log so operators can detect
+        misconfiguration). Body is signed with HMAC-SHA256 in
+        `X-Webhook-Signature`; merchants should de-dup on
+        `X-Webhook-Idempotency-Key`. Each row gets up to 5 outer retry
+        rounds × 4 inline HTTP attempts before going `dead`.
       security:
         - AdminKey: []
       parameters:

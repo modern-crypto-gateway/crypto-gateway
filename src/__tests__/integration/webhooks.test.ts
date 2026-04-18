@@ -48,16 +48,26 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       // Dispatch is deferred via deps.jobs.defer; drain to flush.
       await booted.deps.jobs.drain(1_000);
 
+      // Two webhooks per ingest: the per-status event (invoice.detected) and
+      // the per-transfer event (invoice.transfer_detected). Assert both go to
+      // the merchant URL with the merchant secret, then drill into each.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
-      const call = calls[0]!;
-      expect(call.url).toBe("https://merchant.example.com/hook");
-      expect(call.secret).toBe("b".repeat(64));
-      expect(call.idempotencyKey).toBe(`invoice.detected:${invoice.id}:detected`);
-      const payload = call.payload as { event: string; data: { id: string; status: string } };
-      expect(payload.event).toBe("invoice.detected");
-      expect(payload.data.id).toBe(invoice.id);
-      expect(payload.data.status).toBe("detected");
+      expect(calls).toHaveLength(2);
+      for (const call of calls) {
+        expect(call.url).toBe("https://merchant.example.com/hook");
+        expect(call.secret).toBe("b".repeat(64));
+      }
+      const statusCall = calls.find(
+        (c) => (c.payload as { event: string }).event === "invoice.detected"
+      )!;
+      expect(statusCall.idempotencyKey).toBe(`invoice.detected:${invoice.id}:detected`);
+      const statusPayload = statusCall.payload as { event: string; data: { id: string; status: string } };
+      expect(statusPayload.data.id).toBe(invoice.id);
+      expect(statusPayload.data.status).toBe("detected");
+      const transferCall = calls.find(
+        (c) => (c.payload as { event: string }).event === "invoice.transfer_detected"
+      )!;
+      expect(transferCall.idempotencyKey).toBe(`invoice.transfer_detected:${invoice.id}:0xhook1`);
     } finally {
       await booted.close();
     }
@@ -121,12 +131,15 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
+      // Two webhooks per ingest (status + transfer); both routed to the
+      // per-invoice URL with the per-invoice secret — merchant default
+      // was ignored because the override took precedence.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
-      // Routed to the per-invoice URL with the per-invoice secret — merchant
-      // default was ignored because the override took precedence.
-      expect(calls[0]!.url).toBe("https://merchant.example.com/per-invoice");
-      expect(calls[0]!.secret).toBe("i".repeat(64));
+      expect(calls).toHaveLength(2);
+      for (const c of calls) {
+        expect(c.url).toBe("https://merchant.example.com/per-invoice");
+        expect(c.secret).toBe("i".repeat(64));
+      }
     } finally {
       await booted.close();
     }
@@ -161,10 +174,14 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
+      // Two webhooks per ingest (status + transfer); both fall back to the
+      // merchant default URL/secret since the invoice has no override.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
-      expect(calls[0]!.url).toBe("https://merchant.example.com/default");
-      expect(calls[0]!.secret).toBe("m".repeat(64));
+      expect(calls).toHaveLength(2);
+      for (const c of calls) {
+        expect(c.url).toBe("https://merchant.example.com/default");
+        expect(c.secret).toBe("m".repeat(64));
+      }
     } finally {
       await booted.close();
     }
@@ -194,10 +211,14 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
+      // Two webhooks per ingest (status + transfer); both go to the per-
+      // invoice URL since no merchant default exists.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
-      expect(calls[0]!.url).toBe("https://merchant.example.com/only-invoice");
-      expect(calls[0]!.secret).toBe("i".repeat(64));
+      expect(calls).toHaveLength(2);
+      for (const c of calls) {
+        expect(c.url).toBe("https://merchant.example.com/only-invoice");
+        expect(c.secret).toBe("i".repeat(64));
+      }
     } finally {
       await booted.close();
     }
@@ -246,8 +267,10 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       await booted.deps.jobs.drain(200);
       expect(booted.webhookDispatcher!.calls).toHaveLength(0);
 
-      // A partial-payment transfer (< requiredAmount) emits invoice.partial + tx.detected.
-      // Of those, only invoice.partial is merchant-visible.
+      // A partial-payment transfer (< requiredAmount) emits invoice.partial,
+      // tx.detected, and invoice.transfer_detected. Of those, only the two
+      // merchant-visible ones (invoice.partial + invoice.transfer_detected)
+      // produce webhooks; tx.detected is internal-only.
       await ingestDetectedTransfer(booted.deps, {
         chainId: 999,
         txHash: "0xhook3",
@@ -263,8 +286,9 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       await booted.deps.jobs.drain(1_000);
 
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
-      expect((calls[0]!.payload as { event: string }).event).toBe("invoice.partial");
+      expect(calls).toHaveLength(2);
+      const events = calls.map((c) => (c.payload as { event: string }).event).sort();
+      expect(events).toEqual(["invoice.partial", "invoice.transfer_detected"]);
     } finally {
       await booted.close();
     }

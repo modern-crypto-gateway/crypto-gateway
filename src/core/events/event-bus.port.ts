@@ -57,6 +57,27 @@ export type DomainEvent =
       };
       at: Date;
     }
+  // Per-transfer event fired the FIRST time a transfer is observed against
+  // an invoice but BEFORE it crosses the chain's confirmation threshold.
+  // Pairs with `invoice.payment_received` (which fires once the same transfer
+  // confirms) so a merchant can render "incoming — N/M confirmations" UX.
+  // Idempotency is on (invoice id + tx hash) so a redelivery never produces
+  // a second 'detected' webhook for the same transfer.
+  | {
+      type: "invoice.transfer_detected";
+      invoiceId: InvoiceId;
+      invoice: Invoice;
+      payment: {
+        txHash: string;
+        chainId: number;
+        token: string;
+        amountRaw: string;
+        amountUsd: string | null;
+        usdRate: string | null;
+        confirmations: number;
+      };
+      at: Date;
+    }
   | { type: "tx.detected"; txId: TransactionId; tx: Transaction; at: Date }
   | { type: "tx.confirmed"; txId: TransactionId; tx: Transaction; at: Date }
   | { type: "tx.orphaned"; txId: TransactionId; tx: Transaction; at: Date }

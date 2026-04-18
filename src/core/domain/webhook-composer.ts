@@ -41,6 +41,7 @@ export type WebhookEventName =
   | "invoice.expired"
   | "invoice.canceled"
   | "invoice.demoted"
+  | "invoice.transfer_detected"
   | "invoice.payment_received"
   | "payout.submitted"
   | "payout.confirmed"
@@ -88,8 +89,13 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
       };
 
     case "invoice.payment_received":
-      // Per-payment audit event. Idempotency keys on txHash so merchants
-      // de-duplicate retries across redelivery.
+    case "invoice.transfer_detected":
+      // Per-transfer audit events. transfer_detected fires once per first-seen
+      // unconfirmed transfer; payment_received fires once per confirmed
+      // transfer. Both key idempotency on txHash so merchants de-dup retries
+      // — the event TYPE is part of the key, so a transfer that's first
+      // detected and later confirmed produces TWO distinct webhook rows
+      // (one per type) instead of colliding.
       return {
         merchantId: event.invoice.merchantId,
         resource: { type: "invoice", id: event.invoice.id },

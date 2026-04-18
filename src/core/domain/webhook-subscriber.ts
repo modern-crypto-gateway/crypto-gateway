@@ -36,6 +36,7 @@ const OUTBOUND_EVENT_TYPES = [
   "invoice.expired",
   "invoice.canceled",
   "invoice.demoted",
+  "invoice.transfer_detected",
   "invoice.payment_received",
   "payout.submitted",
   "payout.confirmed",
@@ -83,7 +84,17 @@ async function dispatchEvent(deps: AppDeps, event: DomainEvent): Promise<void> {
   const target = await resolveWebhookTarget(deps, composed.merchantId, composed.resource);
   if (!target) {
     // No webhook configured at any level (per-resource or merchant), or the
-    // merchant is inactive. Silently skip — not an error.
+    // merchant is inactive. Not an error — but log loudly so an operator who
+    // expects a webhook can diagnose "I never got pinged" without grepping
+    // an empty `webhook_deliveries` table. Includes the resource ref so the
+    // operator can patch the right row (per-invoice URL or merchant default).
+    deps.logger.warn("webhook event skipped — no target resolved", {
+      merchantId: composed.merchantId,
+      eventType: composed.payload.event,
+      resourceType: composed.resource.type,
+      resourceId: composed.resource.id,
+      hint: "set merchant.webhookUrl/secret OR pass webhookUrl+webhookSecret on create"
+    });
     return;
   }
 

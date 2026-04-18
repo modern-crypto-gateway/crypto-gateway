@@ -820,7 +820,7 @@
     },
     {
       "name": "Admin / Webhook deliveries",
-      "description": "Operator-only dead-letter queue for outbound webhook deliveries. Use these when a merchant webhook has been failing and you've coordinated a fix.",
+      "description": "Operator-only dead-letter queue for outbound webhook deliveries. Use these when a merchant webhook has been failing and you've coordinated a fix.\n\n### Outbound event types (the `eventType` column)\n\n**Invoice lifecycle** (one row per status transition, idempotency key `{event}:{invoiceId}:{status}`):\n- `invoice.partial`, `invoice.detected`, `invoice.confirmed`, `invoice.overpaid`, `invoice.expired`, `invoice.canceled`\n- `invoice.demoted` — reorg un-confirmation; key includes `{previousStatus}:{newStatus}`\n\n**Per-transfer audit** (one row per on-chain tx per stage; key `{event}:{invoiceId}:{txHash}` so detect→confirm produces TWO distinct rows for the same tx):\n- `invoice.transfer_detected` — first sighting of a pending transfer (push or poll). `data.payment.confirmations` is `0` for push-detected, `n` for poll-detected.\n- `invoice.payment_received` — same transfer reached the confirmation threshold.\n\n**Payout lifecycle**: `payout.submitted`, `payout.confirmed`, `payout.failed`\n\nURL/secret resolution: per-resource override → merchant default → silently skipped (with a `warn` log so misconfig is visible). Body is HMAC-SHA256 signed in `X-Webhook-Signature`; merchants should de-dup on `X-Webhook-Idempotency-Key`.",
       "item": [
         {
           "name": "List dead deliveries",
