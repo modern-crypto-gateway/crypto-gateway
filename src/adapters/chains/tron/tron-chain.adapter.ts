@@ -5,7 +5,7 @@ import type { ChainAdapter } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
-import { findToken } from "../../../core/types/token-registry.js";
+import { findToken, TOKEN_REGISTRY } from "../../../core/types/token-registry.js";
 import type { DetectedTransfer } from "../../../core/types/transaction.js";
 import type { BuildTransferArgs, EstimateArgs, UnsignedTx } from "../../../core/types/unsigned-tx.js";
 import { bytesToHex } from "../../crypto/subtle.js";
@@ -327,15 +327,45 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       return "TRX" as TokenSymbol;
     },
 
-    async getBalance(_args): Promise<AmountRaw> {
-      // Tron balance lookups aren't wired through the RPC backend yet (no
-      // triggerConstantContract method), so payout.service falls back to its
-      // graceful-degrade path and broadcasts without the token pre-check. The
-      // energy-consumption guard in buildTransfer still prevents silent fee
-      // burns on malformed TRC-20 contracts, and Tron's triggerSmartContract
-      // itself does a dry-run that reverts on insufficient balance, so this
-      // is not "no protection" — just "no extra belt-and-braces".
-      throw new Error("Tron getBalance not implemented");
+    async getBalance(args): Promise<AmountRaw> {
+      const client = getClient(args.chainId);
+      const token = findToken(args.chainId as ChainId, args.token);
+      if (!token) {
+        throw new Error(`Tron getBalance: unknown token ${args.token} on chain ${args.chainId}`);
+      }
+      const acct = await client.getAccount(args.address);
+      if (token.contractAddress === null) {
+        return acct.balanceSun as AmountRaw;
+      }
+      return (acct.trc20[token.contractAddress] ?? "0") as AmountRaw;
+    },
+
+    async getAccountBalances(args): Promise<readonly { token: TokenSymbol; amountRaw: AmountRaw }[]> {
+      const client = getClient(args.chainId);
+      const chainId = args.chainId as ChainId;
+      const tokensOnChain = TOKEN_REGISTRY.filter((t) => t.chainId === chainId);
+
+      // Single /v1/accounts/{addr} call covers TRX + every TRC-20 the address
+      // holds. Map back to our registered symbols by contract address; tokens
+      // we don't recognize are silently dropped (matches the EVM behavior).
+      const acct = await client.getAccount(args.address);
+      const out: { token: TokenSymbol; amountRaw: AmountRaw }[] = [];
+      for (const t of tokensOnChain) {
+        if (t.contractAddress === null) {
+          out.push({ token: t.symbol, amountRaw: acct.balanceSun as AmountRaw });
+        } else {
+          const balance = acct.trc20[t.contractAddress] ?? "0";
+          out.push({ token: t.symbol, amountRaw: balance as AmountRaw });
+        }
+      }
+      // No native-symbol entry in registry for Tron mainnet (we don't list TRX
+      // there). Surface it explicitly so callers always see the gas-token
+      // balance — they need it to flag low fee-wallet TRX before payouts fail.
+      const hasNative = tokensOnChain.some((t) => t.contractAddress === null);
+      if (!hasNative) {
+        out.push({ token: "TRX" as TokenSymbol, amountRaw: acct.balanceSun as AmountRaw });
+      }
+      return out;
     },
 
     async estimateGasForTransfer(args: EstimateArgs): Promise<AmountRaw> {

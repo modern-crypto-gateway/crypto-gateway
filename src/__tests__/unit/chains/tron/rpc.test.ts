@@ -29,6 +29,9 @@ function fakeClient(overrides: Partial<TronRpcBackend>): TronRpcBackend {
     },
     async broadcastTransaction() {
       throw new Error("unexpected broadcastTransaction call");
+    },
+    async getAccount() {
+      throw new Error("unexpected getAccount call");
     }
   };
   return { ...stub, ...overrides };

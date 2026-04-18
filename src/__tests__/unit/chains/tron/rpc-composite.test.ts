@@ -38,6 +38,11 @@ function stubBackend(name: string, overrides: Partial<TronRpcBackend>): TronRpcB
       overrides.broadcastTransaction ??
       (async () => {
         throw new Error(`${name}.broadcastTransaction: unexpected call`);
+      }),
+    getAccount:
+      overrides.getAccount ??
+      (async () => {
+        throw new Error(`${name}.getAccount: unexpected call`);
       })
   };
 }

@@ -5,7 +5,7 @@ import type { ChainAdapter } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
-import { findToken } from "../../../core/types/token-registry.js";
+import { findToken, TOKEN_REGISTRY } from "../../../core/types/token-registry.js";
 import type { DetectedTransfer } from "../../../core/types/transaction.js";
 import type { BuildTransferArgs, EstimateArgs, UnsignedTx } from "../../../core/types/unsigned-tx.js";
 import { bytesToHex } from "../../crypto/subtle.js";
@@ -307,15 +307,68 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       return SIGNATURE_FEE_LAMPORTS.toString() as AmountRaw;
     },
 
-    async getBalance(_args): Promise<AmountRaw> {
-      // Solana balance lookups aren't wired through the RPC client (no
-      // getBalance / getTokenAccountsByOwner method). SPL payouts are also
-      // not implemented (buildTransfer throws above), so the only payouts
-      // that would reach here are native SOL — which the payout executor
-      // handles with its graceful-degrade path: it broadcasts and lets the
-      // chain's preflight simulation reject insufficient-balance txs before
-      // they land. Adding a balance pre-check here is a follow-up.
-      throw new Error("Solana getBalance not implemented");
+    async getBalance(args): Promise<AmountRaw> {
+      const client = getClient(args.chainId);
+      const token = findToken(args.chainId as ChainId, args.token);
+      if (!token) {
+        throw new Error(`Solana getBalance: unknown token ${args.token} on chain ${args.chainId}`);
+      }
+      if (token.contractAddress === null) {
+        const lamports = await client.getBalance(args.address);
+        return lamports.toString() as AmountRaw;
+      }
+      // SPL: walk every token account the owner holds and sum balances for
+      // the requested mint. Owners can hold multiple ATAs for the same mint
+      // (e.g. Token-2022 vs SPL-Token); this collapses them.
+      const accounts = await client.getTokenAccountsByOwner(args.address);
+      let total = 0n;
+      for (const acct of accounts) {
+        if (acct.mint !== token.contractAddress) continue;
+        try {
+          total += BigInt(acct.amount);
+        } catch {
+          // Skip malformed entries; treat as 0.
+        }
+      }
+      return total.toString() as AmountRaw;
+    },
+
+    async getAccountBalances(args): Promise<readonly { token: TokenSymbol; amountRaw: AmountRaw }[]> {
+      const client = getClient(args.chainId);
+      const chainId = args.chainId as ChainId;
+      const tokensOnChain = TOKEN_REGISTRY.filter((t) => t.chainId === chainId);
+      const splTokens = tokensOnChain.filter((t) => t.contractAddress !== null);
+      const nativeSym = "SOL" as TokenSymbol;
+
+      // One getBalance + one getTokenAccountsByOwner — total of 2 RPC calls
+      // for the whole address regardless of how many SPL mints we know about.
+      const [lamports, splAccounts] = await Promise.all([
+        client.getBalance(args.address),
+        splTokens.length > 0
+          ? client.getTokenAccountsByOwner(args.address).catch(() => [])
+          : Promise.resolve([])
+      ]);
+
+      // Sum balances per mint (an owner can hold multiple ATAs for the same
+      // mint; merge before mapping back to the registry symbol).
+      const balanceByMint = new Map<string, bigint>();
+      for (const acct of splAccounts) {
+        try {
+          const prev = balanceByMint.get(acct.mint) ?? 0n;
+          balanceByMint.set(acct.mint, prev + BigInt(acct.amount));
+        } catch {
+          // Skip malformed entries.
+        }
+      }
+
+      const out: { token: TokenSymbol; amountRaw: AmountRaw }[] = [
+        { token: nativeSym, amountRaw: lamports.toString() as AmountRaw }
+      ];
+      for (const t of splTokens) {
+        const balance = balanceByMint.get(t.contractAddress as string) ?? 0n;
+        out.push({ token: t.symbol, amountRaw: balance.toString() as AmountRaw });
+      }
+      return out;
     }
   };
 }

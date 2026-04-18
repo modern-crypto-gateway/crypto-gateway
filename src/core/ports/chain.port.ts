@@ -74,4 +74,22 @@ export interface ChainAdapter {
     address: Address;
     token: TokenSymbol;
   }): Promise<AmountRaw>;
+
+  // Returns balances for ALL known tokens (native + every registered token on
+  // the chain) held by `address`, in a single best-effort call. Used by the
+  // admin balance-snapshot surface to walk pool + invoice + fee-wallet
+  // addresses without paying one RPC per (address × token).
+  //
+  // Implementations are expected to coalesce the work into the cheapest
+  // provider call available (alchemy_getTokenBalances, TronGrid /v1/accounts,
+  // Solana getTokenAccountsByOwner) and fall back to per-token loops only when
+  // the bulk endpoint is unavailable for the configured backend.
+  //
+  // Tokens not held by the address SHOULD be omitted (or returned with "0").
+  // A network error MAY throw — callers treat that as "couldn't snapshot
+  // this address" and continue with the rest.
+  getAccountBalances(args: {
+    chainId: ChainId;
+    address: Address;
+  }): Promise<readonly { token: TokenSymbol; amountRaw: AmountRaw }[]>;
 }

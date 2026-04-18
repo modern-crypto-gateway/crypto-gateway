@@ -27,7 +27,8 @@ function spyChainAdapter(spy: (args: Parameters<ChainAdapter["scanIncoming"]>[0]
     },
     nativeSymbol: () => "ETH" as never,
     estimateGasForTransfer: async () => "0" as never,
-    getBalance: async () => "0" as never
+    getBalance: async () => "0" as never,
+    getAccountBalances: async () => []
   };
 }
 

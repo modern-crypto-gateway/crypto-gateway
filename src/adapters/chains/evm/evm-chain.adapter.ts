@@ -15,7 +15,7 @@ import type { ChainAdapter } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
-import { findToken } from "../../../core/types/token-registry.js";
+import { findToken, TOKEN_REGISTRY } from "../../../core/types/token-registry.js";
 import type { DetectedTransfer } from "../../../core/types/transaction.js";
 import type { BuildTransferArgs, EstimateArgs, UnsignedTx } from "../../../core/types/unsigned-tx.js";
 import { ERC20_ABI } from "./erc20.js";
@@ -339,6 +339,73 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         args: [args.address as Hex]
       })) as bigint;
       return balance.toString() as AmountRaw;
+    },
+
+    async getAccountBalances(args): Promise<readonly { token: TokenSymbol; amountRaw: AmountRaw }[]> {
+      const client = getClient(args.chainId);
+      const chainId = args.chainId as ChainId;
+      const tokensOnChain = TOKEN_REGISTRY.filter((t) => t.chainId === chainId);
+      const erc20Tokens = tokensOnChain.filter((t) => t.contractAddress !== null);
+      const nativeSym = (NATIVE_SYMBOLS[args.chainId] ?? "ETH") as TokenSymbol;
+
+      // Try alchemy_getTokenBalances first (single call covers every requested
+      // ERC-20). Falls back to per-token balanceOf when the RPC isn't an
+      // Alchemy endpoint or rejects the method — non-Alchemy callers still
+      // get correct results, just at one call per ERC-20 instead of one total.
+      let erc20Balances: ReadonlyMap<string, bigint> | null = null;
+      if (erc20Tokens.length > 0) {
+        try {
+          const contracts = erc20Tokens.map((t) => t.contractAddress! as Hex);
+          const result = (await client.request({
+            method: "alchemy_getTokenBalances" as never,
+            params: [args.address as Hex, contracts] as never
+          })) as { tokenBalances: Array<{ contractAddress: string; tokenBalance: string | null; error?: string | null }> };
+          const m = new Map<string, bigint>();
+          for (const entry of result.tokenBalances) {
+            if (entry.tokenBalance === null || entry.error) continue;
+            try {
+              m.set(entry.contractAddress.toLowerCase(), BigInt(entry.tokenBalance));
+            } catch {
+              // Skip malformed entries; the caller treats absence as 0.
+            }
+          }
+          erc20Balances = m;
+        } catch {
+          erc20Balances = null;
+        }
+      }
+
+      // Native + ERC-20 fallback (if alchemy_getTokenBalances was unavailable)
+      // run in parallel. A single failure throws; the caller treats that as
+      // "couldn't snapshot this address" and skips it.
+      const calls: Array<Promise<{ token: TokenSymbol; amountRaw: AmountRaw }>> = [];
+      calls.push(
+        client.getBalance({ address: args.address as Hex }).then((b) => ({
+          token: nativeSym,
+          amountRaw: b.toString() as AmountRaw
+        }))
+      );
+      if (erc20Balances !== null) {
+        for (const t of erc20Tokens) {
+          const balance = erc20Balances.get((t.contractAddress as string).toLowerCase()) ?? 0n;
+          calls.push(Promise.resolve({ token: t.symbol, amountRaw: balance.toString() as AmountRaw }));
+        }
+      } else {
+        for (const t of erc20Tokens) {
+          calls.push(
+            (client.readContract({
+              address: t.contractAddress as unknown as Hex,
+              abi: ERC20_ABI,
+              functionName: "balanceOf",
+              args: [args.address as Hex]
+            }) as Promise<bigint>).then((b) => ({
+              token: t.symbol,
+              amountRaw: b.toString() as AmountRaw
+            }))
+          );
+        }
+      }
+      return Promise.all(calls);
     }
   };
 }

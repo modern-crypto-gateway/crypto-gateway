@@ -103,6 +103,13 @@ export function devChainAdapter(config: DevChainConfig = {}): ChainAdapter {
       // payout executor's pre-flight check always passes and the test can
       // focus on the state machine without fixture balance bookkeeping.
       return "1000000000000000000000" as AmountRaw;
+    },
+
+    async getAccountBalances(_args): Promise<readonly { token: TokenSymbol; amountRaw: AmountRaw }[]> {
+      // Dev adapter doesn't model balances. Return the same large native-token
+      // figure under "DEV" so admin balance snapshots have something to render
+      // in test environments without standing up a real provider.
+      return [{ token: "DEV" as TokenSymbol, amountRaw: "1000000000000000000000" as AmountRaw }];
     }
   };
 }

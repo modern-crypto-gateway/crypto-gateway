@@ -2,11 +2,15 @@ import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import type { AppDeps } from "../../core/app-deps.js";
+import {
+  computeBalanceSnapshot,
+  type BalanceSnapshot
+} from "../../core/domain/balance-snapshot.service.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import { registerFeeWallet } from "../../core/domain/payout.service.js";
 import { feeWalletIndex } from "../../adapters/signer-store/hd.adapter.js";
 import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
-import { ChainFamilySchema, type ChainFamily } from "../../core/types/chain.js";
+import { ChainFamilySchema, type ChainFamily, type ChainId } from "../../core/types/chain.js";
 import { sha256Hex, bytesToHex, getRandomValues } from "../../adapters/crypto/subtle.js";
 import { parseAlchemyChainsEnv } from "../../adapters/chains/evm/alchemy-rpc.js";
 import {
@@ -568,6 +572,63 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       await drizzleMigrate(deps.db, { migrationsFolder: deps.migrationsFolder });
       deps.logger.info("admin /migrate", { folder: deps.migrationsFolder });
       return c.json({ ok: true, folder: deps.migrationsFolder }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Operator balance snapshot: walks pool + fee wallets across every
+  // configured chain, asks each chain adapter for ALL token balances in one
+  // call, and joins with the price oracle for USD totals. Output is a
+  // family → chain → address tree with per-token roll-ups at every level.
+  //
+  // Cached for 60s in CacheStore so a dashboard auto-refresh can't melt the
+  // RPC budget. The cache key includes the query string so scoped lookups
+  // (single chain / single address) get their own slot.
+  app.get("/balances", async (c) => {
+    try {
+      const familyParam = c.req.query("family");
+      const chainIdParam = c.req.query("chainId");
+      const kindParam = c.req.query("kind");
+      const addressParam = c.req.query("address");
+
+      const opts: Parameters<typeof computeBalanceSnapshot>[1] = {};
+      if (familyParam !== undefined) {
+        const f = ChainFamilySchema.safeParse(familyParam);
+        if (!f.success) {
+          return c.json({ error: { code: "BAD_FAMILY", message: "family must be one of: evm, tron, solana" } }, 400);
+        }
+        opts.family = f.data;
+      }
+      if (chainIdParam !== undefined) {
+        const n = Number(chainIdParam);
+        if (!Number.isFinite(n) || n <= 0) {
+          return c.json({ error: { code: "BAD_CHAIN_ID", message: "chainId must be a positive integer" } }, 400);
+        }
+        opts.chainId = n as ChainId;
+      }
+      if (kindParam !== undefined) {
+        if (kindParam !== "pool" && kindParam !== "fee") {
+          return c.json({ error: { code: "BAD_KIND", message: "kind must be 'pool' or 'fee'" } }, 400);
+        }
+        opts.kind = kindParam;
+      }
+      if (addressParam !== undefined) {
+        opts.address = addressParam;
+      }
+
+      const cacheKey = "admin:balances:" +
+        [opts.family ?? "*", opts.chainId ?? "*", opts.kind ?? "*", opts.address ?? "*"].join(":");
+      const cached = await deps.cache.getJSON<BalanceSnapshot>(cacheKey);
+      if (cached !== null) {
+        return c.json({ snapshot: cached, cached: true }, 200);
+      }
+      const snapshot = await computeBalanceSnapshot(deps, opts);
+      // 60s TTL: long enough that a dashboard refresh-every-30s rides the
+      // cache, short enough that an operator who just funded a wallet sees
+      // it within the next minute.
+      await deps.cache.putJSON(cacheKey, snapshot, { ttlSeconds: 60 });
+      return c.json({ snapshot, cached: false }, 200);
     } catch (err) {
       return renderError(c, err, deps.logger);
     }

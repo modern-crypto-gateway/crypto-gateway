@@ -83,6 +83,17 @@ export interface CreateTransactionParams {
   amount: number;
 }
 
+// Native TRX + TRC-20 balance snapshot for a single address. Returned by
+// TronGrid's `/v1/accounts/{addr}` endpoint. We normalize it into a flat
+// shape: native sun amount + a (contract → raw atomic balance) map for
+// TRC-20s. Both are absent when the account hasn't been activated on chain.
+export interface TrongridAccount {
+  // Sun (1 TRX = 1_000_000 sun). 0 when the account is unknown.
+  balanceSun: string;
+  // contract address (base58, T-prefixed) → raw atomic balance string.
+  trc20: Readonly<Record<string, string>>;
+}
+
 export interface TronRpcBackend {
   // Stable identifier for logs + metrics. "trongrid" | "alchemy-tron" | ...
   readonly name: string;
@@ -104,6 +115,11 @@ export interface TronRpcBackend {
     txID: string;
     raw_data: unknown;
   }): Promise<TrongridBroadcastResponse>;
+  // One-shot balance snapshot (TRX + every TRC-20 the address holds). Backed
+  // by TronGrid's `/v1/accounts/{addr}` endpoint, which Alchemy Tron does not
+  // expose — alchemy-tron throws TronProviderNotSupportedError so the
+  // composite client can fall through to a TronGrid backend when paired.
+  getAccount(address: string): Promise<TrongridAccount>;
 }
 
 // Thrown when a call targets a method the backend can't service. The
@@ -176,6 +192,33 @@ export function tronGridBackend(config: TronGridBackendConfig): TronRpcBackend {
         method: "POST",
         body: JSON.stringify(params)
       });
+    },
+    async getAccount(address) {
+      // /v1/accounts/{addr} returns an array (single-element when the account
+      // exists, empty when it doesn't). Inactive Tron accounts have no on-chain
+      // record at all — treat as zero balance rather than throwing.
+      const response = await base.request<{
+        data?: ReadonlyArray<{
+          balance?: number | string;
+          trc20?: ReadonlyArray<Readonly<Record<string, string>>>;
+        }>;
+      }>(`/v1/accounts/${address}`);
+      const acct = response.data?.[0];
+      if (!acct) return { balanceSun: "0", trc20: {} };
+      const trc20: Record<string, string> = {};
+      for (const entry of acct.trc20 ?? []) {
+        for (const [contract, amount] of Object.entries(entry)) {
+          // TronGrid sometimes returns multiple entries per contract on
+          // re-issued tokens; sum them rather than overwrite.
+          try {
+            const prev = BigInt(trc20[contract] ?? "0");
+            trc20[contract] = (prev + BigInt(amount)).toString();
+          } catch {
+            // Skip malformed entries.
+          }
+        }
+      }
+      return { balanceSun: String(acct.balance ?? "0"), trc20 };
     }
   };
 }
@@ -237,6 +280,9 @@ export function alchemyTronBackend(config: AlchemyTronBackendConfig): TronRpcBac
         method: "POST",
         body: JSON.stringify(params)
       });
+    },
+    async getAccount() {
+      throw new TronProviderNotSupportedError("alchemy-tron", "getAccount");
     }
   };
 }
@@ -309,7 +355,8 @@ export function tronCompositeClient(
     createTransaction: (params) =>
       tryEach("createTransaction", (b) => b.createTransaction(params)),
     broadcastTransaction: (params) =>
-      tryEach("broadcastTransaction", (b) => b.broadcastTransaction(params))
+      tryEach("broadcastTransaction", (b) => b.broadcastTransaction(params)),
+    getAccount: (address) => tryEach("getAccount", (b) => b.getAccount(address))
   };
 }
 

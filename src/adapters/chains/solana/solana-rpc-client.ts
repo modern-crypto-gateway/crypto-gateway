@@ -5,6 +5,8 @@
 //   - getSignatureStatuses
 //   - sendTransaction
 //   - getSlot
+//   - getBalance
+//   - getTokenAccountsByOwner
 //
 // Solana RPC uses JSON-RPC 2.0. Fetch is injectable for tests.
 
@@ -51,6 +53,17 @@ export interface SolanaSignatureStatus {
   confirmationStatus?: "processed" | "confirmed" | "finalized";
 }
 
+// Subset of the SPL `getTokenAccountsByOwner` (jsonParsed) response used by
+// the admin balance snapshot. We pull the parsed `mint` and the `tokenAmount`
+// pair so the caller can decide whether to include zero-balance accounts.
+export interface SolanaParsedTokenAccount {
+  mint: string;
+  // uiAmountString is decimal; amount is the raw atomic count (string in JSON
+  // because it can exceed JS number precision).
+  amount: string;
+  decimals: number;
+}
+
 export interface SolanaRpcClient {
   getSlot(): Promise<number>;
   getLatestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }>;
@@ -58,6 +71,12 @@ export interface SolanaRpcClient {
   getTransaction(signature: string): Promise<SolanaTransactionResponse | null>;
   getSignatureStatuses(signatures: readonly string[]): Promise<ReadonlyArray<SolanaSignatureStatus | null>>;
   sendTransaction(encodedTxBase58: string): Promise<string>;
+  // Native SOL balance in lamports for `address`. Returns 0 for unknown accounts.
+  getBalance(address: string): Promise<number>;
+  // SPL token accounts owned by `address`. One call returns every mint the
+  // owner holds (including zero-balance ATAs). Caller filters by mint to map
+  // back to registry tokens.
+  getTokenAccountsByOwner(address: string): Promise<readonly SolanaParsedTokenAccount[]>;
 }
 
 export function solanaRpcClient(config: SolanaRpcConfig): SolanaRpcClient {
@@ -129,6 +148,43 @@ export function solanaRpcClient(config: SolanaRpcConfig): SolanaRpcClient {
 
     async sendTransaction(encodedTxBase58) {
       return rpc<string>("sendTransaction", [encodedTxBase58, { encoding: "base58", preflightCommitment: "confirmed" }]);
+    },
+
+    async getBalance(address) {
+      const result = await rpc<{ context: unknown; value: number }>("getBalance", [address]);
+      return result.value;
+    },
+
+    async getTokenAccountsByOwner(address) {
+      // Canonical SPL Token program id. Token-2022 accounts
+      // (TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb) are NOT included here —
+      // when/if we register Token-2022 mints in the registry we'll need a
+      // second call with that program id.
+      const SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+      const result = await rpc<{
+        context: unknown;
+        value: ReadonlyArray<{
+          pubkey: string;
+          account: {
+            data: { parsed: { info: { mint: string; tokenAmount: { amount: string; decimals: number } } } };
+          };
+        }>;
+      }>("getTokenAccountsByOwner", [
+        address,
+        { programId: SPL_TOKEN_PROGRAM },
+        { encoding: "jsonParsed" }
+      ]);
+      const out: SolanaParsedTokenAccount[] = [];
+      for (const entry of result.value) {
+        const info = entry.account?.data?.parsed?.info;
+        if (!info) continue;
+        out.push({
+          mint: info.mint,
+          amount: info.tokenAmount.amount,
+          decimals: info.tokenAmount.decimals
+        });
+      }
+      return out;
     }
   };
 }
