@@ -86,6 +86,149 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
     }
   });
 
+  it("uses per-invoice webhook override when one is set on the invoice", async () => {
+    const booted = await bootTestApp({
+      merchants: [
+        {
+          id: MERCHANT_ID,
+          webhookUrl: "https://merchant.example.com/default",
+          webhookSecret: "m".repeat(64)
+        }
+      ]
+    });
+    try {
+      const invoice = await createInvoiceViaApi(booted, {
+        amountRaw: "1000",
+        webhookUrl: "https://merchant.example.com/per-invoice",
+        webhookSecret: "i".repeat(64)
+      });
+      // Per-invoice URL is echoed; the secret is not (write-only).
+      expect(invoice["webhookUrl"]).toBe("https://merchant.example.com/per-invoice");
+      expect(invoice).not.toHaveProperty("webhookSecret");
+      expect(invoice).not.toHaveProperty("webhookSecretCiphertext");
+
+      await ingestDetectedTransfer(booted.deps, {
+        chainId: 999,
+        txHash: "0xperinvoice",
+        logIndex: 0,
+        fromAddress: "0x0000000000000000000000000000000000000001",
+        toAddress: invoice.receiveAddress,
+        token: "DEV",
+        amountRaw: "1000",
+        blockNumber: 10,
+        confirmations: 0,
+        seenAt: new Date()
+      });
+      await booted.deps.jobs.drain(1_000);
+
+      const calls = booted.webhookDispatcher!.calls;
+      expect(calls).toHaveLength(1);
+      // Routed to the per-invoice URL with the per-invoice secret — merchant
+      // default was ignored because the override took precedence.
+      expect(calls[0]!.url).toBe("https://merchant.example.com/per-invoice");
+      expect(calls[0]!.secret).toBe("i".repeat(64));
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("falls back to the merchant webhook when the invoice has no override", async () => {
+    const booted = await bootTestApp({
+      merchants: [
+        {
+          id: MERCHANT_ID,
+          webhookUrl: "https://merchant.example.com/default",
+          webhookSecret: "m".repeat(64)
+        }
+      ]
+    });
+    try {
+      // No webhookUrl/webhookSecret on the invoice — merchant default kicks in.
+      const invoice = await createInvoiceViaApi(booted, { amountRaw: "1000" });
+      expect(invoice["webhookUrl"]).toBeNull();
+
+      await ingestDetectedTransfer(booted.deps, {
+        chainId: 999,
+        txHash: "0xfallback",
+        logIndex: 0,
+        fromAddress: "0x0000000000000000000000000000000000000001",
+        toAddress: invoice.receiveAddress,
+        token: "DEV",
+        amountRaw: "1000",
+        blockNumber: 10,
+        confirmations: 0,
+        seenAt: new Date()
+      });
+      await booted.deps.jobs.drain(1_000);
+
+      const calls = booted.webhookDispatcher!.calls;
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.url).toBe("https://merchant.example.com/default");
+      expect(calls[0]!.secret).toBe("m".repeat(64));
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("uses the per-invoice webhook even when the merchant has no default", async () => {
+    // No merchant-level webhook; only the invoice-level override exists.
+    const booted = await bootTestApp();
+    try {
+      const invoice = await createInvoiceViaApi(booted, {
+        amountRaw: "1000",
+        webhookUrl: "https://merchant.example.com/only-invoice",
+        webhookSecret: "i".repeat(64)
+      });
+
+      await ingestDetectedTransfer(booted.deps, {
+        chainId: 999,
+        txHash: "0xonlyinvoice",
+        logIndex: 0,
+        fromAddress: "0x0000000000000000000000000000000000000001",
+        toAddress: invoice.receiveAddress,
+        token: "DEV",
+        amountRaw: "1000",
+        blockNumber: 10,
+        confirmations: 0,
+        seenAt: new Date()
+      });
+      await booted.deps.jobs.drain(1_000);
+
+      const calls = booted.webhookDispatcher!.calls;
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.url).toBe("https://merchant.example.com/only-invoice");
+      expect(calls[0]!.secret).toBe("i".repeat(64));
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("rejects an invoice that supplies webhookUrl without webhookSecret (paired)", async () => {
+    const booted = await bootTestApp();
+    try {
+      const apiKey = booted.apiKeys[MERCHANT_ID]!;
+      const res = await booted.app.fetch(
+        new Request("http://test.local/api/v1/invoices", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            chainId: 999,
+            token: "DEV",
+            amountRaw: "1000",
+            webhookUrl: "https://merchant.example.com/half"
+            // webhookSecret intentionally omitted — schema must reject.
+          })
+        })
+      );
+      expect(res.status).toBe(400);
+    } finally {
+      await booted.close();
+    }
+  });
+
   it("does not fire for internal events (invoice.created, tx.detected)", async () => {
     const booted = await bootTestApp({
       merchants: [

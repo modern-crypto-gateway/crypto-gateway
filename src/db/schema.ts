@@ -88,6 +88,14 @@ export const invoices = sqliteTable(
     rateWindowExpiresAt: integer("rate_window_expires_at"),
     ratesJson: text("rates_json"),
 
+    // Per-invoice webhook override. Both NULL → fall back to merchant's
+    // webhook_url / webhook_secret_ciphertext. URL+secret are write-once at
+    // create time and treated as a pair (one without the other is a footgun:
+    // an HMAC needs both halves, mismatching them would silently sign the
+    // wrong endpoint).
+    webhookUrl: text("webhook_url"),
+    webhookSecretCiphertext: text("webhook_secret_ciphertext"),
+
     createdAt: integer("created_at").notNull(),
     expiresAt: integer("expires_at").notNull(),
     confirmedAt: integer("confirmed_at"),
@@ -218,7 +226,12 @@ export const payouts = sqliteTable(
     // Broadcast-idempotency slot. Claimed CAS before the chain-adapter call so
     // a crash after broadcast (but before the `submitted` write) can't retry
     // into a second on-chain tx.
-    broadcastAttemptedAt: integer("broadcast_attempted_at")
+    broadcastAttemptedAt: integer("broadcast_attempted_at"),
+
+    // Per-payout webhook override. Same semantics as invoices.webhook_url:
+    // write-once, URL+secret paired, fall back to merchant default when NULL.
+    webhookUrl: text("webhook_url"),
+    webhookSecretCiphertext: text("webhook_secret_ciphertext")
   },
   (t) => [
     index("idx_payouts_merchant").on(t.merchantId, sql`${t.createdAt} DESC`),
@@ -339,6 +352,12 @@ export const webhookDeliveries = sqliteTable(
     idempotencyKey: text("idempotency_key").notNull().unique(),
     payloadJson: text("payload_json").notNull(),
     targetUrl: text("target_url").notNull(),
+    // Resource the event belongs to. Used at retry time to re-resolve
+    // the dispatch target (per-resource webhook → merchant fallback). NULL on
+    // legacy rows from before per-resource webhooks shipped — those fall back
+    // to merchant lookup directly.
+    resourceType: text("resource_type", { enum: ["invoice", "payout"] }),
+    resourceId: text("resource_id"),
     status: text("status", { enum: ["pending", "delivered", "dead"] }).notNull(),
     attempts: integer("attempts").notNull().default(0),
     lastStatusCode: integer("last_status_code"),

@@ -97,6 +97,8 @@ export async function createInvoiceViaApi(
     amountRaw?: string;
     fiatAmount?: string;
     fiatCurrency?: string;
+    webhookUrl?: string;
+    webhookSecret?: string;
   }
 ): Promise<{ id: string; receiveAddress: string; status: string; [k: string]: unknown }> {
   const merchantId = args.merchantId ?? "00000000-0000-0000-0000-000000000001";
@@ -109,6 +111,8 @@ export async function createInvoiceViaApi(
   if (args.amountRaw !== undefined) body["amountRaw"] = args.amountRaw;
   if (args.fiatAmount !== undefined) body["fiatAmount"] = args.fiatAmount;
   if (args.fiatCurrency !== undefined) body["fiatCurrency"] = args.fiatCurrency;
+  if (args.webhookUrl !== undefined) body["webhookUrl"] = args.webhookUrl;
+  if (args.webhookSecret !== undefined) body["webhookSecret"] = args.webhookSecret;
   const res = await booted.app.fetch(
     new Request("http://test.local/api/v1/invoices", {
       method: "POST",

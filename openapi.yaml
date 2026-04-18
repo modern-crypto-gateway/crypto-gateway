@@ -831,6 +831,23 @@ components:
           minimum: 1
           maximum: 1440
           default: 30
+        webhookUrl:
+          type: string
+          format: uri
+          description: |
+            Per-invoice webhook destination override. When set, dispatch for
+            this invoice's events goes here instead of the merchant-account
+            webhook. Must be supplied together with `webhookSecret` — passing
+            one without the other is a 400. Echoed in responses; the secret is
+            never returned.
+        webhookSecret:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: |
+            HMAC secret paired with `webhookUrl`. Encrypted at rest and never
+            echoed back. Required if `webhookUrl` is set.
       required: [chainId, token]
 
     Invoice:
@@ -881,6 +898,13 @@ components:
           format: date-time
         externalId: { type: [string, "null"] }
         metadata: { type: [object, "null"] }
+        webhookUrl:
+          type: [string, "null"]
+          format: uri
+          description: |
+            Per-invoice webhook URL override (echo-only). Null when the
+            invoice falls back to the merchant-account webhook. The matching
+            secret is write-only and never returned.
         createdAt: { type: string, format: date-time }
         expiresAt: { type: string, format: date-time }
         confirmedAt: { type: [string, "null"], format: date-time }
@@ -978,6 +1002,23 @@ components:
         token: { type: string }
         amountRaw: { type: string, pattern: "^\\d+$" }
         destinationAddress: { type: string, minLength: 1, maxLength: 128 }
+        webhookUrl:
+          type: string
+          format: uri
+          description: |
+            Per-payout webhook destination override. When set, dispatch for
+            this payout's events goes here instead of the merchant-account
+            webhook. Must be supplied together with `webhookSecret` — passing
+            one without the other is a 400. Echoed in responses; the secret is
+            never returned.
+        webhookSecret:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: |
+            HMAC secret paired with `webhookUrl`. Encrypted at rest and never
+            echoed back. Required if `webhookUrl` is set.
 
     Payout:
       type: object
@@ -995,6 +1036,13 @@ components:
         txHash: { type: [string, "null"] }
         feeEstimateNative: { type: [string, "null"] }
         lastError: { type: [string, "null"] }
+        webhookUrl:
+          type: [string, "null"]
+          format: uri
+          description: |
+            Per-payout webhook URL override (echo-only). Null when the payout
+            falls back to the merchant-account webhook. The matching secret
+            is write-only and never returned.
         createdAt: { type: string, format: date-time }
         submittedAt: { type: [string, "null"], format: date-time }
         confirmedAt: { type: [string, "null"], format: date-time }

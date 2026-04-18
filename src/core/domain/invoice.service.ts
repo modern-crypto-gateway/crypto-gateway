@@ -41,6 +41,12 @@ export const CreateInvoiceInputSchema = z
     acceptedFamilies: z.array(ChainFamilySchema).min(1).optional(),
     externalId: z.string().max(256).optional(),
     metadata: z.record(z.unknown()).optional(),
+    // Per-invoice webhook override. Both required together — passing one
+    // without the other is rejected by the .refine below so we never sign
+    // events with a key meant for a different endpoint. Omit both to fall
+    // back to the merchant-account webhook.
+    webhookUrl: z.string().url().optional(),
+    webhookSecret: z.string().min(16).max(512).optional(),
     // Default 30 minutes. Hard ceiling at 24 hours — the scheduler promotes
     // long-expired invoices and merchants who need days-long expiries are
     // doing something unusual.
@@ -64,6 +70,13 @@ export const CreateInvoiceInputSchema = z
   .refine(
     (v) => v.fiatAmount === undefined || v.fiatCurrency !== undefined,
     { message: "`fiatAmount` requires `fiatCurrency`" }
+  )
+  .refine(
+    (v) => (v.webhookUrl === undefined) === (v.webhookSecret === undefined),
+    {
+      message:
+        "`webhookUrl` and `webhookSecret` must be provided together — one without the other would sign events with a mismatched key"
+    }
   );
 export type CreateInvoiceInput = z.infer<typeof CreateInvoiceInputSchema>;
 
@@ -205,6 +218,16 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
     rateWindowExpiresAt = snapshot.expiresAt;
   }
 
+  // 6b. Encrypt the per-invoice webhook secret if one was provided. Stored
+  //     ciphertext only; plaintext lives only in the request body and the
+  //     decrypt-then-HMAC stack frame at dispatch time. The pair (URL +
+  //     secret) is enforced by the input schema's refine — both NULL means
+  //     fall back to the merchant default.
+  const webhookSecretCiphertext =
+    parsed.webhookSecret !== undefined
+      ? await deps.secretsCipher.encrypt(parsed.webhookSecret)
+      : null;
+
   // 7. Insert the invoice row (denormalizes the primary family's address)
   //    and the per-family join rows in a single batch so a partial write
   //    can't leave the invoice unreachable for detection.
@@ -231,6 +254,8 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
     overpaidUsd: "0",
     rateWindowExpiresAt: rateWindowExpiresAt,
     ratesJson: ratesJson,
+    webhookUrl: parsed.webhookUrl ?? null,
+    webhookSecretCiphertext: webhookSecretCiphertext,
     createdAt: now,
     expiresAt: expiresAt,
     confirmedAt: null,

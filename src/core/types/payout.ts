@@ -46,6 +46,11 @@ export const PayoutSchema = z.object({
   // Last broadcast error, human-readable.
   lastError: z.string().max(2048).nullable(),
 
+  // Per-payout webhook destination override. Echoed in API responses; the
+  // matching secret is write-only (encrypted at rest, never returned). When
+  // null, dispatch falls back to the merchant-account webhook.
+  webhookUrl: z.string().url().nullable(),
+
   createdAt: z.date(),
   submittedAt: z.date().nullable(),
   confirmedAt: z.date().nullable(),

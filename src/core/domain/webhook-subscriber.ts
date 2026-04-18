@@ -1,9 +1,12 @@
 import { and, eq } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent, DomainEventType } from "../events/event-bus.port.js";
-import type { WebhookDeliveryRecord } from "../ports/webhook-delivery-store.port.js";
+import type {
+  WebhookDeliveryRecord,
+  WebhookResourceType
+} from "../ports/webhook-delivery-store.port.js";
 import { composeWebhook } from "./webhook-composer.js";
-import { merchants } from "../../db/schema.js";
+import { invoices, merchants, payouts } from "../../db/schema.js";
 
 // Subscribes to domain events and dispatches composed webhooks. Called once
 // per AppDeps from buildApp — the subscriptions stay active for the lifetime
@@ -77,9 +80,10 @@ async function dispatchEvent(deps: AppDeps, event: DomainEvent): Promise<void> {
   const composed = composeWebhook(event);
   if (!composed) return;
 
-  const merchant = await loadMerchantWebhook(deps, composed.merchantId);
-  if (!merchant) {
-    // Merchant has not configured webhooks (or is inactive). Not an error.
+  const target = await resolveWebhookTarget(deps, composed.merchantId, composed.resource);
+  if (!target) {
+    // No webhook configured at any level (per-resource or merchant), or the
+    // merchant is inactive. Silently skip — not an error.
     return;
   }
 
@@ -91,7 +95,14 @@ async function dispatchEvent(deps: AppDeps, event: DomainEvent): Promise<void> {
     eventType: composed.payload.event,
     idempotencyKey: composed.idempotencyKey,
     payload: composed.payload as unknown as Record<string, unknown>,
-    targetUrl: merchant.webhookUrl,
+    targetUrl: target.webhookUrl,
+    // Snapshot the resource ref so the retry path can re-resolve via the same
+    // precedence (resource → merchant). The URL is also snapshotted (above)
+    // for human-readable audit; the secret is NOT snapshotted because the
+    // resolver re-fetches it at retry time, letting merchant secret rotations
+    // take effect mid-flight without any per-row plumbing.
+    resourceType: composed.resource.type,
+    resourceId: composed.resource.id,
     nextAttemptAt: now,
     now
   });
@@ -107,20 +118,26 @@ async function dispatchEvent(deps: AppDeps, event: DomainEvent): Promise<void> {
   await attemptDelivery(deps, id);
 }
 
-// Exported so the sweeper can re-drive an existing row. Looks up the current
-// row + merchant state, dispatches once, and records the outcome. Never
-// throws — a dispatcher exception is recorded as a failure on the row.
+// Exported so the sweeper can re-drive an existing row. Re-resolves the
+// dispatch target with the same precedence used at insert time (per-resource
+// webhook → merchant fallback), dispatches once, and records the outcome.
+// Never throws — a dispatcher exception is recorded as a failure on the row.
 export async function attemptDelivery(deps: AppDeps, deliveryId: string): Promise<void> {
   const row = await deps.webhookDeliveryStore.getById(deliveryId);
   if (row === null || row.status !== "pending") return;
 
-  const merchant = await loadMerchantWebhook(deps, row.merchantId);
-  if (!merchant) {
-    // Merchant deactivated or had their webhook removed after the row was
-    // queued. Cannot retry — mark dead so the sweeper doesn't keep picking it up.
+  const resource =
+    row.resourceType !== null && row.resourceId !== null
+      ? { type: row.resourceType, id: row.resourceId }
+      : null;
+  const target = await resolveWebhookTarget(deps, row.merchantId, resource);
+  if (!target) {
+    // Merchant deactivated, or both per-resource and merchant webhook were
+    // removed after the row was queued. Cannot retry — mark dead so the
+    // sweeper doesn't keep picking it up.
     await deps.webhookDeliveryStore.markFailure({
       id: row.id,
-      error: "merchant inactive or webhook not configured",
+      error: "no webhook target available (resource + merchant both unconfigured or merchant inactive)",
       nextAttemptAt: null,
       now: deps.clock.now().getTime()
     });
@@ -132,7 +149,7 @@ export async function attemptDelivery(deps: AppDeps, deliveryId: string): Promis
   // immediately — no secret should outlive this function's stack frame.
   let secret: string;
   try {
-    secret = await deps.secretsCipher.decrypt(merchant.secretCiphertext);
+    secret = await deps.secretsCipher.decrypt(target.secretCiphertext);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await deps.webhookDeliveryStore.markFailure({
@@ -147,7 +164,7 @@ export async function attemptDelivery(deps: AppDeps, deliveryId: string): Promis
   let result: { delivered: boolean; statusCode?: number; error?: string };
   try {
     result = await deps.webhookDispatcher.dispatch({
-      url: merchant.webhookUrl,
+      url: target.webhookUrl,
       payload: row.payload,
       secret,
       idempotencyKey: row.idempotencyKey
@@ -212,21 +229,71 @@ export async function sweepWebhookDeliveries(
   return { attempted: due.length };
 }
 
-// Internal merchant lookup. Returns undefined when the merchant is inactive
-// or has not configured webhooks. Factored out so the subscriber and the
-// retry path share identical rules — a merchant that deactivates between
-// the insert and the retry correctly stops receiving events.
-async function loadMerchantWebhook(
+// Resolves the (URL, secret) pair to dispatch to. Precedence:
+//   1. Per-resource webhook on the invoice/payout the event is about.
+//   2. Merchant-account webhook fallback.
+//   3. Skip — return undefined; the caller treats that as "no target".
+//
+// Merchant.active is checked unconditionally: a deactivated merchant stops
+// receiving ANY webhooks regardless of per-resource overrides. Without that
+// guard, deactivating a merchant wouldn't drain in-flight per-invoice
+// deliveries. URL+secret are paired at every level — a row with one set and
+// the other NULL is treated as "not configured at this level" so we don't
+// dispatch with a mismatched HMAC key.
+//
+// Used by both the initial dispatch and the retry path so a merchant
+// rotation between insert and retry takes effect on subsequent attempts.
+async function resolveWebhookTarget(
   deps: AppDeps,
-  merchantId: string
+  merchantId: string,
+  resource: { type: WebhookResourceType; id: string } | null
 ): Promise<{ webhookUrl: string; secretCiphertext: string } | undefined> {
-  const [row] = await deps.db
+  // Gate on merchant.active first — if the merchant is off, nothing dispatches.
+  const [merchantRow] = await deps.db
     .select({
       webhookUrl: merchants.webhookUrl,
       webhookSecretCiphertext: merchants.webhookSecretCiphertext
     })
     .from(merchants)
     .where(and(eq(merchants.id, merchantId), eq(merchants.active, 1)))
+    .limit(1);
+  if (!merchantRow) return undefined;
+
+  if (resource !== null) {
+    const resourceTarget = await loadResourceWebhook(deps, resource);
+    if (resourceTarget) return resourceTarget;
+  }
+
+  if (!merchantRow.webhookUrl || !merchantRow.webhookSecretCiphertext) return undefined;
+  return {
+    webhookUrl: merchantRow.webhookUrl,
+    secretCiphertext: merchantRow.webhookSecretCiphertext
+  };
+}
+
+async function loadResourceWebhook(
+  deps: AppDeps,
+  resource: { type: WebhookResourceType; id: string }
+): Promise<{ webhookUrl: string; secretCiphertext: string } | undefined> {
+  if (resource.type === "invoice") {
+    const [row] = await deps.db
+      .select({
+        webhookUrl: invoices.webhookUrl,
+        webhookSecretCiphertext: invoices.webhookSecretCiphertext
+      })
+      .from(invoices)
+      .where(eq(invoices.id, resource.id))
+      .limit(1);
+    if (!row?.webhookUrl || !row.webhookSecretCiphertext) return undefined;
+    return { webhookUrl: row.webhookUrl, secretCiphertext: row.webhookSecretCiphertext };
+  }
+  const [row] = await deps.db
+    .select({
+      webhookUrl: payouts.webhookUrl,
+      webhookSecretCiphertext: payouts.webhookSecretCiphertext
+    })
+    .from(payouts)
+    .where(eq(payouts.id, resource.id))
     .limit(1);
   if (!row?.webhookUrl || !row.webhookSecretCiphertext) return undefined;
   return { webhookUrl: row.webhookUrl, secretCiphertext: row.webhookSecretCiphertext };

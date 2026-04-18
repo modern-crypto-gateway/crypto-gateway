@@ -31,13 +31,29 @@ import { feeWallets, merchants, payouts } from "../../db/schema.js";
 
 // ---- Input validation ----
 
-export const PlanPayoutInputSchema = z.object({
-  merchantId: MerchantIdSchema,
-  chainId: ChainIdSchema,
-  token: TokenSymbolSchema,
-  amountRaw: AmountRawSchema,
-  destinationAddress: z.string().min(1).max(128)
-});
+export const PlanPayoutInputSchema = z
+  .object({
+    merchantId: MerchantIdSchema,
+    chainId: ChainIdSchema,
+    token: TokenSymbolSchema,
+    amountRaw: AmountRawSchema,
+    destinationAddress: z.string().min(1).max(128),
+
+    // Per-payout webhook override. Both URL and secret must be provided
+    // together — sending only one would dispatch events HMAC-signed with the
+    // wrong key (or to the wrong URL with the merchant's key) and silently
+    // break verification on the merchant's side. The secret is encrypted at
+    // rest and never echoed in any API response.
+    webhookUrl: z.string().url().optional(),
+    webhookSecret: z.string().min(16).max(512).optional()
+  })
+  .refine(
+    (v) => (v.webhookUrl === undefined) === (v.webhookSecret === undefined),
+    {
+      message:
+        "`webhookUrl` and `webhookSecret` must be provided together — one without the other would sign events with a mismatched key"
+    }
+  );
 export type PlanPayoutInput = z.infer<typeof PlanPayoutInputSchema>;
 
 // ---- Errors ----
@@ -92,6 +108,16 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   }
   const destination = chainAdapter.canonicalizeAddress(parsed.destinationAddress);
 
+  // Encrypt the per-payout webhook secret if one was provided. Stored
+  // ciphertext only; plaintext lives only in the request body and the
+  // decrypt-then-HMAC stack frame at dispatch time. URL+secret pairing is
+  // enforced by the input schema's refine — both NULL means fall back to the
+  // merchant default.
+  const webhookSecretCiphertext =
+    parsed.webhookSecret !== undefined
+      ? await deps.secretsCipher.encrypt(parsed.webhookSecret)
+      : null;
+
   const now = deps.clock.now().getTime();
   const payoutId = globalThis.crypto.randomUUID();
   await deps.db.insert(payouts).values({
@@ -109,7 +135,9 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
     createdAt: now,
     submittedAt: null,
     confirmedAt: null,
-    updatedAt: now
+    updatedAt: now,
+    webhookUrl: parsed.webhookUrl ?? null,
+    webhookSecretCiphertext: webhookSecretCiphertext
   });
 
   const row = await fetchPayout(deps, payoutId);

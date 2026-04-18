@@ -6,7 +6,8 @@ import type {
   MarkFailureArgs,
   WebhookDeliveryRecord,
   WebhookDeliveryStatus,
-  WebhookDeliveryStore
+  WebhookDeliveryStore,
+  WebhookResourceType
 } from "../../core/ports/webhook-delivery-store.port.js";
 
 // SQL-backed outbox. `INSERT … ON CONFLICT DO NOTHING` dedupes by
@@ -22,6 +23,8 @@ function drizzleRowToRecord(row: typeof webhookDeliveries.$inferSelect): Webhook
     idempotencyKey: row.idempotencyKey,
     payload: JSON.parse(row.payloadJson) as Record<string, unknown>,
     targetUrl: row.targetUrl,
+    resourceType: row.resourceType as WebhookResourceType | null,
+    resourceId: row.resourceId,
     status: row.status as WebhookDeliveryStatus,
     attempts: row.attempts,
     lastStatusCode: row.lastStatusCode,
@@ -45,6 +48,8 @@ export function dbWebhookDeliveryStore(db: Db): WebhookDeliveryStore {
           idempotencyKey: args.idempotencyKey,
           payloadJson: JSON.stringify(args.payload),
           targetUrl: args.targetUrl,
+          resourceType: args.resourceType,
+          resourceId: args.resourceId,
           status: "pending",
           attempts: 0,
           lastStatusCode: null,

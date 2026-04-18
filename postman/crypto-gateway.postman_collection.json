@@ -257,7 +257,7 @@
               "mode": "raw",
               "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"externalId\": \"{{runExternalId}}\",\n  \"expiresInMinutes\": 30\n}"
             },
-            "description": "Uses `chainId`, `token`, `amountRaw` from the environment. Flip chains by changing the environment values; or use one of the `Quick starts` requests that pre-set them.\n\nAlternative shape: omit `amountRaw` and provide `fiatAmount` + `fiatCurrency` to let the gateway quote the crypto amount against the price oracle."
+            "description": "Uses `chainId`, `token`, `amountRaw` from the environment. Flip chains by changing the environment values; or use one of the `Quick starts` requests that pre-set them.\n\nAlternative shape: omit `amountRaw` and provide `fiatAmount` + `fiatCurrency` to let the gateway quote the crypto amount against the price oracle.\n\nOptional per-invoice webhook override: pass `webhookUrl` + `webhookSecret` together to route this invoice's events to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned. Dispatch precedence: invoice override → merchant default → skip. See `Create invoice (with per-invoice webhook)` for an example."
           },
           "event": [
             {
@@ -273,6 +273,36 @@
                   "  console.log('saved invoiceId =', body.invoice.id);",
                   "  console.log('receiveAddress =', body.invoice.receiveAddress);",
                   "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create invoice (with per-invoice webhook)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/invoices", "host": ["{{baseUrl}}"], "path": ["api", "v1", "invoices"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"externalId\": \"{{runExternalId}}-perinv\",\n  \"webhookUrl\": \"https://merchant.example.com/per-invoice/hook\",\n  \"webhookSecret\": \"replace-with-min-16-char-shared-secret\"\n}"
+            },
+            "description": "Same as the parametric Create invoice, but sets a per-invoice `webhookUrl` + `webhookSecret`. Events for THIS invoice (`invoice.detected`, `invoice.confirmed`, etc.) dispatch to the per-invoice URL signed with the per-invoice secret instead of the merchant-account default. Response echoes `webhookUrl`; `webhookSecret` is never returned."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('echoes webhookUrl', () => pm.expect(body.invoice.webhookUrl).to.eql('https://merchant.example.com/per-invoice/hook'));",
+                  "pm.test('does not echo webhookSecret', () => pm.expect(body.invoice).to.not.have.property('webhookSecret'));"
                 ]
               }
             }
@@ -535,7 +565,7 @@
               "mode": "raw",
               "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"destinationAddress\": \"{{destinationAddress}}\"\n}"
             },
-            "description": "Creates a `planned` payout. The `executeReservedPayouts` cron job picks it up, CAS-reserves a fee wallet, builds + signs + broadcasts the transfer. Polls `getConfirmationStatus` each tick until finalized."
+            "description": "Creates a `planned` payout. The `executeReservedPayouts` cron job picks it up, CAS-reserves a fee wallet, builds + signs + broadcasts the transfer. Polls `getConfirmationStatus` each tick until finalized.\n\nOptional per-payout webhook override: pass `webhookUrl` + `webhookSecret` together to route this payout's events (`payout.submitted`, `payout.confirmed`, `payout.failed`) to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned. Dispatch precedence: payout override → merchant default → skip. See `Plan payout (with per-payout webhook)` for an example."
           },
           "event": [
             {
@@ -573,6 +603,36 @@
                 "exec": [
                   "const body = pm.response.json();",
                   "if (body.payout && body.payout.id) { pm.environment.set('payoutId', body.payout.id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Plan payout (with per-payout webhook)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"destinationAddress\": \"{{destinationAddress}}\",\n  \"webhookUrl\": \"https://merchant.example.com/per-payout/hook\",\n  \"webhookSecret\": \"replace-with-min-16-char-shared-secret\"\n}"
+            },
+            "description": "Same as the parametric Plan payout, but sets a per-payout `webhookUrl` + `webhookSecret`. Events for THIS payout dispatch to the per-payout URL signed with the per-payout secret instead of the merchant-account default. Response echoes `webhookUrl`; `webhookSecret` is never returned."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('echoes webhookUrl', () => pm.expect(body.payout.webhookUrl).to.eql('https://merchant.example.com/per-payout/hook'));",
+                  "pm.test('does not echo webhookSecret', () => pm.expect(body.payout).to.not.have.property('webhookSecret'));"
                 ]
               }
             }

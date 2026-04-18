@@ -18,6 +18,11 @@ import type { Payout } from "../types/payout.js";
 
 export interface ComposedWebhook {
   merchantId: string;
+  // Resource the event belongs to. Snapshotted onto the delivery row so the
+  // retry path knows whether to look up the per-invoice or per-payout webhook
+  // override before falling back to the merchant default. Always present —
+  // every outbound event we surface relates to one or the other.
+  resource: { type: "invoice" | "payout"; id: string };
   payload: WebhookPayload;
   idempotencyKey: string;
 }
@@ -51,6 +56,7 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
     case "invoice.canceled":
       return {
         merchantId: event.invoice.merchantId,
+        resource: { type: "invoice", id: event.invoice.id },
         payload: {
           event: event.type,
           timestamp: event.at.toISOString(),
@@ -67,6 +73,7 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
       // `poolCollided > 0`.
       return {
         merchantId: event.invoice.merchantId,
+        resource: { type: "invoice", id: event.invoice.id },
         payload: {
           event: event.type,
           timestamp: event.at.toISOString(),
@@ -85,6 +92,7 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
       // de-duplicate retries across redelivery.
       return {
         merchantId: event.invoice.merchantId,
+        resource: { type: "invoice", id: event.invoice.id },
         payload: {
           event: event.type,
           timestamp: event.at.toISOString(),
@@ -101,6 +109,7 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
     case "payout.failed":
       return {
         merchantId: event.payout.merchantId,
+        resource: { type: "payout", id: event.payout.id },
         payload: {
           event: event.type,
           timestamp: event.at.toISOString(),

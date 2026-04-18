@@ -500,7 +500,14 @@ silently drops the second one.
   `X-Alchemy-Signature`. Constant-time comparison; blanket `401` on failure.
 - **Cron trigger** (`/internal/cron/tick`): `Authorization: Bearer <CRON_SECRET>`.
 - **Outbound webhooks to merchants**: HMAC-SHA256 in `X-Webhook-Signature`;
-  `X-Webhook-Idempotency-Key` stable across retries.
+  `X-Webhook-Idempotency-Key` stable across retries. Each `POST /api/v1/invoices`
+  and `POST /api/v1/payouts` accepts an optional `webhookUrl` + `webhookSecret`
+  pair — when set, that resource's events dispatch to the per-resource URL/secret
+  instead of the merchant-account default. Precedence at dispatch time is
+  `resource → merchant → skip`. The URL is echoed in API responses; the secret
+  is encrypted at rest and never returned. Both must be supplied together (one
+  without the other is a 400) — mismatched URL/secret would silently break HMAC
+  verification on the merchant side.
 
 ## API reference
 

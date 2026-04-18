@@ -37,3 +37,7 @@ Thumbs.db
 *.db-journal
 *.sqlite
 *.sqlite3
+
+# drizzle generated migrations — schema is applied directly to Turso
+drizzle/migrations/0[1-9]*_*.sql
+drizzle/migrations/meta/0[1-9]*_snapshot.json

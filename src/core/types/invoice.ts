@@ -93,6 +93,12 @@ export const InvoiceSchema = z.object({
   externalId: z.string().max(256).nullable(),
   metadata: z.record(z.unknown()).nullable(),
 
+  // Per-invoice webhook destination override. Echoed in API responses so
+  // merchants can confirm what they configured. The matching secret is
+  // write-only (encrypted at rest, never returned). When null, dispatch
+  // falls back to the merchant-account webhook.
+  webhookUrl: z.string().url().nullable(),
+
   createdAt: z.date(),
   expiresAt: z.date(),
   confirmedAt: z.date().nullable(),

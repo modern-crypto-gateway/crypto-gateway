@@ -10,6 +10,13 @@
 
 export type WebhookDeliveryStatus = "pending" | "delivered" | "dead";
 
+// Tag identifying the entity an event is about, snapshotted on the delivery
+// row so the retry path can re-resolve the dispatch target with the same
+// resource→merchant precedence used at insert time. Both fields NULL on rows
+// created before per-resource webhooks shipped; those rows fall back to
+// merchant-only lookup.
+export type WebhookResourceType = "invoice" | "payout";
+
 export interface WebhookDeliveryRecord {
   readonly id: string;
   readonly merchantId: string;
@@ -17,6 +24,8 @@ export interface WebhookDeliveryRecord {
   readonly idempotencyKey: string;
   readonly payload: Record<string, unknown>;
   readonly targetUrl: string;
+  readonly resourceType: WebhookResourceType | null;
+  readonly resourceId: string | null;
   readonly status: WebhookDeliveryStatus;
   readonly attempts: number;
   readonly lastStatusCode: number | null;
@@ -34,6 +43,8 @@ export interface InsertPendingArgs {
   readonly idempotencyKey: string;
   readonly payload: Record<string, unknown>;
   readonly targetUrl: string;
+  readonly resourceType: WebhookResourceType | null;
+  readonly resourceId: string | null;
   readonly nextAttemptAt: number;
   readonly now: number;
 }
