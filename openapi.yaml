@@ -267,6 +267,41 @@ paths:
         "429": { $ref: "#/components/responses/RateLimited" }
 
   /admin/merchants:
+    get:
+      tags: [admin]
+      summary: List merchants
+      description: |
+        Paginated listing, newest first. Never leaks `api_key_hash` or
+        `webhook_secret_ciphertext`. Use `?active=true|false` to scope to
+        live or deactivated rows.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+        - in: query
+          name: active
+          schema: { type: string, enum: [true, false] }
+      responses:
+        "200":
+          description: Merchants page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Merchant" }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
     post:
       tags: [admin]
       summary: Create a merchant
@@ -352,6 +387,27 @@ paths:
         "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
 
   /admin/merchants/{id}:
+    get:
+      tags: [admin]
+      summary: Get a single merchant
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Merchant
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant: { $ref: "#/components/schemas/Merchant" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
     patch:
       tags: [admin]
       summary: Update a merchant's mutable defaults
@@ -412,6 +468,109 @@ paths:
                       addressCooldownSeconds: { type: integer }
                       updatedAt: { type: string, format: date-time }
         "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+
+  /admin/merchants/{id}/rotate-key:
+    post:
+      tags: [admin]
+      summary: Rotate a merchant's API key
+      description: |
+        Generates a fresh `sk_<hex>` plaintext and replaces the stored hash.
+        The returned `apiKey` is the one and only chance to capture it. The
+        prior key is rejected on the next request. Webhook URL/secret are
+        intentionally not rotated here.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Key rotated; new plaintext returned once
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      active: { type: boolean }
+                      updatedAt: { type: string, format: date-time }
+                  apiKey:
+                    type: string
+                    description: Plaintext API key. Shown once; store it immediately.
+                    pattern: "^sk_[0-9a-f]{64}$"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+
+  /admin/merchants/{id}/deactivate:
+    post:
+      tags: [admin]
+      summary: Deactivate a merchant
+      description: |
+        Sets `active=false`. Inbound API requests with the merchant's API
+        key are rejected with 401 while inactive. Idempotent. Deactivation
+        does NOT invalidate the stored key hash — reactivation restores
+        access with the same credential. Rotate the key first if deactivation
+        is prompted by a credential leak.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Merchant deactivated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      active: { type: boolean }
+                      updatedAt: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Merchant not found }
+
+  /admin/merchants/{id}/activate:
+    post:
+      tags: [admin]
+      summary: Reactivate a merchant
+      description: Sets `active=true`. Idempotent.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Merchant activated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      active: { type: boolean }
+                      updatedAt: { type: string, format: date-time }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Merchant not found }
 
@@ -523,6 +682,58 @@ paths:
         "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
 
   /admin/fee-wallets:
+    get:
+      tags: [admin]
+      summary: List fee wallets with reservation state
+      description: |
+        Operator view of the fee-wallet fleet. The `reservedByPayoutId` field
+        surfaces the current CAS reservation (set while a payout holds the
+        wallet; released on status transition). Use `?reserved=true` to list
+        every in-flight reservation across every chain — the fastest way to
+        spot payouts stuck in `reserved`/`submitted` status.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: chainId
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: active
+          schema: { type: string, enum: [true, false] }
+        - in: query
+          name: reserved
+          schema: { type: string, enum: [true, false] }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Fee-wallet page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallets:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        chainId: { type: integer }
+                        address: { type: string }
+                        label: { type: string }
+                        active: { type: boolean }
+                        reservedByPayoutId: { type: [string, "null"] }
+                        reservedAt: { type: [string, "null"], format: date-time }
+                        createdAt: { type: string, format: date-time }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
     post:
       tags: [admin]
       summary: Register a fee wallet — address is HD-derived from MASTER_SEED
@@ -1197,6 +1408,23 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
+    Merchant:
+      type: object
+      description: |
+        Merchant row as returned by the admin GET endpoints. Secret-adjacent
+        fields (`api_key_hash`, `webhook_secret_ciphertext`) are never
+        included.
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        webhookUrl: { type: [string, "null"] }
+        active: { type: boolean }
+        paymentToleranceUnderBps: { type: integer, minimum: 0, maximum: 2000 }
+        paymentToleranceOverBps: { type: integer, minimum: 0, maximum: 2000 }
+        addressCooldownSeconds: { type: integer, minimum: 0, maximum: 604800 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
     Error:
       type: object
       required: [error]

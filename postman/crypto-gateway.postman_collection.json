@@ -129,6 +129,108 @@
           ]
         },
         {
+          "name": "2c. List merchants",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants?limit=50&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants"],
+              "query": [
+                { "key": "limit", "value": "50" },
+                { "key": "offset", "value": "0" },
+                { "key": "active", "value": "true", "disabled": true }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Paginated list of merchants, newest first. Never leaks `api_key_hash` or `webhook_secret_ciphertext`. Enable the `active` query param to scope to live (`true`) or deactivated (`false`) rows."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns merchants array', () => pm.expect(body.merchants).to.be.an('array'));",
+                  "pm.test('no secret fields leaked', () => {",
+                  "  const s = JSON.stringify(body);",
+                  "  pm.expect(s).to.not.match(/apiKeyHash|webhookSecret|ciphertext/i);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2d. Get merchant by id",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}", "host": ["{{baseUrl}}"], "path": ["admin", "merchants", "{{merchantId}}"] },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Fetch a single merchant by id. Returns the same shape as the list endpoint (minus pagination wrapper). 404 when unknown."
+          }
+        },
+        {
+          "name": "2e. Rotate merchant API key",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}/rotate-key",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants", "{{merchantId}}", "rotate-key"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Issues a fresh plaintext API key. The prior key is rejected on the next request. Use this if the old key has leaked — OR if it was lost at create time (`POST /admin/merchants` only returns the plaintext once). The test script overwrites `merchantApiKey` in the environment so downstream requests automatically chain to the new key.\n\nWebhook URL/secret are intentionally NOT rotated here — changing them mid-flight orphans pending outbox rows signed under the old key."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns new plaintext apiKey', () => {",
+                  "  pm.expect(body.apiKey).to.match(/^sk_[0-9a-f]{64}$/);",
+                  "});",
+                  "if (body.apiKey) {",
+                  "  pm.environment.set('merchantApiKey', body.apiKey);",
+                  "  console.log('rotated merchantApiKey');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2f. Deactivate merchant",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}/deactivate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants", "{{merchantId}}", "deactivate"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Sets `active=false`. Inbound requests using the merchant's API key start returning 401 immediately. Idempotent. Does NOT invalidate the stored key hash — reactivation with `2g. Reactivate merchant` restores the same credential. If the key has been compromised, rotate (`2e`) first."
+          }
+        },
+        {
+          "name": "2g. Reactivate merchant",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/merchants/{{merchantId}}/activate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "merchants", "{{merchantId}}", "activate"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Sets `active=true`. Idempotent."
+          }
+        },
+        {
           "name": "3a. Initialize address pool",
           "request": {
             "method": "POST",
@@ -188,6 +290,26 @@
               "raw": "{\n  \"chainId\": 999,\n  \"family\": \"evm\",\n  \"label\": \"dev-hot-1\"\n}"
             },
             "description": "Registers a fee wallet for payouts. The gateway HD-derives the `(address, privateKey)` pair from `MASTER_SEED` at a deterministic index keyed by `(family, label)` and returns the derived address in `feeWallet.address`. No private key is accepted here — the operator funds the returned address out-of-band. The same `label` always derives to the same address across redeploys. Use `chainId: 999` + `family: evm` for local runs; for real chains use the appropriate chainId from the table in the README."
+          }
+        },
+        {
+          "name": "3b. List fee wallets",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets?limit=100&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets"],
+              "query": [
+                { "key": "limit", "value": "100" },
+                { "key": "offset", "value": "0" },
+                { "key": "chainId", "value": "999", "disabled": true },
+                { "key": "active", "value": "true", "disabled": true },
+                { "key": "reserved", "value": "true", "disabled": true }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Lists fee wallets with reservation state. `reservedByPayoutId` shows the current CAS reservation — set while a payout holds the wallet, released on status transition. Enable the `reserved=true` filter to surface every in-flight reservation across every chain, the fastest way to spot payouts stuck in `reserved`/`submitted`."
           }
         },
         {

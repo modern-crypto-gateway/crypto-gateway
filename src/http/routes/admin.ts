@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { and, asc, desc, eq, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import type { AppDeps } from "../../core/app-deps.js";
 import {
@@ -29,7 +29,7 @@ import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registr
 import { readAlchemyNotifyToken } from "../../adapters/detection/alchemy-token.js";
 import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
 import { migrate as drizzleMigrate } from "drizzle-orm/libsql/migrator";
-import { invoices, merchants, transactions } from "../../db/schema.js";
+import { feeWallets, invoices, merchants, transactions } from "../../db/schema.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
@@ -310,6 +310,206 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     }
   });
 
+  // List merchants. Paginated; supports ?active=true|false to filter out
+  // deactivated rows for live-dashboard views. Never returns api_key_hash or
+  // webhook_secret_ciphertext — both are secrets-adjacent and not useful to
+  // display. Operators who need to revoke a leaked key use the rotate-key
+  // endpoint; the old hash becomes invalid automatically.
+  app.get("/merchants", async (c) => {
+    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "50"), 1), 500);
+    const offset = Math.max(Number(c.req.query("offset") ?? "0"), 0);
+    const activeParam = c.req.query("active");
+    const conds: SQL[] = [];
+    if (activeParam === "true") conds.push(eq(merchants.active, 1));
+    else if (activeParam === "false") conds.push(eq(merchants.active, 0));
+    else if (activeParam !== undefined) {
+      return c.json(
+        { error: { code: "BAD_ACTIVE", message: "active must be 'true' or 'false'" } },
+        400
+      );
+    }
+    const base = deps.db
+      .select({
+        id: merchants.id,
+        name: merchants.name,
+        webhookUrl: merchants.webhookUrl,
+        active: merchants.active,
+        paymentToleranceUnderBps: merchants.paymentToleranceUnderBps,
+        paymentToleranceOverBps: merchants.paymentToleranceOverBps,
+        addressCooldownSeconds: merchants.addressCooldownSeconds,
+        createdAt: merchants.createdAt,
+        updatedAt: merchants.updatedAt
+      })
+      .from(merchants)
+      .orderBy(desc(merchants.createdAt))
+      .limit(limit)
+      .offset(offset);
+    const rows = conds.length === 0 ? await base : await base.where(and(...conds));
+    return c.json(
+      {
+        merchants: rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          webhookUrl: r.webhookUrl,
+          active: r.active === 1,
+          paymentToleranceUnderBps: r.paymentToleranceUnderBps,
+          paymentToleranceOverBps: r.paymentToleranceOverBps,
+          addressCooldownSeconds: r.addressCooldownSeconds,
+          createdAt: new Date(r.createdAt).toISOString(),
+          updatedAt: new Date(r.updatedAt).toISOString()
+        })),
+        limit,
+        offset
+      },
+      200
+    );
+  });
+
+  app.get("/merchants/:id", async (c) => {
+    const id = c.req.param("id");
+    const [row] = await deps.db
+      .select({
+        id: merchants.id,
+        name: merchants.name,
+        webhookUrl: merchants.webhookUrl,
+        active: merchants.active,
+        paymentToleranceUnderBps: merchants.paymentToleranceUnderBps,
+        paymentToleranceOverBps: merchants.paymentToleranceOverBps,
+        addressCooldownSeconds: merchants.addressCooldownSeconds,
+        createdAt: merchants.createdAt,
+        updatedAt: merchants.updatedAt
+      })
+      .from(merchants)
+      .where(eq(merchants.id, id))
+      .limit(1);
+    if (!row) {
+      return c.json(
+        { error: { code: "MERCHANT_NOT_FOUND", message: `Merchant not found: ${id}` } },
+        404
+      );
+    }
+    return c.json(
+      {
+        merchant: {
+          id: row.id,
+          name: row.name,
+          webhookUrl: row.webhookUrl,
+          active: row.active === 1,
+          paymentToleranceUnderBps: row.paymentToleranceUnderBps,
+          paymentToleranceOverBps: row.paymentToleranceOverBps,
+          addressCooldownSeconds: row.addressCooldownSeconds,
+          createdAt: new Date(row.createdAt).toISOString(),
+          updatedAt: new Date(row.updatedAt).toISOString()
+        }
+      },
+      200
+    );
+  });
+
+  // Rotate a merchant's API key. Generates a fresh `sk_<hex>` plaintext,
+  // replaces the stored hash in one UPDATE, and returns the plaintext in the
+  // response body — exactly like the create flow, this is the one and only
+  // chance to capture it. The prior key stops working immediately on the
+  // next request (auth middleware hashes inbound tokens and looks them up
+  // by hash). Webhook URL / secret are intentionally left alone: rotating
+  // those mid-flight would orphan pending outbox rows signed under the old
+  // secret (see PATCH handler comment).
+  app.post("/merchants/:id/rotate-key", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const apiKey = `sk_${bytesToRandomHex(32)}`;
+      const apiKeyHash = await sha256Hex(apiKey);
+      const now = deps.clock.now().getTime();
+      const [row] = await deps.db
+        .update(merchants)
+        .set({ apiKeyHash, updatedAt: now })
+        .where(eq(merchants.id, id))
+        .returning();
+      if (!row) {
+        return c.json(
+          { error: { code: "MERCHANT_NOT_FOUND", message: `Merchant not found: ${id}` } },
+          404
+        );
+      }
+      deps.logger.info("admin rotated merchant api key", { merchantId: id });
+      return c.json(
+        {
+          merchant: {
+            id: row.id,
+            name: row.name,
+            active: row.active === 1,
+            updatedAt: new Date(row.updatedAt).toISOString()
+          },
+          apiKey
+        },
+        200
+      );
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Deactivate / reactivate a merchant. Sets the `active` column; idempotent
+  // (deactivating an already-inactive merchant returns 200 with active=false).
+  // Deactivation does NOT invalidate the API key hash — reactivation restores
+  // the same credential. Use rotate-key first if the deactivation is
+  // prompted by a credential leak.
+  app.post("/merchants/:id/deactivate", async (c) => {
+    const id = c.req.param("id");
+    const now = deps.clock.now().getTime();
+    const [row] = await deps.db
+      .update(merchants)
+      .set({ active: 0, updatedAt: now })
+      .where(eq(merchants.id, id))
+      .returning();
+    if (!row) {
+      return c.json(
+        { error: { code: "MERCHANT_NOT_FOUND", message: `Merchant not found: ${id}` } },
+        404
+      );
+    }
+    deps.logger.info("admin deactivated merchant", { merchantId: id });
+    return c.json(
+      {
+        merchant: {
+          id: row.id,
+          name: row.name,
+          active: row.active === 1,
+          updatedAt: new Date(row.updatedAt).toISOString()
+        }
+      },
+      200
+    );
+  });
+
+  app.post("/merchants/:id/activate", async (c) => {
+    const id = c.req.param("id");
+    const now = deps.clock.now().getTime();
+    const [row] = await deps.db
+      .update(merchants)
+      .set({ active: 1, updatedAt: now })
+      .where(eq(merchants.id, id))
+      .returning();
+    if (!row) {
+      return c.json(
+        { error: { code: "MERCHANT_NOT_FOUND", message: `Merchant not found: ${id}` } },
+        404
+      );
+    }
+    deps.logger.info("admin activated merchant", { merchantId: id });
+    return c.json(
+      {
+        merchant: {
+          id: row.id,
+          name: row.name,
+          active: row.active === 1,
+          updatedAt: new Date(row.updatedAt).toISOString()
+        }
+      },
+      200
+    );
+  });
+
   // Register a fee wallet. The gateway derives address + private key from
   // MASTER_SEED at a deterministic index keyed by (family, label). Operator
   // never supplies a private key (none to leak over the admin API), and funds
@@ -355,6 +555,83 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     } catch (err) {
       return renderError(c, err, deps.logger);
     }
+  });
+
+  // List fee wallets with their reservation state. The `reservedByPayoutId`
+  // field is what operators care about most: a wallet stuck with the same
+  // reservation for longer than the payout's broadcast window is the
+  // classic "payout stuck" signal. Filters (chainId, active, reserved) are
+  // AND-combined so `?reserved=true` on its own surfaces every in-flight
+  // reservation across the fleet in one call.
+  app.get("/fee-wallets", async (c) => {
+    const chainIdParam = c.req.query("chainId");
+    const activeParam = c.req.query("active");
+    const reservedParam = c.req.query("reserved");
+    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "100"), 1), 500);
+    const offset = Math.max(Number(c.req.query("offset") ?? "0"), 0);
+
+    const conds: SQL[] = [];
+    if (chainIdParam !== undefined) {
+      const n = Number(chainIdParam);
+      if (!Number.isFinite(n) || n <= 0) {
+        return c.json(
+          { error: { code: "BAD_CHAIN_ID", message: "chainId must be a positive integer" } },
+          400
+        );
+      }
+      conds.push(eq(feeWallets.chainId, n));
+    }
+    if (activeParam === "true") conds.push(eq(feeWallets.active, 1));
+    else if (activeParam === "false") conds.push(eq(feeWallets.active, 0));
+    else if (activeParam !== undefined) {
+      return c.json(
+        { error: { code: "BAD_ACTIVE", message: "active must be 'true' or 'false'" } },
+        400
+      );
+    }
+    if (reservedParam === "true") conds.push(isNotNull(feeWallets.reservedByPayoutId));
+    else if (reservedParam === "false") conds.push(isNull(feeWallets.reservedByPayoutId));
+    else if (reservedParam !== undefined) {
+      return c.json(
+        { error: { code: "BAD_RESERVED", message: "reserved must be 'true' or 'false'" } },
+        400
+      );
+    }
+
+    const base = deps.db
+      .select({
+        id: feeWallets.id,
+        chainId: feeWallets.chainId,
+        address: feeWallets.address,
+        label: feeWallets.label,
+        active: feeWallets.active,
+        reservedByPayoutId: feeWallets.reservedByPayoutId,
+        reservedAt: feeWallets.reservedAt,
+        createdAt: feeWallets.createdAt
+      })
+      .from(feeWallets)
+      .orderBy(asc(feeWallets.chainId), asc(feeWallets.label))
+      .limit(limit)
+      .offset(offset);
+    const rows = conds.length === 0 ? await base : await base.where(and(...conds));
+
+    return c.json(
+      {
+        feeWallets: rows.map((r) => ({
+          id: r.id,
+          chainId: r.chainId,
+          address: r.address,
+          label: r.label,
+          active: r.active === 1,
+          reservedByPayoutId: r.reservedByPayoutId,
+          reservedAt: r.reservedAt === null ? null : new Date(r.reservedAt).toISOString(),
+          createdAt: new Date(r.createdAt).toISOString()
+        })),
+        limit,
+        offset
+      },
+      200
+    );
   });
 
   app.post("/bootstrap/alchemy-webhooks", async (c) => {

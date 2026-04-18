@@ -156,3 +156,382 @@ describe("POST /admin/fee-wallets", () => {
     expect(body.error.code).toBe("FAMILY_MISMATCH");
   });
 });
+
+async function createMerchant(
+  booted: BootedTestApp,
+  body: Record<string, unknown> = { name: "Acme" }
+): Promise<{ id: string; apiKey: string }> {
+  const res = await booted.app.fetch(
+    new Request("http://test.local/admin/merchants", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+      body: JSON.stringify(body)
+    })
+  );
+  const parsed = (await res.json()) as { merchant: { id: string }; apiKey: string };
+  return { id: parsed.merchant.id, apiKey: parsed.apiKey };
+}
+
+describe("GET /admin/merchants", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  it("lists created merchants without leaking secrets", async () => {
+    const first = await createMerchant(booted, { name: "First" });
+    const second = await createMerchant(booted, { name: "Second" });
+
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/merchants", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      merchants: ReadonlyArray<{ id: string; name: string; active: boolean }>;
+      limit: number;
+      offset: number;
+    };
+    // bootTestApp seeds a default "Test Merchant" before our two → 3 rows.
+    const ids = body.merchants.map((m) => m.id);
+    expect(ids).toContain(first.id);
+    expect(ids).toContain(second.id);
+    expect(body.merchants.every((m) => m.active)).toBe(true);
+    // No secret fields leaked.
+    const json = JSON.stringify(body);
+    expect(json).not.toMatch(/apiKeyHash|webhookSecret|ciphertext/i);
+  });
+
+  it("filters by active status", async () => {
+    const m1 = await createMerchant(booted, { name: "Kept" });
+    const m2 = await createMerchant(booted, { name: "Gone" });
+    // deactivate m2
+    await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${m2.id}/deactivate`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+
+    const activeRes = await booted.app.fetch(
+      new Request("http://test.local/admin/merchants?active=true", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    const activeBody = (await activeRes.json()) as {
+      merchants: ReadonlyArray<{ id: string }>;
+    };
+    const activeIds = activeBody.merchants.map((m) => m.id);
+    expect(activeIds).toContain(m1.id);
+    expect(activeIds).not.toContain(m2.id);
+
+    const inactiveRes = await booted.app.fetch(
+      new Request("http://test.local/admin/merchants?active=false", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    const inactiveBody = (await inactiveRes.json()) as {
+      merchants: ReadonlyArray<{ id: string }>;
+    };
+    expect(inactiveBody.merchants.map((m) => m.id)).toEqual([m2.id]);
+  });
+
+  it("rejects invalid ?active values", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/merchants?active=maybe", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("GET /admin/merchants/:id", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  it("returns the merchant by id", async () => {
+    const created = await createMerchant(booted, { name: "Solo" });
+    const res = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${created.id}`, {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { merchant: { id: string; name: string; active: boolean } };
+    expect(body.merchant.id).toBe(created.id);
+    expect(body.merchant.name).toBe("Solo");
+    expect(body.merchant.active).toBe(true);
+  });
+
+  it("returns 404 for an unknown id", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/merchants/00000000-0000-0000-0000-000000000000", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /admin/merchants/:id/rotate-key", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  it("issues a new plaintext key, old key stops working, new key works", async () => {
+    const { id, apiKey: oldKey } = await createMerchant(booted);
+
+    // old key works pre-rotation
+    const preRes = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${oldKey}` },
+        body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
+      })
+    );
+    expect(preRes.status).toBe(201);
+
+    const rotateRes = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${id}/rotate-key`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(rotateRes.status).toBe(200);
+    const rotateBody = (await rotateRes.json()) as { apiKey: string };
+    expect(rotateBody.apiKey).toMatch(/^sk_[0-9a-f]{64}$/);
+    expect(rotateBody.apiKey).not.toBe(oldKey);
+
+    // old key rejected
+    const postOldRes = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${oldKey}` },
+        body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
+      })
+    );
+    expect(postOldRes.status).toBe(401);
+
+    // new key works
+    const postNewRes = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${rotateBody.apiKey}` },
+        body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
+      })
+    );
+    expect(postNewRes.status).toBe(201);
+  });
+
+  it("returns 404 for an unknown id", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/merchants/00000000-0000-0000-0000-000000000000/rotate-key", {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /admin/merchants/:id/deactivate + /activate", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  it("deactivation blocks inbound API; reactivation restores access", async () => {
+    const { id, apiKey } = await createMerchant(booted);
+
+    const deact = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${id}/deactivate`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(deact.status).toBe(200);
+    const deactBody = (await deact.json()) as { merchant: { active: boolean } };
+    expect(deactBody.merchant.active).toBe(false);
+
+    const blocked = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
+      })
+    );
+    expect(blocked.status).toBe(401);
+
+    const reactivate = await booted.app.fetch(
+      new Request(`http://test.local/admin/merchants/${id}/activate`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(reactivate.status).toBe(200);
+    const reactBody = (await reactivate.json()) as { merchant: { active: boolean } };
+    expect(reactBody.merchant.active).toBe(true);
+
+    // same key works again after reactivation — no rotation needed.
+    const unblocked = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ chainId: 999, token: "DEV", amountRaw: "1" })
+      })
+    );
+    expect(unblocked.status).toBe(201);
+  });
+
+  it("deactivating an already-inactive merchant is idempotent", async () => {
+    const { id } = await createMerchant(booted);
+    for (let i = 0; i < 2; i++) {
+      const res = await booted.app.fetch(
+        new Request(`http://test.local/admin/merchants/${id}/deactivate`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${ADMIN_KEY}` }
+        })
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { merchant: { active: boolean } };
+      expect(body.merchant.active).toBe(false);
+    }
+  });
+
+  it("returns 404 for an unknown id", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/merchants/00000000-0000-0000-0000-000000000000/deactivate", {
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("GET /admin/fee-wallets", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  it("lists registered fee wallets with reservation state", async () => {
+    await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ chainId: 999, label: "hot-1", family: "evm" })
+      })
+    );
+    await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ chainId: 999, label: "hot-2", family: "evm" })
+      })
+    );
+
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      feeWallets: ReadonlyArray<{
+        label: string;
+        chainId: number;
+        active: boolean;
+        reservedByPayoutId: string | null;
+        reservedAt: string | null;
+      }>;
+    };
+    expect(body.feeWallets.length).toBe(2);
+    expect(body.feeWallets.every((w) => w.active)).toBe(true);
+    expect(body.feeWallets.every((w) => w.reservedByPayoutId === null)).toBe(true);
+    expect(body.feeWallets.every((w) => w.reservedAt === null)).toBe(true);
+    expect(new Set(body.feeWallets.map((w) => w.label))).toEqual(new Set(["hot-1", "hot-2"]));
+  });
+
+  it("filters by chainId, active, and reserved", async () => {
+    await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ chainId: 999, label: "hot-1", family: "evm" })
+      })
+    );
+
+    const byChain = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets?chainId=999", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(byChain.status).toBe(200);
+    const byChainBody = (await byChain.json()) as {
+      feeWallets: ReadonlyArray<{ chainId: number }>;
+    };
+    expect(byChainBody.feeWallets.length).toBe(1);
+
+    const byOther = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets?chainId=1", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    const byOtherBody = (await byOther.json()) as { feeWallets: ReadonlyArray<unknown> };
+    expect(byOtherBody.feeWallets.length).toBe(0);
+
+    const byReserved = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets?reserved=true", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    const byReservedBody = (await byReserved.json()) as { feeWallets: ReadonlyArray<unknown> };
+    expect(byReservedBody.feeWallets.length).toBe(0);
+  });
+
+  it("rejects invalid filter values", async () => {
+    const badChain = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets?chainId=abc", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(badChain.status).toBe(400);
+    const badActive = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets?active=maybe", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(badActive.status).toBe(400);
+  });
+});
