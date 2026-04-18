@@ -289,7 +289,7 @@
               "mode": "raw",
               "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"externalId\": \"{{runExternalId}}\",\n  \"expiresInMinutes\": 30\n}"
             },
-            "description": "Uses `chainId`, `token`, `amountRaw` from the environment. Flip chains by changing the environment values; or use one of the `Quick starts` requests that pre-set them.\n\nAlternative shape: omit `amountRaw` and provide `fiatAmount` + `fiatCurrency` to let the gateway quote the crypto amount against the price oracle.\n\nOptional per-invoice webhook override: pass `webhookUrl` + `webhookSecret` together to route this invoice's events to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned. Dispatch precedence: invoice override → merchant default → skip. See `Create invoice (with per-invoice webhook)` for an example."
+            "description": "Uses `chainId`, `token`, `amountRaw` from the environment. Flip chains by changing the environment values; or use one of the `Quick starts` requests that pre-set them.\n\nAlternative shape: omit `amountRaw` and provide `fiatAmount` + `fiatCurrency` to let the gateway quote the crypto amount against the price oracle.\n\n**Idempotency.** `externalId` is your dedup key (Stripe-style). A retry of the same `(merchantId, externalId)` returns the original invoice — same body, same `receiveAddress` — instead of allocating a new pool address. Safe to send the same POST twice after a network blip. The default body uses a fresh `runExternalId` per request so Collection Runner loops don't collide; pin `externalId` to a constant value to exercise the idempotent-replay path explicitly.\n\nOptional per-invoice webhook override: pass `webhookUrl` + `webhookSecret` together to route this invoice's events to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned. Dispatch precedence: invoice override → merchant default → skip. See `Create invoice (with per-invoice webhook)` for an example."
           },
           "event": [
             {
@@ -879,6 +879,136 @@
                   "pm.test('200 OK', () => pm.response.to.have.status(200));",
                   "const body = pm.response.json();",
                   "pm.test('replayed echoes id', () => pm.expect(body.replayed).to.have.property('id'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Admin / Balances",
+      "description": "Operator-only treasury view. Walks every pool address + registered fee wallet on every wired chain, asks the chain adapter for ALL token balances in one bulk call, and rolls up USD totals at every level (token → address → chain → family → grand total).\n\nBacked by a 60-second cache keyed on the query string, so a dashboard auto-refresh can't melt the RPC budget. Each response carries `cached: true|false` so the UI can show staleness. Per-chain rows include an `errors` count — non-zero means some addresses couldn't be reached and the totals are partial.\n\nCost shape: an EVM family with N pool addresses across C chains issues N×C bulk calls (one `alchemy_getTokenBalances` + one `eth_getBalance` each). Tron and Solana are one call per address per chain.",
+      "item": [
+        {
+          "name": "Snapshot — all families, all addresses",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Full sweep across every family and every chain wired into the gateway. Returns `{ snapshot, cached }`. Run once to populate the cache; subsequent identical calls within 60 s come back as `cached: true`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('has snapshot.families + cached flag', () => {",
+                  "  pm.expect(body).to.have.property('cached');",
+                  "  pm.expect(body.snapshot).to.have.property('families');",
+                  "  pm.expect(body.snapshot).to.have.property('totalUsd');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Snapshot — narrow by family (evm)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?family=evm",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [
+                { "key": "family", "value": "evm", "description": "evm | tron | solana" }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Restricts the sweep to one family. Cheaper than the full snapshot when you only want EVM treasury. Cached separately from the unfiltered call."
+          }
+        },
+        {
+          "name": "Snapshot — narrow by chainId (Ethereum mainnet)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?chainId=1",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [{ "key": "chainId", "value": "1" }]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Single-chain snapshot. Use when investigating a specific chain (e.g. after funding a fee wallet on it)."
+          }
+        },
+        {
+          "name": "Snapshot — fee wallets only",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?kind=fee",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [
+                { "key": "kind", "value": "fee", "description": "pool | fee — default is both" }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Excludes pool addresses entirely — useful for an ops dashboard that just shows hot/cold wallet balances. Each address row includes `feeLabel` so you can identify it."
+          }
+        },
+        {
+          "name": "Snapshot — single address spot-check",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/balances?address={{invoiceReceiveAddress}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "balances"],
+              "query": [
+                { "key": "address", "value": "{{invoiceReceiveAddress}}", "description": "Any address known to the gateway (pool or fee). Uses the receive address from the most recent invoice by default." }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Skips the rest of the universe and only snapshots one address. Cheapest possible call — handy when an operator wants to verify a specific wallet without paying the full sweep cost."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin / Migrate",
+      "description": "Operator-only schema migration trigger. Most production runtimes (Workers, Vercel Edge) have no filesystem at runtime and return 501 here — use `wrangler d1 migrations apply` or the Turso CLI for those. Local Node + remote libSQL/Postgres deployments can call this directly.",
+      "item": [
+        {
+          "name": "Apply pending migrations",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/migrate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "migrate"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Runs the bundled migration set through the idempotent runner. Already-applied IDs are skipped. Returns `{ applied: [...], skipped: [...] }`. On runtimes without filesystem access (Workers / Vercel Edge) returns 501 with code `MIGRATIONS_NOT_BUNDLED`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 or 501 (runtime-dependent)', () => {",
+                  "  pm.expect([200, 501]).to.include(pm.response.code);",
+                  "});"
                 ]
               }
             }

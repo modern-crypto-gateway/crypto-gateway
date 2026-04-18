@@ -90,6 +90,11 @@ paths:
         gateway's HD seed. The merchant is resolved from the API key — the
         caller MUST NOT include `merchantId` in the body; if they do, it's
         ignored.
+
+        **Idempotency.** Pass `externalId` to make the call idempotent: a
+        retry with the same `(merchantId, externalId)` returns the existing
+        invoice instead of creating a duplicate. Safe to send the same POST
+        multiple times after a timeout or 5xx.
       requestBody:
         required: true
         content:
@@ -743,6 +748,81 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /admin/balances:
+    get:
+      tags: [admin]
+      summary: Snapshot every gateway-owned address with token + USD totals
+      description: |
+        Walks every pool address and registered fee wallet, asks each chain
+        adapter for ALL token balances in one bulk call (Alchemy
+        `alchemy_getTokenBalances` for EVM, Solana
+        `getTokenAccountsByOwner` + `getBalance`, TronGrid
+        `/v1/accounts/{addr}` for Tron), then prices everything via the
+        oracle and rolls up:
+
+          token → address → chain → family → grand total
+
+        Each level carries its own `totalUsd`. Per-chain rows include an
+        `errors` count — addresses we tried but couldn't reach (bad RPC,
+        missing adapter); use it to detect partial snapshots.
+
+        Pricing: USD rates are fetched once per snapshot via
+        `priceOracle.getUsdRates([...symbols])`. Tokens the oracle can't
+        price get `usdRate=null` and `usd="0.00"` so callers can distinguish
+        "really zero" from "couldn't price".
+
+        ### Caching
+
+        Cached for **60 seconds** in CacheStore, keyed by query string
+        (`family`, `chainId`, `kind`, `address`) so a narrow lookup
+        doesn't share a slot with the full sweep. The response includes
+        `cached: true|false` so dashboards can show staleness.
+
+        ### Cost shape
+
+        For an EVM family with `N` pool addresses across `C` configured
+        EVM chains: `N×C` calls to `getAccountBalances`, each one bulk
+        endpoint plus one native-balance call. Tron and Solana are one
+        call per address per chain.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: family
+          schema: { type: string, enum: [evm, tron, solana] }
+          description: Narrow to one family.
+        - in: query
+          name: chainId
+          schema: { type: integer }
+          description: Narrow to one chainId. Implicitly narrows family.
+        - in: query
+          name: kind
+          schema: { type: string, enum: [pool, fee] }
+          description: Narrow to one address kind. Default returns both.
+        - in: query
+          name: address
+          schema: { type: string }
+          description: Spot-check one address without paying the full sweep cost.
+      responses:
+        "200":
+          description: Snapshot computed (or served from the 60s cache)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [snapshot, cached]
+                properties:
+                  snapshot: { $ref: "#/components/schemas/BalanceSnapshot" }
+                  cached:
+                    type: boolean
+                    description: True when this response came from the in-memory cache instead of a fresh sweep.
+        "400":
+          description: Invalid query parameter (BAD_FAMILY, BAD_CHAIN_ID, BAD_KIND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /admin/migrate:
     post:
       tags: [admin]
@@ -928,7 +1008,13 @@ components:
         externalId:
           type: string
           maxLength: 256
-          description: Merchant's opaque reference (e.g. cart id)
+          description: |
+            Merchant's opaque reference (e.g. cart id). Doubles as a Stripe-
+            style idempotency key: a second `POST /api/v1/invoices` from the
+            same merchant with the same `externalId` returns the original
+            invoice (HTTP 201 again, identical body) instead of creating a
+            duplicate. Safe to retry on network errors. Omit it and every
+            POST creates a new invoice.
         metadata:
           type: object
           additionalProperties: true
@@ -1154,6 +1240,97 @@ components:
           description: |
             HMAC secret paired with `webhookUrl`. Encrypted at rest and never
             echoed back. Required if `webhookUrl` is set.
+
+    BalanceSnapshot:
+      type: object
+      required: [generatedAt, totalUsd, families]
+      properties:
+        generatedAt: { type: string, format: date-time }
+        totalUsd:
+          type: string
+          description: Grand total USD across every family in the snapshot, fixed to 2 decimal places.
+        families:
+          type: array
+          items: { $ref: "#/components/schemas/FamilyBalance" }
+
+    FamilyBalance:
+      type: object
+      required: [family, totalUsd, chains]
+      properties:
+        family: { type: string, enum: [evm, tron, solana] }
+        totalUsd: { type: string }
+        chains:
+          type: array
+          items: { $ref: "#/components/schemas/ChainBalance" }
+
+    ChainBalance:
+      type: object
+      required: [chainId, totalUsd, tokens, addresses, errors]
+      properties:
+        chainId: { type: integer }
+        totalUsd: { type: string }
+        tokens:
+          type: array
+          description: Per-token roll-up across every address on this chain.
+          items:
+            type: object
+            required: [token, amountRaw, amountDecimal, usd]
+            properties:
+              token: { type: string }
+              amountRaw: { type: string, description: Sum of raw token amounts (smallest units). }
+              amountDecimal: { type: string }
+              usd: { type: string }
+        addresses:
+          type: array
+          items: { $ref: "#/components/schemas/AddressBalance" }
+        errors:
+          type: integer
+          description: |
+            Number of addresses on this chain we tried to snapshot but couldn't
+            (RPC error, missing adapter). Non-zero means the totals are partial
+            and shouldn't be read as authoritative.
+
+    AddressBalance:
+      type: object
+      required: [address, kind, totalUsd, tokens]
+      properties:
+        address: { type: string }
+        kind: { type: string, enum: [pool, fee] }
+        poolStatus:
+          type: string
+          enum: [available, allocated, quarantined]
+          description: Present only on `kind=pool` rows.
+        poolAllocatedToInvoiceId:
+          type: [string, "null"]
+          description: |
+            Invoice this pool address is currently allocated to (when
+            `poolStatus=allocated`). Present only on `kind=pool` rows.
+        feeLabel:
+          type: string
+          description: Operator label of the fee wallet (e.g. `hot-1`). Present only on `kind=fee` rows.
+        totalUsd: { type: string }
+        tokens:
+          type: array
+          items: { $ref: "#/components/schemas/TokenBalance" }
+
+    TokenBalance:
+      type: object
+      required: [token, decimals, amountRaw, amountDecimal, usd, usdRate]
+      properties:
+        token: { type: string }
+        decimals: { type: integer }
+        amountRaw:
+          type: string
+          description: Raw integer string in the token's smallest units.
+        amountDecimal:
+          type: string
+          description: Human-readable decimal form (UI convenience).
+        usd:
+          type: string
+          description: USD value of this balance. `"0.00"` when the token isn't priced (oracle miss); check `usdRate` to distinguish.
+        usdRate:
+          type: [string, "null"]
+          description: USD-per-token rate at snapshot time. `null` when the price oracle had no entry.
 
     Payout:
       type: object
