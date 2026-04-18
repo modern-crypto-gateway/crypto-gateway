@@ -134,8 +134,10 @@ async function computeBalanceSnapshotDb(
     };
   }
 
-  // 2. Sum confirmed incoming transfers by (toAddress, chainId, token).
-  //    One grouped query covers every address we care about.
+  // 2. Fetch confirmed incoming transfers for our addresses and aggregate
+  //    in JS with BigInt. We deliberately don't use SQL SUM here: amount_raw
+  //    is TEXT (uint256 values would overflow INT64 and lose precision when
+  //    SQLite coerces TEXT → REAL). See schema comment on TEXT amounts.
   const creditConds: SQL[] = [
     eq(transactions.status, "confirmed"),
     inArray(transactions.toAddress, allAddresses)
@@ -146,34 +148,31 @@ async function computeBalanceSnapshotDb(
       address: transactions.toAddress,
       chainId: transactions.chainId,
       token: transactions.token,
-      amountRaw: sql<string>`COALESCE(SUM(CAST(${transactions.amountRaw} AS TEXT)), '0')`
+      amountRaw: transactions.amountRaw
     })
     .from(transactions)
-    .where(and(...creditConds))
-    .groupBy(transactions.toAddress, transactions.chainId, transactions.token);
+    .where(and(...creditConds));
 
-  // 3. Sum confirmed outgoing payouts by (sourceAddress, chainId, token).
+  // 3. Same treatment for confirmed outgoing payouts: fetch, sum in JS.
   //    Only applies to fee wallets (pool addresses never appear as a payout
-  //    source — payouts fund from fee wallets). Guard on source not being
-  //    null so the planned/reserved rows don't contribute.
+  //    source). Skip the query entirely when there are no fee wallets in
+  //    scope.
   const debitConds: SQL[] = [
     eq(payouts.status, "confirmed"),
     sql`${payouts.sourceAddress} IS NOT NULL`
   ];
   if (opts.chainId !== undefined) debitConds.push(eq(payouts.chainId, opts.chainId));
-  const debitRowsRaw = feeRows.length > 0
+  const debitRows = feeRows.length > 0
     ? await deps.db
         .select({
           address: payouts.sourceAddress,
           chainId: payouts.chainId,
           token: payouts.token,
-          amountRaw: sql<string>`COALESCE(SUM(CAST(${payouts.amountRaw} AS TEXT)), '0')`
+          amountRaw: payouts.amountRaw
         })
         .from(payouts)
         .where(and(...debitConds))
-        .groupBy(payouts.sourceAddress, payouts.chainId, payouts.token)
     : [];
-  const debitRows = debitRowsRaw.filter((r) => r.address !== null);
 
   // 4. Fold credits + debits into per-(address, chainId) buckets. Pool rows
   //    use credits only; fee rows use credits − debits clamped at 0 (a
