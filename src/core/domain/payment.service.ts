@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
 import type { ChainFamily } from "../types/chain.js";
@@ -729,6 +729,172 @@ function invoiceEventFor(status: InvoiceStatus, invoice: Invoice, now: number): 
     case "overpaid":
       return { type: "invoice.overpaid", invoiceId: invoice.id, invoice, at };
   }
+}
+
+// ---- Recovery: relink orphan transactions ----
+
+// Background: prior to the address-canonicalization fix, EVM addresses were
+// stored EIP-55 mixed-case in `transactions.to_address` but lowercase in
+// `invoice_receive_addresses.address`. SQLite's case-sensitive TEXT compare
+// silently dropped the JOIN in `ingestDetectedTransfer`, leaving the row
+// with `invoice_id = NULL`. This function walks every still-orphan tx, runs
+// the same `family + canonicalAddress` lookup the live ingest path uses,
+// links the matches, and recomputes touched invoices so downstream
+// merchant webhooks fire.
+
+export interface RelinkOrphansOptions {
+  // Default false: report what would change without writing. Pass `apply: true`
+  // to commit the linkage and trigger invoice recompute + webhook events.
+  apply?: boolean;
+  // Cap rows scanned per call. Recovery scripts can iterate; default is generous
+  // (10k) since the work per row is one cheap address join.
+  limit?: number;
+}
+
+export interface RelinkOrphansResult {
+  apply: boolean;
+  candidatesScanned: number;
+  linked: number;
+  invoicesTouched: number;
+  invoicesPromoted: number;
+  skipped: Array<{ txId: string; chainId: number; toAddress: string; reason: string }>;
+  // Up to 20 sample (txId -> invoiceId) mappings for operator audit.
+  samples: Array<{ txId: string; chainId: number; toAddress: string; invoiceId: string; status: TxStatus }>;
+}
+
+export async function relinkOrphanTransactions(
+  deps: AppDeps,
+  opts: RelinkOrphansOptions = {}
+): Promise<RelinkOrphansResult> {
+  const apply = opts.apply ?? false;
+  const limit = opts.limit ?? 10_000;
+  const now = deps.clock.now().getTime();
+
+  const orphans = await deps.db
+    .select()
+    .from(transactions)
+    .where(
+      and(
+        isNull(transactions.invoiceId),
+        // Reverted / orphaned rows are end-state — re-linking them would just
+        // confuse the audit trail. Recover only live (detected) and confirmed
+        // payments that should have credited an invoice.
+        inArray(transactions.status, ["detected", "confirmed"])
+      )
+    )
+    .limit(limit);
+
+  const skipped: RelinkOrphansResult["skipped"] = [];
+  const samples: RelinkOrphansResult["samples"] = [];
+  const touchedInvoiceIds = new Set<string>();
+  let linked = 0;
+
+  for (const row of orphans) {
+    let chainAdapter: ChainAdapter;
+    try {
+      chainAdapter = findChainAdapter(deps, row.chainId);
+    } catch {
+      skipped.push({ txId: row.id, chainId: row.chainId, toAddress: row.toAddress, reason: "no chain adapter" });
+      continue;
+    }
+
+    let canonicalTo: string;
+    let canonicalFrom: string;
+    try {
+      canonicalTo = chainAdapter.canonicalizeAddress(row.toAddress);
+      canonicalFrom = chainAdapter.canonicalizeAddress(row.fromAddress);
+    } catch (err) {
+      skipped.push({
+        txId: row.id,
+        chainId: row.chainId,
+        toAddress: row.toAddress,
+        reason: `canonicalize failed: ${err instanceof Error ? err.message : String(err)}`
+      });
+      continue;
+    }
+
+    const family = chainAdapter.family;
+    const [matched] = await deps.db
+      .select({ invoice: invoices })
+      .from(invoices)
+      .innerJoin(invoiceReceiveAddresses, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
+      .where(and(eq(invoiceReceiveAddresses.address, canonicalTo), eq(invoiceReceiveAddresses.family, family)))
+      .limit(1);
+
+    if (!matched) {
+      skipped.push({ txId: row.id, chainId: row.chainId, toAddress: row.toAddress, reason: "no invoice for address" });
+      continue;
+    }
+
+    if (apply) {
+      // Lowercase the stored addresses while we're here — same canonicalization
+      // the post-fix ingest path applies, so future joins (and the recompute
+      // below, when it filters by invoice_id, doesn't need it but still) use
+      // the same case the rest of the system uses.
+      await deps.db
+        .update(transactions)
+        .set({ invoiceId: matched.invoice.id, toAddress: canonicalTo, fromAddress: canonicalFrom })
+        .where(eq(transactions.id, row.id));
+
+      // Per-payment webhook for confirmed orphans, mirroring the live ingest
+      // path (only confirmed transfers fire `invoice.payment_received`).
+      if (row.status === "confirmed") {
+        const addresses = await fetchInvoiceReceiveAddresses(deps, matched.invoice.id);
+        const snapshotInvoice = drizzleRowToInvoice(matched.invoice, addresses);
+        await deps.events.publish({
+          type: "invoice.payment_received",
+          invoiceId: matched.invoice.id as InvoiceId,
+          invoice: snapshotInvoice,
+          payment: {
+            txHash: row.txHash,
+            chainId: row.chainId,
+            token: row.token,
+            amountRaw: row.amountRaw,
+            amountUsd: row.amountUsd,
+            usdRate: row.usdRate
+          },
+          at: new Date(now)
+        });
+      }
+
+      touchedInvoiceIds.add(matched.invoice.id);
+    }
+
+    linked += 1;
+    if (samples.length < 20) {
+      samples.push({
+        txId: row.id,
+        chainId: row.chainId,
+        toAddress: canonicalTo,
+        invoiceId: matched.invoice.id,
+        status: row.status as TxStatus
+      });
+    }
+  }
+
+  // Recompute every touched invoice. The recompute itself fires the
+  // status-transition events (invoice.confirmed / .partial / etc.) so
+  // merchants see both the per-payment ping and the invoice lifecycle event.
+  let invoicesPromoted = 0;
+  if (apply && touchedInvoiceIds.size > 0) {
+    const ids = [...touchedInvoiceIds];
+    const invoiceRows = await deps.db.select().from(invoices).where(inArray(invoices.id, ids));
+    for (const invoiceRow of invoiceRows) {
+      const before = invoiceRow.status as InvoiceStatus;
+      const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, now);
+      if (before !== "confirmed" && after === "confirmed") invoicesPromoted += 1;
+    }
+  }
+
+  return {
+    apply,
+    candidatesScanned: orphans.length,
+    linked,
+    invoicesTouched: touchedInvoiceIds.size,
+    invoicesPromoted,
+    skipped,
+    samples
+  };
 }
 
 // ---- Error helpers ----

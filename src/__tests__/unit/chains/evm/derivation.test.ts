@@ -7,20 +7,23 @@ import { evmChainAdapter } from "../../../../adapters/chains/evm/evm-chain.adapt
 // (viem, ethers, web3.js, wagmi) and make safe fixtures.
 const HARDHAT_MNEMONIC = "test test test test test test test test test test test junk";
 
+// All addresses are stored / returned LOWERCASE — see
+// `evmChainAdapter.canonicalizeAddress` for the rationale (case-sensitive
+// SQLite joins must not depend on EIP-55 checksum case).
 const HARDHAT_DERIVED = [
   {
     index: 0,
-    address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
     privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
   },
   {
     index: 1,
-    address: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    address: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
     privateKey: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
   },
   {
     index: 2,
-    address: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+    address: "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
     privateKey: "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
   }
 ];
@@ -74,24 +77,36 @@ describe("evmChainAdapter.deriveAddress", () => {
   });
 });
 
-describe("evmChainAdapter.canonicalizeAddress (EIP-55)", () => {
-  it("converts a lowercase address to checksummed form", () => {
+describe("evmChainAdapter.canonicalizeAddress (lowercase canonical)", () => {
+  // Background: EVM addresses are case-insensitive on chain. EIP-55 mixed
+  // case is purely a typo-detection hint. We store + compare lowercase so
+  // SQLite joins between detected transfers and invoice/pool rows can't
+  // miss because of a single mismatched character — a bug class that
+  // silently orphaned every confirmed payment in production for one user.
+  const VITALIK = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045";
+
+  it("converts an EIP-55 mixed-case address to lowercase", () => {
     const adapter = makeAdapter();
-    // Vitalik's address in all-lowercase; canonical form is the one below.
-    const canonical = adapter.canonicalizeAddress("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
-    expect(canonical).toBe("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+    expect(adapter.canonicalizeAddress("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")).toBe(VITALIK);
   });
 
-  it("round-trips: canonical form stays canonical", () => {
+  it("converts an all-uppercase address to lowercase", () => {
     const adapter = makeAdapter();
-    const canonical = adapter.canonicalizeAddress("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
-    expect(canonical).toBe("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+    expect(adapter.canonicalizeAddress("0xD8DA6BF26964AF9D7EED9E03E53415D37AA96045")).toBe(VITALIK);
   });
 
-  it("normalizes mixed case to the canonical checksum", () => {
+  it("round-trips: lowercase stays lowercase", () => {
     const adapter = makeAdapter();
-    const out = adapter.canonicalizeAddress("0xD8DA6BF26964AF9D7EED9E03E53415D37AA96045");
-    expect(out).toBe("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+    expect(adapter.canonicalizeAddress(VITALIK)).toBe(VITALIK);
+  });
+
+  it("any case form canonicalizes to the same string (join-safety)", () => {
+    const adapter = makeAdapter();
+    const a = adapter.canonicalizeAddress("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+    const b = adapter.canonicalizeAddress("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+    const c = adapter.canonicalizeAddress("0xD8DA6BF26964AF9D7EED9E03E53415D37AA96045");
+    expect(a).toBe(b);
+    expect(b).toBe(c);
   });
 
   it("throws on a bogus address", () => {

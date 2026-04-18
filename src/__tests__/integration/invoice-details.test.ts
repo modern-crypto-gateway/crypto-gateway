@@ -30,6 +30,20 @@ function authHeader(apiKey: string): HeadersInit {
   return { "content-type": "application/json", authorization: `Bearer ${apiKey}` };
 }
 
+// Build a mixed-case rendering of a lowercase 0x-address — alternates upper/
+// lower on the hex chars so the result is byte-different from the input but
+// represents the same on-chain account. Used to simulate Alchemy / RPC
+// emitting EIP-55-style mixed case in the regression test below.
+function toMixedCase(addr: string): string {
+  const hex = addr.slice(2);
+  let out = "0x";
+  for (let i = 0; i < hex.length; i++) {
+    const ch = hex[i]!;
+    out += i % 2 === 0 ? ch.toUpperCase() : ch.toLowerCase();
+  }
+  return out;
+}
+
 interface DetailsResponse {
   invoice: {
     id: string;
@@ -194,6 +208,61 @@ describe("GET /api/v1/invoices/:id details", () => {
     expect(rev).toBeDefined();
     expect(rev!.chainId).toBe(1);
     expect(rev!.amountRaw).toBe("50000000");
+  });
+
+  it("attaches incoming transfer to invoice even when chain reports toAddress in EIP-55 mixed case (regression: orphan-tx bug)", async () => {
+    // Background: production bug where every USDT/USDC payment got recorded
+    // with `transactions.invoice_id = NULL` because the invoice's stored
+    // address was lowercase but the webhook's canonicalized `toAddress` was
+    // EIP-55 mixed-case, and the SQLite join is case-sensitive. Fix:
+    // canonicalize EVM addresses to lowercase. This test pretends the
+    // adapter is sent the address in MIXED-CASE (as Alchemy / a live RPC
+    // does) and asserts the join still resolves the invoice.
+
+    const createRes = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: authHeader(apiKey),
+        body: JSON.stringify({
+          chainId: 1,
+          token: "USDC",
+          amountUsd: "10.00",
+          acceptedFamilies: ["evm"]
+        })
+      })
+    );
+    const created = (await createRes.json()) as { invoice: { id: string; receiveAddress: string } };
+
+    // Spell the receive address in MIXED case to simulate what arrives over
+    // the wire from Alchemy / RPC. Canonicalize-to-lowercase inside ingest
+    // must restore the join.
+    const mixedCaseTo = toMixedCase(created.invoice.receiveAddress);
+    expect(mixedCaseTo).not.toBe(created.invoice.receiveAddress); // sanity: actually different
+
+    await ingestDetectedTransfer(booted.deps, {
+      chainId: 1,
+      txHash: "0x" + "d".repeat(64),
+      logIndex: 0,
+      fromAddress: "0x1111111111111111111111111111111111111111",
+      toAddress: mixedCaseTo,
+      token: "USDC",
+      amountRaw: "10000000" as AmountRaw,
+      blockNumber: 100,
+      confirmations: 20,
+      seenAt: new Date()
+    });
+
+    const getRes = await booted.app.fetch(
+      new Request(`http://test.local/api/v1/invoices/${created.invoice.id}`, {
+        headers: authHeader(apiKey)
+      })
+    );
+    const body = (await getRes.json()) as DetailsResponse;
+    expect(body.invoice.status).toBe("confirmed");
+    expect(body.amounts.confirmedUsd).toBe("10.00");
+    expect(body.transactions).toHaveLength(1);
+    // Stored on the row as lowercase regardless of incoming case.
+    expect(body.transactions[0]!.toAddress).toBe(created.invoice.receiveAddress);
   });
 
   it("returns all-null amounts breakdown for legacy single-token invoices", async () => {

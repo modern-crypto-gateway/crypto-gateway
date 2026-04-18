@@ -103,7 +103,12 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         throw new Error(`EVM derivation produced an account without a private key (index=${index})`);
       }
       const privateKey = `0x${bytesToHex(hdKey.privateKey)}`;
-      return { address: account.address as Address, privateKey };
+      // Lowercased to match `canonicalizeAddress`. On-chain EVM addresses are
+      // case-insensitive (EIP-55 is just a typo-detection checksum); storing
+      // one canonical case makes joins between detected transfers and
+      // invoice/pool rows reliable. Turso/SQLite TEXT compares are
+      // case-sensitive — a single mismatched char silently drops the join.
+      return { address: account.address.toLowerCase() as Address, privateKey };
     },
 
     validateAddress(addr: string): boolean {
@@ -111,8 +116,10 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
     },
 
     canonicalizeAddress(addr: string): Address {
-      // EIP-55 checksummed form. `getAddress` throws on invalid hex/length.
-      return getAddress(addr) as Address;
+      // Lowercased hex. `getAddress` throws on invalid hex/length first so we
+      // still reject malformed input — we just discard the EIP-55 checksum
+      // case afterwards for storage. See deriveAddress comment for rationale.
+      return getAddress(addr).toLowerCase() as Address;
     },
 
     // ---- Detection ----
