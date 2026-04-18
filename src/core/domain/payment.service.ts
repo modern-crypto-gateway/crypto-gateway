@@ -6,6 +6,7 @@ import type { ChainAdapter } from "../ports/chain.port.js";
 import type { Invoice, InvoiceId, InvoiceStatus } from "../types/invoice.js";
 import { DetectedTransferSchema, type TransactionId, type TxStatus } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
+import { isUniqueViolation } from "./db-errors.js";
 import {
   drizzleRowToInvoice,
   drizzleRowToTransaction,
@@ -897,16 +898,3 @@ export async function relinkOrphanTransactions(
   };
 }
 
-// ---- Error helpers ----
-
-function isUniqueViolation(err: unknown): boolean {
-  // libSQL / SQLite surface UNIQUE violations with "UNIQUE constraint failed"
-  // in the message. Drizzle wraps the driver error in a DrizzleQueryError whose own
-  // message is "Failed query: ..." — walk the `.cause` chain to find the inner error.
-  let current: unknown = err;
-  while (current instanceof Error) {
-    if (/UNIQUE constraint failed/i.test(current.message)) return true;
-    current = (current as { cause?: unknown }).cause;
-  }
-  return false;
-}

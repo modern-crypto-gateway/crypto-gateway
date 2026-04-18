@@ -10,9 +10,10 @@ import { TokenSymbolSchema } from "../types/token.js";
 import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
 import type { Transaction } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
+import { isUniqueViolation } from "./db-errors.js";
 import { drizzleRowToInvoice, drizzleRowToTransaction, fetchInvoiceReceiveAddresses, loadInvoice } from "./mappers.js";
 import { DomainError } from "../errors.js";
-import { allocateForInvoice } from "./pool.service.js";
+import { allocateForInvoice, releaseFromInvoice } from "./pool.service.js";
 import { addUsd, snapshotRates, subUsd, tokenDecimalsFor, tokensForFamilies } from "./rate-window.js";
 import { invoices, invoiceReceiveAddresses, merchants, transactions } from "../../db/schema.js";
 
@@ -82,6 +83,19 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
   }
   if (merchant.active !== 1) {
     throw new InvoiceError("MERCHANT_INACTIVE", `Merchant is inactive: ${parsed.merchantId}`);
+  }
+
+  // 1b. Idempotency: if the merchant has already created an invoice with
+  //     this `external_id`, return the existing one (Stripe-style). The
+  //     external_id is the merchant's own dedup key — usually their order
+  //     number — so a retry of the same POST should be safe and return the
+  //     same invoice. Doing this BEFORE pool allocation avoids burning a
+  //     pool address per duplicate attempt. The race window between this
+  //     SELECT and the INSERT below is closed by step 7's UNIQUE-violation
+  //     fallback (same return semantics).
+  if (parsed.externalId !== undefined) {
+    const existing = await loadInvoiceByExternalId(deps, parsed.merchantId, parsed.externalId);
+    if (existing !== null) return existing;
   }
 
   // 2. Token must be registered for this chain. For the USD path this is
@@ -232,16 +246,53 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
       createdAt: now
     })
   );
-  await deps.db.batch([invoiceInsertStmt, ...rxInsertStmts] as [
-    typeof invoiceInsertStmt,
-    ...typeof rxInsertStmts
-  ]);
+  try {
+    await deps.db.batch([invoiceInsertStmt, ...rxInsertStmts] as [
+      typeof invoiceInsertStmt,
+      ...typeof rxInsertStmts
+    ]);
+  } catch (err) {
+    // Pool addresses were already flipped to 'allocated' against this brand-
+    // new invoiceId; without the invoice row they'd leak. Release them on
+    // any insert failure before either returning the duplicate or rethrowing.
+    await releaseFromInvoice(deps, invoiceId);
+
+    // Race with the step-1b idempotency check: another concurrent create
+    // beat us to the unique index. Return the winner's invoice — same
+    // semantics as the pre-check would have given.
+    if (
+      isUniqueViolation(err) &&
+      parsed.externalId !== undefined
+    ) {
+      const winner = await loadInvoiceByExternalId(deps, parsed.merchantId, parsed.externalId);
+      if (winner !== null) return winner;
+    }
+    throw err;
+  }
 
   const invoice = drizzleRowToInvoice(invoiceInsert, receiveRows);
 
   await deps.events.publish({ type: "invoice.created", invoiceId: invoice.id, invoice, at: new Date(now) });
 
   return invoice;
+}
+
+// Lookup helper for the idempotency path: hydrates a full Invoice (including
+// receive_addresses) from the (merchant_id, external_id) pair. Returns null
+// when no match exists.
+async function loadInvoiceByExternalId(
+  deps: AppDeps,
+  merchantId: string,
+  externalId: string
+): Promise<Invoice | null> {
+  const [row] = await deps.db
+    .select()
+    .from(invoices)
+    .where(and(eq(invoices.merchantId, merchantId), eq(invoices.externalId, externalId)))
+    .limit(1);
+  if (!row) return null;
+  const addresses = await fetchInvoiceReceiveAddresses(deps, row.id);
+  return drizzleRowToInvoice(row, addresses);
 }
 
 export async function getInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<Invoice | null> {

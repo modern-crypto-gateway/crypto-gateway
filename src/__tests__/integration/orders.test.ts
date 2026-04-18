@@ -190,6 +190,64 @@ describe("POST /api/v1/invoices", () => {
 
     expect(events).toEqual(["invoice.created", "invoice.expired"]);
   });
+
+  it("returns the existing invoice when externalId is reused (Stripe-style idempotency)", async () => {
+    // Background: prior to this behavior, retrying a POST with the same
+    // `externalId` (typical: merchant's order ID) hit the partial unique index
+    // `uq_invoices_external_id (merchant_id, external_id)` and surfaced as a
+    // 500. Now we return the original invoice — same id, same address, same
+    // amounts — and never touch the address pool a second time.
+    const body = JSON.stringify({
+      chainId: 999,
+      token: "DEV",
+      amountRaw: "1000000",
+      externalId: "order-12345"
+    });
+    const first = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: authHeader(apiKey),
+        body
+      })
+    );
+    expect(first.status).toBe(201);
+    const firstBody = (await first.json()) as { invoice: { id: string; receiveAddress: string; addressIndex: number } };
+
+    const second = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: authHeader(apiKey),
+        body
+      })
+    );
+    // 200 when returning an existing resource (the route layer maps creation
+    // -> 201; idempotent return is the same code today, but the body equality
+    // is what merchants depend on).
+    expect([200, 201]).toContain(second.status);
+    const secondBody = (await second.json()) as { invoice: { id: string; receiveAddress: string; addressIndex: number } };
+
+    expect(secondBody.invoice.id).toBe(firstBody.invoice.id);
+    expect(secondBody.invoice.receiveAddress).toBe(firstBody.invoice.receiveAddress);
+    expect(secondBody.invoice.addressIndex).toBe(firstBody.invoice.addressIndex);
+
+    // Pool wasn't burned by the duplicate: the next NEW invoice (different
+    // externalId) still gets index 1, not index 2.
+    const third = await booted.app.fetch(
+      new Request("http://test.local/api/v1/invoices", {
+        method: "POST",
+        headers: authHeader(apiKey),
+        body: JSON.stringify({
+          chainId: 999,
+          token: "DEV",
+          amountRaw: "1000000",
+          externalId: "order-67890"
+        })
+      })
+    );
+    expect(third.status).toBe(201);
+    const thirdBody = (await third.json()) as { invoice: { addressIndex: number } };
+    expect(thirdBody.invoice.addressIndex).toBe(1);
+  });
 });
 
 describe("GET /health", () => {
