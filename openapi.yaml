@@ -82,6 +82,82 @@ paths:
                   phase: { type: integer }
 
   /api/v1/invoices:
+    get:
+      tags: [invoices]
+      summary: List invoices for the authenticated merchant
+      description: |
+        Returns invoices created by the authenticated merchant, newest first
+        (`createdAt DESC`). All filters are optional and AND-combined. The
+        `merchantId` is always taken from the API key — there is no way to
+        list another merchant's invoices.
+
+        Pagination uses `limit` + `offset`. The response includes `hasMore`
+        (computed without a `COUNT(*)`), so callers can page until `hasMore`
+        is false.
+      parameters:
+        - name: status
+          in: query
+          description: |
+            Comma-separated list of statuses. Any of:
+            `created,partial,detected,confirmed,overpaid,expired,canceled`.
+            Unknown values yield 400.
+          schema: { type: string }
+        - name: chainId
+          in: query
+          schema: { type: integer }
+        - name: token
+          in: query
+          schema: { type: string }
+        - name: externalId
+          in: query
+          description: Merchant-supplied dedup key (exact match).
+          schema: { type: string }
+        - name: toAddress
+          in: query
+          description: |
+            Invoice receive address — what the payer saw on the checkout page.
+            Exact match; pass the canonicalized form.
+          schema: { type: string }
+        - name: fromAddress
+          in: query
+          description: |
+            Payer address. Matches invoices that have any detected or confirmed
+            transaction from this address. Reverted / orphaned transactions
+            are excluded so a single failed payment doesn't surface a stale
+            invoice.
+          schema: { type: string }
+        - name: createdFrom
+          in: query
+          description: Inclusive lower bound on `createdAt`. ISO-8601 or unix-ms.
+          schema: { type: string }
+        - name: createdTo
+          in: query
+          description: Inclusive upper bound on `createdAt`. ISO-8601 or unix-ms.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Paginated list of invoices
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invoices, limit, offset, hasMore]
+                properties:
+                  invoices:
+                    type: array
+                    items: { $ref: "#/components/schemas/Invoice" }
+                  limit: { type: integer }
+                  offset: { type: integer }
+                  hasMore: { type: boolean }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
     post:
       tags: [invoices]
       summary: Create an invoice
@@ -167,6 +243,71 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
 
   /api/v1/payouts:
+    get:
+      tags: [payouts]
+      summary: List payouts for the authenticated merchant
+      description: |
+        Returns payouts planned by the authenticated merchant, newest first
+        (`createdAt DESC`). All filters optional, AND-combined. `merchantId`
+        is always taken from the API key.
+
+        Pagination via `limit` + `offset`; response includes `hasMore`
+        (computed without `COUNT(*)`).
+      parameters:
+        - name: status
+          in: query
+          description: |
+            Comma-separated list of statuses. Any of:
+            `planned,reserved,submitted,confirmed,failed,canceled`.
+          schema: { type: string }
+        - name: chainId
+          in: query
+          schema: { type: integer }
+        - name: token
+          in: query
+          schema: { type: string }
+        - name: destinationAddress
+          in: query
+          description: Exact-match on the canonicalized destination.
+          schema: { type: string }
+        - name: sourceAddress
+          in: query
+          description: |
+            Fee wallet that funded the payout. Populated only after reservation,
+            so this filter implicitly excludes `planned` rows.
+          schema: { type: string }
+        - name: createdFrom
+          in: query
+          description: Inclusive lower bound on `createdAt`. ISO-8601 or unix-ms.
+          schema: { type: string }
+        - name: createdTo
+          in: query
+          description: Inclusive upper bound on `createdAt`. ISO-8601 or unix-ms.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Paginated list of payouts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payouts, limit, offset, hasMore]
+                properties:
+                  payouts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Payout" }
+                  limit: { type: integer }
+                  offset: { type: integer }
+                  hasMore: { type: boolean }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
     post:
       tags: [payouts]
       summary: Plan a payout

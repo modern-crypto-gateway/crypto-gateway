@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { and, asc, eq, inArray, isNotNull, isNull, lt } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import { ChainIdSchema, type Address, type ChainId } from "../types/chain.js";
@@ -440,6 +440,84 @@ export async function confirmPayouts(
 
 export async function getPayout(deps: AppDeps, id: PayoutId): Promise<Payout | null> {
   return fetchPayout(deps, id);
+}
+
+// ---- List / filter ----
+
+// Ceiling mirrors invoices: a single page stays bounded regardless of what
+// the caller asks for. No receive-address hydration here, so payouts can
+// afford the same 100-row ceiling without a fan-out cost.
+const LIST_PAYOUTS_MAX_LIMIT = 100;
+
+export const ListPayoutsInputSchema = z
+  .object({
+    merchantId: MerchantIdSchema,
+    status: z
+      .array(z.enum(["planned", "reserved", "submitted", "confirmed", "failed", "canceled"]))
+      .optional(),
+    chainId: ChainIdSchema.optional(),
+    token: TokenSymbolSchema.optional(),
+    // Where the payout is going. Exact match on the canonicalized address —
+    // HTTP layer canonicalizes before calling.
+    destinationAddress: z.string().min(1).max(128).optional(),
+    // Which fee wallet the payout was funded from. NULL until `reserved`, so
+    // this filter also implicitly excludes `planned` rows when set.
+    sourceAddress: z.string().min(1).max(128).optional(),
+    createdFrom: z.number().int().nonnegative().optional(),
+    createdTo: z.number().int().nonnegative().optional(),
+    limit: z.number().int().min(1).max(LIST_PAYOUTS_MAX_LIMIT).default(25),
+    offset: z.number().int().min(0).default(0)
+  })
+  .refine(
+    (v) => v.createdFrom === undefined || v.createdTo === undefined || v.createdFrom <= v.createdTo,
+    { message: "`createdFrom` must be <= `createdTo`" }
+  );
+export type ListPayoutsInput = z.infer<typeof ListPayoutsInputSchema>;
+
+export interface ListPayoutsResult {
+  payouts: readonly Payout[];
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+// Merchant-scoped payout listing. Sort: createdAt DESC, backed by
+// `idx_payouts_merchant` on (merchantId, createdAt DESC). All filters hit
+// native columns on the payouts table — no JOINs needed.
+export async function listPayouts(deps: AppDeps, input: unknown): Promise<ListPayoutsResult> {
+  const parsed = ListPayoutsInputSchema.parse(input);
+
+  const conditions: SQL[] = [eq(payouts.merchantId, parsed.merchantId)];
+  if (parsed.status && parsed.status.length > 0) {
+    conditions.push(inArray(payouts.status, parsed.status));
+  }
+  if (parsed.chainId !== undefined) conditions.push(eq(payouts.chainId, parsed.chainId));
+  if (parsed.token !== undefined) conditions.push(eq(payouts.token, parsed.token));
+  if (parsed.destinationAddress !== undefined) {
+    conditions.push(eq(payouts.destinationAddress, parsed.destinationAddress));
+  }
+  if (parsed.sourceAddress !== undefined) {
+    conditions.push(eq(payouts.sourceAddress, parsed.sourceAddress));
+  }
+  if (parsed.createdFrom !== undefined) conditions.push(gte(payouts.createdAt, parsed.createdFrom));
+  if (parsed.createdTo !== undefined) conditions.push(lte(payouts.createdAt, parsed.createdTo));
+
+  const rows = await deps.db
+    .select()
+    .from(payouts)
+    .where(and(...conditions))
+    .orderBy(desc(payouts.createdAt))
+    .limit(parsed.limit + 1)
+    .offset(parsed.offset);
+
+  const hasMore = rows.length > parsed.limit;
+  const page = hasMore ? rows.slice(0, parsed.limit) : rows;
+  return {
+    payouts: page.map(drizzleRowToPayout),
+    limit: parsed.limit,
+    offset: parsed.offset,
+    hasMore
+  };
 }
 
 export interface FeeWalletSweepResult {

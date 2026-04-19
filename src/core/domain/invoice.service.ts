@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { and, asc, eq, inArray, lte } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, lte, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainFamilySchema, ChainIdSchema, type ChainFamily } from "../types/chain.js";
 import { chainSlug } from "../types/chain-registry.js";
@@ -348,6 +348,150 @@ async function loadInvoiceByExternalId(
 
 export async function getInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<Invoice | null> {
   return loadInvoice(deps, invoiceId);
+}
+
+// ---- List / filter ----
+
+// Hard ceiling keeps a single call from pulling the whole merchant's history —
+// large page sizes stress both the `receive_addresses` hydration (one extra
+// batch read per page) and the caller's JSON parser. Callers needing more
+// either paginate via `offset` or narrow with filters.
+const LIST_INVOICES_MAX_LIMIT = 100;
+
+export const ListInvoicesInputSchema = z
+  .object({
+    merchantId: MerchantIdSchema,
+    // Comma-separated in the HTTP layer; the schema accepts either an array or
+    // a single status. Empty array = no filter.
+    status: z.array(z.enum(["created", "partial", "detected", "confirmed", "overpaid", "expired", "canceled"])).optional(),
+    chainId: ChainIdSchema.optional(),
+    token: TokenSymbolSchema.optional(),
+    // Merchant-supplied dedup / order key. Exact match — usually cart / order id.
+    externalId: z.string().max(256).optional(),
+    // The invoice-level `receive_address` (what the payer sees on the checkout
+    // page). Matches across any token paid into that address for this merchant.
+    // Canonicalized at the HTTP layer before calling — domain does exact match.
+    toAddress: z.string().min(1).max(128).optional(),
+    // Payer address filter. Requires a subquery against `transactions` because
+    // invoices don't carry a payer column — an invoice matches when ANY of its
+    // confirmed-or-detected transactions has this `from_address`. `reverted` /
+    // `orphaned` transactions are excluded so a single stray payment doesn't
+    // surface unrelated invoices.
+    fromAddress: z.string().min(1).max(128).optional(),
+    // Inclusive lower / upper bounds on `createdAt`. Either or both; both
+    // omitted = unbounded. Unix ms epoch — the HTTP layer parses ISO strings.
+    createdFrom: z.number().int().nonnegative().optional(),
+    createdTo: z.number().int().nonnegative().optional(),
+    limit: z.number().int().min(1).max(LIST_INVOICES_MAX_LIMIT).default(25),
+    offset: z.number().int().min(0).default(0)
+  })
+  .refine(
+    (v) => v.createdFrom === undefined || v.createdTo === undefined || v.createdFrom <= v.createdTo,
+    { message: "`createdFrom` must be <= `createdTo`" }
+  );
+export type ListInvoicesInput = z.infer<typeof ListInvoicesInputSchema>;
+
+export interface ListInvoicesResult {
+  invoices: readonly Invoice[];
+  limit: number;
+  offset: number;
+  // True when another page exists. Computed via fetch-N+1 rather than
+  // COUNT(*) — COUNT on a heavily-filtered table with 100k+ invoices adds a
+  // second index scan per page, which we don't want on the hot list path.
+  hasMore: boolean;
+}
+
+// Merchant-scoped invoice listing. Sort is fixed: createdAt DESC (newest
+// first) — backed by `idx_invoices_merchant` on (merchantId, createdAt DESC).
+// Caller is responsible for ensuring `merchantId` is the authenticated
+// merchant's id (the HTTP layer injects it from the auth context).
+export async function listInvoices(
+  deps: AppDeps,
+  input: unknown
+): Promise<ListInvoicesResult> {
+  const parsed = ListInvoicesInputSchema.parse(input);
+
+  const conditions: SQL[] = [eq(invoices.merchantId, parsed.merchantId)];
+  if (parsed.status && parsed.status.length > 0) {
+    conditions.push(inArray(invoices.status, parsed.status));
+  }
+  if (parsed.chainId !== undefined) conditions.push(eq(invoices.chainId, parsed.chainId));
+  if (parsed.token !== undefined) conditions.push(eq(invoices.token, parsed.token));
+  if (parsed.externalId !== undefined) conditions.push(eq(invoices.externalId, parsed.externalId));
+  if (parsed.toAddress !== undefined) conditions.push(eq(invoices.receiveAddress, parsed.toAddress));
+  if (parsed.fromAddress !== undefined) {
+    // `transactions` has no direct merchant column — the outer
+    // `invoices.merchantId = X` filter scopes the result, so the subquery
+    // can restrict purely on the payer address. Excludes reverted / orphaned
+    // statuses so a failed or mis-attributed tx doesn't surface a stale
+    // invoice on the merchant's list.
+    conditions.push(
+      inArray(
+        invoices.id,
+        deps.db
+          .select({ id: transactions.invoiceId })
+          .from(transactions)
+          .where(
+            and(
+              eq(transactions.fromAddress, parsed.fromAddress),
+              inArray(transactions.status, ["detected", "confirmed"]),
+              isNotNull(transactions.invoiceId)
+            )
+          )
+      )
+    );
+  }
+  if (parsed.createdFrom !== undefined) conditions.push(gte(invoices.createdAt, parsed.createdFrom));
+  if (parsed.createdTo !== undefined) conditions.push(lte(invoices.createdAt, parsed.createdTo));
+
+  // fetch limit+1 to detect hasMore without a COUNT(*) round-trip. The extra
+  // row (if any) is dropped before we hydrate addresses.
+  const rows = await deps.db
+    .select()
+    .from(invoices)
+    .where(and(...conditions))
+    .orderBy(desc(invoices.createdAt))
+    .limit(parsed.limit + 1)
+    .offset(parsed.offset);
+
+  const hasMore = rows.length > parsed.limit;
+  const page = hasMore ? rows.slice(0, parsed.limit) : rows;
+
+  // Hydrate receive-addresses. Batched into one SELECT with IN (ids) rather
+  // than N per-invoice reads — important on a 100-row page where the
+  // per-request hydration would otherwise be a 100-query fan-out.
+  const hydrated = await hydrateInvoicesWithAddresses(deps, page);
+
+  return { invoices: hydrated, limit: parsed.limit, offset: parsed.offset, hasMore };
+}
+
+async function hydrateInvoicesWithAddresses(
+  deps: AppDeps,
+  rows: readonly (typeof invoices.$inferSelect)[]
+): Promise<Invoice[]> {
+  if (rows.length === 0) return [];
+  const ids = rows.map((r) => r.id);
+  const addrRows = await deps.db
+    .select({
+      invoiceId: invoiceReceiveAddresses.invoiceId,
+      family: invoiceReceiveAddresses.family,
+      address: invoiceReceiveAddresses.address,
+      poolAddressId: invoiceReceiveAddresses.poolAddressId
+    })
+    .from(invoiceReceiveAddresses)
+    .where(inArray(invoiceReceiveAddresses.invoiceId, ids))
+    .orderBy(asc(invoiceReceiveAddresses.family));
+  const byInvoice = new Map<string, InvoiceReceiveAddress[]>();
+  for (const r of addrRows) {
+    const list = byInvoice.get(r.invoiceId) ?? [];
+    list.push({
+      family: r.family as ChainFamily,
+      address: r.address as InvoiceReceiveAddress["address"],
+      poolAddressId: r.poolAddressId
+    });
+    byInvoice.set(r.invoiceId, list);
+  }
+  return rows.map((row) => drizzleRowToInvoice(row, byInvoice.get(row.id) ?? []));
 }
 
 // Per-transaction view returned in the invoice GET breakdown. Strictly a

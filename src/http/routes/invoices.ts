@@ -5,9 +5,10 @@ import {
   expireInvoice,
   getInvoice,
   getInvoiceDetails,
+  listInvoices,
   type InvoiceDetails
 } from "../../core/domain/invoice.service.js";
-import { InvoiceIdSchema, type Invoice, type InvoiceId } from "../../core/types/invoice.js";
+import { InvoiceIdSchema, InvoiceStatusSchema, type Invoice, type InvoiceId } from "../../core/types/invoice.js";
 import { renderError } from "../middleware/error-handler.js";
 import { rateLimit } from "../middleware/rate-limit.js";
 import { apiKeyAuth, type AuthedVariables } from "../middleware/api-key-auth.js";
@@ -41,6 +42,73 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
       windowSeconds: 60
     })
   );
+
+  // Paginated list, newest first. All filters are optional and AND-combined.
+  // Ownership is implicit — merchantId is injected from the auth context and
+  // never read from the query string, so there's no way to list another
+  // merchant's invoices by construction.
+  app.get("/", async (c) => {
+    try {
+      const statusParam = c.req.query("status");
+      const status =
+        statusParam === undefined || statusParam === ""
+          ? undefined
+          : statusParam
+              .split(",")
+              .map((s) => s.trim())
+              .filter((s) => s.length > 0);
+      // Reject unknown status values with 400 rather than silently dropping them
+      // — quietly ignoring typos would make a misspelled status produce a
+      // merchant's entire backlog and look like a working filter.
+      if (status !== undefined) {
+        for (const s of status) {
+          if (!InvoiceStatusSchema.safeParse(s).success) {
+            return c.json(
+              { error: { code: "BAD_STATUS", message: `Unknown status: ${s}` } },
+              400
+            );
+          }
+        }
+      }
+
+      const chainIdRaw = c.req.query("chainId");
+      const chainId = chainIdRaw === undefined ? undefined : Number(chainIdRaw);
+      if (chainIdRaw !== undefined && !Number.isFinite(chainId)) {
+        return c.json({ error: { code: "BAD_CHAIN_ID", message: "chainId must be a number" } }, 400);
+      }
+
+      const createdFrom = parseTimestampQuery(c.req.query("createdFrom"));
+      const createdTo = parseTimestampQuery(c.req.query("createdTo"));
+      if (createdFrom === "invalid" || createdTo === "invalid") {
+        return c.json(
+          { error: { code: "BAD_TIMESTAMP", message: "createdFrom / createdTo must be ISO-8601 or unix-ms" } },
+          400
+        );
+      }
+
+      const result = await listInvoices(deps, {
+        merchantId: c.get("merchantId"),
+        status,
+        chainId,
+        token: c.req.query("token"),
+        externalId: c.req.query("externalId"),
+        toAddress: c.req.query("toAddress"),
+        fromAddress: c.req.query("fromAddress"),
+        createdFrom,
+        createdTo,
+        limit: c.req.query("limit") !== undefined ? Number(c.req.query("limit")) : undefined,
+        offset: c.req.query("offset") !== undefined ? Number(c.req.query("offset")) : undefined
+      });
+      return c.json({
+        invoices: result.invoices.map(serializeInvoice),
+        limit: result.limit,
+        offset: result.offset,
+        hasMore: result.hasMore
+      });
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
 
   app.post("/", async (c) => {
     const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
@@ -89,6 +157,23 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
   });
 
   return app;
+}
+
+// Accepts either an ISO-8601 string or a unix-ms numeric string. Returns
+// undefined for missing input, the parsed number on success, or the literal
+// "invalid" sentinel on a malformed value — the caller 400s on sentinel.
+// Done inline rather than through Zod because the sentinel propagates the
+// distinction between "absent" and "malformed" with less ceremony than two
+// separate Zod pipelines.
+function parseTimestampQuery(raw: string | undefined): number | undefined | "invalid" {
+  if (raw === undefined || raw === "") return undefined;
+  // Pure numeric string -> unix ms.
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : "invalid";
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : "invalid";
 }
 
 // Validate that the path-param id is a UUID before it ever touches the DB.
