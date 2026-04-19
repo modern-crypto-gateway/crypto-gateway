@@ -244,6 +244,12 @@ export const payouts = sqliteTable(
     chainId: integer("chain_id").notNull(),
     token: text("token").notNull(),
     amountRaw: text("amount_raw").notNull(),
+    // USD-pegged audit trail. Populated only when the create request used
+    // `amountUSD`; both NULL for `amountRaw` / `amount` paths. Stored so the
+    // operator can later answer "what rate did we apply for this payout?"
+    // without having to replay the price oracle.
+    quotedAmountUsd: text("quoted_amount_usd"),
+    quotedRate: text("quoted_rate"),
     destinationAddress: text("destination_address").notNull(),
     // NULL until planned → reserved picks a fee wallet.
     sourceAddress: text("source_address"),

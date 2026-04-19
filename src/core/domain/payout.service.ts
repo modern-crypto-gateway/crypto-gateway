@@ -31,12 +31,27 @@ import { feeWallets, merchants, payouts } from "../../db/schema.js";
 
 // ---- Input validation ----
 
+// Decimal-string regex used by `amount` and `amountUSD` paths. Strings only —
+// JS numbers lose precision on monetary values. No leading zeros except "0",
+// optional fractional part. Negatives + scientific notation rejected by shape.
+const DECIMAL_STRING = /^(0|[1-9]\d*)(\.\d+)?$/;
+
 export const PlanPayoutInputSchema = z
   .object({
     merchantId: MerchantIdSchema,
     chainId: ChainIdSchema,
     token: TokenSymbolSchema,
-    amountRaw: AmountRawSchema,
+    // Three mutually-exclusive amount inputs. Exactly one must be provided.
+    //   amountRaw — uint256 string in token's smallest unit (e.g. "1000000" for 1 USDC)
+    //   amount    — human decimal string (e.g. "1.5"), parsed via BigInt against token.decimals
+    //   amountUSD — fiat-pegged decimal string. Converted via priceOracle at create time;
+    //               the resolved rate is snapshotted onto quoted_rate for audit.
+    //               Supported on ALL tokens (stable + volatile). For non-stable tokens
+    //               the broadcast may happen seconds-to-minutes later, so the executed
+    //               payout's market value drifts from amountUSD — accepted as v1 cost.
+    amountRaw: AmountRawSchema.optional(),
+    amount: z.string().regex(DECIMAL_STRING, "amount must be a non-negative decimal string").optional(),
+    amountUSD: z.string().regex(DECIMAL_STRING, "amountUSD must be a non-negative decimal string").optional(),
     destinationAddress: z.string().min(1).max(128),
 
     // Per-payout webhook override. Both URL and secret must be provided
@@ -53,6 +68,14 @@ export const PlanPayoutInputSchema = z
       message:
         "`webhookUrl` and `webhookSecret` must be provided together — one without the other would sign events with a mismatched key"
     }
+  )
+  .refine(
+    (v) =>
+      Number(v.amountRaw !== undefined) +
+        Number(v.amount !== undefined) +
+        Number(v.amountUSD !== undefined) ===
+      1,
+    { message: "Provide exactly one of: amountRaw, amount, amountUSD" }
   );
 export type PlanPayoutInput = z.infer<typeof PlanPayoutInputSchema>;
 
@@ -63,6 +86,8 @@ export type PayoutErrorCode =
   | "MERCHANT_INACTIVE"
   | "TOKEN_NOT_SUPPORTED"
   | "INVALID_DESTINATION"
+  | "BAD_AMOUNT"
+  | "ORACLE_FAILED"
   | "NO_FEE_WALLET_AVAILABLE";
 
 const PAYOUT_ERROR_HTTP_STATUS: Readonly<Record<PayoutErrorCode, number>> = {
@@ -70,6 +95,8 @@ const PAYOUT_ERROR_HTTP_STATUS: Readonly<Record<PayoutErrorCode, number>> = {
   MERCHANT_INACTIVE: 403,
   TOKEN_NOT_SUPPORTED: 400,
   INVALID_DESTINATION: 400,
+  BAD_AMOUNT: 400,
+  ORACLE_FAILED: 503,
   NO_FEE_WALLET_AVAILABLE: 503
 };
 
@@ -79,6 +106,22 @@ export class PayoutError extends DomainError {
     super(code, message, PAYOUT_ERROR_HTTP_STATUS[code], details);
     this.name = "PayoutError";
   }
+}
+
+// Convert a human-decimal string ("1.5") to the token's smallest-unit uint256
+// string. BigInt math throughout — no floats, no precision loss. Input format
+// already validated by the schema regex; this only enforces the per-token
+// decimals cap (e.g. "1.5555555" rejected for USDC which has 6 decimals max).
+function decimalToRaw(amount: string, decimals: number): string {
+  const [whole, frac = ""] = amount.split(".");
+  if (frac.length > decimals) {
+    throw new PayoutError(
+      "BAD_AMOUNT",
+      `amount has more than ${decimals} decimal places for this token`
+    );
+  }
+  const padded = frac.padEnd(decimals, "0");
+  return (BigInt(whole!) * 10n ** BigInt(decimals) + BigInt(padded || "0")).toString();
 }
 
 // ---- Operations ----
@@ -108,6 +151,40 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   }
   const destination = chainAdapter.canonicalizeAddress(parsed.destinationAddress);
 
+  // Resolve the canonical `amountRaw` from whichever input shape was given.
+  // Schema's refine already guaranteed exactly one is set.
+  let amountRaw: string;
+  let quotedAmountUsd: string | null = null;
+  let quotedRate: string | null = null;
+  if (parsed.amountRaw !== undefined) {
+    amountRaw = parsed.amountRaw;
+  } else if (parsed.amount !== undefined) {
+    amountRaw = decimalToRaw(parsed.amount, token.decimals);
+  } else {
+    // amountUSD path — call the price oracle. A failure here surfaces as
+    // 503 ORACLE_FAILED so the merchant can retry; we never silently
+    // substitute a stale rate (no fallback by design — the merchant asked
+    // for "this many dollars" and we either honor it at a known rate or
+    // refuse the create).
+    let conversion: { amountRaw: string; rate: string };
+    try {
+      conversion = await deps.priceOracle.fiatToTokenAmount(
+        parsed.amountUSD!,
+        parsed.token,
+        "USD" as Parameters<typeof deps.priceOracle.fiatToTokenAmount>[2],
+        token.decimals
+      );
+    } catch (err) {
+      throw new PayoutError(
+        "ORACLE_FAILED",
+        `Failed to fetch ${parsed.token}/USD rate: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    amountRaw = conversion.amountRaw;
+    quotedAmountUsd = parsed.amountUSD!;
+    quotedRate = conversion.rate;
+  }
+
   // Encrypt the per-payout webhook secret if one was provided. Stored
   // ciphertext only; plaintext lives only in the request body and the
   // decrypt-then-HMAC stack frame at dispatch time. URL+secret pairing is
@@ -126,7 +203,9 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
     status: "planned",
     chainId: parsed.chainId,
     token: parsed.token,
-    amountRaw: parsed.amountRaw,
+    amountRaw,
+    quotedAmountUsd,
+    quotedRate,
     destinationAddress: destination,
     sourceAddress: null,
     txHash: null,

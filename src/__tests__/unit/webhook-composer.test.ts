@@ -52,6 +52,8 @@ function fixturePayout(overrides: Partial<Payout> = {}): Payout {
     chainId: 1,
     token: "USDC",
     amountRaw: "500000",
+    quotedAmountUsd: null,
+    quotedRate: null,
     destinationAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
     sourceAddress: "0x1111111111111111111111111111111111111111",
     txHash: "0xabc",

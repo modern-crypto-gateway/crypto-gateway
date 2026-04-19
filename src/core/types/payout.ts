@@ -33,6 +33,14 @@ export const PayoutSchema = z.object({
   token: TokenSymbolSchema,
   amountRaw: AmountRawSchema,
 
+  // USD-pegged audit. Populated only when the create request used `amountUSD`;
+  // both null for `amountRaw` / `amount` paths. `quotedRate` is USD per 1
+  // whole token at create time. For non-stable tokens (ETH/MATIC/…) the
+  // actual broadcast happens later, so the executed payout's market value
+  // drifts from `quotedAmountUsd` — accepted; stables are no-drift.
+  quotedAmountUsd: z.string().nullable(),
+  quotedRate: z.string().nullable(),
+
   destinationAddress: AddressSchema,
   // Chosen by source-selection once we know which fee wallet has enough balance + native-gas.
   // null while status="planned".

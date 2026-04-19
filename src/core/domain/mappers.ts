@@ -114,6 +114,8 @@ export function drizzleRowToPayout(row: typeof payouts.$inferSelect): Payout {
     chainId: row.chainId,
     token: row.token,
     amountRaw: row.amountRaw,
+    quotedAmountUsd: row.quotedAmountUsd,
+    quotedRate: row.quotedRate,
     destinationAddress: row.destinationAddress,
     sourceAddress: row.sourceAddress,
     txHash: row.txHash,

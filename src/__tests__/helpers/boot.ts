@@ -71,6 +71,10 @@ export interface BootTestAppOptions {
   // Subscribable-chains map injected into deps. Tests that exercise the
   // pool → subscription fan-out supply it; most tests leave it undefined.
   alchemySubscribableChainsByFamily?: AppDeps["alchemySubscribableChainsByFamily"];
+  // Price oracle override. Defaults to the static-peg adapter (USDC/USDT/DAI/DEV
+  // pegged to $1, EVM/Solana/Tron natives at fixed prices). Tests that need to
+  // exercise USD-pegged failure paths (oracle outage) pass a stub that throws.
+  priceOracle?: AppDeps["priceOracle"];
 }
 
 export interface BootedTestApp {
@@ -241,7 +245,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
       masterSeed: secretsOverrides["MASTER_SEED"]!,
       chains
     }),
-    priceOracle: staticPegPriceOracle(),
+    priceOracle: options.priceOracle ?? staticPegPriceOracle(),
     webhookDispatcher: options.webhookDispatcher ?? capturingDispatcher!,
     webhookDeliveryStore: dbWebhookDeliveryStore(db),
     events: createInMemoryEventBus(),

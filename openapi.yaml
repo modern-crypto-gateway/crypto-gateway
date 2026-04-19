@@ -2070,11 +2070,38 @@ components:
 
     PlanPayoutInput:
       type: object
-      required: [chainId, token, amountRaw, destinationAddress]
+      required: [chainId, token, destinationAddress]
+      description: |
+        Provide **exactly one** of `amountRaw`, `amount`, or `amountUSD`.
+        - `amountRaw` — uint256 string in the token's smallest unit (e.g. `"1000000"` for 1 USDC).
+        - `amount` — human decimal string (e.g. `"1.5"`); converted via BigInt
+          against `token.decimals`. Must not have more decimal places than the
+          token supports — e.g. USDC (6 decimals) accepts up to 6; rejected
+          with `BAD_AMOUNT` (400) otherwise.
+        - `amountUSD` — fiat-pegged decimal string (e.g. `"10.00"`); converted
+          via the price oracle at create time. The resolved rate is
+          snapshotted onto `quotedRate` and `quotedAmountUsd` for audit.
+          Supported on **all** tokens (stable + volatile). For non-stable
+          tokens (ETH/MATIC/…) the actual broadcast happens seconds-to-minutes
+          later, so the executed payout's market value drifts from
+          `amountUSD` — accepted as v1 cost. If the oracle is unavailable, the
+          create fails with `503 ORACLE_FAILED`; we never substitute a stale
+          rate.
       properties:
         chainId: { type: integer }
         token: { type: string }
-        amountRaw: { type: string, pattern: "^\\d+$" }
+        amountRaw:
+          type: string
+          pattern: "^\\d+$"
+          description: uint256 smallest-unit integer string. Mutually exclusive with `amount` / `amountUSD`.
+        amount:
+          type: string
+          pattern: "^(0|[1-9]\\d*)(\\.\\d+)?$"
+          description: Human decimal. Mutually exclusive with `amountRaw` / `amountUSD`.
+        amountUSD:
+          type: string
+          pattern: "^(0|[1-9]\\d*)(\\.\\d+)?$"
+          description: Fiat-pegged decimal. Mutually exclusive with `amountRaw` / `amount`.
         destinationAddress: { type: string, minLength: 1, maxLength: 128 }
         webhookUrl:
           type: string
@@ -2203,6 +2230,18 @@ components:
         chainId: { type: integer }
         token: { type: string }
         amountRaw: { type: string }
+        quotedAmountUsd:
+          type: [string, "null"]
+          description: |
+            Original USD-pegged input from the create request. Populated only
+            when the create used `amountUSD`; null for `amountRaw` / `amount` paths.
+        quotedRate:
+          type: [string, "null"]
+          description: |
+            Price-oracle rate (USD per 1 whole token) snapshotted at create time.
+            Populated only when the create used `amountUSD`. For non-stable
+            tokens the broadcast may happen later — this is the create-time
+            rate, not the executed-time rate.
         destinationAddress: { type: string }
         sourceAddress: { type: [string, "null"] }
         txHash: { type: [string, "null"] }
