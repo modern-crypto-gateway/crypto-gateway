@@ -337,11 +337,12 @@
                 { "key": "offset", "value": "0" },
                 { "key": "chainId", "value": "999", "disabled": true },
                 { "key": "active", "value": "true", "disabled": true },
-                { "key": "reserved", "value": "true", "disabled": true }
+                { "key": "reserved", "value": "true", "disabled": true },
+                { "key": "includeBalance", "value": "true", "description": "Add nativeSymbol/nativeDecimals/nativeBalance per row. Costs 1 RPC per row.", "disabled": true }
               ]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "Lists fee wallets with reservation state. `reservedByPayoutId` shows the current CAS reservation — set while a payout holds the wallet, released on status transition. Enable the `reserved=true` filter to surface every in-flight reservation across every chain, the fastest way to spot payouts stuck in `reserved`/`submitted`."
+            "description": "Lists fee wallets with reservation state. Each row includes `chain` (slug like 'arbitrum').\n\n`reservedByPayoutId` shows the current CAS reservation — set while a payout holds the wallet, released on status transition. Enable the `reserved=true` filter to surface every in-flight reservation across every chain, the fastest way to spot payouts stuck in `reserved`/`submitted`.\n\n**Native balance (opt-in):** enable `includeBalance=true` to add per-row `nativeSymbol` ('ETH'/'MATIC'/'TRX'/'SOL'), `nativeDecimals` (EVM=18, Tron=6, Solana=9), and raw `nativeBalance` (smallest units). Costs **one RPC per row** — keep `limit` reasonable. Per-row failures don't fail the page: a dead RPC returns `nativeBalance: null` + `nativeBalanceError: 'rpc_error'`; chains without a loaded adapter return `'chain_not_wired'`."
           }
         },
         {
@@ -358,7 +359,7 @@
               ]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "Discovery endpoint for the dashboard's bootstrap picker. Returns every chain in the static `CHAIN_REGISTRY` plus a `wired: bool` flag (true when a `ChainAdapter` for that chainId is loaded), the static token list per chain, and the confirmation threshold the gateway will apply.\n\nCross-reference against:\n- `GET /admin/alchemy-webhooks` — has the chain been bootstrapped on Alchemy?\n- `GET /admin/fee-wallets` — does the chain have at least one fee wallet for payouts?\n\nNever returns secrets (signing keys, seeds, env)."
+            "description": "Discovery endpoint for the dashboard's bootstrap picker. Returns every chain in the static `CHAIN_REGISTRY` (minus the synthetic dev chain `999`) along with three readiness booleans per chain so the dashboard can decide bootstrap state in a single call:\n\n- `wired`          — a `ChainAdapter` for the chainId is loaded in `deps.chains`\n- `webhooks`       — a row exists in `alchemy_webhook_registry` for this chainId\n- `feeWallets`     — at least one **active** fee wallet exists for this chainId\n- `bootstrapReady` — convenience: `wired && webhooks && feeWallets`. Fully provisioned.\n\nAlso returns the static token list per chain and the confirmation threshold the gateway will apply. The dev chain (chainId 999) is excluded — it's a test-harness chain, never bootstrap real Alchemy webhooks against it.\n\nNever returns secrets (signing keys, seeds, env)."
           },
           "event": [
             {
@@ -372,8 +373,11 @@
                   "  pm.expect(body).to.have.property('chains');",
                   "  pm.expect(body.chains).to.be.an('array');",
                   "  if (body.chains.length > 0) {",
-                  "    pm.expect(body.chains[0]).to.include.keys(['chainId','slug','family','wired','tokens']);",
+                  "    pm.expect(body.chains[0]).to.include.keys(['chainId','slug','family','wired','webhooks','feeWallets','bootstrapReady','tokens']);",
                   "  }",
+                  "});",
+                  "pm.test('dev chain (999) is hidden', () => {",
+                  "  pm.expect(body.chains.find(c => c.chainId === 999)).to.equal(undefined);",
                   "});",
                   "pm.test('no secrets leaked', () => {",
                   "  pm.expect(pm.response.text()).to.not.match(/whsec_|signing|MASTER_SEED|privateKey/);",

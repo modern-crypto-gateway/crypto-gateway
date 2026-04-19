@@ -852,14 +852,21 @@ paths:
   /admin/chains:
     get:
       tags: [admin]
-      summary: Discovery — chains the gateway recognises and which are wired
+      summary: Discovery — chains the gateway recognises and their bootstrap state
       description: |
-        Read of the static chain registry, augmented with a `wired` flag (true
-        when a `ChainAdapter` for the chainId is loaded in `deps.chains`) and
-        the static token list per chain. The dashboard uses this to populate
-        a chain picker for bootstrap; cross-reference against
-        `GET /admin/alchemy-webhooks` and `GET /admin/fee-wallets` to decide
-        whether bootstrap is still needed for each chain.
+        Read of the static chain registry, augmented with three readiness
+        booleans per chain so the dashboard can decide what still needs
+        bootstrapping in a single call:
+
+        - `wired`          — a `ChainAdapter` for the chainId is loaded in `deps.chains`
+        - `webhooks`       — a row exists in `alchemy_webhook_registry` for this chainId
+        - `feeWallets`     — at least one **active** fee wallet exists for this chainId
+        - `bootstrapReady` — convenience: `wired && webhooks && feeWallets`. The
+          chain is fully provisioned and can accept payments / payouts.
+
+        The synthetic dev chain (chainId 999, slug `dev`) is **excluded** from
+        this response — it's a test-harness chain only and operators should
+        never attempt to register Alchemy webhooks or fee wallets for it.
 
         Tokens come from the static `TOKEN_REGISTRY` — they are the same for
         every operator and never include any per-merchant overrides. The
@@ -890,13 +897,16 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [chainId, slug, family, displayName, wired, confirmationsRequired, tokens]
+                      required: [chainId, slug, family, displayName, wired, webhooks, feeWallets, bootstrapReady, confirmationsRequired, tokens]
                       properties:
                         chainId: { type: integer }
                         slug: { type: string, description: "Stable short id, e.g. 'ethereum' / 'tron-nile'." }
                         family: { type: string, enum: [evm, tron, solana] }
                         displayName: { type: string }
                         wired: { type: boolean, description: "True when a ChainAdapter for this chainId is loaded." }
+                        webhooks: { type: boolean, description: "True when a row exists in alchemy_webhook_registry for this chainId." }
+                        feeWallets: { type: boolean, description: "True when at least one active fee wallet exists for this chainId." }
+                        bootstrapReady: { type: boolean, description: "Convenience flag: wired && webhooks && feeWallets. Fully provisioned chain." }
                         confirmationsRequired:
                           type: integer
                           description: "Confirmation threshold from `deps.confirmationThresholds`; transactions promote to `confirmed` at this count."
@@ -1024,6 +1034,14 @@ paths:
         wallet; released on status transition). Use `?reserved=true` to list
         every in-flight reservation across every chain — the fastest way to
         spot payouts stuck in `reserved`/`submitted` status.
+
+        **Native balance enrichment** — pass `?includeBalance=true` to add
+        `nativeSymbol` / `nativeDecimals` / `nativeBalance` to every row. This
+        costs **one RPC per row** (cap response with `limit` accordingly), so
+        it's opt-in. Per-row failures are isolated: a single dead RPC sets
+        `nativeBalance: null` and `nativeBalanceError: "rpc_error"` for that
+        row only, the rest of the page still returns. Chains without a loaded
+        adapter return `nativeBalanceError: "chain_not_wired"`.
       security:
         - AdminKey: []
       parameters:
@@ -1035,6 +1053,12 @@ paths:
           schema: { type: string, enum: [true, false] }
         - in: query
           name: reserved
+          schema: { type: string, enum: [true, false] }
+        - in: query
+          name: includeBalance
+          description: |
+            When `true`, fetch the native gas balance per row via one RPC each.
+            Off by default to keep listing cheap.
           schema: { type: string, enum: [true, false] }
         - in: query
           name: limit
@@ -1057,12 +1081,17 @@ paths:
                       properties:
                         id: { type: string }
                         chainId: { type: integer }
+                        chain: { type: [string, "null"], description: "Stable slug like 'arbitrum'; null when chainId isn't in the static registry." }
                         address: { type: string }
                         label: { type: string }
                         active: { type: boolean }
                         reservedByPayoutId: { type: [string, "null"] }
                         reservedAt: { type: [string, "null"], format: date-time }
                         createdAt: { type: string, format: date-time }
+                        nativeSymbol: { type: [string, "null"], description: "Only present when ?includeBalance=true. e.g. 'ETH', 'MATIC', 'TRX', 'SOL'." }
+                        nativeDecimals: { type: [integer, "null"], description: "Only present when ?includeBalance=true. EVM=18, Tron=6, Solana=9." }
+                        nativeBalance: { type: [string, "null"], description: "Only present when ?includeBalance=true. Raw integer string in smallest units (wei/sun/lamports). Divide by 10^nativeDecimals to display." }
+                        nativeBalanceError: { type: [string, "null"], description: "Only present when ?includeBalance=true. Null on success; 'chain_not_wired' or 'rpc_error' on failure." }
                   limit: { type: integer }
                   offset: { type: integer }
         "400": { $ref: "#/components/responses/ValidationError" }

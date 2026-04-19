@@ -638,6 +638,99 @@ describe("GET /admin/fee-wallets", () => {
     expect(new Set(body.feeWallets.map((w) => w.label))).toEqual(new Set(["hot-1", "hot-2"]));
   });
 
+  it("includes the chain slug on every row by default and omits balance fields when ?includeBalance is not set", async () => {
+    await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ chainId: 999, label: "hot-1", family: "evm" })
+      })
+    );
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      feeWallets: ReadonlyArray<Record<string, unknown>>;
+    };
+    expect(body.feeWallets[0]?.["chain"]).toBe("dev");
+    // includeBalance is opt-in — these keys must not appear in the default response.
+    expect(body.feeWallets[0]).not.toHaveProperty("nativeSymbol");
+    expect(body.feeWallets[0]).not.toHaveProperty("nativeBalance");
+    expect(body.feeWallets[0]).not.toHaveProperty("nativeBalanceError");
+  });
+
+  it("?includeBalance=true enriches each row with nativeSymbol/decimals/balance via the chain adapter", async () => {
+    await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ chainId: 999, label: "hot-1", family: "evm" })
+      })
+    );
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets?includeBalance=true", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      feeWallets: ReadonlyArray<{
+        chain: string | null;
+        nativeSymbol: string | null;
+        nativeDecimals: number | null;
+        nativeBalance: string | null;
+        nativeBalanceError: string | null;
+      }>;
+    };
+    const row = body.feeWallets[0];
+    expect(row?.chain).toBe("dev");
+    // Dev adapter is wired in the test boot — its getBalance() returns a fixed
+    // sentinel so the enrichment path is exercised end-to-end.
+    expect(row?.nativeSymbol).toBe("DEV");
+    expect(row?.nativeDecimals).toBe(18);
+    expect(typeof row?.nativeBalance).toBe("string");
+    expect(BigInt(row?.nativeBalance ?? "0") > 0n).toBe(true);
+    expect(row?.nativeBalanceError).toBeNull();
+  });
+
+  it("?includeBalance=true returns 'chain_not_wired' for chains without a loaded adapter", async () => {
+    // The default test boot loads only the dev adapter. Insert a fee wallet
+    // for a chainId no adapter serves (8453 = Base mainnet) directly, then
+    // confirm the enrichment path short-circuits gracefully instead of
+    // throwing 500.
+    await booted.deps.db.insert(feeWallets).values({
+      id: "fw-base-test",
+      chainId: 8453,
+      address: "0x0000000000000000000000000000000000000001",
+      label: "base-hot",
+      active: 1,
+      createdAt: Date.now()
+    });
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets?chainId=8453&includeBalance=true", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      feeWallets: ReadonlyArray<{
+        chain: string | null;
+        nativeSymbol: string | null;
+        nativeDecimals: number | null;
+        nativeBalance: string | null;
+        nativeBalanceError: string | null;
+      }>;
+    };
+    const row = body.feeWallets[0];
+    expect(row?.nativeSymbol).toBeNull();
+    expect(row?.nativeDecimals).toBeNull();
+    expect(row?.nativeBalance).toBeNull();
+    expect(row?.nativeBalanceError).toBe("chain_not_wired");
+  });
+
   it("filters by chainId, active, and reserved", async () => {
     await booted.app.fetch(
       new Request("http://test.local/admin/fee-wallets", {
@@ -715,7 +808,7 @@ describe("GET /admin/chains", () => {
     expect(res.status).toBe(401);
   });
 
-  it("returns the static registry with wired flag and tokens", async () => {
+  it("returns the static registry with wired/webhooks/feeWallets flags and tokens; hides the dev chain", async () => {
     const res = await listChains();
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -724,30 +817,33 @@ describe("GET /admin/chains", () => {
         slug: string;
         family: string;
         wired: boolean;
+        webhooks: boolean;
+        feeWallets: boolean;
+        bootstrapReady: boolean;
         tokens: Array<{ symbol: string; decimals: number }>;
       }>;
     };
-    // The dev chain (999) is wired by default in bootTestApp.
-    const dev = body.chains.find((c) => c.chainId === 999);
-    expect(dev).toBeDefined();
-    expect(dev?.wired).toBe(true);
-    expect(dev?.slug).toBe("dev");
-    expect(dev?.tokens.find((t) => t.symbol === "DEV")).toMatchObject({ decimals: 6 });
+    // Dev chain (999) is integration-only and excluded from this surface.
+    expect(body.chains.find((c) => c.chainId === 999)).toBeUndefined();
+    expect(body.chains.find((c) => c.slug === "dev")).toBeUndefined();
 
-    // Ethereum is in the registry but no adapter is wired in the test boot.
+    // Ethereum is in the registry but no adapter is wired in the test boot,
+    // and nothing has been bootstrapped — every readiness flag is false.
     const eth = body.chains.find((c) => c.chainId === 1);
     expect(eth).toBeDefined();
     expect(eth?.wired).toBe(false);
+    expect(eth?.webhooks).toBe(false);
+    expect(eth?.feeWallets).toBe(false);
+    expect(eth?.bootstrapReady).toBe(false);
     expect(eth?.tokens.map((t) => t.symbol)).toEqual(expect.arrayContaining(["USDC", "USDT"]));
   });
 
-  it("?wired=true narrows to wired adapters only", async () => {
+  it("?wired=true narrows to wired adapters only (and still hides dev)", async () => {
     const res = await listChains("?wired=true");
     const body = (await res.json()) as { chains: Array<{ chainId: number; wired: boolean }> };
-    expect(body.chains.length).toBeGreaterThan(0);
-    expect(body.chains.every((c) => c.wired === true)).toBe(true);
-    expect(body.chains.find((c) => c.chainId === 999)).toBeDefined();
-    expect(body.chains.find((c) => c.chainId === 1)).toBeUndefined();
+    // No real adapters are wired in the default test boot, dev is hidden, so
+    // the wired-only view is empty.
+    expect(body.chains).toEqual([]);
   });
 
   it("?family=evm narrows to one family", async () => {

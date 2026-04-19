@@ -15,7 +15,7 @@ import {
   recomputeInvoiceFromTransactions
 } from "../../core/domain/payment.service.js";
 import { confirmationThreshold } from "../../core/domain/payment-config.js";
-import { ChainFamilySchema, type ChainFamily, type ChainId } from "../../core/types/chain.js";
+import { ChainFamilySchema, type Address, type ChainFamily, type ChainId } from "../../core/types/chain.js";
 import { CHAIN_REGISTRY, chainEntry, chainSlug } from "../../core/types/chain-registry.js";
 import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
 import type { TokenSymbol } from "../../core/types/token.js";
@@ -702,6 +702,7 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     const chainIdParam = c.req.query("chainId");
     const activeParam = c.req.query("active");
     const reservedParam = c.req.query("reserved");
+    const includeBalance = c.req.query("includeBalance") === "true";
     const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "100"), 1), 500);
     const offset = Math.max(Number(c.req.query("offset") ?? "0"), 0);
 
@@ -750,23 +751,87 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       .offset(offset);
     const rows = conds.length === 0 ? await base : await base.where(and(...conds));
 
-    return c.json(
-      {
-        feeWallets: rows.map((r) => ({
-          id: r.id,
-          chainId: r.chainId,
-          address: r.address,
-          label: r.label,
-          active: r.active === 1,
-          reservedByPayoutId: r.reservedByPayoutId,
-          reservedAt: r.reservedAt === null ? null : new Date(r.reservedAt).toISOString(),
-          createdAt: new Date(r.createdAt).toISOString()
-        })),
-        limit,
-        offset
-      },
-      200
+    const baseRows = rows.map((r) => ({
+      id: r.id,
+      chainId: r.chainId,
+      chain: chainSlug(r.chainId as ChainId) ?? null,
+      address: r.address,
+      label: r.label,
+      active: r.active === 1,
+      reservedByPayoutId: r.reservedByPayoutId,
+      reservedAt: r.reservedAt === null ? null : new Date(r.reservedAt).toISOString(),
+      createdAt: new Date(r.createdAt).toISOString()
+    }));
+
+    if (!includeBalance) {
+      return c.json({ feeWallets: baseRows, limit, offset }, 200);
+    }
+
+    // Opt-in path: one RPC per row to fetch the native gas balance. Per-row
+    // failures are swallowed into `nativeBalanceError` so a single dead RPC
+    // doesn't fail the whole list. Native decimals are fixed per family —
+    // EVM=18, Tron=6 (sun), Solana=9 (lamports) — so the frontend can format
+    // without a second registry lookup.
+    const NATIVE_DECIMALS_BY_FAMILY: Record<ChainFamily, number> = {
+      evm: 18,
+      tron: 6,
+      solana: 9
+    };
+
+    type EnrichedRow = (typeof baseRows)[number] & {
+      nativeSymbol: string | null;
+      nativeDecimals: number | null;
+      nativeBalance: string | null;
+      nativeBalanceError: string | null;
+    };
+
+    const enriched = await Promise.all(
+      baseRows.map(async (row): Promise<EnrichedRow> => {
+        let adapter;
+        try {
+          adapter = findChainAdapter(deps, row.chainId as ChainId);
+        } catch {
+          return {
+            ...row,
+            nativeSymbol: null,
+            nativeDecimals: null,
+            nativeBalance: null,
+            nativeBalanceError: "chain_not_wired"
+          };
+        }
+        const sym = adapter.nativeSymbol(row.chainId as ChainId);
+        const decimals = NATIVE_DECIMALS_BY_FAMILY[adapter.family];
+        try {
+          const raw = await adapter.getBalance({
+            chainId: row.chainId as ChainId,
+            address: row.address as Address,
+            token: sym
+          });
+          return {
+            ...row,
+            nativeSymbol: sym as string,
+            nativeDecimals: decimals,
+            nativeBalance: raw as string,
+            nativeBalanceError: null
+          };
+        } catch (err) {
+          deps.logger.warn("admin.fee-wallets.balance_fetch_failed", {
+            chainId: row.chainId,
+            address: row.address,
+            err: err instanceof Error ? err.message : String(err)
+          });
+          return {
+            ...row,
+            nativeSymbol: sym as string,
+            nativeDecimals: decimals,
+            nativeBalance: null,
+            nativeBalanceError: "rpc_error"
+          };
+        }
+      })
     );
+
+    return c.json({ feeWallets: enriched, limit, offset }, 200);
   });
 
   app.post("/bootstrap/alchemy-webhooks", async (c) => {
@@ -899,17 +964,21 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
   // the same chainId overwrites (intended: rotation after a dashboard
   // delete+recreate produces a new key).
   // Discovery surface for the admin dashboard: which chains the gateway has
-  // wired vs. which it merely recognises in the static registry. The dashboard
-  // uses this to populate the "Bootstrap" picker — the operator selects a
-  // wired chain, then the dashboard cross-references against
-  // GET /admin/alchemy-webhooks and GET /admin/fee-wallets to decide whether
-  // bootstrap is still needed.
+  // wired vs. which it merely recognises in the static registry, with
+  // bootstrap-readiness flags inlined so the dashboard renders the picker in
+  // a single round-trip.
   //
-  // `wired: true` means a ChainAdapter for this chainId is loaded in
-  // `deps.chains`; `wired: false` rows are in CHAIN_REGISTRY but no adapter is
-  // actually configured (e.g. the operator didn't set the chain's RPC env).
-  // Tokens come from the static TOKEN_REGISTRY — never from any per-merchant
-  // override so the dashboard view is consistent across operators.
+  //   wired:      ChainAdapter for this chainId is loaded in deps.chains
+  //   webhooks:   row exists in alchemy_webhook_registry (= POST /admin/bootstrap/alchemy-webhooks ran)
+  //   feeWallets: ≥1 ACTIVE fee wallet for this chain (deactivated wallets don't count toward "ready")
+  //
+  // The dev chain (chainId 999) is excluded — it's an integration-test fixture,
+  // not something operators should ever bootstrap. Listing it would clutter
+  // the picker and let an operator accidentally try to wire a real Alchemy
+  // webhook to a synthetic chainId.
+  //
+  // Tokens come from the static TOKEN_REGISTRY — same for every operator,
+  // never includes per-merchant overrides.
   app.get("/chains", async (c) => {
     const familyParam = c.req.query("family");
     const wiredParam = c.req.query("wired");
@@ -926,12 +995,30 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       for (const id of adapter.supportedChainIds) wiredChainIds.add(id as number);
     }
 
+    // Two small SELECTs to derive the readiness flags. Both return the
+    // distinct chainIds we care about; building Sets keeps the per-row check
+    // O(1). Cheaper than left-joining inside the registry walk and easy to
+    // understand at a glance.
+    const webhookRows = await deps.db
+      .select({ chainId: alchemyWebhookRegistry.chainId })
+      .from(alchemyWebhookRegistry);
+    const webhookChainIds = new Set(webhookRows.map((r) => r.chainId));
+
+    const feeWalletRows = await deps.db
+      .selectDistinct({ chainId: feeWallets.chainId })
+      .from(feeWallets)
+      .where(eq(feeWallets.active, 1));
+    const feeWalletChainIds = new Set(feeWalletRows.map((r) => r.chainId));
+
     type ChainOut = {
       chainId: number;
       slug: string;
       family: ChainFamily;
       displayName: string;
       wired: boolean;
+      webhooks: boolean;
+      feeWallets: boolean;
+      bootstrapReady: boolean;
       confirmationsRequired: number;
       tokens: Array<{
         symbol: string;
@@ -942,6 +1029,10 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       }>;
     };
 
+    // ChainIds excluded from the dashboard view entirely. 999 = dev chain
+    // used only by integration tests; surfacing it would be operator-confusing.
+    const HIDDEN_CHAIN_IDS = new Set<number>([999]);
+
     const out: ChainOut[] = [];
 
     // Walk the static registry first so the response order is stable
@@ -951,17 +1042,24 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     // operators can see what's actually loaded.
     const seen = new Set<number>();
     for (const entry of CHAIN_REGISTRY) {
-      seen.add(entry.chainId as number);
-      const wired = wiredChainIds.has(entry.chainId as number);
+      const id = entry.chainId as number;
+      seen.add(id);
+      if (HIDDEN_CHAIN_IDS.has(id)) continue;
+      const wired = wiredChainIds.has(id);
       if (familyParam !== undefined && entry.family !== familyParam) continue;
       if (wiredParam === "true" && !wired) continue;
       if (wiredParam === "false" && wired) continue;
+      const hasWebhook = webhookChainIds.has(id);
+      const hasFeeWallet = feeWalletChainIds.has(id);
       out.push({
-        chainId: entry.chainId as number,
+        chainId: id,
         slug: entry.slug,
         family: entry.family,
         displayName: entry.displayName,
         wired,
+        webhooks: hasWebhook,
+        feeWallets: hasFeeWallet,
+        bootstrapReady: wired && hasWebhook && hasFeeWallet,
         confirmationsRequired: confirmationThreshold(entry.chainId, deps.confirmationThresholds),
         tokens: TOKEN_REGISTRY.filter((t) => t.chainId === entry.chainId).map((t) => ({
           symbol: t.symbol as string,
@@ -975,15 +1073,21 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     // Wired-but-unregistered tail.
     for (const id of wiredChainIds) {
       if (seen.has(id)) continue;
+      if (HIDDEN_CHAIN_IDS.has(id)) continue;
       const family = (deps.chains.find((a) => a.supportedChainIds.includes(id as ChainId))?.family) ?? "evm";
       if (familyParam !== undefined && family !== familyParam) continue;
       if (wiredParam === "false") continue;
+      const hasWebhook = webhookChainIds.has(id);
+      const hasFeeWallet = feeWalletChainIds.has(id);
       out.push({
         chainId: id,
         slug: chainSlug(id) ?? `chain-${id}`,
         family,
         displayName: chainEntry(id)?.displayName ?? `Chain ${id}`,
         wired: true,
+        webhooks: hasWebhook,
+        feeWallets: hasFeeWallet,
+        bootstrapReady: hasWebhook && hasFeeWallet,
         confirmationsRequired: confirmationThreshold(id, deps.confirmationThresholds),
         tokens: TOKEN_REGISTRY.filter((t) => t.chainId === id).map((t) => ({
           symbol: t.symbol as string,
