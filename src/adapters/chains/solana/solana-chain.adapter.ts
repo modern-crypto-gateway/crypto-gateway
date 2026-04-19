@@ -131,20 +131,30 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       const client = getClient(chainId);
 
       const nativeSymbol = "SOL" as TokenSymbol;
-      // Pull-based SPL detection (scanning `getTransaction` + pre/post token
-      // balances per signature) is DEFERRED. The Alchemy Notify webhook path
-      // carries SPL today — see alchemy-notify.adapter.ts `parseSolanaEvent`.
-      // Until the pull path catches up, `scanIncoming` stays native-SOL-only:
-      // SPL support here needs jsonParsed token-balance extraction plus an
-      // ATA-owner cross-check per signature, which is a separate piece of work.
-      const wantsNative = tokens.some((t) => t === nativeSymbol);
-      if (!wantsNative) return [];
-      void tokens;
 
-      // Per address: list recent signatures, fetch each tx, extract the native
-      // transfer amount from balance deltas.
+      // Build a mint -> symbol lookup for every registered SPL token on this
+      // chain, filtered to the symbols the caller asked for. Token balances
+      // in the jsonParsed tx response carry `mint`; we need the symbol to
+      // label the DetectedTransfer consistently with the registry.
+      const wantedSymbols = new Set<TokenSymbol>(tokens);
+      const symbolByMint = new Map<string, TokenSymbol>();
+      for (const t of TOKEN_REGISTRY) {
+        if (t.chainId !== chainId) continue;
+        if (t.contractAddress === null) continue;
+        if (!wantedSymbols.has(t.symbol)) continue;
+        symbolByMint.set(t.contractAddress, t.symbol);
+      }
+      const wantsNative = wantedSymbols.has(nativeSymbol);
+      const wantsAnySpl = symbolByMint.size > 0;
+      if (!wantsNative && !wantsAnySpl) return [];
+
+      // Per address: list recent signatures, fetch each tx, extract native +
+      // SPL transfer amounts from pre/post balance deltas.
       const cutoffMs = sinceMs;
       const transfers: DetectedTransfer[] = [];
+      const confirmationsFor = (sig: { confirmationStatus?: string }): number =>
+        sig.confirmationStatus === "finalized" ? 32 : sig.confirmationStatus === "confirmed" ? 1 : 0;
+
       for (const address of addresses) {
         const signatures = await client.getSignaturesForAddress(address, { limit: scanLimit });
         for (const sig of signatures) {
@@ -153,46 +163,116 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
           const tx = await client.getTransaction(sig.signature);
           if (!tx || !tx.meta || tx.meta.err !== null) continue;
 
-          // Find `address` in the account list and compute the balance delta.
           const accountKeys = tx.transaction.message.accountKeys.map((k) =>
             typeof k === "string" ? k : k.pubkey
           );
-          const idx = accountKeys.indexOf(address);
-          if (idx === -1) continue;
-          const pre = tx.meta.preBalances[idx];
-          const post = tx.meta.postBalances[idx];
-          if (pre === undefined || post === undefined) continue;
-          const delta = post - pre;
-          // Credit-only: ignore outflows, ignore self-pay with delta=0.
-          if (delta <= 0) continue;
 
-          // Identify sender by whichever account saw the opposite delta.
-          // Fallback to index 0 (conventional payer) when multiple accounts
-          // moved — this is a heuristic, not a proof.
-          let fromAddress = accountKeys[0] ?? "unknown";
-          for (let i = 0; i < accountKeys.length; i += 1) {
-            if (i === idx) continue;
-            const dPre = tx.meta.preBalances[i];
-            const dPost = tx.meta.postBalances[i];
-            if (dPre === undefined || dPost === undefined) continue;
-            if (dPost - dPre === -delta - tx.meta.fee || dPost - dPre === -delta) {
-              fromAddress = accountKeys[i] ?? fromAddress;
-              break;
+          // ---- Native SOL credit to `address` ----
+          if (wantsNative) {
+            const idx = accountKeys.indexOf(address);
+            if (idx !== -1) {
+              const pre = tx.meta.preBalances[idx];
+              const post = tx.meta.postBalances[idx];
+              if (pre !== undefined && post !== undefined) {
+                const delta = post - pre;
+                if (delta > 0) {
+                  // Identify sender by whichever account saw the opposite delta.
+                  // Fallback to index 0 (conventional payer) when multiple
+                  // accounts moved — heuristic, not a proof.
+                  let fromAddress = accountKeys[0] ?? "unknown";
+                  for (let i = 0; i < accountKeys.length; i += 1) {
+                    if (i === idx) continue;
+                    const dPre = tx.meta.preBalances[i];
+                    const dPost = tx.meta.postBalances[i];
+                    if (dPre === undefined || dPost === undefined) continue;
+                    if (dPost - dPre === -delta - tx.meta.fee || dPost - dPre === -delta) {
+                      fromAddress = accountKeys[i] ?? fromAddress;
+                      break;
+                    }
+                  }
+                  transfers.push({
+                    chainId: chainId as ChainId,
+                    txHash: sig.signature,
+                    logIndex: null,
+                    fromAddress,
+                    toAddress: address,
+                    token: nativeSymbol,
+                    amountRaw: delta.toString() as AmountRaw,
+                    blockNumber: sig.slot,
+                    confirmations: confirmationsFor(sig),
+                    seenAt: new Date()
+                  });
+                }
+              }
             }
           }
 
-          transfers.push({
-            chainId: chainId as ChainId,
-            txHash: sig.signature,
-            logIndex: null,
-            fromAddress,
-            toAddress: address,
-            token: nativeSymbol,
-            amountRaw: delta.toString() as AmountRaw,
-            blockNumber: sig.slot,
-            confirmations: sig.confirmationStatus === "finalized" ? 32 : sig.confirmationStatus === "confirmed" ? 1 : 0,
-            seenAt: new Date()
-          });
+          // ---- SPL credits to `address` (owner) ----
+          // Audit path: the user watches the owner address (wallet), not the
+          // ATA. Token balances under jsonParsed encoding include `owner`, so
+          // we match (owner === address, mint ∈ wantedSymbols) and diff the
+          // amount across pre/post to derive the credit.
+          if (wantsAnySpl) {
+            const preTokens = tx.meta.preTokenBalances ?? [];
+            const postTokens = tx.meta.postTokenBalances ?? [];
+            if (preTokens.length > 0 || postTokens.length > 0) {
+              const preAmounts = new Map<string, bigint>();
+              const postAmounts = new Map<string, bigint>();
+              for (const b of preTokens) {
+                if (!b.owner || b.owner !== address) continue;
+                if (!symbolByMint.has(b.mint)) continue;
+                try {
+                  preAmounts.set(b.mint, BigInt(b.uiTokenAmount.amount));
+                } catch { /* unparseable amount — treat as absent */ }
+              }
+              for (const b of postTokens) {
+                if (!b.owner || b.owner !== address) continue;
+                if (!symbolByMint.has(b.mint)) continue;
+                try {
+                  postAmounts.set(b.mint, BigInt(b.uiTokenAmount.amount));
+                } catch { /* unparseable amount — treat as absent */ }
+              }
+              const mints = new Set<string>([...preAmounts.keys(), ...postAmounts.keys()]);
+              for (const mint of mints) {
+                const pre = preAmounts.get(mint) ?? 0n;
+                const post = postAmounts.get(mint) ?? 0n;
+                const delta = post - pre;
+                if (delta <= 0n) continue;
+                // Sender-side: any (other-owner, same-mint) whose amount
+                // dropped by -delta. Best-effort; falls back to accountKeys[0].
+                let fromAddress = accountKeys[0] ?? "unknown";
+                for (const b of postTokens) {
+                  if (!b.owner || b.owner === address || b.mint !== mint) continue;
+                  let postOther: bigint;
+                  try { postOther = BigInt(b.uiTokenAmount.amount); } catch { continue; }
+                  // Match to pre entry for the same owner+mint.
+                  let preOther = 0n;
+                  for (const p of preTokens) {
+                    if (p.owner === b.owner && p.mint === mint) {
+                      try { preOther = BigInt(p.uiTokenAmount.amount); } catch { /* ignore */ }
+                      break;
+                    }
+                  }
+                  if (postOther - preOther === -delta) {
+                    fromAddress = b.owner;
+                    break;
+                  }
+                }
+                transfers.push({
+                  chainId: chainId as ChainId,
+                  txHash: sig.signature,
+                  logIndex: null,
+                  fromAddress,
+                  toAddress: address,
+                  token: symbolByMint.get(mint)!,
+                  amountRaw: delta.toString() as AmountRaw,
+                  blockNumber: sig.slot,
+                  confirmations: confirmationsFor(sig),
+                  seenAt: new Date()
+                });
+              }
+            }
+          }
         }
       }
       return transfers;

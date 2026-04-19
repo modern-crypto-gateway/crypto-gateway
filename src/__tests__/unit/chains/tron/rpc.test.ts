@@ -235,6 +235,107 @@ describe("tronChainAdapter.scanIncoming", () => {
     });
     expect(transfers).toEqual([]);
   });
+
+  it("drops dust native TRX address-poisoning spam (amount=0 and amount=1 sun) but keeps the real payment", async () => {
+    const toAddr = "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL";
+    const attackerAddr = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
+    const realSenderAddr = "TPr9ZWE1jPWT3QjXEBYF89RY8FKGnrS4pC";
+    const toHex = "41" + tronToEvmCoreHex(toAddr).slice(2);
+    const attackerHex = "41" + tronToEvmCoreHex(attackerAddr).slice(2);
+    const realSenderHex = "41" + tronToEvmCoreHex(realSenderAddr).slice(2);
+
+    const client = fakeClient({
+      async listTrxTransfers() {
+        return [
+          // Classic zero-value spam — dropped by threshold.
+          { txID: "aa".repeat(32), blockNumber: 55_111_110, blockTimestamp: 1_700_000_000_000, from: attackerHex, to: toHex, value: "0" },
+          // One-sun spam (the evolved pattern that defeats a naive "> 0" filter).
+          { txID: "cc".repeat(32), blockNumber: 55_111_112, blockTimestamp: 1_700_000_000_000, from: attackerHex, to: toHex, value: "1" },
+          // Legitimate 5 TRX payment — must be kept.
+          { txID: "bb".repeat(32), blockNumber: 55_111_111, blockTimestamp: 1_700_000_000_000, from: realSenderHex, to: toHex, value: "5000000" }
+        ];
+      }
+    });
+
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+
+    const transfers = await adapter.scanIncoming({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      addresses: [toAddr],
+      tokens: ["TRX"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]).toMatchObject({ txHash: "bb".repeat(32), amountRaw: "5000000" });
+  });
+
+  it("keeps the real payment exactly at the dust threshold (0.001 TRX = 1000 sun)", async () => {
+    const toAddr = "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL";
+    const fromAddr = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
+    const toHex = "41" + tronToEvmCoreHex(toAddr).slice(2);
+    const fromHex = "41" + tronToEvmCoreHex(fromAddr).slice(2);
+
+    const client = fakeClient({
+      async listTrxTransfers() {
+        return [
+          // One sun below threshold — must be dropped.
+          { txID: "aa".repeat(32), blockNumber: 55_111_110, blockTimestamp: 1_700_000_000_000, from: fromHex, to: toHex, value: "999" },
+          // Exactly at threshold — must be kept (boundary inclusive).
+          { txID: "bb".repeat(32), blockNumber: 55_111_111, blockTimestamp: 1_700_000_000_000, from: fromHex, to: toHex, value: "1000" }
+        ];
+      }
+    });
+
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+
+    const transfers = await adapter.scanIncoming({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      addresses: [toAddr],
+      tokens: ["TRX"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]?.amountRaw).toBe("1000");
+  });
+
+  it("drops dust TRC-20 spam (amount=0 and amount=1 USDT base unit) but keeps the real payment", async () => {
+    const toAddr = "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL";
+    const attackerAddr = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
+    const realSenderAddr = "TPr9ZWE1jPWT3QjXEBYF89RY8FKGnrS4pC";
+
+    const client = fakeClient({
+      async listTrc20Transfers() {
+        return [
+          { transaction_id: "aa".repeat(32), block_timestamp: 1_700_000_000_000, block: 55_000_000, from: attackerAddr, to: toAddr, value: "0", token_info: { address: USDT_TRON_CONTRACT, decimals: 6, name: "", symbol: "USDT" }, type: "Transfer" },
+          { transaction_id: "cc".repeat(32), block_timestamp: 1_700_000_000_000, block: 55_000_002, from: attackerAddr, to: toAddr, value: "1", token_info: { address: USDT_TRON_CONTRACT, decimals: 6, name: "", symbol: "USDT" }, type: "Transfer" },
+          { transaction_id: "bb".repeat(32), block_timestamp: 1_700_000_000_000, block: 55_000_001, from: realSenderAddr, to: toAddr, value: "1000000", token_info: { address: USDT_TRON_CONTRACT, decimals: 6, name: "", symbol: "USDT" }, type: "Transfer" }
+        ];
+      }
+    });
+
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+
+    const transfers = await adapter.scanIncoming({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      addresses: [toAddr],
+      tokens: ["USDT"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]).toMatchObject({ txHash: "bb".repeat(32), amountRaw: "1000000" });
+  });
 });
 
 describe("tronChainAdapter.getConfirmationStatus", () => {

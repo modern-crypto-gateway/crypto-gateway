@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { alchemyNotifyDetection } from "../../adapters/detection/alchemy-notify.adapter.js";
 import { solanaChainAdapter, SOLANA_MAINNET_CHAIN_ID } from "../../adapters/chains/solana/solana-chain.adapter.js";
 import { bootTestApp } from "../helpers/boot.js";
+import { bufferingLogger } from "../../adapters/logging/console.adapter.js";
+import type { AppDeps } from "../../core/app-deps.js";
 
 // SPL mint addresses from the token registry. Must match the registry entries
 // exactly — the parser resolves `mint` -> symbol via the registry.
@@ -21,6 +23,18 @@ function solanaAdapterForTests() {
     chainIds: [SOLANA_MAINNET_CHAIN_ID],
     rpc: { [SOLANA_MAINNET_CHAIN_ID]: { url: "http://unused.test/rpc" } }
   });
+}
+
+// Minimal AppDeps for parser-only tests — the Solana webhook parser only
+// reaches `deps.logger` and `deps.chains`. Sidesteps bootTestApp (which
+// requires a migrated libSQL schema) for pure-parse assertions.
+function minimalDepsForParser() {
+  const logger = bufferingLogger();
+  const deps = {
+    logger,
+    chains: [solanaAdapterForTests()]
+  } as unknown as AppDeps;
+  return { deps, logger };
 }
 
 describe("alchemyNotifyDetection — Solana SPL payload", () => {
@@ -253,12 +267,100 @@ describe("alchemyNotifyDetection — Solana SPL payload", () => {
     }
   });
 
-  it("references ATA_WATCHED + ATA_PAYER placeholders in test fixtures", () => {
-    // Cosmetic — these are reserved for a future test that exercises the
-    // account_index -> owner mapping path (not all payloads include `owner`
-    // on balance rows). Declaring them here keeps the linter quiet and
-    // signals intent if a future contributor extends coverage.
-    expect(ATA_WATCHED.length).toBeGreaterThan(0);
-    expect(ATA_PAYER.length).toBeGreaterThan(0);
+  it("does not emit a native SOL credit for ATA rent funding when the same tx carries an SPL credit", async () => {
+    const { deps } = minimalDepsForParser();
+    {
+      const strategy = alchemyNotifyDetection();
+      // Models the real-world case: sender has a USDC ATA already, recipient
+      // doesn't. The tx creates ATA_WATCHED (index 2) and funds it with the
+      // rent-exempt minimum for a 165-byte SPL token account (2039280
+      // lamports), then transfers 0.49 USDC into it. Without the fix, the
+      // native-SOL loop emitted a spurious credit with toAddress=ATA_WATCHED
+      // and amount=2039280 (orphaned, no invoice match).
+      const payload = {
+        type: "ADDRESS_ACTIVITY",
+        event: {
+          network: "SOLANA_MAINNET",
+          transaction: [
+            {
+              signature: "rent_plus_spl_tx",
+              slot: 414295134,
+              transaction: [{
+                signatures: ["rent_plus_spl_tx"],
+                message: [{ account_keys: [EXTERNAL_PAYER, ATA_PAYER, ATA_WATCHED, WATCHED_WALLET] }]
+              }],
+              meta: [
+                {
+                  err: null,
+                  fee: 5000,
+                  pre_balances:  [1_000_000_000,       0,       0, 0],
+                  post_balances: [  997_955_720,       0, 2_039_280, 0],
+                  pre_token_balances: [
+                    { account_index: 1, mint: USDC_MINT, owner: EXTERNAL_PAYER, ui_token_amount: { amount: "5000000", decimals: 6 } }
+                  ],
+                  post_token_balances: [
+                    { account_index: 1, mint: USDC_MINT, owner: EXTERNAL_PAYER, ui_token_amount: { amount: "4510000", decimals: 6 } },
+                    { account_index: 2, mint: USDC_MINT, owner: WATCHED_WALLET, ui_token_amount: { amount:  "490000", decimals: 6 } }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      };
+      const transfers = await strategy.handlePush!(deps, payload);
+      // Exactly one transfer: the USDC credit to the owner wallet. The
+      // rent-funded ATA must NOT produce a native SOL row.
+      expect(transfers).toHaveLength(1);
+      expect(transfers[0]?.token).toBe("USDC");
+      expect(transfers[0]?.toAddress).toBe(WATCHED_WALLET);
+      expect(transfers[0]?.amountRaw).toBe("490000");
+      // Defensive — make sure no row carries the rent magic number as SOL.
+      expect(transfers.find((t) => t.token === "SOL" && t.amountRaw === "2039280")).toBeUndefined();
+    }
+  });
+
+  it("logs a diagnostic when token balances are present but have no resolvable owner", async () => {
+    const { deps, logger } = minimalDepsForParser();
+    {
+      const strategy = alchemyNotifyDetection();
+      // Payload variant where Alchemy drops `owner` from the balance rows.
+      // indexTokenBalances rejects such entries; if we don't surface that,
+      // real USDC deposits silently fail to detect.
+      const payload = {
+        type: "ADDRESS_ACTIVITY",
+        event: {
+          network: "SOLANA_MAINNET",
+          transaction: [
+            {
+              signature: "owner_missing_tx",
+              meta: [
+                {
+                  err: null,
+                  fee: 5000,
+                  pre_token_balances: [
+                    { account_index: 2, mint: USDC_MINT, ui_token_amount: { amount: "0", decimals: 6 } }
+                  ],
+                  post_token_balances: [
+                    { account_index: 2, mint: USDC_MINT, ui_token_amount: { amount: "490000", decimals: 6 } }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      };
+      const transfers = await strategy.handlePush!(deps, payload);
+      expect(transfers).toEqual([]);
+      const warned = logger.entries.find(
+        (e) => e.level === "warn" && e.message.includes("no SPL credit emitted")
+      );
+      expect(warned).toBeDefined();
+      expect(warned?.fields).toMatchObject({
+        txHash: "owner_missing_tx",
+        balanceEntries: 2,
+        indexedEntries: 0
+      });
+    }
   });
 });

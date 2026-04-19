@@ -44,6 +44,16 @@ const DEFAULT_CHANGE_INDEX = 0;
 // ~10s. Tron block time is ~3s, so this is at most one stale-by-3-blocks read.
 const NOW_BLOCK_CACHE_TTL_MS = 10_000;
 
+// Dust threshold for address-poisoning spam on Tron. TRX sun and USDT/USDC
+// base units (both 6 decimals on Tron) below this are dropped at scan time.
+// Rationale: legitimate payment flows on Tron never send sub-milli-unit
+// amounts — wallets don't expose that precision in their UIs. The spam wave
+// we observe uses amountRaw="1" (1 sun / 0.000001 TRX) explicitly to defeat
+// a naive "> 0" filter. 1000 base units = 0.001 token ≈ $0.0003 at current
+// prices, comfortably below the smallest real checkout amount (typically
+// $0.01+). Applies uniformly to TRX and all 6-decimal TRC-20 tokens.
+const TRON_DUST_THRESHOLD = 1_000n;
+
 export interface TronChainConfig {
   // Which chainIds this adapter serves. Defaults to Tron mainnet only.
   chainIds?: readonly number[];
@@ -172,6 +182,16 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
                 transfers
                   .filter((t) => t.token_info?.address !== undefined && allowedContracts.has(t.token_info.address))
                   .filter((t) => addressSet.has(t.to))
+                  // Drop dust TRC-20 address-poisoning spam. Common on Tron:
+                  // attackers blast 0- or 1-unit USDT/USDC transfers (1 unit
+                  // = 0.000001 stablecoin) to pollute wallet tx histories.
+                  // A naive "> 0" filter is defeated by amount=1; threshold
+                  // at 0.001 token (TRON_DUST_THRESHOLD) blocks the pattern
+                  // without touching any plausible payment amount.
+                  .filter((t) => {
+                    try { return BigInt(t.value) >= TRON_DUST_THRESHOLD; }
+                    catch { return false; }
+                  })
                   .map<DetectedTransfer>((t) => ({
                     chainId: chainId as ChainId,
                     txHash: t.transaction_id,
@@ -210,6 +230,14 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
                   return [];
                 }
                 if (!addressSet.has(toCanonical as Address)) return [];
+                // Drop dust native TRX address-poisoning spam. The active
+                // spam pattern sends amountRaw="1" (1 sun) specifically to
+                // slip past a naive "> 0" filter. TRON_DUST_THRESHOLD pins
+                // the floor at 0.001 TRX — well below the smallest real
+                // checkout amount, well above the spam traffic.
+                let amount: bigint;
+                try { amount = BigInt(t.value); } catch { return []; }
+                if (amount < TRON_DUST_THRESHOLD) return [];
                 return [
                   {
                     chainId: chainId as ChainId,

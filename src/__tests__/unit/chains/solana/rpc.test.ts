@@ -56,13 +56,13 @@ describe("solanaChainAdapter.scanIncoming", () => {
     expect(result).toEqual([]);
   });
 
-  it("skips when the caller didn't ask for SOL (SPL detection is Phase 7.5)", async () => {
+  it("skips when the caller asks for no native and no registered SPL tokens", async () => {
     const adapter = solanaChainAdapter({
       chainIds: [SOLANA_MAINNET_CHAIN_ID],
       clients: {
         [SOLANA_MAINNET_CHAIN_ID]: fakeClient({
           async getSignaturesForAddress() {
-            throw new Error("must not be called when only SPL tokens requested");
+            throw new Error("must not be called when only unknown tokens requested");
           }
         })
       }
@@ -70,10 +70,109 @@ describe("solanaChainAdapter.scanIncoming", () => {
     const result = await adapter.scanIncoming({
       chainId: SOLANA_MAINNET_CHAIN_ID,
       addresses: ["A".repeat(43)],
-      tokens: ["USDC"],
+      // Neither native SOL nor any mint registered on chainId 900.
+      tokens: ["UNKNOWN_TOKEN"],
       sinceMs: Date.now() - 60_000
     });
     expect(result).toEqual([]);
+  });
+
+  it("detects USDC SPL credits to the owner address via pre/postTokenBalances", async () => {
+    const owner = "GWbk6imVCagBJGGkGuP2npGiJVBRfsBy6Lz2B1CFtszo";
+    const sender = "FRXkFACBJEaTfTGygsgFBbA7KBfhPNQDk8fwf8FBX2Vp";
+    const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    // ATAs (addresses inside accountKeys; not referenced by scanIncoming
+    // directly but realistic for the payload shape).
+    const recipientAta = "3TPkxwzM4f5KqjyxcEui1QzdaBcDeFgHiJkLmNoPqRsTu";
+    const senderAta = "9xAtaSenderABCdefGHIJKLMNOPQRSTUvwxYZ01234567";
+
+    const client = fakeClient({
+      async getSignaturesForAddress(address) {
+        expect(address).toBe(owner);
+        return [
+          {
+            signature: "5o1QwXtrHJfJTXr4k73nnwLFSplCreditExampleSignature",
+            slot: 414295300,
+            blockTime: Math.floor(Date.now() / 1000),
+            err: null,
+            confirmationStatus: "confirmed"
+          }
+        ];
+      },
+      async getTransaction() {
+        // Models the real-world ATA-creation + USDC transfer. accountKeys
+        // ordering: [sender, senderAta, recipientAta, owner, systemProg].
+        // Native balances show the fee burn on sender + rent-exempt funding
+        // on the recipient's new ATA (2039280 lamports) — the adapter must
+        // NOT emit a native row for the ATA index because it's not `owner`.
+        return {
+          slot: 414295300,
+          blockTime: Math.floor(Date.now() / 1000),
+          meta: {
+            err: null,
+            fee: 5000,
+            preBalances:  [1_000_000_000, 0,         0, 0, 1],
+            postBalances: [  997_955_720, 0, 2_039_280, 0, 1],
+            preTokenBalances: [
+              {
+                accountIndex: 1,
+                mint: USDC_MINT,
+                owner: sender,
+                uiTokenAmount: { amount: "5000000", decimals: 6 }
+              }
+            ],
+            postTokenBalances: [
+              {
+                accountIndex: 1,
+                mint: USDC_MINT,
+                owner: sender,
+                uiTokenAmount: { amount: "4510000", decimals: 6 }
+              },
+              {
+                accountIndex: 2,
+                mint: USDC_MINT,
+                owner,
+                uiTokenAmount: { amount: "490000", decimals: 6 }
+              }
+            ]
+          },
+          transaction: {
+            message: {
+              accountKeys: [sender, senderAta, recipientAta, owner, "11111111111111111111111111111111"],
+              instructions: []
+            },
+            signatures: ["5o1QwXtrHJfJTXr4k73nnwLFSplCreditExampleSignature"]
+          }
+        };
+      }
+    });
+
+    const adapter = solanaChainAdapter({
+      chainIds: [SOLANA_MAINNET_CHAIN_ID],
+      clients: { [SOLANA_MAINNET_CHAIN_ID]: client }
+    });
+
+    const transfers = await adapter.scanIncoming({
+      chainId: SOLANA_MAINNET_CHAIN_ID,
+      addresses: [owner],
+      tokens: ["USDC", "SOL"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    // Exactly one USDC credit. The ATA-rent 2039280 lamports must NOT be
+    // emitted because the credited index (recipientAta) is not `owner`.
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]).toMatchObject({
+      chainId: SOLANA_MAINNET_CHAIN_ID,
+      txHash: "5o1QwXtrHJfJTXr4k73nnwLFSplCreditExampleSignature",
+      logIndex: null,
+      fromAddress: sender,
+      toAddress: owner,
+      token: "USDC",
+      amountRaw: "490000",
+      blockNumber: 414295300,
+      confirmations: 1
+    });
   });
 
   it("reads native SOL transfers from signature+transaction responses, using balance deltas", async () => {

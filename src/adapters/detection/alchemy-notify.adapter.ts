@@ -111,7 +111,7 @@ export function alchemyNotifyDetection(): DetectionStrategy {
       // for SPL) vs EVM's flat event.activity[] (with rawContract.address +
       // rawValue). Branch on family so each parser stays single-purpose.
       if (chainAdapter.family === "solana") {
-        return parseSolanaEvent(payload.event?.transaction ?? [], chainId, chainAdapter);
+        return parseSolanaEvent(payload.event?.transaction ?? [], chainId, chainAdapter, deps);
       }
 
       // Build a contract-address -> symbol map from the registry for this chain.
@@ -152,7 +152,8 @@ export function alchemyNotifyDetection(): DetectionStrategy {
 function parseSolanaEvent(
   transactions: readonly SolanaWebhookTransaction[],
   chainId: ChainId,
-  chainAdapter: ReturnType<typeof findChainAdapter>
+  chainAdapter: ReturnType<typeof findChainAdapter>,
+  deps: AppDeps
 ): readonly DetectedTransfer[] {
   const now = new Date();
   // Mint -> symbol map for SPL resolution.
@@ -179,12 +180,32 @@ function parseSolanaEvent(
     const postBalances = meta.post_balances ?? meta.postBalances;
     const fee = meta.fee ?? 0;
 
+    const preTokens = meta.pre_token_balances ?? meta.preTokenBalances ?? [];
+    const postTokens = meta.post_token_balances ?? meta.postTokenBalances ?? [];
+
+    // Any accountKeys index that shows up in pre/post_token_balances is a
+    // token account (ATA or legacy) — not a wallet. These receive lamports
+    // purely as rent funding when an ATA is created in the same tx
+    // (canonical rent-exempt minimum is 2039280 lamports for a 165-byte
+    // SPL token account). Emitting them as native SOL credits produces
+    // spurious orphan rows keyed on the ATA address instead of the owner.
+    const tokenAccountIndices = new Set<number>();
+    for (const b of preTokens) {
+      const idx = b.account_index ?? b.accountIndex;
+      if (typeof idx === "number") tokenAccountIndices.add(idx);
+    }
+    for (const b of postTokens) {
+      const idx = b.account_index ?? b.accountIndex;
+      if (typeof idx === "number") tokenAccountIndices.add(idx);
+    }
+
     // Native SOL credits — account[i] where post-pre is strictly positive.
     // The account paying the fee (index 0 by Solana convention) is excluded
     // from being credited by adjusting for `fee` — otherwise a 0-lamport
     // transfer from account[0] would read as -fee and never match.
     if (preBalances && postBalances && accountKeys.length > 0) {
       for (let i = 0; i < accountKeys.length; i += 1) {
+        if (tokenAccountIndices.has(i)) continue;
         const pre = preBalances[i];
         const post = postBalances[i];
         if (pre === undefined || post === undefined) continue;
@@ -217,22 +238,31 @@ function parseSolanaEvent(
     // for SPL is harder to recover without full instruction parsing; we
     // leave fromAddress as a placeholder and let the sweeper fill via
     // `getTransaction` if needed.
-    const preTokens = meta.pre_token_balances ?? meta.preTokenBalances ?? [];
-    const postTokens = meta.post_token_balances ?? meta.postTokenBalances ?? [];
     if (preTokens.length > 0 || postTokens.length > 0) {
       const preMap = indexTokenBalances(preTokens);
       const postMap = indexTokenBalances(postTokens);
       const keys = new Set<string>([...preMap.keys(), ...postMap.keys()]);
+      const emittedBefore = transfers.length;
+      let droppedMissingOwner = 0;
+      let droppedUnknownMint = 0;
+      let droppedNonPositive = 0;
+      // Reasons a token-balance entry was silently filtered by
+      // indexTokenBalances (missing owner/mint or unparseable amount).
+      // A payload that arrives without `owner` on balance rows would
+      // produce preMap/postMap empty despite preTokens/postTokens
+      // carrying entries — that's the common Alchemy-variant failure.
+      const balanceEntries = preTokens.length + postTokens.length;
+      const indexedEntries = preMap.size + postMap.size;
       for (const key of keys) {
         const pre = preMap.get(key) ?? { owner: "", mint: "", amount: 0n };
         const post = postMap.get(key) ?? { owner: "", mint: "", amount: 0n };
         const owner = post.owner || pre.owner;
         const mint = post.mint || pre.mint;
-        if (!owner || !mint) continue;
+        if (!owner || !mint) { droppedMissingOwner += 1; continue; }
         const symbol = symbolByMint.get(mint);
-        if (symbol === undefined) continue;
+        if (symbol === undefined) { droppedUnknownMint += 1; continue; }
         const delta = post.amount - pre.amount;
-        if (delta <= 0n) continue;
+        if (delta <= 0n) { droppedNonPositive += 1; continue; }
         // Try to find the sender: the (other-owner, same-mint) pair whose
         // amount dropped by -delta. Best-effort; falls back to account[0].
         const fromAddress = guessSplSender(preMap, postMap, owner, mint, delta) ?? accountKeys[0] ?? "unknown";
@@ -247,6 +277,21 @@ function parseSolanaEvent(
           blockNumber: rawTx.slot ?? null,
           confirmations: 1,
           seenAt: now
+        });
+      }
+      // Diagnostic: the tx carried token-balance entries but we emitted
+      // nothing. Most common cause is a payload variant where `owner` is
+      // absent on each balance row (indexedEntries < balanceEntries), which
+      // would silently disable SPL detection on real USDC/USDT deposits.
+      if (transfers.length === emittedBefore) {
+        deps.logger.warn("solana webhook: token balances present but no SPL credit emitted", {
+          chainId,
+          txHash: rawTx.signature,
+          balanceEntries,
+          indexedEntries,
+          droppedMissingOwner,
+          droppedUnknownMint,
+          droppedNonPositive
         });
       }
     }

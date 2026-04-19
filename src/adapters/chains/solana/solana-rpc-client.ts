@@ -33,10 +33,26 @@ export interface SolanaSignatureInfo {
 
 // Solana's parsed getTransaction response is nested and polymorphic. We only
 // consume a few top-level fields; callers pick what they need from `raw`.
+export interface SolanaTokenBalance {
+  accountIndex?: number;
+  mint: string;
+  owner?: string;
+  uiTokenAmount: { amount: string; decimals: number };
+}
+
 export interface SolanaTransactionResponse {
   slot: number;
   blockTime: number | null;
-  meta: { err: unknown | null; fee: number; preBalances: number[]; postBalances: number[] } | null;
+  meta: {
+    err: unknown | null;
+    fee: number;
+    preBalances: number[];
+    postBalances: number[];
+    // Present when the tx touched any SPL token account. `owner` is populated
+    // under jsonParsed encoding, which is what getTransaction requests.
+    preTokenBalances?: SolanaTokenBalance[];
+    postTokenBalances?: SolanaTokenBalance[];
+  } | null;
   transaction: {
     message: {
       accountKeys: Array<string | { pubkey: string; signer: boolean; writable: boolean }>;
