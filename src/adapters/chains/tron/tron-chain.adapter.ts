@@ -329,6 +329,12 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
 
     async getBalance(args): Promise<AmountRaw> {
       const client = getClient(args.chainId);
+      // Native gas (TRX) isn't in TOKEN_REGISTRY (only USDC/USDT for Tron),
+      // so route around findToken when fee-wallet checks ask for "TRX".
+      if (args.token === "TRX") {
+        const acct = await client.getAccount(args.address);
+        return acct.balanceSun as AmountRaw;
+      }
       const token = findToken(args.chainId as ChainId, args.token);
       if (!token) {
         throw new Error(`Tron getBalance: unknown token ${args.token} on chain ${args.chainId}`);

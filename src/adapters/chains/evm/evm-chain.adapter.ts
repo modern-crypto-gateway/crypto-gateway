@@ -324,6 +324,16 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
 
     async getBalance(args): Promise<AmountRaw> {
       const client = getClient(args.chainId);
+      // Native gas token short-circuit. TOKEN_REGISTRY lists only payment
+      // tokens (USDC/USDT) — native gas (ETH/MATIC/BNB/AVAX) isn't there
+      // because the gateway doesn't accept native as a payment token. Fee-
+      // wallet balance checks still need to read native, so route around
+      // findToken when the requested symbol matches the chain's native.
+      const nativeSym = NATIVE_SYMBOLS[args.chainId] ?? "ETH";
+      if (args.token === nativeSym) {
+        const balance = await client.getBalance({ address: args.address as Hex });
+        return balance.toString() as AmountRaw;
+      }
       const token = findToken(args.chainId as ChainId, args.token);
       if (!token) {
         throw new Error(`EVM getBalance: unknown token ${args.token} on chain ${args.chainId}`);
