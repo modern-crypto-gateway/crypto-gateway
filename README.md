@@ -339,6 +339,45 @@ for Solana) and **immediately removes it from the watch list** via
 mint/burn events on the zero address. Real HD-derived addresses come from
 the address pool (below).
 
+## Supported tokens
+
+Native gas tokens are **first-class** alongside stablecoins — invoices and
+payouts treat them identically. Cross-reference the live picture with
+`GET /admin/chains` (each row's `tokens` array enumerates exactly what's
+registered for that chainId).
+
+| Chain | chainId | Native | Stables |
+| --- | --- | --- | --- |
+| Ethereum | 1 | ETH | USDC, USDT |
+| Optimism | 10 | ETH | USDC, USDT |
+| BNB Smart Chain | 56 | BNB | USDC, USDT |
+| Polygon | 137 | POL | USDC, USDT |
+| Base | 8453 | ETH | USDC, USDT |
+| Arbitrum One | 42161 | ETH | USDC, USDT |
+| Avalanche C-Chain | 43114 | AVAX | USDC, USDT |
+| Sepolia (testnet) | 11155111 | ETH | USDC |
+| Tron mainnet | 728126428 | TRX | USDC, USDT |
+| Tron Nile (testnet) | 3448148188 | TRX | USDT |
+| Solana mainnet | 900 | SOL | USDC, USDT |
+| Solana devnet | 901 | SOL | — |
+
+Notes:
+- **Decimals differ.** Most stables are 6 decimals; BNB-chain USDC/USDT are
+  18; native gas is 18 for all EVM chains, 6 for TRX (sun), 9 for SOL
+  (lamports). Always quote against the per-token `decimals` from
+  `/admin/chains` — never assume 6.
+- **Universal acceptance via `amountUSD`.** A USD-pegged invoice can be paid
+  in **any combination** of registered tokens at the same address. Each
+  transfer's USD value is computed at detection time via the rate snapshot
+  and summed. e.g. $50 USDC + $50 ETH = $100 invoice → confirmed.
+- **Single-token invoices** (`amountRaw + token`) only credit the quoted
+  token. Wrong-token transfers at the address still get logged for audit
+  but don't satisfy the invoice.
+- **Tron native (TRX) detection** routes through TronGrid
+  (`/v1/accounts/{addr}/transactions`); Alchemy's Tron RPC has no indexed
+  address-history endpoints. Outbound (payouts) works through either
+  TronGrid or Alchemy.
+
 ## Multi-family invoice acceptance
 
 An invoice can accept payment across multiple chain families. The merchant sets
@@ -382,9 +421,10 @@ chains (Ethereum, Polygon, Base, Arbitrum, OP, Avalanche, BSC) against the
 chains. Tron and Solana each get their own canonical address.
 
 Omitting `acceptedFamilies` defaults to `[familyOf(chainId)]` — single-family
-invoices keep working without change. In A1.b, the **token** is still scoped
-per-chain; A2 introduces USD-pegged amounts and any-token acceptance within
-a family (e.g. pay $100 in USDC, USDT, or native ETH on any EVM chain).
+invoices keep working without change. Use `amountUSD` instead of
+`amountRaw` to make the invoice payable in **any registered token** on the
+accepted families (USDC + USDT + native ETH/POL/BNB/AVAX, in any
+combination). See "Supported tokens" above for the per-chain symbol list.
 
 ## Address pool
 

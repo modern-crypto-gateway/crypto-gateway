@@ -1832,14 +1832,23 @@ components:
             a token amount at creation via the price oracle.
       properties:
         chainId: { type: integer }
-        token: { type: string, pattern: "^[A-Z0-9]+$" }
+        token:
+          type: string
+          pattern: "^[A-Z0-9]+$"
+          description: |
+            Any symbol registered on this `chainId`, including native gas
+            tokens (ETH/POL/BNB/AVAX/TRX/SOL) — natives are first-class
+            alongside USDC/USDT. Discover the valid symbols per chain via
+            `GET /admin/chains` (each row's `tokens` array).
         amountUsd:
           type: string
           pattern: "^\\d+(\\.\\d{1,8})?$"
           description: |
-            USD-pegged target. Combined with `acceptedFamilies` lets the same
-            invoice be settled in USDC, USDT, ETH, SOL, TRX, etc. across every
-            wired chain.
+            USD-pegged target — the invoice can be settled in **any
+            combination** of registered tokens at the receive address. Each
+            transfer is converted to USD via the rate snapshot at detection
+            time and summed. e.g. $50 USDC + $50 ETH satisfies a $100
+            invoice. Pair with `acceptedFamilies` to span every wired chain.
         acceptedFamilies:
           type: array
           items: { type: string, enum: [evm, tron, solana] }
@@ -1851,7 +1860,12 @@ components:
         amountRaw:
           type: string
           pattern: "^\\d+$"
-          description: Raw token amount in smallest units.
+          description: |
+            Raw token amount in smallest units (wei for 18-dec ETH/POL/BNB/AVAX,
+            sun for TRX, lamports for SOL, micro-units for 6-dec USDC/USDT).
+            Single-token invoices: only the quoted `token` credits toward this
+            target — wrong-token transfers at the receive address are logged for
+            audit but ignored. Use `amountUsd` if you want universal acceptance.
         fiatAmount:
           type: string
           pattern: "^\\d+(\\.\\d+)?$"
@@ -2089,7 +2103,13 @@ components:
           rate.
       properties:
         chainId: { type: integer }
-        token: { type: string }
+        token:
+          type: string
+          description: |
+            Any symbol registered on this `chainId`, including native gas
+            tokens (ETH/POL/BNB/AVAX/TRX/SOL) — natives are first-class for
+            payouts, not just stablecoins. Discover the valid symbols per
+            chain via `GET /admin/chains` (each row's `tokens` array).
         amountRaw:
           type: string
           pattern: "^\\d+$"

@@ -865,7 +865,7 @@
                   { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
                 ],
                 "body": { "mode": "raw", "raw": "{\n  \"chainId\": 1,\n  \"token\": \"USDC\",\n  \"amountUsd\": \"25.00\",\n  \"acceptedFamilies\": [\"evm\", \"tron\", \"solana\"],\n  \"externalId\": \"{{runExternalId}}\"\n}" },
-                "description": "USD-pegged invoice payable from ANY supported chain in ANY token the gateway can price. Difference vs. `Multi-family — USDT`:\n\n- `amountUsd` instead of `amountRaw` — invoice tracks the $25 target across whichever token/chain pays.\n- Rates are pinned at creation for 10 minutes (the rate window). Pay with USDC on Polygon, ETH on Ethereum, USDT on Tron, SOL on Solana — all convert via the pinned snapshot.\n- `chainId` + `token` are the *primary* family (used for the legacy `receiveAddress`). Real acceptance is everything in `acceptedFamilies`.\n\nResponse contains `acceptedFamilies`, `receiveAddresses[]`, `amountUsd`, `paidUsd`, `rates`, and `rateWindowExpiresAt`. Follow up with `Get invoice` to see the live USD breakdown + per-tx detail (including any reverted/detected rows).\n\nThe checkout page (`GET /checkout/:id`) renders one row per (chain, token) combination via the `payableTokens` field — pre-computed minimum amounts ready to pay."
+                "description": "USD-pegged invoice payable from ANY supported chain in ANY registered token — including native gas tokens. Difference vs. `Multi-family — USDT`:\n\n- `amountUsd` instead of `amountRaw` — invoice tracks the $25 target across whichever token/chain pays.\n- **Universal token acceptance.** Stable + native are equally first-class. Pay with USDC on Arbitrum, ETH on Ethereum, USDT on Tron, TRX on Tron, POL on Polygon, AVAX on Avalanche, BNB on BSC, SOL on Solana — even mix them: $15 USDC + $10 ETH satisfies a $25 invoice. Each transfer's USD value is computed at detection time via the pinned rate snapshot and summed.\n- Rates are pinned at creation for 10 minutes (the rate window).\n- `chainId` + `token` are the *primary* family (used for the legacy `receiveAddress`). Real acceptance is everything in `acceptedFamilies`.\n\nResponse contains `acceptedFamilies`, `receiveAddresses[]`, `amountUsd`, `paidUsd`, `rates`, and `rateWindowExpiresAt`. Follow up with `Get invoice` to see the live USD breakdown + per-tx detail (including any reverted/detected rows).\n\nThe checkout page (`GET /checkout/:id`) renders one row per (chain, token) combination via the `payableTokens` field — pre-computed minimum amounts ready to pay."
               },
               "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const b=pm.response.json(); if(b.invoice){pm.environment.set('invoiceId',b.invoice.id); pm.environment.set('invoiceReceiveAddress',b.invoice.receiveAddress);}"] } }]
             },
@@ -904,7 +904,7 @@
               "mode": "raw",
               "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"destinationAddress\": \"{{destinationAddress}}\"\n}"
             },
-            "description": "Creates a `planned` payout. The `executeReservedPayouts` cron job picks it up, CAS-reserves a fee wallet, builds + signs + broadcasts the transfer. Polls `getConfirmationStatus` each tick until finalized.\n\n**Amount input (pick exactly one):**\n- `amountRaw` — uint256 string in token's smallest unit (e.g. `\"1000000\"` = 1 USDC)\n- `amount` — human decimal string (e.g. `\"1.5\"`); converted via BigInt against `token.decimals`. Too many decimal places → 400 `BAD_AMOUNT`.\n- `amountUSD` — fiat-pegged decimal (e.g. `\"10.00\"`); converted via the price oracle at create time. Resolved rate snapshotted onto `quotedRate` + `quotedAmountUsd` for audit. Supported on **all** tokens (stable + volatile). For non-stable tokens (ETH/MATIC/...) the broadcast happens later, so the executed payout's market value drifts from `amountUSD`. Oracle outage → 503 `ORACLE_FAILED`; never substitutes a stale rate.\n\nOptional per-payout webhook override: pass `webhookUrl` + `webhookSecret` together to route this payout's events (`payout.submitted`, `payout.confirmed`, `payout.failed`) to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned. Dispatch precedence: payout override → merchant default → skip. See `Plan payout (with per-payout webhook)` for an example."
+            "description": "Creates a `planned` payout. The `executeReservedPayouts` cron job picks it up, CAS-reserves a fee wallet, builds + signs + broadcasts the transfer. Polls `getConfirmationStatus` each tick until finalized.\n\n**Token symbol** can be any registered on the chain — stablecoins (USDC/USDT) **and** native gas (ETH/POL/BNB/AVAX/TRX/SOL). Natives are first-class. Discover valid symbols per chain via `GET /admin/chains`.\n\n**Amount input (pick exactly one):**\n- `amountRaw` — uint256 string in token's smallest unit (e.g. `\"1000000\"` = 1 USDC, `\"1000000000000000000\"` = 1 ETH)\n- `amount` — human decimal string (e.g. `\"1.5\"`); converted via BigInt against `token.decimals`. Too many decimal places → 400 `BAD_AMOUNT`.\n- `amountUSD` — fiat-pegged decimal (e.g. `\"10.00\"`); converted via the price oracle at create time. Resolved rate snapshotted onto `quotedRate` + `quotedAmountUsd` for audit. Supported on **all** tokens (stable + volatile). For non-stable tokens (ETH/POL/...) the broadcast happens later, so the executed payout's market value drifts from `amountUSD`. Oracle outage → 503 `ORACLE_FAILED`; never substitutes a stale rate.\n\nOptional per-payout webhook override: pass `webhookUrl` + `webhookSecret` together to route this payout's events (`payout.submitted`, `payout.confirmed`, `payout.failed`) to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned. Dispatch precedence: payout override → merchant default → skip. See `Plan payout (with per-payout webhook)` for an example."
           },
           "event": [
             {
@@ -946,6 +946,38 @@
               }
             }
           ]
+        },
+        {
+          "name": "Plan native payout — Arbitrum ETH (decimal amount)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 42161,\n  \"token\": \"ETH\",\n  \"amount\": \"0.05\",\n  \"destinationAddress\": \"0x16214769e25a97256419aeea44b35b4a72ddc4c1\"\n}"
+            },
+            "description": "Sends 0.05 ETH on Arbitrum from a fee wallet. Native gas tokens (ETH/POL/BNB/AVAX/TRX/SOL) are first-class — no separate API, just pass the native symbol as `token`. The adapter takes the `isNative` branch internally (no contract call, value:amount in the tx). The fee wallet must be funded with ETH on the destination chain — check via `GET /admin/fee-wallets?chainId=42161&includeBalance=true`."
+          }
+        },
+        {
+          "name": "Plan native payout — Tron TRX (USD-pegged)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 728126428,\n  \"token\": \"TRX\",\n  \"amountUSD\": \"5.00\",\n  \"destinationAddress\": \"TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7\"\n}"
+            },
+            "description": "Sends $5 worth of native TRX on Tron mainnet. The price oracle resolves TRX/USD at create time; the resolved rate is snapshotted on the row as `quotedRate` (e.g. `\"0.25\"` for $0.25 per TRX → ~20 TRX). Note: TRX is volatile, so the actual broadcast value may drift slightly from $5 by the time the cron picks it up. Oracle outage → 503 `ORACLE_FAILED`."
+          }
         },
         {
           "name": "Plan payout (with per-payout webhook)",
