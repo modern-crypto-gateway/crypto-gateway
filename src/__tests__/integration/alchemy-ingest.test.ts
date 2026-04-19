@@ -251,19 +251,53 @@ describe("POST /webhooks/alchemy", () => {
     expect(Number(count?.n)).toBe(0);
   });
 
-  it("skips non-token categories (external / internal)", async () => {
+  it("detects native (external/internal) transfers as the chain's native symbol", async () => {
+    const invoice = await createInvoiceViaApi(booted, {
+      merchantId: MERCHANT_ID,
+      chainId: 1,
+      token: "ETH",
+      amountRaw: "1000000000000000000" // 1 ETH (18 decimals)
+    });
+
+    const body = buildPayload([
+      {
+        fromAddress: "0x1111111111111111111111111111111111111111",
+        toAddress: invoice.receiveAddress,
+        blockNum: "0x1234",
+        hash: `0x${"b".repeat(64)}`,
+        category: "external", // native ETH transfer between EOAs
+        rawContract: {
+          rawValue: "0xde0b6b3a7640000", // 1 * 10^18 wei
+          address: undefined, // native has no contract
+          decimals: 18
+        }
+      }
+    ]);
+
+    const res = await booted.app.fetch(await signedRequest(body));
+    expect(res.status).toBe(200);
+    await booted.deps.jobs.drain(2_000);
+
+    const [tx] = await booted.deps.db
+      .select({ invoice_id: transactions.invoiceId, amount_raw: transactions.amountRaw, token: transactions.token })
+      .from(transactions)
+      .where(eq(transactions.txHash, `0x${"b".repeat(64)}`))
+      .limit(1);
+    expect(tx).toBeDefined();
+    expect(tx?.invoice_id).toBe(invoice.id);
+    expect(tx?.token).toBe("ETH");
+    expect(tx?.amount_raw).toBe("1000000000000000000");
+  });
+
+  it("ignores categories other than token/external/internal (e.g. erc721)", async () => {
     const body = buildPayload([
       {
         fromAddress: "0x1111111111111111111111111111111111111111",
         toAddress: "0x2222222222222222222222222222222222222222",
         blockNum: "0x1",
         hash: "0xfd",
-        category: "external", // native transfer — not supported in Phase 4b
-        rawContract: {
-          rawValue: "0x1",
-          address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-          decimals: 18
-        }
+        category: "erc721",
+        rawContract: { rawValue: "0x1", address: "0xdeadbeef", decimals: 0 }
       }
     ]);
     const res = await booted.app.fetch(await signedRequest(body));

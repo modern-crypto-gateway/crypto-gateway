@@ -29,6 +29,20 @@ export interface TrongridTrc20Transfer {
   type: string;
 }
 
+// Native TRX transfer surfaced by GET /v1/accounts/{addr}/transactions.
+// The endpoint returns full Tron transactions; we project only what we need.
+// `txID` is the Tron canonical id; `blockNumber` is set when the tx is
+// included; `value` is in sun (1 TRX = 10^6 sun).
+export interface TrongridTrxTransfer {
+  txID: string;
+  blockNumber: number;
+  blockTimestamp: number;
+  from: string;
+  to: string;
+  // Sun (TRX's smallest unit). String to stay consistent with TRC-20 amounts.
+  value: string;
+}
+
 export interface TrongridTxInfo {
   blockNumber?: number;
   receipt?: { result?: string };
@@ -105,6 +119,16 @@ export interface TronRpcBackend {
     address: string,
     opts?: { minTimestamp?: number; contractAddress?: string; limit?: number }
   ): Promise<readonly TrongridTrc20Transfer[]>;
+  // Address-indexed list of native TRX transfers crediting `address`. Backed
+  // by TronGrid's `/v1/accounts/{addr}/transactions` endpoint, filtered to
+  // `TransferContract` records (native TRX moves; TRC-20 lives at the
+  // `/trc20` sibling endpoint). Alchemy's Tron RPC has no equivalent yet —
+  // alchemyTronBackend throws TronProviderNotSupportedError so the composite
+  // client falls through to a TronGrid backend when paired.
+  listTrxTransfers(
+    address: string,
+    opts?: { minTimestamp?: number; limit?: number }
+  ): Promise<readonly TrongridTrxTransfer[]>;
   getTransactionInfo(txId: string): Promise<TrongridTxInfo | null>;
   getNowBlock(): Promise<TrongridBlock>;
   triggerSmartContract(params: TriggerSmartContractParams): Promise<TrongridTriggerSmartContractResponse>;
@@ -164,6 +188,56 @@ export function tronGridBackend(config: TronGridBackendConfig): TronRpcBackend {
         `/v1/accounts/${address}/transactions/trc20?${params.toString()}`
       );
       return response.data ?? [];
+    },
+    async listTrxTransfers(address, opts = {}) {
+      // `/v1/accounts/{addr}/transactions` returns full Tron txs (any type:
+      // native transfer, smart-contract trigger, freeze, vote, …). We filter
+      // to `TransferContract` (native TRX) and `to === address` to drop
+      // outbound + cross-account txs the operator isn't watching for here.
+      // `searchInternal=false` keeps internal contract-call TRX moves out;
+      // those should surface through TRC-20 / contract-event paths instead.
+      const params = new URLSearchParams({
+        only_to: "true",
+        only_confirmed: "true",
+        search_internal: "false"
+      });
+      if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+      if (opts.minTimestamp !== undefined) params.set("min_timestamp", String(opts.minTimestamp));
+      type RawTx = {
+        txID?: string;
+        blockNumber?: number;
+        block_timestamp?: number;
+        raw_data?: {
+          contract?: ReadonlyArray<{
+            type?: string;
+            parameter?: { value?: { amount?: number | string; owner_address?: string; to_address?: string } };
+          }>;
+        };
+      };
+      const response = await base.request<{ data?: readonly RawTx[] }>(
+        `/v1/accounts/${address}/transactions?${params.toString()}`
+      );
+      const out: TrongridTrxTransfer[] = [];
+      for (const tx of response.data ?? []) {
+        const contract = tx.raw_data?.contract?.[0];
+        if (contract?.type !== "TransferContract") continue;
+        const v = contract.parameter?.value;
+        if (!v?.owner_address || !v?.to_address || v.amount === undefined) continue;
+        if (!tx.txID || tx.blockNumber === undefined || tx.block_timestamp === undefined) continue;
+        // TronGrid returns hex-prefixed addresses (41-prefix). Caller
+        // (tron-chain.adapter scanIncoming) re-canonicalizes to base58 via
+        // `chainAdapter.canonicalizeAddress` before matching against
+        // invoice receive addresses.
+        out.push({
+          txID: tx.txID,
+          blockNumber: tx.blockNumber,
+          blockTimestamp: tx.block_timestamp,
+          from: v.owner_address,
+          to: v.to_address,
+          value: String(v.amount)
+        });
+      }
+      return out;
     },
     async getTransactionInfo(txId) {
       const body = await base.request<TrongridTxInfo & Record<string, unknown>>(
@@ -252,6 +326,9 @@ export function alchemyTronBackend(config: AlchemyTronBackendConfig): TronRpcBac
     supportsDetection: false,
     async listTrc20Transfers() {
       throw new TronProviderNotSupportedError("alchemy-tron", "listTrc20Transfers");
+    },
+    async listTrxTransfers() {
+      throw new TronProviderNotSupportedError("alchemy-tron", "listTrxTransfers");
     },
     async getTransactionInfo(txId) {
       const body = await base.request<TrongridTxInfo & Record<string, unknown>>(
@@ -348,6 +425,8 @@ export function tronCompositeClient(
     supportsDetection: anySupportsDetection,
     listTrc20Transfers: (address, opts2) =>
       tryEach("listTrc20Transfers", (b) => b.listTrc20Transfers(address, opts2)),
+    listTrxTransfers: (address, opts2) =>
+      tryEach("listTrxTransfers", (b) => b.listTrxTransfers(address, opts2)),
     getTransactionInfo: (txId) => tryEach("getTransactionInfo", (b) => b.getTransactionInfo(txId)),
     getNowBlock: () => tryEach("getNowBlock", (b) => b.getNowBlock()),
     triggerSmartContract: (params) =>

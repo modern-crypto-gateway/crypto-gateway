@@ -29,7 +29,8 @@ const NATIVE_SYMBOLS: Readonly<Record<number, string>> = {
   8453: "ETH",
   11155111: "ETH",
   56: "BNB",
-  137: "POL"
+  137: "POL",
+  43114: "AVAX"
 };
 
 // Default BIP44 derivation path prefix for EVM. addressIndex is appended.
@@ -162,6 +163,13 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         .map((sym) => findToken(chainId as ChainId, sym))
         .filter((t): t is NonNullable<typeof t> => t !== null);
 
+      // RPC-poll only handles ERC-20 (one event-log filter per token contract).
+      // Native incoming (ETH/MATIC/BNB/AVAX) intentionally falls through to
+      // the Alchemy webhook path (handlePush), which receives `category:
+      // "external"`/`"internal"` events. Block-walking 2k blocks × ~200 txs
+      // each just to find native receives would be a heavy hot path; webhooks
+      // are the right tool. Chains without Alchemy coverage get no native
+      // detection on this code path — accepted limitation for now.
       const erc20Targets = targetTokens.filter((t) => t.contractAddress !== null);
 
       // One log query per token. We could do one call across all contracts,

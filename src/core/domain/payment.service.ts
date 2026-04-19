@@ -614,12 +614,22 @@ export async function recomputeInvoiceFromTransactions(
   // Sum across contributing txs. We include both 'detected' and 'confirmed'
   // because partial-payment progress should update as soon as a transfer is
   // observed, not wait for confirmation. Reverted/orphaned are excluded.
+  //
+  // Token filter is critical: with native tokens (ETH/POL/BNB/AVAX/TRX) now
+  // first-class in the registry, an Alchemy webhook can push e.g. an ETH
+  // transfer at the receive address of a USDC invoice. The amounts are in
+  // incomparable units (1 wei vs 1 micro-USDC); summing them blindly would
+  // wrongly confirm the invoice. The wrong-token tx still gets recorded
+  // (linked to the invoice for audit) but doesn't credit toward the total.
+  // The USD-path recompute doesn't need this filter — it sums `amount_usd`
+  // which normalizes across tokens.
   const contributing = await deps.db
     .select({ amountRaw: transactions.amountRaw, status: transactions.status })
     .from(transactions)
     .where(
       and(
         eq(transactions.invoiceId, invoiceRow.id),
+        eq(transactions.token, invoiceRow.token),
         inArray(transactions.status, ["detected", "confirmed"])
       )
     );

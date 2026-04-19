@@ -193,6 +193,76 @@ describe("PaymentService.ingestDetectedTransfer", () => {
       .limit(1);
     expect(row?.invoice_id).toBeNull();
   });
+
+  it("does NOT credit a wrong-token transfer toward a single-token invoice (Alchemy webhook fans out all native+ERC-20 activity at the address)", async () => {
+    // Single-token invoice: 1 DEV @ 6 decimals = "1000000".
+    const invoice = await createInvoice(booted, { amountRaw: "1000000" });
+
+    // Wrong token at the same address — would happen if a user sent ETH/USDC
+    // to a USDC invoice's receive address and the Alchemy webhook pushed
+    // all activity. Amount is huge in raw units (more than the DEV target)
+    // so a unit-blind sum would wrongly confirm the invoice.
+    const wrongTokenResult = await ingestDetectedTransfer(booted.deps, {
+      chainId: 999,
+      txHash: "0xwrong",
+      logIndex: 0,
+      fromAddress: "0x0000000000000000000000000000000000000001",
+      toAddress: invoice.receiveAddress,
+      token: "USDC",
+      amountRaw: "999999999999999999999",
+      blockNumber: 100,
+      confirmations: 0,
+      seenAt: new Date()
+    });
+    // The tx still gets recorded and linked to the invoice for audit, but the
+    // invoice MUST stay in `created` (no credit toward the DEV-denominated
+    // total) and `received_amount_raw` MUST stay 0.
+    expect(wrongTokenResult.inserted).toBe(true);
+    expect(wrongTokenResult.invoiceStatusBefore).toBe("created");
+    expect(wrongTokenResult.invoiceStatusAfter).toBe("created");
+
+    const [invoiceRow] = await booted.deps.db
+      .select({ status: invoices.status, received: invoices.receivedAmountRaw })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
+    expect(invoiceRow?.status).toBe("created");
+    expect(invoiceRow?.received).toBe("0");
+
+    // Audit row exists with the invoice link — operator can still see what landed.
+    const [auditRow] = await booted.deps.db
+      .select({ invoice_id: transactions.invoiceId, token: transactions.token })
+      .from(transactions)
+      .where(eq(transactions.txHash, "0xwrong"))
+      .limit(1);
+    expect(auditRow?.invoice_id).toBe(invoice.id);
+    expect(auditRow?.token).toBe("USDC");
+
+    // Now the matching-token transfer covers the invoice — it should confirm
+    // (well, detect — confirmation comes via the cron). The presence of the
+    // earlier wrong-token row must not interfere.
+    const correctResult = await ingestDetectedTransfer(booted.deps, {
+      chainId: 999,
+      txHash: "0xcorrect",
+      logIndex: 0,
+      fromAddress: "0x0000000000000000000000000000000000000001",
+      toAddress: invoice.receiveAddress,
+      token: "DEV",
+      amountRaw: "1000000",
+      blockNumber: 101,
+      confirmations: 0,
+      seenAt: new Date()
+    });
+    expect(correctResult.invoiceStatusAfter).toBe("detected");
+
+    const [afterRow] = await booted.deps.db
+      .select({ status: invoices.status, received: invoices.receivedAmountRaw })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
+    expect(afterRow?.status).toBe("detected");
+    expect(afterRow?.received).toBe("1000000");
+  });
 });
 
 describe("PaymentService.confirmTransactions", () => {

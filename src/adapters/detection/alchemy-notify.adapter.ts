@@ -331,14 +331,26 @@ function parseActivity(
   const { fromAddress, toAddress, hash, blockNum, category } = activity;
   if (!fromAddress || !toAddress || !hash) return null;
 
-  // Only token transfers are supported in Phase 4b. Native (category "external")
-  // can be added when the EVM adapter grows a native-scan path.
-  if (category !== "token") return null;
-
-  const contractAddress = activity.rawContract?.address;
-  if (!contractAddress) return null;
-  const symbol = symbolByContract.get(contractAddress.toLowerCase());
-  if (!symbol) return null;
+  // Resolve the token symbol from the activity's category:
+  //   - "token"    → ERC-20 transfer; symbol comes from rawContract.address
+  //                  → registry lookup. Unknown contracts are skipped.
+  //   - "external" → native gas-token transfer between EOAs (ETH/MATIC/BNB/...).
+  //                  Symbol comes from the chain adapter's nativeSymbol map.
+  //   - "internal" → native sent FROM a contract via internal CALL (forwarders,
+  //                  multicalls, etc.). Same native-symbol resolution.
+  // Anything else (e.g. "erc721", "erc1155") is ignored — we don't index NFTs.
+  let symbol: string;
+  if (category === "token") {
+    const contractAddress = activity.rawContract?.address;
+    if (!contractAddress) return null;
+    const matched = symbolByContract.get(contractAddress.toLowerCase());
+    if (!matched) return null;
+    symbol = matched;
+  } else if (category === "external" || category === "internal") {
+    symbol = chainAdapter.nativeSymbol(chainId);
+  } else {
+    return null;
+  }
 
   const rawValueHex = activity.rawContract?.rawValue;
   if (!rawValueHex) return null;

@@ -14,6 +14,11 @@ function stubBackend(name: string, overrides: Partial<TronRpcBackend>): TronRpcB
       (async () => {
         throw new Error(`${name}.listTrc20Transfers: unexpected call`);
       }),
+    listTrxTransfers:
+      overrides.listTrxTransfers ??
+      (async () => {
+        throw new Error(`${name}.listTrxTransfers: unexpected call`);
+      }),
     getTransactionInfo:
       overrides.getTransactionInfo ??
       (async () => {

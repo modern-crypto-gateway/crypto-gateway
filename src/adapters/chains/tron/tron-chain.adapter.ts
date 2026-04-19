@@ -11,6 +11,7 @@ import type { BuildTransferArgs, EstimateArgs, UnsignedTx } from "../../../core/
 import { bytesToHex } from "../../crypto/subtle.js";
 import {
   decodeTronAddress,
+  hexAddressToTron,
   isValidTronAddress,
   privateKeyToTronAddress,
   tronToEvmCoreHex
@@ -142,20 +143,24 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       const now = Date.now();
       const minTimestamp = Math.max(sinceMs, now - maxScanWindowMs);
 
-      // Map requested token symbols -> contract addresses for this chain.
+      // Resolve requested token symbols against the registry, then split into
+      // TRC-20 (contractAddress !== null) and native TRX (contractAddress === null).
+      // Each takes a different TronGrid endpoint so we fan out separately.
       const targets = tokens
         .map((sym) => findToken(chainId as ChainId, sym))
-        .filter((t): t is NonNullable<typeof t> => t !== null && t.contractAddress !== null);
+        .filter((t): t is NonNullable<typeof t> => t !== null);
+      const trc20Targets = targets.filter((t) => t.contractAddress !== null);
+      const wantsNative = targets.some((t) => t.contractAddress === null);
 
-      const allowedContracts = new Set(targets.map((t) => t.contractAddress!));
+      const allowedContracts = new Set(trc20Targets.map((t) => t.contractAddress!));
       const addressSet = new Set(addresses.map((a) => a));
-      const symbolByContract = new Map(targets.map((t) => [t.contractAddress!, t.symbol]));
+      const symbolByContract = new Map(trc20Targets.map((t) => [t.contractAddress!, t.symbol]));
 
       // Fan out: one listTrc20Transfers call per (address x contract). TronGrid
       // doesn't offer a multi-contract filter, so this is the natural shape.
       const calls: Array<Promise<readonly DetectedTransfer[]>> = [];
       for (const addr of addresses) {
-        for (const target of targets) {
+        for (const target of trc20Targets) {
           calls.push(
             client
               .listTrc20Transfers(addr, {
@@ -183,6 +188,44 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
                     seenAt: new Date(t.block_timestamp)
                   }))
               )
+          );
+        }
+      }
+
+      // Native TRX path: `/v1/accounts/{addr}/transactions` already returns
+      // one row per native TransferContract crediting `addr` (the backend
+      // does the filtering). TronGrid emits hex 41-prefix addresses; convert
+      // back to base58check so they match invoice receive addresses.
+      if (wantsNative) {
+        for (const addr of addresses) {
+          calls.push(
+            client.listTrxTransfers(addr, { minTimestamp, limit: 200 }).then((transfers) =>
+              transfers.flatMap<DetectedTransfer>((t) => {
+                let toCanonical: string;
+                let fromCanonical: string;
+                try {
+                  toCanonical = hexAddressToTron(t.to);
+                  fromCanonical = hexAddressToTron(t.from);
+                } catch {
+                  return [];
+                }
+                if (!addressSet.has(toCanonical as Address)) return [];
+                return [
+                  {
+                    chainId: chainId as ChainId,
+                    txHash: t.txID,
+                    logIndex: null,
+                    fromAddress: fromCanonical,
+                    toAddress: toCanonical,
+                    token: "TRX" as TokenSymbol,
+                    amountRaw: t.value as AmountRaw,
+                    blockNumber: t.blockNumber,
+                    confirmations: 0,
+                    seenAt: new Date(t.blockTimestamp)
+                  }
+                ];
+              })
+            )
           );
         }
       }

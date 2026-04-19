@@ -5,7 +5,100 @@ import type { TokenInfo, TokenSymbol } from "./token.js";
 // Phase 8 can promote it to a DB-backed or config-backed source if merchants
 // need to register custom tokens. For now a data-literal keeps the surface small.
 
+// Native tokens are first-class citizens in the registry — same treatment as
+// USDC/USDT for both invoices (incoming) and payouts (outgoing). They share
+// `contractAddress: null` with the dev token, which adapters already special-
+// case for build/balance/scan paths. `isStable: false` for every native; the
+// rate window snapshots a real USD rate at create time.
 export const TOKEN_REGISTRY: readonly TokenInfo[] = [
+  // ===== Native gas tokens =====
+  // ETH on Ethereum mainnet + every EVM L2 we serve. All 18 decimals (EVM standard).
+  {
+    symbol: "ETH" as TokenSymbol,
+    chainId: 1 as ChainId,
+    contractAddress: null,
+    decimals: 18,
+    isStable: false,
+    displayName: "Ether"
+  },
+  {
+    symbol: "ETH" as TokenSymbol,
+    chainId: 10 as ChainId,
+    contractAddress: null,
+    decimals: 18,
+    isStable: false,
+    displayName: "Ether (Optimism)"
+  },
+  {
+    symbol: "ETH" as TokenSymbol,
+    chainId: 8453 as ChainId,
+    contractAddress: null,
+    decimals: 18,
+    isStable: false,
+    displayName: "Ether (Base)"
+  },
+  {
+    symbol: "ETH" as TokenSymbol,
+    chainId: 42161 as ChainId,
+    contractAddress: null,
+    decimals: 18,
+    isStable: false,
+    displayName: "Ether (Arbitrum)"
+  },
+  {
+    symbol: "ETH" as TokenSymbol,
+    chainId: 11155111 as ChainId,
+    contractAddress: null,
+    decimals: 18,
+    isStable: false,
+    displayName: "Ether (Sepolia)"
+  },
+  // POL on Polygon (formerly MATIC; the asset rebranded in 2024). 18 decimals.
+  {
+    symbol: "POL" as TokenSymbol,
+    chainId: 137 as ChainId,
+    contractAddress: null,
+    decimals: 18,
+    isStable: false,
+    displayName: "Polygon"
+  },
+  // BNB on BSC. 18 decimals (matches BSC's BEP-20 convention).
+  {
+    symbol: "BNB" as TokenSymbol,
+    chainId: 56 as ChainId,
+    contractAddress: null,
+    decimals: 18,
+    isStable: false,
+    displayName: "BNB"
+  },
+  // AVAX on Avalanche C-Chain. 18 decimals.
+  {
+    symbol: "AVAX" as TokenSymbol,
+    chainId: 43114 as ChainId,
+    contractAddress: null,
+    decimals: 18,
+    isStable: false,
+    displayName: "Avalanche"
+  },
+  // TRX on Tron mainnet + Nile testnet. 6 decimals (sun = 10^-6 TRX).
+  {
+    symbol: "TRX" as TokenSymbol,
+    chainId: 728126428 as ChainId,
+    contractAddress: null,
+    decimals: 6,
+    isStable: false,
+    displayName: "Tron"
+  },
+  {
+    symbol: "TRX" as TokenSymbol,
+    chainId: 3448148188 as ChainId,
+    contractAddress: null,
+    decimals: 6,
+    isStable: false,
+    displayName: "Tron (Nile)"
+  },
+
+  // ===== ERC-20 / TRC-20 / SPL stablecoins =====
   // Ethereum mainnet
   {
     symbol: "USDC" as TokenSymbol,

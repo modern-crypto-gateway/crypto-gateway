@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { tronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../../../adapters/chains/tron/tron-chain.adapter.js";
 import type { TronRpcBackend } from "../../../../adapters/chains/tron/tron-rpc.js";
+import { tronToEvmCoreHex } from "../../../../adapters/chains/tron/tron-address.js";
 
 // USDT TRC-20 contract on Tron mainnet, matching the token registry entry.
 const USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
@@ -14,6 +15,9 @@ function fakeClient(overrides: Partial<TronRpcBackend>): TronRpcBackend {
     supportsDetection: true,
     async listTrc20Transfers() {
       throw new Error("unexpected listTrc20Transfers call");
+    },
+    async listTrxTransfers() {
+      throw new Error("unexpected listTrxTransfers call");
     },
     async getTransactionInfo() {
       throw new Error("unexpected getTransactionInfo call");
@@ -110,6 +114,92 @@ describe("tronChainAdapter.scanIncoming", () => {
       blockNumber: 55_000_000,
       confirmations: 0
     });
+  });
+
+  it("detects native TRX incoming via listTrxTransfers and canonicalizes hex addresses", async () => {
+    const toAddr = "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL";
+    const fromAddr = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
+    // TronGrid emits hex 41-prefix addresses; the adapter must convert back
+    // to base58check before matching against the watched-address set.
+    const toHex = "41" + tronToEvmCoreHex(toAddr).slice(2);
+    const fromHex = "41" + tronToEvmCoreHex(fromAddr).slice(2);
+
+    const client = fakeClient({
+      async listTrxTransfers(address, opts) {
+        expect(address).toBe(toAddr);
+        expect(opts?.limit).toBe(200);
+        return [
+          {
+            txID: "cd".repeat(32),
+            blockNumber: 55_111_111,
+            blockTimestamp: 1_700_000_000_000,
+            from: fromHex,
+            to: toHex,
+            value: "5000000" // 5 TRX (6 decimals)
+          }
+        ];
+      }
+    });
+
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+
+    const transfers = await adapter.scanIncoming({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      addresses: [toAddr],
+      tokens: ["TRX"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]).toMatchObject({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      txHash: "cd".repeat(32),
+      logIndex: null,
+      fromAddress: fromAddr,
+      toAddress: toAddr,
+      token: "TRX",
+      amountRaw: "5000000",
+      blockNumber: 55_111_111,
+      confirmations: 0
+    });
+  });
+
+  it("drops native transfers whose `to` (after hex→base58) is not watched", async () => {
+    const ourAddr = "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL";
+    const strangerAddr = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
+    const strangerHex = "41" + tronToEvmCoreHex(strangerAddr).slice(2);
+
+    const client = fakeClient({
+      async listTrxTransfers() {
+        return [
+          {
+            txID: "ee".repeat(32),
+            blockNumber: 55_111_222,
+            blockTimestamp: 1_700_000_000_000,
+            from: strangerHex,
+            to: strangerHex,
+            value: "1000000"
+          }
+        ];
+      }
+    });
+
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+
+    const transfers = await adapter.scanIncoming({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      addresses: [ourAddr],
+      tokens: ["TRX"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    expect(transfers).toEqual([]);
   });
 
   it("filters out transfers whose `to` is not one of our watched addresses", async () => {
