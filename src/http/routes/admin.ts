@@ -21,6 +21,7 @@ import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
 import type { TokenSymbol } from "../../core/types/token.js";
 import { sha256Hex, bytesToHex, getRandomValues } from "../../adapters/crypto/subtle.js";
 import { parseAlchemyChainsEnv } from "../../adapters/chains/evm/alchemy-rpc.js";
+import { ALCHEMY_FAMILY_BY_CHAIN_ID } from "../../adapters/detection/alchemy-network.js";
 import {
   alchemyAdminClient,
   type AlchemyAdminClient
@@ -968,9 +969,23 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
   // bootstrap-readiness flags inlined so the dashboard renders the picker in
   // a single round-trip.
   //
-  //   wired:      ChainAdapter for this chainId is loaded in deps.chains
-  //   webhooks:   row exists in alchemy_webhook_registry (= POST /admin/bootstrap/alchemy-webhooks ran)
-  //   feeWallets: ≥1 ACTIVE fee wallet for this chain (deactivated wallets don't count toward "ready")
+  //   wired:             ChainAdapter for this chainId is loaded in deps.chains
+  //   webhooksSupported: chainId is in ALCHEMY_FAMILY_BY_CHAIN_ID (EVM + Solana
+  //                      networks Alchemy serves). False for Tron — it uses RPC
+  //                      polling, has no webhook concept. Frontend should hide
+  //                      the "register webhook" CTA when this is false.
+  //   alchemyConfigured: operator's ALCHEMY_CHAINS env actually includes this
+  //                      chainId (i.e. deps.alchemySubscribableChainsByFamily
+  //                      lists it). Independent of webhook registration.
+  //   webhooks:          row exists in alchemy_webhook_registry (= POST /admin/bootstrap/alchemy-webhooks ran).
+  //                      Only meaningful when webhooksSupported=true.
+  //   feeWallets:        ≥1 ACTIVE fee wallet for this chain (deactivated wallets don't count toward "ready")
+  //   detection:         "alchemy" if webhooksSupported, else "rpc-poll" — pure
+  //                      derived field, surfaced so the frontend doesn't have
+  //                      to know our chain-family taxonomy.
+  //
+  // bootstrapReady drops the webhook requirement when webhooksSupported is
+  // false, so RPC-poll chains (Tron) can still report ready when wired+funded.
   //
   // The dev chain (chainId 999) is excluded — it's an integration-test fixture,
   // not something operators should ever bootstrap. Listing it would clutter
@@ -1010,14 +1025,24 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       .where(eq(feeWallets.active, 1));
     const feeWalletChainIds = new Set(feeWalletRows.map((r) => r.chainId));
 
+    // Per-family alchemy subscription set, flattened so per-chainId lookups
+    // are O(1). Empty when the entrypoint didn't supply Alchemy config.
+    const alchemyConfiguredChainIds = new Set<number>();
+    for (const ids of Object.values(deps.alchemySubscribableChainsByFamily ?? {})) {
+      for (const id of ids ?? []) alchemyConfiguredChainIds.add(id);
+    }
+
     type ChainOut = {
       chainId: number;
       slug: string;
       family: ChainFamily;
       displayName: string;
       wired: boolean;
+      webhooksSupported: boolean;
+      alchemyConfigured: boolean;
       webhooks: boolean;
       feeWallets: boolean;
+      detection: "alchemy" | "rpc-poll";
       bootstrapReady: boolean;
       confirmationsRequired: number;
       tokens: Array<{
@@ -1051,15 +1076,20 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       if (wiredParam === "false" && wired) continue;
       const hasWebhook = webhookChainIds.has(id);
       const hasFeeWallet = feeWalletChainIds.has(id);
+      const webhooksSupported = ALCHEMY_FAMILY_BY_CHAIN_ID[id] !== undefined;
+      const alchemyConfigured = alchemyConfiguredChainIds.has(id);
       out.push({
         chainId: id,
         slug: entry.slug,
         family: entry.family,
         displayName: entry.displayName,
         wired,
+        webhooksSupported,
+        alchemyConfigured,
         webhooks: hasWebhook,
         feeWallets: hasFeeWallet,
-        bootstrapReady: wired && hasWebhook && hasFeeWallet,
+        detection: webhooksSupported ? "alchemy" : "rpc-poll",
+        bootstrapReady: wired && (!webhooksSupported || hasWebhook) && hasFeeWallet,
         confirmationsRequired: confirmationThreshold(entry.chainId, deps.confirmationThresholds),
         tokens: TOKEN_REGISTRY.filter((t) => t.chainId === entry.chainId).map((t) => ({
           symbol: t.symbol as string,
@@ -1079,15 +1109,20 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       if (wiredParam === "false") continue;
       const hasWebhook = webhookChainIds.has(id);
       const hasFeeWallet = feeWalletChainIds.has(id);
+      const webhooksSupported = ALCHEMY_FAMILY_BY_CHAIN_ID[id] !== undefined;
+      const alchemyConfigured = alchemyConfiguredChainIds.has(id);
       out.push({
         chainId: id,
         slug: chainSlug(id) ?? `chain-${id}`,
         family,
         displayName: chainEntry(id)?.displayName ?? `Chain ${id}`,
         wired: true,
+        webhooksSupported,
+        alchemyConfigured,
         webhooks: hasWebhook,
         feeWallets: hasFeeWallet,
-        bootstrapReady: hasWebhook && hasFeeWallet,
+        detection: webhooksSupported ? "alchemy" : "rpc-poll",
+        bootstrapReady: (!webhooksSupported || hasWebhook) && hasFeeWallet,
         confirmationsRequired: confirmationThreshold(id, deps.confirmationThresholds),
         tokens: TOKEN_REGISTRY.filter((t) => t.chainId === id).map((t) => ({
           symbol: t.symbol as string,

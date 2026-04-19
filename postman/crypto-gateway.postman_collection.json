@@ -359,7 +359,7 @@
               ]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "Discovery endpoint for the dashboard's bootstrap picker. Returns every chain in the static `CHAIN_REGISTRY` (minus the synthetic dev chain `999`) along with three readiness booleans per chain so the dashboard can decide bootstrap state in a single call:\n\n- `wired`          — a `ChainAdapter` for the chainId is loaded in `deps.chains`\n- `webhooks`       — a row exists in `alchemy_webhook_registry` for this chainId\n- `feeWallets`     — at least one **active** fee wallet exists for this chainId\n- `bootstrapReady` — convenience: `wired && webhooks && feeWallets`. Fully provisioned.\n\nAlso returns the static token list per chain and the confirmation threshold the gateway will apply. The dev chain (chainId 999) is excluded — it's a test-harness chain, never bootstrap real Alchemy webhooks against it.\n\nNever returns secrets (signing keys, seeds, env)."
+            "description": "Discovery endpoint for the dashboard's bootstrap picker. Returns every chain in the static `CHAIN_REGISTRY` (minus the synthetic dev chain `999`) along with three readiness booleans per chain so the dashboard can decide bootstrap state in a single call:\n\n- `wired`             — a `ChainAdapter` for the chainId is loaded in `deps.chains`\n- `webhooksSupported` — chain *can* use Alchemy webhooks (EVM + Solana). **False for Tron** — RPC-poll only, no webhook concept. Frontend should hide the 'register webhook' CTA when this is false.\n- `alchemyConfigured` — operator's `ALCHEMY_CHAINS` env actually includes this chainId.\n- `webhooks`          — row exists in `alchemy_webhook_registry`. Only meaningful when `webhooksSupported=true`.\n- `feeWallets`        — at least one **active** fee wallet exists for this chainId.\n- `detection`         — `alchemy` | `rpc-poll`. Derived from `webhooksSupported`.\n- `bootstrapReady`    — `wired && (!webhooksSupported || webhooks) && feeWallets`. Tron can be ready with just `wired+feeWallets`.\n\nAlso returns the static token list per chain and the confirmation threshold the gateway will apply. The dev chain (chainId 999) is excluded — it's a test-harness chain, never bootstrap real Alchemy webhooks against it.\n\nNever returns secrets (signing keys, seeds, env)."
           },
           "event": [
             {
@@ -373,7 +373,7 @@
                   "  pm.expect(body).to.have.property('chains');",
                   "  pm.expect(body.chains).to.be.an('array');",
                   "  if (body.chains.length > 0) {",
-                  "    pm.expect(body.chains[0]).to.include.keys(['chainId','slug','family','wired','webhooks','feeWallets','bootstrapReady','tokens']);",
+                  "    pm.expect(body.chains[0]).to.include.keys(['chainId','slug','family','wired','webhooksSupported','alchemyConfigured','webhooks','feeWallets','detection','bootstrapReady','tokens']);",
                   "  }",
                   "});",
                   "pm.test('dev chain (999) is hidden', () => {",

@@ -808,7 +808,7 @@ describe("GET /admin/chains", () => {
     expect(res.status).toBe(401);
   });
 
-  it("returns the static registry with wired/webhooks/feeWallets flags and tokens; hides the dev chain", async () => {
+  it("returns the static registry with readiness flags and tokens; hides the dev chain", async () => {
     const res = await listChains();
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -817,8 +817,11 @@ describe("GET /admin/chains", () => {
         slug: string;
         family: string;
         wired: boolean;
+        webhooksSupported: boolean;
+        alchemyConfigured: boolean;
         webhooks: boolean;
         feeWallets: boolean;
+        detection: "alchemy" | "rpc-poll";
         bootstrapReady: boolean;
         tokens: Array<{ symbol: string; decimals: number }>;
       }>;
@@ -835,7 +838,38 @@ describe("GET /admin/chains", () => {
     expect(eth?.webhooks).toBe(false);
     expect(eth?.feeWallets).toBe(false);
     expect(eth?.bootstrapReady).toBe(false);
+    // Ethereum is an Alchemy-served EVM chain.
+    expect(eth?.webhooksSupported).toBe(true);
+    expect(eth?.detection).toBe("alchemy");
+    // No ALCHEMY_CHAINS configured in the default test boot.
+    expect(eth?.alchemyConfigured).toBe(false);
     expect(eth?.tokens.map((t) => t.symbol)).toEqual(expect.arrayContaining(["USDC", "USDT"]));
+  });
+
+  it("Tron is reported as RPC-poll (no webhook capability) and bootstrapReady ignores webhooks", async () => {
+    const res = await listChains();
+    const body = (await res.json()) as {
+      chains: Array<{
+        chainId: number;
+        family: string;
+        webhooksSupported: boolean;
+        alchemyConfigured: boolean;
+        webhooks: boolean;
+        feeWallets: boolean;
+        detection: string;
+        bootstrapReady: boolean;
+      }>;
+    };
+    const tron = body.chains.find((c) => c.family === "tron");
+    expect(tron).toBeDefined();
+    expect(tron?.webhooksSupported).toBe(false);
+    expect(tron?.alchemyConfigured).toBe(false);
+    expect(tron?.detection).toBe("rpc-poll");
+    // Even though webhooks=false, bootstrapReady is gated only by wired+feeWallets
+    // for Tron. Test boot has neither wired nor a fee wallet, so still false —
+    // but the field MUST NOT be blocked by the absent webhook.
+    expect(tron?.webhooks).toBe(false);
+    expect(tron?.bootstrapReady).toBe(false);
   });
 
   it("?wired=true narrows to wired adapters only (and still hides dev)", async () => {

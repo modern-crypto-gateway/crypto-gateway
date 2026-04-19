@@ -858,11 +858,25 @@ paths:
         booleans per chain so the dashboard can decide what still needs
         bootstrapping in a single call:
 
-        - `wired`          — a `ChainAdapter` for the chainId is loaded in `deps.chains`
-        - `webhooks`       — a row exists in `alchemy_webhook_registry` for this chainId
-        - `feeWallets`     — at least one **active** fee wallet exists for this chainId
-        - `bootstrapReady` — convenience: `wired && webhooks && feeWallets`. The
-          chain is fully provisioned and can accept payments / payouts.
+        - `wired`             — a `ChainAdapter` for the chainId is loaded in `deps.chains`
+        - `webhooksSupported` — chain *can* use Alchemy webhooks (EVM + Solana
+          chains Alchemy serves). False for Tron — it's RPC-poll only and has
+          no webhook concept. **Frontend should hide the "register webhook" CTA
+          when this is false.**
+        - `alchemyConfigured` — operator's `ALCHEMY_CHAINS` env actually
+          includes this chainId. Independent of whether a webhook is registered.
+        - `webhooks`          — a row exists in `alchemy_webhook_registry`.
+          Only meaningful when `webhooksSupported=true`; false-and-irrelevant
+          for RPC-poll chains.
+        - `feeWallets`        — at least one **active** fee wallet exists.
+        - `detection`         — `"alchemy"` when `webhooksSupported=true`, else
+          `"rpc-poll"`. Pure derived field surfaced so the frontend doesn't
+          have to know our chain-family taxonomy.
+        - `bootstrapReady`    — convenience: chain is fully provisioned for
+          payments + payouts. Formula adjusts for detection strategy:
+          `wired && (!webhooksSupported || webhooks) && feeWallets`. So Tron
+          can be ready with just `wired+feeWallets`, while EVM/Solana also need
+          `webhooks`.
 
         The synthetic dev chain (chainId 999, slug `dev`) is **excluded** from
         this response — it's a test-harness chain only and operators should
@@ -897,16 +911,19 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [chainId, slug, family, displayName, wired, webhooks, feeWallets, bootstrapReady, confirmationsRequired, tokens]
+                      required: [chainId, slug, family, displayName, wired, webhooksSupported, alchemyConfigured, webhooks, feeWallets, detection, bootstrapReady, confirmationsRequired, tokens]
                       properties:
                         chainId: { type: integer }
                         slug: { type: string, description: "Stable short id, e.g. 'ethereum' / 'tron-nile'." }
                         family: { type: string, enum: [evm, tron, solana] }
                         displayName: { type: string }
                         wired: { type: boolean, description: "True when a ChainAdapter for this chainId is loaded." }
-                        webhooks: { type: boolean, description: "True when a row exists in alchemy_webhook_registry for this chainId." }
+                        webhooksSupported: { type: boolean, description: "True when this chain can use Alchemy Notify webhooks (EVM + Solana). False for RPC-poll chains like Tron — frontend should hide webhook CTAs." }
+                        alchemyConfigured: { type: boolean, description: "True when operator's ALCHEMY_CHAINS env includes this chainId." }
+                        webhooks: { type: boolean, description: "True when a row exists in alchemy_webhook_registry. Only meaningful if webhooksSupported is true." }
                         feeWallets: { type: boolean, description: "True when at least one active fee wallet exists for this chainId." }
-                        bootstrapReady: { type: boolean, description: "Convenience flag: wired && webhooks && feeWallets. Fully provisioned chain." }
+                        detection: { type: string, enum: [alchemy, rpc-poll], description: "Which detection strategy this chain uses. Pure derived field for frontend convenience." }
+                        bootstrapReady: { type: boolean, description: "wired && (!webhooksSupported || webhooks) && feeWallets — webhook requirement is dropped for RPC-poll chains." }
                         confirmationsRequired:
                           type: integer
                           description: "Confirmation threshold from `deps.confirmationThresholds`; transactions promote to `confirmed` at this count."
