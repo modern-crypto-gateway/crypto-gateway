@@ -16,6 +16,7 @@ import {
 } from "../../core/domain/payment.service.js";
 import { confirmationThreshold } from "../../core/domain/payment-config.js";
 import { ChainFamilySchema, type ChainFamily, type ChainId } from "../../core/types/chain.js";
+import { CHAIN_REGISTRY, chainEntry, chainSlug } from "../../core/types/chain-registry.js";
 import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
 import type { TokenSymbol } from "../../core/types/token.js";
 import { sha256Hex, bytesToHex, getRandomValues } from "../../adapters/crypto/subtle.js";
@@ -29,7 +30,7 @@ import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registr
 import { readAlchemyNotifyToken } from "../../adapters/detection/alchemy-token.js";
 import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
 import { migrate as drizzleMigrate } from "drizzle-orm/libsql/migrator";
-import { feeWallets, invoices, merchants, transactions } from "../../db/schema.js";
+import { alchemyWebhookRegistry, feeWallets, invoices, merchants, transactions } from "../../db/schema.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
@@ -897,6 +898,157 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
   // before it hits the registry, same path bootstrap uses. Re-running with
   // the same chainId overwrites (intended: rotation after a dashboard
   // delete+recreate produces a new key).
+  // Discovery surface for the admin dashboard: which chains the gateway has
+  // wired vs. which it merely recognises in the static registry. The dashboard
+  // uses this to populate the "Bootstrap" picker — the operator selects a
+  // wired chain, then the dashboard cross-references against
+  // GET /admin/alchemy-webhooks and GET /admin/fee-wallets to decide whether
+  // bootstrap is still needed.
+  //
+  // `wired: true` means a ChainAdapter for this chainId is loaded in
+  // `deps.chains`; `wired: false` rows are in CHAIN_REGISTRY but no adapter is
+  // actually configured (e.g. the operator didn't set the chain's RPC env).
+  // Tokens come from the static TOKEN_REGISTRY — never from any per-merchant
+  // override so the dashboard view is consistent across operators.
+  app.get("/chains", async (c) => {
+    const familyParam = c.req.query("family");
+    const wiredParam = c.req.query("wired");
+
+    if (familyParam !== undefined && !ChainFamilySchema.safeParse(familyParam).success) {
+      return c.json(
+        { error: { code: "BAD_FAMILY", message: "family must be one of: evm, tron, solana" } },
+        400
+      );
+    }
+
+    const wiredChainIds = new Set<number>();
+    for (const adapter of deps.chains) {
+      for (const id of adapter.supportedChainIds) wiredChainIds.add(id as number);
+    }
+
+    type ChainOut = {
+      chainId: number;
+      slug: string;
+      family: ChainFamily;
+      displayName: string;
+      wired: boolean;
+      confirmationsRequired: number;
+      tokens: Array<{
+        symbol: string;
+        decimals: number;
+        isStable: boolean;
+        displayName: string;
+        contractAddress: string | null;
+      }>;
+    };
+
+    const out: ChainOut[] = [];
+
+    // Walk the static registry first so the response order is stable
+    // (registry order = response order). Wired chains that aren't in the
+    // static registry are appended at the end — defensive: a wired adapter
+    // without a registry entry is a config bug, but we still surface it so
+    // operators can see what's actually loaded.
+    const seen = new Set<number>();
+    for (const entry of CHAIN_REGISTRY) {
+      seen.add(entry.chainId as number);
+      const wired = wiredChainIds.has(entry.chainId as number);
+      if (familyParam !== undefined && entry.family !== familyParam) continue;
+      if (wiredParam === "true" && !wired) continue;
+      if (wiredParam === "false" && wired) continue;
+      out.push({
+        chainId: entry.chainId as number,
+        slug: entry.slug,
+        family: entry.family,
+        displayName: entry.displayName,
+        wired,
+        confirmationsRequired: confirmationThreshold(entry.chainId, deps.confirmationThresholds),
+        tokens: TOKEN_REGISTRY.filter((t) => t.chainId === entry.chainId).map((t) => ({
+          symbol: t.symbol as string,
+          decimals: t.decimals,
+          isStable: t.isStable,
+          displayName: t.displayName,
+          contractAddress: t.contractAddress
+        }))
+      });
+    }
+    // Wired-but-unregistered tail.
+    for (const id of wiredChainIds) {
+      if (seen.has(id)) continue;
+      const family = (deps.chains.find((a) => a.supportedChainIds.includes(id as ChainId))?.family) ?? "evm";
+      if (familyParam !== undefined && family !== familyParam) continue;
+      if (wiredParam === "false") continue;
+      out.push({
+        chainId: id,
+        slug: chainSlug(id) ?? `chain-${id}`,
+        family,
+        displayName: chainEntry(id)?.displayName ?? `Chain ${id}`,
+        wired: true,
+        confirmationsRequired: confirmationThreshold(id, deps.confirmationThresholds),
+        tokens: TOKEN_REGISTRY.filter((t) => t.chainId === id).map((t) => ({
+          symbol: t.symbol as string,
+          decimals: t.decimals,
+          isStable: t.isStable,
+          displayName: t.displayName,
+          contractAddress: t.contractAddress
+        }))
+      });
+    }
+
+    return c.json({ chains: out });
+  });
+
+  // List Alchemy webhook registrations (one row per chain). The signing key
+  // is encrypted at rest and is NEVER returned — operators who need to verify
+  // a key should rotate via POST /alchemy-webhooks/signing-keys instead. This
+  // endpoint is the dashboard's read of "what did /bootstrap/alchemy-webhooks
+  // actually create"; the dashboard uses it to decide which chains still need
+  // bootstrapping vs. which are already wired.
+  app.get("/alchemy-webhooks", async (c) => {
+    const chainIdParam = c.req.query("chainId");
+    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "100"), 1), 500);
+    const offset = Math.max(Number(c.req.query("offset") ?? "0"), 0);
+
+    const conds: SQL[] = [];
+    if (chainIdParam !== undefined) {
+      const n = Number(chainIdParam);
+      if (!Number.isFinite(n)) {
+        return c.json({ error: { code: "BAD_CHAIN_ID", message: "chainId must be a number" } }, 400);
+      }
+      conds.push(eq(alchemyWebhookRegistry.chainId, n));
+    }
+
+    const rows = await deps.db
+      .select({
+        chainId: alchemyWebhookRegistry.chainId,
+        webhookId: alchemyWebhookRegistry.webhookId,
+        webhookUrl: alchemyWebhookRegistry.webhookUrl,
+        createdAt: alchemyWebhookRegistry.createdAt,
+        updatedAt: alchemyWebhookRegistry.updatedAt
+      })
+      .from(alchemyWebhookRegistry)
+      .where(conds.length > 0 ? and(...conds) : undefined)
+      .orderBy(asc(alchemyWebhookRegistry.chainId))
+      .limit(limit + 1)
+      .offset(offset);
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    return c.json({
+      webhooks: page.map((r) => ({
+        chainId: r.chainId,
+        chain: chainSlug(r.chainId),
+        webhookId: r.webhookId,
+        webhookUrl: r.webhookUrl,
+        createdAt: new Date(r.createdAt).toISOString(),
+        updatedAt: new Date(r.updatedAt).toISOString()
+      })),
+      limit,
+      offset,
+      hasMore
+    });
+  });
+
   app.post("/alchemy-webhooks/signing-keys", async (c) => {
     const body = (await c.req.json().catch(() => null)) as unknown;
     if (body === null) {

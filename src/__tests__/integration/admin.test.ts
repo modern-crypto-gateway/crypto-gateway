@@ -690,3 +690,83 @@ describe("GET /admin/fee-wallets", () => {
     expect(badActive.status).toBe(400);
   });
 });
+
+describe("GET /admin/chains", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  async function listChains(query = ""): Promise<Response> {
+    return booted.app.fetch(
+      new Request(`http://test.local/admin/chains${query}`, {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+  }
+
+  it("401 without an admin key", async () => {
+    const res = await booted.app.fetch(new Request("http://test.local/admin/chains"));
+    expect(res.status).toBe(401);
+  });
+
+  it("returns the static registry with wired flag and tokens", async () => {
+    const res = await listChains();
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      chains: Array<{
+        chainId: number;
+        slug: string;
+        family: string;
+        wired: boolean;
+        tokens: Array<{ symbol: string; decimals: number }>;
+      }>;
+    };
+    // The dev chain (999) is wired by default in bootTestApp.
+    const dev = body.chains.find((c) => c.chainId === 999);
+    expect(dev).toBeDefined();
+    expect(dev?.wired).toBe(true);
+    expect(dev?.slug).toBe("dev");
+    expect(dev?.tokens.find((t) => t.symbol === "DEV")).toMatchObject({ decimals: 6 });
+
+    // Ethereum is in the registry but no adapter is wired in the test boot.
+    const eth = body.chains.find((c) => c.chainId === 1);
+    expect(eth).toBeDefined();
+    expect(eth?.wired).toBe(false);
+    expect(eth?.tokens.map((t) => t.symbol)).toEqual(expect.arrayContaining(["USDC", "USDT"]));
+  });
+
+  it("?wired=true narrows to wired adapters only", async () => {
+    const res = await listChains("?wired=true");
+    const body = (await res.json()) as { chains: Array<{ chainId: number; wired: boolean }> };
+    expect(body.chains.length).toBeGreaterThan(0);
+    expect(body.chains.every((c) => c.wired === true)).toBe(true);
+    expect(body.chains.find((c) => c.chainId === 999)).toBeDefined();
+    expect(body.chains.find((c) => c.chainId === 1)).toBeUndefined();
+  });
+
+  it("?family=evm narrows to one family", async () => {
+    const res = await listChains("?family=evm");
+    const body = (await res.json()) as { chains: Array<{ family: string }> };
+    expect(body.chains.length).toBeGreaterThan(0);
+    expect(body.chains.every((c) => c.family === "evm")).toBe(true);
+  });
+
+  it("400 on a bogus family", async () => {
+    const res = await listChains("?family=bitcoin");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("BAD_FAMILY");
+  });
+
+  it("never leaks any signing or env material", async () => {
+    const res = await listChains();
+    const text = await res.text();
+    expect(text).not.toMatch(/whsec_|signing|MASTER_SEED|privateKey|ADMIN_KEY/);
+  });
+});

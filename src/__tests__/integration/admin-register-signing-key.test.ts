@@ -132,3 +132,99 @@ describe("POST /admin/alchemy-webhooks/signing-keys", () => {
     expect(res.status).toBe(401);
   });
 });
+
+describe("GET /admin/alchemy-webhooks", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  async function listWebhooks(query = "", token = ADMIN_KEY): Promise<Response> {
+    return booted.app.fetch(
+      new Request(`http://test.local/admin/alchemy-webhooks${query}`, {
+        headers: { authorization: `Bearer ${token}` }
+      })
+    );
+  }
+
+  it("401 without an admin key", async () => {
+    const res = await booted.app.fetch(new Request("http://test.local/admin/alchemy-webhooks"));
+    expect(res.status).toBe(401);
+  });
+
+  it("returns one row per registered chain, signing key never present", async () => {
+    await register(booted, {
+      chainId: 1,
+      webhookId: "wh_eth",
+      signingKey: "whsec_eth_secret",
+      webhookUrl: "https://gateway.example.com/webhooks/alchemy"
+    });
+    await register(booted, {
+      chainId: 137,
+      webhookId: "wh_polygon",
+      signingKey: "whsec_polygon_secret",
+      webhookUrl: "https://gateway.example.com/webhooks/alchemy"
+    });
+
+    const res = await listWebhooks();
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      webhooks: Array<Record<string, unknown>>;
+      hasMore: boolean;
+    };
+    expect(body.webhooks).toHaveLength(2);
+    expect(body.hasMore).toBe(false);
+    const chainIds = body.webhooks.map((w) => w["chainId"]);
+    expect(chainIds).toEqual([1, 137]);
+    // Signing key (or its ciphertext) must never appear in the response.
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("whsec_");
+    expect(serialized).not.toContain("signing");
+    expect(body.webhooks[0]).toMatchObject({
+      chainId: 1,
+      webhookId: "wh_eth",
+      webhookUrl: "https://gateway.example.com/webhooks/alchemy",
+      chain: "ethereum"
+    });
+  });
+
+  it("filters by chainId", async () => {
+    await register(booted, {
+      chainId: 1,
+      webhookId: "wh_eth",
+      signingKey: "whsec_eth",
+      webhookUrl: "https://gateway.example.com/webhooks/alchemy"
+    });
+    await register(booted, {
+      chainId: 137,
+      webhookId: "wh_polygon",
+      signingKey: "whsec_polygon",
+      webhookUrl: "https://gateway.example.com/webhooks/alchemy"
+    });
+
+    const res = await listWebhooks("?chainId=137");
+    const body = (await res.json()) as { webhooks: Array<{ chainId: number }> };
+    expect(body.webhooks).toHaveLength(1);
+    expect(body.webhooks[0]?.chainId).toBe(137);
+  });
+
+  it("400 on a non-numeric chainId", async () => {
+    const res = await listWebhooks("?chainId=abc");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("BAD_CHAIN_ID");
+  });
+
+  it("returns an empty list when nothing is registered", async () => {
+    const res = await listWebhooks();
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { webhooks: unknown[]; hasMore: boolean };
+    expect(body.webhooks).toEqual([]);
+    expect(body.hasMore).toBe(false);
+  });
+});

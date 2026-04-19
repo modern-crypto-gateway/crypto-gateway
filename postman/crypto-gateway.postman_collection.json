@@ -345,6 +345,80 @@
           }
         },
         {
+          "name": "0. Discover chains (wired vs registry-only, with token list)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/chains",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "chains"],
+              "query": [
+                { "key": "family", "value": "evm", "description": "evm | tron | solana", "disabled": true },
+                { "key": "wired", "value": "true", "description": "true = only adapters loaded into deps.chains; false = registry-only", "disabled": true }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Discovery endpoint for the dashboard's bootstrap picker. Returns every chain in the static `CHAIN_REGISTRY` plus a `wired: bool` flag (true when a `ChainAdapter` for that chainId is loaded), the static token list per chain, and the confirmation threshold the gateway will apply.\n\nCross-reference against:\n- `GET /admin/alchemy-webhooks` — has the chain been bootstrapped on Alchemy?\n- `GET /admin/fee-wallets` — does the chain have at least one fee wallet for payouts?\n\nNever returns secrets (signing keys, seeds, env)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('chains array with shape', () => {",
+                  "  pm.expect(body).to.have.property('chains');",
+                  "  pm.expect(body.chains).to.be.an('array');",
+                  "  if (body.chains.length > 0) {",
+                  "    pm.expect(body.chains[0]).to.include.keys(['chainId','slug','family','wired','tokens']);",
+                  "  }",
+                  "});",
+                  "pm.test('no secrets leaked', () => {",
+                  "  pm.expect(pm.response.text()).to.not.match(/whsec_|signing|MASTER_SEED|privateKey/);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4a. List Alchemy webhook registrations (one per chain)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/alchemy-webhooks?limit=100&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "alchemy-webhooks"],
+              "query": [
+                { "key": "limit", "value": "100", "description": "1..500, default 100" },
+                { "key": "offset", "value": "0" },
+                { "key": "chainId", "value": "", "description": "Narrow to one chain id.", "disabled": true }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Read-only view of `alchemy_webhook_registry`. Use this from the dashboard to decide which chains are already wired (skip bootstrap) versus which still need it. The signing key is **never** returned — it stays encrypted at rest. To verify or rotate a key, use `POST /admin/alchemy-webhooks/signing-keys`.\n\nResponse:\n```json\n{\n  \"webhooks\": [\n    { \"chainId\": 1, \"chain\": \"ethereum\", \"webhookId\": \"wh_...\", \"webhookUrl\": \"https://...\", \"createdAt\": \"...\", \"updatedAt\": \"...\" }\n  ],\n  \"limit\": 100,\n  \"offset\": 0,\n  \"hasMore\": false\n}\n```"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('paginated response, no signing key leaked', () => {",
+                  "  pm.expect(body).to.have.property('webhooks');",
+                  "  pm.expect(JSON.stringify(body)).to.not.include('whsec_');",
+                  "  pm.expect(JSON.stringify(body)).to.not.include('signing');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "name": "4b. Manually register a signing key (dashboard-created webhook)",
           "request": {
             "method": "POST",
