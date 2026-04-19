@@ -1,6 +1,5 @@
 import { buildApp } from "../app.js";
 import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
-import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { wireSolana } from "../adapters/chains/solana/wire.js";
@@ -90,11 +89,10 @@ async function main(): Promise<void> {
   const cache = memoryCacheAdapter();
   const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
 
-  // Dev adapter only outside production (it synthesizes chainId=999/DEV
-  // which shouldn't surface on /admin/balances in prod).
-  const denoNodeEnv = secrets.getOptional("NODE_ENV");
-  const denoIsProd = denoNodeEnv === "production" || denoNodeEnv === "staging";
-  const chains: ChainAdapter[] = denoIsProd ? [] : [devChainAdapter()];
+  // Real-chain adapters (EVM / Tron / Solana) wire below based on creds.
+  // The synthetic dev adapter is intentionally NOT wired here — it's a
+  // test-only fixture, never shipped to a running server.
+  const chains: ChainAdapter[] = [];
   const detectionStrategies: Record<number, ReturnType<typeof rpcPollDetection>> = {};
   const activeAlchemyChainIds: number[] = [];
   const alchemyApiKey = secrets.getOptional("ALCHEMY_API_KEY");

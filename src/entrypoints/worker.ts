@@ -1,7 +1,6 @@
 import type { ExecutionContext, KVNamespace, RateLimit, ScheduledController } from "@cloudflare/workers-types";
 import { buildApp, registerEventSubscribers } from "../app.js";
 import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
-import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { wireSolana } from "../adapters/chains/solana/wire.js";
@@ -114,13 +113,10 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     });
   }
 
-  // Same Alchemy-optional pattern as the Node entrypoint: dev adapter
-  // only outside production (it would surface DEV/chainId=999 on
-  // /admin/balances otherwise), real EVM + RPC-poll detection when
-  // ALCHEMY_API_KEY is set.
-  const workerNodeEnv = typeof env["NODE_ENV"] === "string" ? env["NODE_ENV"] : undefined;
-  const workerIsProd = workerNodeEnv === "production" || workerNodeEnv === "staging";
-  const chains: ChainAdapter[] = workerIsProd ? [] : [devChainAdapter()];
+  // Real-chain adapters wire below based on creds (Alchemy-optional EVM,
+  // Solana, Tron). The synthetic dev adapter is intentionally NOT wired
+  // here — it's a test-only fixture, never shipped to a running server.
+  const chains: ChainAdapter[] = [];
   const detectionStrategies: Record<number, ReturnType<typeof rpcPollDetection>> = {};
   const activeAlchemyChainIds: number[] = [];
   const alchemyApiKey = typeof env["ALCHEMY_API_KEY"] === "string" ? env["ALCHEMY_API_KEY"] : undefined;

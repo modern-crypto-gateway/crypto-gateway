@@ -16,7 +16,6 @@ import { hdSignerStore } from "../adapters/signer-store/hd.adapter.js";
 import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
-import { devChainAdapter } from "../adapters/chains/dev/dev-chain.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { wireSolana } from "../adapters/chains/solana/wire.js";
@@ -106,13 +105,12 @@ async function main(): Promise<void> {
   // has no TTL floor of its own, so sub-minute windows work correctly here.
   const rateLimiter = cacheBackedRateLimiter(cache, { minTtlSeconds: 1 });
 
-  // Chain adapters + their matching detection strategies. The dev adapter
-  // is wired only outside production — it synthesizes a "DEV" token on
-  // chainId=999 so tests and local dev have a deterministic adapter, but
-  // surfacing it in prod would pollute /admin/balances and misclassify
-  // chainId 999 as a real chain. Real-chain adapters (EVM / Tron / Solana)
-  // are gated on their respective provider creds further down.
-  const chains: ChainAdapter[] = production ? [] : [devChainAdapter()];
+  // Chain adapters + their matching detection strategies. Real-chain
+  // adapters (EVM / Tron / Solana) are gated on their respective provider
+  // creds further down. The synthetic dev adapter is intentionally NOT
+  // wired here — it's a test-only fixture loaded by the integration test
+  // boot, never shipped to any running server.
+  const chains: ChainAdapter[] = [];
   const detectionStrategies: Record<number, DetectionStrategy> = {};
   // Union of chainIds for the pool's Alchemy subscription fan-out (EVM + Solana).
   // Collected as entrypoint wires each family so the pool knows, at refill
