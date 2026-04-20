@@ -81,6 +81,26 @@ export interface TriggerSmartContractParams {
   call_value: number;
 }
 
+// Read-only simulation params. Same shape as TriggerSmartContractParams
+// minus fee_limit (no fee burned on constant calls) — but we keep both
+// fields optional so callers that share a single params builder don't
+// need a second code path.
+export interface TriggerConstantContractParams {
+  owner_address: string;
+  contract_address: string;
+  function_selector: string;
+  parameter: string;
+}
+
+// Response from /wallet/triggerconstantcontract. `constant_result` is an
+// array of hex strings, each being the raw return data of one invocation
+// (for balanceOf, a single 64-char uint256 hex string).
+export interface TrongridTriggerConstantContractResponse {
+  result: { result?: boolean; message?: string };
+  constant_result?: readonly string[];
+  energy_used?: number;
+}
+
 // Native TRX transfer build response. TronGrid returns the fully-formed
 // unsigned transaction; shape matches triggerSmartContract's `transaction`
 // field so downstream sign+broadcast handles both identically.
@@ -135,6 +155,13 @@ export interface TronRpcBackend {
   getTransactionInfo(txId: string): Promise<TrongridTxInfo | null>;
   getNowBlock(): Promise<TrongridBlock>;
   triggerSmartContract(params: TriggerSmartContractParams): Promise<TrongridTriggerSmartContractResponse>;
+  // Read-only contract call (view/pure methods like balanceOf). Unlike
+  // triggerSmartContract this doesn't build an unsigned tx; it just returns
+  // the EVM-style hex-encoded return data in `constant_result[0]`. Used by
+  // getAccountBalances for authoritative TRC-20 balance reads (TronGrid's
+  // `/v1/accounts/{addr}` indexed TRC-20 list is known to lag or omit
+  // balances for addresses without recent outbound activity).
+  triggerConstantContract(params: TriggerConstantContractParams): Promise<TrongridTriggerConstantContractResponse>;
   createTransaction(params: CreateTransactionParams): Promise<TrongridCreateTransactionResponse>;
   broadcastTransaction(params: {
     raw_data_hex: string;
@@ -258,6 +285,12 @@ export function tronGridBackend(config: TronGridBackendConfig): TronRpcBackend {
         body: JSON.stringify(params)
       });
     },
+    async triggerConstantContract(params) {
+      return base.request<TrongridTriggerConstantContractResponse>("/wallet/triggerconstantcontract", {
+        method: "POST",
+        body: JSON.stringify(params)
+      });
+    },
     async createTransaction(params) {
       return base.request<TrongridCreateTransactionResponse>("/wallet/createtransaction", {
         method: "POST",
@@ -349,6 +382,12 @@ export function alchemyTronBackend(config: AlchemyTronBackendConfig): TronRpcBac
         body: JSON.stringify(params)
       });
     },
+    async triggerConstantContract(params) {
+      return base.request<TrongridTriggerConstantContractResponse>("/wallet/triggerconstantcontract", {
+        method: "POST",
+        body: JSON.stringify(params)
+      });
+    },
     async createTransaction(params) {
       return base.request<TrongridCreateTransactionResponse>("/wallet/createtransaction", {
         method: "POST",
@@ -361,8 +400,23 @@ export function alchemyTronBackend(config: AlchemyTronBackendConfig): TronRpcBac
         body: JSON.stringify(params)
       });
     },
-    async getAccount() {
-      throw new TronProviderNotSupportedError("alchemy-tron", "getAccount");
+    async getAccount(address) {
+      // Alchemy exposes Tron's native `/wallet/getaccount`, so the composite
+      // client can now genuinely failover for balance reads. This endpoint
+      // returns TRX balance (in sun) at full-node resolution — it does NOT
+      // populate a TRC-20 balance map the way TronGrid's indexed
+      // `/v1/accounts/{addr}` does. That's fine: getAccountBalances now
+      // reads every TRC-20 via balanceOf (triggerConstantContract) anyway,
+      // precisely so it can't be fooled by TronGrid's lagging TRC-20 index.
+      // `visible: true` keeps address encoding as base58 on both sides.
+      const response = await base.request<{
+        address?: string;
+        balance?: number | string;
+      }>("/wallet/getaccount", {
+        method: "POST",
+        body: JSON.stringify({ address, visible: true })
+      });
+      return { balanceSun: String(response.balance ?? "0"), trc20: {} };
     }
   };
 }
@@ -434,6 +488,8 @@ export function tronCompositeClient(
     getNowBlock: () => tryEach("getNowBlock", (b) => b.getNowBlock()),
     triggerSmartContract: (params) =>
       tryEach("triggerSmartContract", (b) => b.triggerSmartContract(params)),
+    triggerConstantContract: (params) =>
+      tryEach("triggerConstantContract", (b) => b.triggerConstantContract(params)),
     createTransaction: (params) =>
       tryEach("createTransaction", (b) => b.createTransaction(params)),
     broadcastTransaction: (params) =>

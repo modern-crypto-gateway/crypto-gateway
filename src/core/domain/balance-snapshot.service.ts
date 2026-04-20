@@ -52,6 +52,12 @@ export interface AddressBalance {
   feeLabel?: string;
   totalUsd: string;
   tokens: readonly TokenBalance[];
+  // Set (rpc mode only) when getAccountBalances failed for this address —
+  // TronGrid rate-limit, network timeout, malformed response. Without this
+  // field the address was silently dropped from the rendered list, which
+  // looked like "the snapshot ignored that address" to operators. Presence
+  // of `error` means the tokens array is empty / un-reconciled, not "zero".
+  error?: string;
 }
 
 export interface ChainBalance {
@@ -337,25 +343,32 @@ async function computeBalanceSnapshotRpc(
 
   // 2. Fan out one getAccountBalances call per (chainId, address). Errors
   //    are caught per-tuple so one bad RPC doesn't poison the whole report.
+  //    We carry the error message forward so the rendered snapshot can mark
+  //    the specific row that failed, instead of silently dropping it.
   const perAddressResults = await Promise.all(
     targets.map(async (t) => {
       const adapter = deps.chains.find((a) => a.supportedChainIds.includes(t.chainId));
       if (!adapter) {
-        return { target: t, balances: null as readonly { token: TokenSymbol; amountRaw: string }[] | null };
+        return {
+          target: t,
+          balances: null as readonly { token: TokenSymbol; amountRaw: string }[] | null,
+          errorMessage: "no adapter wired for chainId"
+        };
       }
       try {
         const balances = await adapter.getAccountBalances({
           chainId: t.chainId,
           address: t.address as Address
         });
-        return { target: t, balances };
+        return { target: t, balances, errorMessage: null as string | null };
       } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
         deps.logger.warn("balance snapshot: getAccountBalances failed", {
           chainId: t.chainId,
           address: t.address,
-          error: err instanceof Error ? err.message : String(err)
+          error: errorMessage
         });
-        return { target: t, balances: null };
+        return { target: t, balances: null, errorMessage };
       }
     })
   );
@@ -378,10 +391,28 @@ async function computeBalanceSnapshotRpc(
   const familyMap = new Map<ChainFamily, Map<ChainId, ChainAggregator>>();
 
   for (const result of perAddressResults) {
-    const { target, balances } = result;
+    const { target, balances, errorMessage } = result;
     const agg = ensureAggregator(familyMap, target.family, target.chainId);
     if (balances === null) {
       agg.errors += 1;
+      // Still emit the row so the operator can see WHICH address failed
+      // without cross-referencing logs. `tokens: []` + `error: <message>`
+      // distinguishes "un-reconciled" from "really zero".
+      pushAddressRow(
+        agg,
+        target.kind === "pool"
+          ? {
+              address: target.address,
+              kind: "pool",
+              poolStatus: target.poolStatus,
+              poolAllocatedToInvoiceId: target.poolAllocatedToInvoiceId ?? null
+            }
+          : { address: target.address, kind: "fee", feeLabel: target.feeLabel },
+        [],
+        target.chainId,
+        usdRates,
+        errorMessage ?? "unknown error"
+      );
       continue;
     }
     const tokens = balances.map((b) => ({
@@ -463,7 +494,8 @@ function pushAddressRow(
     | { address: string; kind: "fee"; feeLabel: string },
   tokens: readonly { token: TokenSymbol; amountRaw: bigint | string }[],
   chainId: ChainId,
-  usdRates: Record<string, string>
+  usdRates: Record<string, string>,
+  errorMessage?: string
 ): void {
   const tokensWithUsd = tokens.map((b) => {
     const decimals = decimalsFor(chainId, b.token);
@@ -477,6 +509,12 @@ function pushAddressRow(
   let addressTotal = 0;
   for (const t of tokensWithUsd) addressTotal = addUsd(addressTotal, t.usd);
 
+  const baseRow = {
+    totalUsd: addressTotal.toFixed(2),
+    tokens: tokensWithUsd,
+    ...(errorMessage !== undefined ? { error: errorMessage } : {})
+  };
+
   const addressRow: AddressBalance =
     meta.kind === "pool"
       ? {
@@ -484,15 +522,13 @@ function pushAddressRow(
           kind: "pool",
           poolStatus: meta.poolStatus,
           poolAllocatedToInvoiceId: meta.poolAllocatedToInvoiceId,
-          totalUsd: addressTotal.toFixed(2),
-          tokens: tokensWithUsd
+          ...baseRow
         }
       : {
           address: meta.address,
           kind: "fee",
           feeLabel: meta.feeLabel,
-          totalUsd: addressTotal.toFixed(2),
-          tokens: tokensWithUsd
+          ...baseRow
         };
   agg.addresses.push(addressRow);
   agg.totalUsd = addUsd(agg.totalUsd, addressRow.totalUsd);

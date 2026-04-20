@@ -426,11 +426,18 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       if (!token) {
         throw new Error(`Tron getBalance: unknown token ${args.token} on chain ${args.chainId}`);
       }
-      const acct = await client.getAccount(args.address);
       if (token.contractAddress === null) {
+        // Non-TRX native case — only applies if a future registry entry
+        // adds another native asset on a Tron-family chain. Fall back to
+        // getAccount's sun balance for correctness.
+        const acct = await client.getAccount(args.address);
         return acct.balanceSun as AmountRaw;
       }
-      return (acct.trc20[token.contractAddress] ?? "0") as AmountRaw;
+      // TRC-20: read balanceOf(address) directly. Reading from
+      // getAccount().trc20 would be wrong on both backends — Alchemy's
+      // /wallet/getaccount returns no TRC-20 data at all, and TronGrid's
+      // /v1/accounts trc20 list is a lagging secondary index.
+      return (await readTrc20Balance(client, args.address, token.contractAddress)).toString() as AmountRaw;
     },
 
     async getAccountBalances(args): Promise<readonly { token: TokenSymbol; amountRaw: AmountRaw }[]> {
@@ -438,25 +445,25 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       const chainId = args.chainId as ChainId;
       const tokensOnChain = TOKEN_REGISTRY.filter((t) => t.chainId === chainId);
 
-      // Single /v1/accounts/{addr} call covers TRX + every TRC-20 the address
-      // holds. Map back to our registered symbols by contract address; tokens
-      // we don't recognize are silently dropped (matches the EVM behavior).
+      // Native TRX comes from /wallet/getaccount — that field is authoritative
+      // (pulled straight from the node state, not a secondary index). TRC-20
+      // balances are NOT reliable from that endpoint: TronGrid's /v1/accounts
+      // trc20 list is a lagging index, and Alchemy's /wallet/getaccount
+      // returns no TRC-20 data at all. For those we call balanceOf directly
+      // via triggerConstantContract — same path wallets use, consistent with
+      // what holders see on Tronscan. 1 call for TRX + 1 per registered
+      // TRC-20 token; for the current registry that's 3 calls per address
+      // on Tron mainnet (TRX + USDT + USDC).
       const acct = await client.getAccount(args.address);
       const out: { token: TokenSymbol; amountRaw: AmountRaw }[] = [];
+
+      // Native TRX first, whether or not it's in the registry.
+      out.push({ token: "TRX" as TokenSymbol, amountRaw: acct.balanceSun as AmountRaw });
+
       for (const t of tokensOnChain) {
-        if (t.contractAddress === null) {
-          out.push({ token: t.symbol, amountRaw: acct.balanceSun as AmountRaw });
-        } else {
-          const balance = acct.trc20[t.contractAddress] ?? "0";
-          out.push({ token: t.symbol, amountRaw: balance as AmountRaw });
-        }
-      }
-      // No native-symbol entry in registry for Tron mainnet (we don't list TRX
-      // there). Surface it explicitly so callers always see the gas-token
-      // balance — they need it to flag low fee-wallet TRX before payouts fail.
-      const hasNative = tokensOnChain.some((t) => t.contractAddress === null);
-      if (!hasNative) {
-        out.push({ token: "TRX" as TokenSymbol, amountRaw: acct.balanceSun as AmountRaw });
+        if (t.contractAddress === null) continue; // TRX handled above
+        const amount = await readTrc20Balance(client, args.address, t.contractAddress);
+        out.push({ token: t.symbol, amountRaw: amount.toString() as AmountRaw });
       }
       return out;
     },
@@ -487,6 +494,37 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
 }
 
 // ---- Local helpers ----
+
+// Read a TRC-20 balance via `balanceOf(address)` on the token contract. Used
+// in place of reading getAccount().trc20[contract] because that secondary
+// index is either lagging (TronGrid) or not populated at all (Alchemy's
+// /wallet/getaccount returns only native TRX). A transient RPC failure, an
+// empty/short hex result, or an unparseable value collapses to 0n — the
+// snapshot-level error bookkeeping is the right place to surface per-address
+// failures, not per-token-on-a-good-address failures.
+async function readTrc20Balance(
+  client: TronRpcBackend,
+  ownerBase58: string,
+  contractBase58: string
+): Promise<bigint> {
+  try {
+    const resp = await client.triggerConstantContract({
+      owner_address: base58ToHex(ownerBase58),
+      contract_address: base58ToHex(contractBase58),
+      function_selector: "balanceOf(address)",
+      parameter: tronToEvmCoreHex(ownerBase58).slice(2).padStart(64, "0")
+    });
+    const hex = resp.constant_result?.[0];
+    if (hex === undefined || hex.length === 0) return 0n;
+    try {
+      return BigInt(`0x${hex}`);
+    } catch {
+      return 0n;
+    }
+  } catch {
+    return 0n;
+  }
+}
 
 function base58ToHex(base58Address: string): string {
   const bytes = decodeTronAddress(base58Address);

@@ -304,6 +304,64 @@ describe("balance-snapshot — rpc mode (opts.live=true)", () => {
   });
 });
 
+describe("balance-snapshot — rpc mode error visibility", () => {
+  // A pool address whose getAccountBalances fails must NOT silently vanish
+  // from the rendered snapshot — pre-fix behavior just bumped
+  // `chain.errors` and dropped the row, so operators couldn't tell which
+  // specific address had failed without cross-referencing Worker logs.
+  // The row now carries `error: <message>` and `tokens: []`.
+  it("emits a row with `error` for each address whose getAccountBalances throws, instead of silently dropping it", async () => {
+    const { devChainAdapter } = await import("../../adapters/chains/dev/dev-chain.adapter.js");
+    const base = devChainAdapter();
+    const failing = new Set<string>();
+    const wrapped = {
+      ...base,
+      async getAccountBalances(args: { chainId: number; address: string }) {
+        if (failing.has(args.address)) {
+          throw new Error("simulated TronGrid 429");
+        }
+        return base.getAccountBalances(args);
+      }
+    };
+
+    const booted = await bootTestApp({
+      secretsOverrides: { ADMIN_KEY },
+      chains: [wrapped],
+      poolInitialSize: 3
+    });
+    try {
+      const poolRows = await booted.deps.db.select().from(addressPool);
+      expect(poolRows.length).toBe(3);
+      // Fail the first pool address only; the other two succeed.
+      const failed = poolRows[0]!.address;
+      failing.add(failed);
+
+      const snapshot = await computeBalanceSnapshot(booted.deps, { live: true });
+      const chain = snapshot.families[0]!.chains[0]!;
+
+      // All three addresses are rendered — none silently disappear.
+      expect(chain.addresses).toHaveLength(3);
+      expect(chain.errors).toBe(1);
+
+      const errorRow = chain.addresses.find((a) => a.address === failed);
+      expect(errorRow).toBeDefined();
+      expect(errorRow!.tokens).toHaveLength(0);
+      expect(errorRow!.totalUsd).toBe("0.00");
+      expect(errorRow!.error).toContain("TronGrid");
+
+      const healthyRows = chain.addresses.filter((a) => a.address !== failed);
+      expect(healthyRows).toHaveLength(2);
+      for (const row of healthyRows) {
+        expect(row.error).toBeUndefined();
+        expect(row.tokens).toHaveLength(1);
+        expect(row.tokens[0]!.token).toBe("DEV");
+      }
+    } finally {
+      await booted.close();
+    }
+  });
+});
+
 describe("balance-snapshot — admin route", () => {
   let booted: BootedTestApp;
 

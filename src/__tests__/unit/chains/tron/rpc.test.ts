@@ -28,6 +28,9 @@ function fakeClient(overrides: Partial<TronRpcBackend>): TronRpcBackend {
     async triggerSmartContract() {
       throw new Error("unexpected triggerSmartContract call");
     },
+    async triggerConstantContract() {
+      throw new Error("unexpected triggerConstantContract call");
+    },
     async createTransaction() {
       throw new Error("unexpected createTransaction call");
     },
@@ -381,6 +384,86 @@ describe("tronChainAdapter.scanIncoming", () => {
 
     expect(transfers).toHaveLength(1);
     expect(transfers[0]).toMatchObject({ txHash: "bb".repeat(32), amountRaw: "1000000" });
+  });
+});
+
+describe("tronChainAdapter.getAccountBalances", () => {
+  it("reads TRC-20 balances via balanceOf (triggerConstantContract), not the indexed /v1/accounts trc20 list", async () => {
+    // Models the real bug we observed: TronGrid's /v1/accounts/{addr}
+    // returns a balanceSun value (authoritative) but omits the USDT entry
+    // from the `trc20` array (lagging secondary index). Pre-fix code
+    // surfaced 0 USDT for this address. Post-fix, balanceOf returns the
+    // correct value regardless of what /v1/accounts said.
+    const addr = "TGEn5Z3oktHonC4M2rqpH8DvNi6g3wR4At";
+    // 4.641 USDT = 4_641_000 base units. uint256 hex, no 0x prefix, 64 chars.
+    const usdtRaw = 4_641_000n;
+    const usdtHex = usdtRaw.toString(16).padStart(64, "0");
+
+    const constantCalls: string[] = [];
+    const client = fakeClient({
+      async getAccount() {
+        // balanceSun correct; trc20 deliberately empty (the bug scenario).
+        return { balanceSun: "10000000", trc20: {} };
+      },
+      async triggerConstantContract(params) {
+        constantCalls.push(params.contract_address);
+        // The adapter issues one call per registered TRC-20 on this chain.
+        // We return non-zero for the FIRST call (USDT per registry order)
+        // and zero for the rest (USDC). This keeps the assertion tight
+        // without caring about the hex form of contract addresses.
+        if (constantCalls.length === 1) {
+          return { result: { result: true }, constant_result: [usdtHex] };
+        }
+        return { result: { result: true }, constant_result: ["0".repeat(64)] };
+      }
+    });
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+
+    const balances = await adapter.getAccountBalances({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      address: addr
+    });
+
+    const trx = balances.find((b) => b.token === "TRX");
+    expect(trx?.amountRaw).toBe("10000000"); // 10 TRX from /v1/accounts.
+
+    const usdt = balances.find((b) => b.token === "USDT");
+    expect(usdt?.amountRaw).toBe("4641000");
+
+    // Exactly N balanceOf calls, one per registered TRC-20 on chain.
+    // Registry has USDT + USDC on Tron mainnet, so N=2.
+    expect(constantCalls.length).toBe(2);
+  });
+
+  it("tolerates a per-token balanceOf failure: records 0 for that token and keeps the rest", async () => {
+    const addr = "TLBq4D6nxz5wH6fm8am41mEnynK5F7Q6nC";
+    let callCount = 0;
+    const client = fakeClient({
+      async getAccount() {
+        return { balanceSun: "0", trc20: {} };
+      },
+      async triggerConstantContract() {
+        callCount += 1;
+        if (callCount === 1) throw new Error("simulated RPC 500");
+        return { result: { result: true }, constant_result: ["0".repeat(64)] };
+      }
+    });
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+
+    const balances = await adapter.getAccountBalances({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      address: addr
+    });
+
+    // TRX + USDT (failed, recorded as 0) + USDC = 3 rows. No throw.
+    expect(balances.length).toBe(3);
+    expect(balances.every((b) => b.amountRaw === "0")).toBe(true);
   });
 });
 
