@@ -1,4 +1,4 @@
-import type { ChainAdapter } from "../../../core/ports/chain.port.ts";
+import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
@@ -96,6 +96,20 @@ export function devChainAdapter(config: DevChainConfig = {}): ChainAdapter {
 
     async estimateGasForTransfer(_args: EstimateArgs): Promise<AmountRaw> {
       return "21000" as AmountRaw;
+    },
+
+    async quoteFeeTiers(args: EstimateArgs): Promise<FeeTierQuote> {
+      // Dev adapter: flat quote across tiers so integration tests can exercise
+      // the estimate endpoint without any real RPC. Returns the estimateGas
+      // value as the native amount so the plumbing is provably end-to-end.
+      const gas = (await this.estimateGasForTransfer(args)) as AmountRaw;
+      return {
+        low: { tier: "low", nativeAmountRaw: gas },
+        medium: { tier: "medium", nativeAmountRaw: gas },
+        high: { tier: "high", nativeAmountRaw: gas },
+        tieringSupported: false,
+        nativeSymbol: "DEV" as TokenSymbol
+      };
     },
 
     async getBalance(_args): Promise<AmountRaw> {

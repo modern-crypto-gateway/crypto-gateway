@@ -1,6 +1,6 @@
 import type { CacheStore } from "./ports/cache.port.ts";
 import type { ChainAdapter } from "./ports/chain.port.ts";
-import type { Db } from "../db/client.ts";
+import type { Db } from "../db/client.js";
 import type { DetectionStrategy } from "./ports/detection.port.ts";
 import type { JobRunner } from "./ports/jobs.port.ts";
 import type { Logger } from "./ports/logger.port.ts";
@@ -93,6 +93,15 @@ export interface AppDeps {
   // FINALITY_OVERRIDES env var (e.g. "1:20,137:64"). Empty / undefined means
   // fall back to the defaults.
   readonly confirmationThresholds?: Readonly<Record<number, number>>;
+
+  // Bounded-concurrency cap for `executeReservedPayouts`, applied per chainId.
+  // Cross-chain runs are unconditionally parallel (no shared resource); within
+  // a chain, this many `executeOnePayout` calls run concurrently. The CAS
+  // reservation on `fee_wallets` makes contention safe — losers retry against
+  // the next candidate. Default 16. On Cloudflare Workers the ~50 subrequest
+  // budget is the real ceiling; tune lower if a tick approaches it. Override
+  // via env `PAYOUT_CONCURRENCY_PER_CHAIN`.
+  readonly payoutConcurrencyPerChain?: number;
 }
 
 // Per-surface rate-limit caps. Populated from AppConfig by the entrypoint so

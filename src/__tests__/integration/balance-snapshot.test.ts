@@ -114,6 +114,7 @@ describe("balance-snapshot — db mode (default)", () => {
       chainId: 999,
       address: feeAddr,
       label: "hot-1",
+      derivationIndex: 0x40000000,
       active: 1,
       createdAt: now
     });
@@ -185,6 +186,7 @@ describe("balance-snapshot — db mode (default)", () => {
       chainId: 999,
       address: feeAddr,
       label: "hot-1",
+      derivationIndex: 0x40000000,
       active: 1,
       createdAt: now
     });
@@ -262,6 +264,7 @@ describe("balance-snapshot — rpc mode (opts.live=true)", () => {
       chainId: 999,
       address: "0x0000000000000000000000000000000000000fee",
       label: "hot-1",
+      derivationIndex: 0x40000000,
       active: 1,
       createdAt: now
     });
@@ -279,6 +282,7 @@ describe("balance-snapshot — rpc mode (opts.live=true)", () => {
       chainId: 999,
       address: "0x0000000000000000000000000000000000000fee",
       label: "hot-1",
+      derivationIndex: 0x40000000,
       active: 1,
       createdAt: now
     });

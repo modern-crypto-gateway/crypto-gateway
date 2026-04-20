@@ -1,6 +1,12 @@
 import { Hono } from "hono";
 import type { AppDeps } from "../../core/app-deps.js";
-import { getPayout, listPayouts, planPayout } from "../../core/domain/payout.service.js";
+import {
+  estimatePayoutFees,
+  getPayout,
+  listPayouts,
+  planPayout,
+  planPayoutBatch
+} from "../../core/domain/payout.service.js";
 import { PayoutIdSchema, PayoutStatusSchema, type Payout, type PayoutId } from "../../core/types/payout.js";
 import { renderError } from "../middleware/error-handler.js";
 import { rateLimit } from "../middleware/rate-limit.js";
@@ -72,6 +78,7 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
         token: c.req.query("token"),
         destinationAddress: c.req.query("destinationAddress"),
         sourceAddress: c.req.query("sourceAddress"),
+        batchId: c.req.query("batchId"),
         createdFrom,
         createdTo,
         limit: c.req.query("limit") !== undefined ? Number(c.req.query("limit")) : undefined,
@@ -97,6 +104,93 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
       const input = { ...body, merchantId: c.get("merchantId") };
       const payout = await planPayout(deps, input);
       return c.json({ payout: serializePayout(payout) }, 201);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Mass-create up to 100 payouts in one call. Per-row validation; partial
+  // success is the norm (HTTP 200 when ANY row succeeds, 400 only when the
+  // batch itself is malformed). Every successfully-planned row shares a
+  // single `batchId` returned on the response, which the merchant can use
+  // to list them together via `GET /api/v1/payouts?batchId=<id>`.
+  app.post("/batch", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (body === null) {
+      return c.json({ error: { code: "BAD_JSON", message: "Request body must be JSON" } }, 400);
+    }
+    const rows = Array.isArray((body as { payouts?: unknown }).payouts)
+      ? ((body as { payouts: unknown[] }).payouts)
+      : null;
+    if (rows === null) {
+      return c.json(
+        { error: { code: "BAD_JSON", message: "Request body must be { payouts: [...] }" } },
+        400
+      );
+    }
+    try {
+      const merchantId = c.get("merchantId") as string;
+
+      // Proportional rate limit: a batch of N rows costs N tokens against
+      // the merchant's per-minute budget. The surrounding `rateLimit`
+      // middleware already consumed 1 token (for THIS request); we consume
+      // `N - 1` more before doing the heavy work. Prevents a merchant from
+      // bursting 100×`merchantPerMinute` payout creates via 1 token of cost.
+      const extraTokens = Math.max(0, rows.length - 1);
+      for (let i = 0; i < extraTokens; i += 1) {
+        const r = await deps.rateLimiter.consume({
+          key: `merchant-api:payouts:${merchantId}`,
+          limit: deps.rateLimits.merchantPerMinute,
+          windowSeconds: 60
+        });
+        if (!r.allowed) {
+          const retryAfter = Math.max(1, Math.ceil((r.resetMs - Date.now()) / 1000));
+          c.header("retry-after", String(retryAfter));
+          return c.json(
+            {
+              error: {
+                code: "RATE_LIMITED",
+                message: `Batch size ${rows.length} exceeds remaining quota. Retry after ${retryAfter}s or split into smaller batches.`
+              }
+            },
+            429
+          );
+        }
+      }
+
+      const result = await planPayoutBatch(deps, merchantId, rows);
+      // Serialize every planned payout the same way the single-create
+      // endpoint does so the client's payload handler is uniform.
+      const serialized = {
+        batchId: result.batchId,
+        results: result.results.map((r) =>
+          r.status === "planned"
+            ? { index: r.index, status: "planned" as const, payout: serializePayout(r.payout) }
+            : r
+        ),
+        summary: result.summary
+      };
+      return c.json(serialized, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Quote three fee tiers for a hypothetical payout WITHOUT planning anything
+  // or reserving a wallet. The merchant uses this to show the operator low /
+  // medium / high cost options before they commit to a tier on the actual
+  // POST. Re-estimation at broadcast time picks up baseFee drift, so a small
+  // delta between quoted and actual is expected (especially on EVM under
+  // congestion).
+  app.post("/estimate", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (body === null) {
+      return c.json({ error: { code: "BAD_JSON", message: "Request body must be JSON" } }, 400);
+    }
+    try {
+      const input = { ...body, merchantId: c.get("merchantId") };
+      const result = await estimatePayoutFees(deps, input);
+      return c.json(result, 200);
     } catch (err) {
       return renderError(c, err, deps.logger);
     }

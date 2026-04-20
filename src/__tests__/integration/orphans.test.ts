@@ -155,8 +155,8 @@ describe("PaymentService ingest — orphan write path", () => {
       fromAddress: "0x0000000000000000000000000000000000000001",
       toAddress: "0x0000000000000000000000000000000000000099",
       token: "DEV",
-      // DEV has 18 decimals; 1 DEV raw = 10^18. Send half a DEV.
-      amountRaw: "500000000000000000",
+      // DEV has 6 decimals in the registry (1 DEV raw = 10^6). Send half a DEV.
+      amountRaw: "500000",
       blockNumber: 100,
       confirmations: 5,
       seenAt: new Date()

@@ -1,7 +1,7 @@
 import { HDKey } from "@scure/bip32";
 import { mnemonicToSeedSync } from "@scure/bip39";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
-import type { ChainAdapter } from "../../../core/ports/chain.port.ts";
+import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
@@ -489,6 +489,30 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       });
       const energy = resp.energy_used ?? 0;
       return energy.toString() as AmountRaw;
+    },
+
+    async quoteFeeTiers(args: EstimateArgs): Promise<FeeTierQuote> {
+      // Tron has no concept of priority tiers — TRX txs either fit under the
+      // account's staked bandwidth/energy allowance or burn SUN at a fixed
+      // rate. We quote the burn-all-SUN worst case so the estimate never
+      // undersells what the operator will pay if the account's stake is
+      // insufficient. Energy burn rate is ~420 SUN/unit; bandwidth burn is
+      // ~1000 SUN/byte — both are network parameters that rarely change.
+      // Returning `fee_limit` (the max the operator will spend) as the
+      // conservative upper bound keeps the estimate honest.
+      const energy = BigInt(await this.estimateGasForTransfer(args));
+      // 420 SUN per energy unit is the post-Stake 2.0 burn rate.
+      const ENERGY_BURN_SUN = 420n;
+      // Bandwidth for a TRC-20 transfer is ~345 bytes × 1000 SUN/byte.
+      const BANDWIDTH_SUN = 345n * 1000n;
+      const totalSun = (energy * ENERGY_BURN_SUN + BANDWIDTH_SUN).toString() as AmountRaw;
+      return {
+        low: { tier: "low", nativeAmountRaw: totalSun },
+        medium: { tier: "medium", nativeAmountRaw: totalSun },
+        high: { tier: "high", nativeAmountRaw: totalSun },
+        tieringSupported: false,
+        nativeSymbol: this.nativeSymbol(args.chainId as ChainId)
+      };
     }
   };
 }

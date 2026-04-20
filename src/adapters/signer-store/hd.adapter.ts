@@ -96,9 +96,11 @@ export function hdSignerStore(opts: HdSignerStoreOptions): SignerStore {
       const { privateKey } = adapter.deriveAddress(masterSeed, index);
       return privateKey;
     }
-    // fee-wallet
+    // fee-wallet — prefer the explicit derivationIndex when supplied (used
+    // by wallets promoted from the address pool), else fall back to the
+    // deterministic hash of the label (legacy single-API path).
     const adapter = requireAdapter(scope.family);
-    const index = feeWalletIndex(scope.family, scope.label);
+    const index = scope.derivationIndex ?? feeWalletIndex(scope.family, scope.label);
     const { privateKey } = adapter.deriveAddress(masterSeed, index);
     return privateKey;
   }

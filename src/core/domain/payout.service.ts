@@ -4,7 +4,7 @@ import type { AppDeps } from "../app-deps.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import { ChainIdSchema, type Address, type ChainId } from "../types/chain.js";
 import { MerchantIdSchema } from "../types/merchant.js";
-import { AmountRawSchema } from "../types/money.js";
+import { AmountRawSchema, type AmountRaw } from "../types/money.js";
 import type { Payout, PayoutId } from "../types/payout.js";
 import { TokenSymbolSchema, type TokenSymbol } from "../types/token.js";
 import { findToken } from "../types/token-registry.js";
@@ -13,6 +13,7 @@ import { findChainAdapter } from "./chain-lookup.js";
 import { drizzleRowToPayout } from "./mappers.js";
 import { confirmationThreshold } from "./payment-config.js";
 import { DomainError } from "../errors.js";
+import { assertWebhookUrlSafe } from "./url-safety.js";
 import { feeWallets, merchants, payouts } from "../../db/schema.js";
 
 // PayoutService lifecycle:
@@ -52,6 +53,23 @@ export const PlanPayoutInputSchema = z
     amountRaw: AmountRawSchema.optional(),
     amount: z.string().regex(DECIMAL_STRING, "amount must be a non-negative decimal string").optional(),
     amountUSD: z.string().regex(DECIMAL_STRING, "amountUSD must be a non-negative decimal string").optional(),
+    // Optional fee tier hint. When set, EVM `buildTransfer` binds
+    // maxFeePerGas / maxPriorityFeePerGas at this tier; other families
+    // ignore. When unset, the executor uses the chain's default (medium-
+    // equivalent on EVM, single-tier elsewhere).
+    feeTier: z.enum(["low", "medium", "high"]).optional(),
+    // Optional grouping id. Set by `planPayoutBatch` to the same value on
+    // every row of a batch; ignored when posted directly on a single create
+    // (the schema accepts it for uniformity but the normal `/` endpoint
+    // doesn't expose batching).
+    batchId: z.string().min(1).max(64).optional(),
+    // Opt-in fallback: if no single fee wallet has enough balance for this
+    // payout, the executor may split it across multiple wallets and broadcast
+    // N parallel txs. Default false — the executor defers with
+    // NO_FEE_WALLET_FUNDED and the operator tops up or retries with the flag.
+    // Setting this to true does NOT force multi-source: single-source is
+    // always attempted first, and multi-source only kicks in as a fallback.
+    allowMultiSource: z.boolean().optional(),
     destinationAddress: z.string().min(1).max(128),
 
     // Per-payout webhook override. Both URL and secret must be provided
@@ -62,6 +80,10 @@ export const PlanPayoutInputSchema = z
     webhookUrl: z.string().url().optional(),
     webhookSecret: z.string().min(16).max(512).optional()
   })
+  // Reject unknown keys. Prevents silent extra-field attacks where a future
+  // refactor that adds a sensitive field could accidentally honor a value
+  // the client slipped in before the field was defined.
+  .strict()
   .refine(
     (v) => (v.webhookUrl === undefined) === (v.webhookSecret === undefined),
     {
@@ -88,7 +110,12 @@ export type PayoutErrorCode =
   | "INVALID_DESTINATION"
   | "BAD_AMOUNT"
   | "ORACLE_FAILED"
-  | "NO_FEE_WALLET_AVAILABLE";
+  | "NO_FEE_WALLET_AVAILABLE"
+  | "NO_FEE_WALLET_FUNDED"
+  | "INVALID_FEE_TIER"
+  | "FEE_ESTIMATE_FAILED"
+  | "BATCH_TOO_LARGE"
+  | "INSUFFICIENT_TOTAL_BALANCE";
 
 const PAYOUT_ERROR_HTTP_STATUS: Readonly<Record<PayoutErrorCode, number>> = {
   MERCHANT_NOT_FOUND: 404,
@@ -97,7 +124,12 @@ const PAYOUT_ERROR_HTTP_STATUS: Readonly<Record<PayoutErrorCode, number>> = {
   INVALID_DESTINATION: 400,
   BAD_AMOUNT: 400,
   ORACLE_FAILED: 503,
-  NO_FEE_WALLET_AVAILABLE: 503
+  NO_FEE_WALLET_AVAILABLE: 503,
+  NO_FEE_WALLET_FUNDED: 503,
+  INVALID_FEE_TIER: 400,
+  FEE_ESTIMATE_FAILED: 503,
+  BATCH_TOO_LARGE: 400,
+  INSUFFICIENT_TOTAL_BALANCE: 503
 };
 
 export class PayoutError extends DomainError {
@@ -134,8 +166,13 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
     .from(merchants)
     .where(eq(merchants.id, parsed.merchantId))
     .limit(1);
-  if (!merchant) throw new PayoutError("MERCHANT_NOT_FOUND", `Merchant not found: ${parsed.merchantId}`);
-  if (merchant.active !== 1) throw new PayoutError("MERCHANT_INACTIVE", `Merchant is inactive: ${parsed.merchantId}`);
+  // Generic error messages — don't echo the submitted merchantId back to the
+  // caller. The value is already known to whoever holds the API key (it's
+  // derivable from the key itself server-side), and echoing it in the
+  // response just makes error-log scraping easier for any attacker with a
+  // leaked key trying to probe for victim UUIDs.
+  if (!merchant) throw new PayoutError("MERCHANT_NOT_FOUND", "Merchant not found");
+  if (merchant.active !== 1) throw new PayoutError("MERCHANT_INACTIVE", "Merchant is inactive");
 
   const token = findToken(parsed.chainId, parsed.token);
   if (!token) {
@@ -146,10 +183,39 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   }
 
   const chainAdapter = findChainAdapter(deps, parsed.chainId);
-  if (!chainAdapter.validateAddress(parsed.destinationAddress)) {
-    throw new PayoutError("INVALID_DESTINATION", `Invalid ${chainAdapter.family} address: ${parsed.destinationAddress}`);
+  // Canonicalize FIRST, then validate the canonical form. If a merchant
+  // sends a valid-but-non-canonical address (e.g., mixed-case EVM), this
+  // keeps the stored value consistent with what the adapter will later
+  // verify on-chain, and catches any case where canonicalize would produce
+  // something validateAddress would reject on a second pass.
+  let destination: string;
+  try {
+    destination = chainAdapter.canonicalizeAddress(parsed.destinationAddress);
+  } catch {
+    throw new PayoutError("INVALID_DESTINATION", `Invalid ${chainAdapter.family} address`);
   }
-  const destination = chainAdapter.canonicalizeAddress(parsed.destinationAddress);
+  if (!chainAdapter.validateAddress(destination)) {
+    throw new PayoutError("INVALID_DESTINATION", `Invalid ${chainAdapter.family} address`);
+  }
+
+  // SSRF guard on the per-payout webhook override. Admin merchant-create
+  // already runs this check on the merchant-default URL; payouts need their
+  // own application of the same guard because an authenticated merchant
+  // could otherwise point payout-event webhooks at internal metadata
+  // endpoints (169.254.169.254/...) or loopback services running in the
+  // gateway's VPC. `allowHttp` is the same dev/test escape hatch used by
+  // admin: development and test envs can target http://localhost receivers.
+  if (parsed.webhookUrl !== undefined) {
+    const envName = deps.secrets.getOptional("NODE_ENV");
+    const allowHttp = envName === "development" || envName === "test";
+    const safety = assertWebhookUrlSafe(parsed.webhookUrl, { allowHttp });
+    if (!safety.ok) {
+      throw new PayoutError(
+        "INVALID_DESTINATION",
+        `Per-payout webhookUrl rejected: ${safety.detail ?? safety.reason}`
+      );
+    }
+  }
 
   // Resolve the canonical `amountRaw` from whichever input shape was given.
   // Schema's refine already guaranteed exactly one is set.
@@ -185,6 +251,34 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
     quotedRate = conversion.rate;
   }
 
+  // When the merchant picked a specific fee tier at create time, snapshot
+  // the quoted native-unit cost onto the row. Lets operators later compare
+  // `feeQuotedNative` against the on-chain actual fee for drift analysis
+  // (and lets dispute reconciliation answer "what was the merchant told
+  // this would cost?"). Best-effort — tier quoting uses the chain's RPC and
+  // can fail; a quoting failure here must not block the plan, so we log and
+  // continue with null.
+  let feeQuotedNative: string | null = null;
+  if (parsed.feeTier !== undefined) {
+    try {
+      const tiers = await chainAdapter.quoteFeeTiers({
+        chainId: parsed.chainId as ChainId,
+        fromAddress: destination as Address, // placeholder; gas est is tx-payload-driven
+        toAddress: destination as Address,
+        token: parsed.token as TokenSymbol,
+        amountRaw: amountRaw as AmountRaw
+      });
+      feeQuotedNative = tiers[parsed.feeTier].nativeAmountRaw;
+    } catch (err) {
+      deps.logger.warn("payout.plan.fee_tier_quote_failed", {
+        chainId: parsed.chainId,
+        token: parsed.token,
+        feeTier: parsed.feeTier,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
+
   // Encrypt the per-payout webhook secret if one was provided. Stored
   // ciphertext only; plaintext lives only in the request body and the
   // decrypt-then-HMAC stack frame at dispatch time. URL+secret pairing is
@@ -206,6 +300,12 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
     amountRaw,
     quotedAmountUsd,
     quotedRate,
+    feeTier: parsed.feeTier ?? null,
+    feeQuotedNative,
+    batchId: parsed.batchId ?? null,
+    allowMultiSource: parsed.allowMultiSource === true ? 1 : 0,
+    sourceAddressesJson: null,
+    txHashesJson: null,
     destinationAddress: destination,
     sourceAddress: null,
     txHash: null,
@@ -226,16 +326,335 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   return row;
 }
 
+// Maximum rows per batch. Keeps the per-request work bounded so a single
+// batch can't starve the rate limiter or push the runtime past its
+// subrequest budget. Larger queues should chunk client-side.
+const PAYOUT_BATCH_MAX = 100;
+
+export type PayoutBatchOutcome =
+  | { index: number; status: "planned"; payout: Payout }
+  | { index: number; status: "failed"; error: { code: string; message: string } };
+
+export interface PlanPayoutBatchResult {
+  batchId: string;
+  results: PayoutBatchOutcome[];
+  summary: { planned: number; failed: number };
+}
+
+// Plan up to `PAYOUT_BATCH_MAX` payouts in one call. Each row is validated
+// and inserted independently inside a per-row try/catch — one bad row
+// doesn't sink the whole batch. Every successfully-planned row carries the
+// same `batchId` so operators can list them together later via
+// `GET /api/v1/payouts?batchId=<id>`.
+//
+// Atomicity is PER-ROW: we don't wrap the whole batch in a single DB
+// transaction because libSQL batch transactions don't span the non-DB work
+// (price-oracle calls, adapter validation, signer) that planPayout does.
+// Fail-open per-row is the safer default for mass payouts — partial success
+// beats all-or-nothing here.
+export async function planPayoutBatch(
+  deps: AppDeps,
+  merchantId: string,
+  payoutsInput: readonly unknown[]
+): Promise<PlanPayoutBatchResult> {
+  if (payoutsInput.length === 0) {
+    // Empty batch: don't even mint a batchId.
+    return { batchId: "", results: [], summary: { planned: 0, failed: 0 } };
+  }
+  if (payoutsInput.length > PAYOUT_BATCH_MAX) {
+    throw new PayoutError(
+      "BATCH_TOO_LARGE",
+      `Batch size ${payoutsInput.length} exceeds cap ${PAYOUT_BATCH_MAX}. Split into smaller batches.`
+    );
+  }
+
+  const batchId = globalThis.crypto.randomUUID();
+  const results: PayoutBatchOutcome[] = [];
+  let planned = 0;
+  let failed = 0;
+
+  for (let i = 0; i < payoutsInput.length; i += 1) {
+    const row = payoutsInput[i];
+    try {
+      // Merge in the batch-level merchantId and batchId. Accept-only semantics:
+      // the merchant cannot override these from the body.
+      const input = {
+        ...((row as Record<string, unknown>) ?? {}),
+        merchantId,
+        batchId
+      };
+      const payout = await planPayout(deps, input);
+      results.push({ index: i, status: "planned", payout });
+      planned += 1;
+    } catch (err) {
+      if (err instanceof DomainError) {
+        results.push({
+          index: i,
+          status: "failed",
+          error: { code: err.code, message: err.message }
+        });
+      } else if (err instanceof z.ZodError) {
+        results.push({
+          index: i,
+          status: "failed",
+          error: { code: "VALIDATION_FAILED", message: err.issues.map((x) => x.message).join("; ") }
+        });
+      } else {
+        results.push({
+          index: i,
+          status: "failed",
+          error: {
+            code: "INTERNAL",
+            message: err instanceof Error ? err.message : String(err)
+          }
+        });
+      }
+      failed += 1;
+    }
+  }
+
+  return { batchId, results, summary: { planned, failed } };
+}
+
+// Quote three fee tiers for a hypothetical payout WITHOUT planning anything
+// or reserving a fee wallet. Operators call this from the dashboard before
+// committing — the merchant picks a tier, then plans the payout with that
+// tier set in the body. The price oracle converts each tier's native amount
+// to USD for display; oracle failure is non-fatal here (the operator can
+// still pick a tier knowing only the native cost).
+//
+// The fee wallet's `fromAddress` for the underlying gas estimate isn't known
+// at this point (no CAS yet), so we use a placeholder address — gas estimates
+// for straight transfers don't depend meaningfully on `from` for ERC-20 or
+// native transfers. The actual broadcast re-estimates with the real wallet.
+export interface EstimatePayoutFeesInput {
+  merchantId: string;
+  chainId: number;
+  token: string;
+  amountRaw?: string;
+  amount?: string;
+  amountUSD?: string;
+  destinationAddress: string;
+}
+
+export interface EstimatePayoutFeesResult {
+  amountRaw: string;
+  quotedAmountUsd: string | null;
+  quotedRate: string | null;
+  tiers: {
+    tieringSupported: boolean;
+    nativeSymbol: string;
+    low: { tier: "low"; nativeAmountRaw: string; usdAmount: string | null };
+    medium: { tier: "medium"; nativeAmountRaw: string; usdAmount: string | null };
+    high: { tier: "high"; nativeAmountRaw: string; usdAmount: string | null };
+  };
+}
+
+export async function estimatePayoutFees(
+  deps: AppDeps,
+  input: unknown
+): Promise<EstimatePayoutFeesResult> {
+  // Reuse PlanPayoutInputSchema for shape validation. We strip webhook fields
+  // by passing only the relevant subset — the schema's refines on amount-key
+  // exclusivity and merchant existence are exactly what we need here too.
+  const parsed = PlanPayoutInputSchema.parse(input);
+
+  const [merchant] = await deps.db
+    .select({ id: merchants.id, active: merchants.active })
+    .from(merchants)
+    .where(eq(merchants.id, parsed.merchantId))
+    .limit(1);
+  if (!merchant) throw new PayoutError("MERCHANT_NOT_FOUND", `Merchant not found: ${parsed.merchantId}`);
+  if (merchant.active !== 1) throw new PayoutError("MERCHANT_INACTIVE", `Merchant is inactive: ${parsed.merchantId}`);
+
+  const token = findToken(parsed.chainId, parsed.token);
+  if (!token) {
+    throw new PayoutError(
+      "TOKEN_NOT_SUPPORTED",
+      `Token ${parsed.token} not supported on chain ${parsed.chainId}`
+    );
+  }
+
+  const chainAdapter = findChainAdapter(deps, parsed.chainId);
+  if (!chainAdapter.validateAddress(parsed.destinationAddress)) {
+    throw new PayoutError(
+      "INVALID_DESTINATION",
+      `Invalid ${chainAdapter.family} address: ${parsed.destinationAddress}`
+    );
+  }
+  const destination = chainAdapter.canonicalizeAddress(parsed.destinationAddress);
+
+  // Resolve amountRaw the same way planPayout does. USD-pegged path may fail
+  // with ORACLE_FAILED; that's fine — the operator's best path is to retry.
+  let amountRaw: string;
+  let quotedAmountUsd: string | null = null;
+  let quotedRate: string | null = null;
+  if (parsed.amountRaw !== undefined) {
+    amountRaw = parsed.amountRaw;
+  } else if (parsed.amount !== undefined) {
+    amountRaw = decimalToRaw(parsed.amount, token.decimals);
+  } else {
+    let conversion: { amountRaw: string; rate: string };
+    try {
+      conversion = await deps.priceOracle.fiatToTokenAmount(
+        parsed.amountUSD!,
+        parsed.token,
+        "USD" as Parameters<typeof deps.priceOracle.fiatToTokenAmount>[2],
+        token.decimals
+      );
+    } catch (err) {
+      throw new PayoutError(
+        "ORACLE_FAILED",
+        `Failed to fetch ${parsed.token}/USD rate: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    amountRaw = conversion.amountRaw;
+    quotedAmountUsd = parsed.amountUSD!;
+    quotedRate = conversion.rate;
+  }
+
+  // Pick a placeholder fromAddress for gas estimation. We use the FIRST
+  // active fee wallet on the chain if one exists (its derivation history
+  // doesn't matter for gas estimation), else fall back to the destination
+  // itself — gas estimates for straight transfers are address-insensitive
+  // for the most part, and the broadcast re-estimates with the real wallet.
+  const [sampleWallet] = await deps.db
+    .select({ address: feeWallets.address })
+    .from(feeWallets)
+    .where(and(eq(feeWallets.chainId, parsed.chainId), eq(feeWallets.active, 1)))
+    .limit(1);
+  const fromForEstimate = (sampleWallet?.address ?? destination) as Address;
+
+  let tiers: Awaited<ReturnType<ChainAdapter["quoteFeeTiers"]>>;
+  try {
+    tiers = await chainAdapter.quoteFeeTiers({
+      chainId: parsed.chainId as ChainId,
+      fromAddress: fromForEstimate,
+      toAddress: destination as Address,
+      token: parsed.token as TokenSymbol,
+      amountRaw: amountRaw as AmountRaw
+    });
+  } catch (err) {
+    throw new PayoutError(
+      "FEE_ESTIMATE_FAILED",
+      `Fee estimation failed for chain ${parsed.chainId}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  // Convert each tier's native amount to USD. Best-effort — oracle outage
+  // here doesn't fail the whole estimate; we just return null usdAmount and
+  // the operator gets to see the native cost.
+  const decimalsForNative = token.symbol === tiers.nativeSymbol ? token.decimals : nativeDecimalsForFamily(chainAdapter.family);
+  async function toUsd(nativeRaw: string): Promise<string | null> {
+    try {
+      const wholeNative = formatRawDecimal(nativeRaw, decimalsForNative);
+      const rate = await deps.priceOracle.tokenToFiat(
+        tiers.nativeSymbol as TokenSymbol,
+        "USD" as Parameters<typeof deps.priceOracle.tokenToFiat>[1]
+      );
+      return mulDecimal(wholeNative, rate.rate);
+    } catch {
+      return null;
+    }
+  }
+
+  const [lowUsd, midUsd, highUsd] = await Promise.all([
+    toUsd(tiers.low.nativeAmountRaw),
+    toUsd(tiers.medium.nativeAmountRaw),
+    toUsd(tiers.high.nativeAmountRaw)
+  ]);
+
+  return {
+    amountRaw,
+    quotedAmountUsd,
+    quotedRate,
+    tiers: {
+      tieringSupported: tiers.tieringSupported,
+      nativeSymbol: tiers.nativeSymbol,
+      low: { tier: "low", nativeAmountRaw: tiers.low.nativeAmountRaw, usdAmount: lowUsd },
+      medium: { tier: "medium", nativeAmountRaw: tiers.medium.nativeAmountRaw, usdAmount: midUsd },
+      high: { tier: "high", nativeAmountRaw: tiers.high.nativeAmountRaw, usdAmount: highUsd }
+    }
+  };
+}
+
+// Native decimals per family. Used by the estimate endpoint to convert the
+// returned native amount into a USD figure via the priceOracle.
+function nativeDecimalsForFamily(family: "evm" | "tron" | "solana"): number {
+  if (family === "evm") return 18;
+  if (family === "tron") return 6;
+  return 9;
+}
+
+// Format a raw integer string as a decimal whole-units string at `decimals`
+// precision. Mirrors the inverse of `decimalToRaw` above.
+function formatRawDecimal(raw: string, decimals: number): string {
+  const padded = raw.padStart(decimals + 1, "0");
+  const whole = padded.slice(0, -decimals);
+  const frac = padded.slice(-decimals);
+  // Trim trailing zeros in the fractional part for a tidy display value;
+  // priceOracle.tokenToFiat is decimal-safe regardless.
+  const trimmedFrac = frac.replace(/0+$/, "");
+  return trimmedFrac.length === 0 ? whole : `${whole}.${trimmedFrac}`;
+}
+
+// Multiply two non-negative decimal strings without floating-point loss.
+// Used by the estimate endpoint to compute USD from native × USD/native.
+// Always half-up rounds to 2 decimals — truncation produced systematic
+// under-quoting (1000 ops × $0.005 drift = $5 invisible leak), and leading
+// ".99" (empty wholePart) produced legally broken display strings.
+//
+// Exported for unit testing the edge cases that an earlier version missed.
+export function mulDecimal(a: string, b: string): string {
+  const aNorm = a.includes(".") ? a : `${a}.`;
+  const bNorm = b.includes(".") ? b : `${b}.`;
+  const [aWholeRaw, aFrac = ""] = aNorm.split(".");
+  const [bWholeRaw, bFrac = ""] = bNorm.split(".");
+  const aWhole = aWholeRaw === "" ? "0" : (aWholeRaw ?? "0");
+  const bWhole = bWholeRaw === "" ? "0" : (bWholeRaw ?? "0");
+  const aScaled = BigInt(aWhole + aFrac);
+  const bScaled = BigInt(bWhole + bFrac);
+  const product = aScaled * bScaled;
+  const totalFracDigits = aFrac.length + bFrac.length;
+  // Half-up round to 2 decimals. Take 3 digits past the decimal point, then
+  // round based on the 3rd. This avoids the 0.001/2500.999 = $2.09 truncation
+  // bug — correct rounded value is $2.50 (the full product is 2.502497499).
+  const fullProductStr = product.toString().padStart(totalFracDigits + 1, "0");
+  const wholePartRaw = totalFracDigits === 0 ? fullProductStr : fullProductStr.slice(0, -totalFracDigits);
+  const fracFull = totalFracDigits === 0 ? "" : fullProductStr.slice(-totalFracDigits);
+  const fracFor2dp = (fracFull + "000").slice(0, 3); // always 3 digits for rounding
+  const firstTwo = fracFor2dp.slice(0, 2);
+  const roundDigit = Number(fracFor2dp[2] ?? "0");
+  let roundedWhole = wholePartRaw === "" ? "0" : wholePartRaw;
+  let roundedFrac = firstTwo;
+  if (roundDigit >= 5) {
+    // Add 1 to the cents via BigInt to avoid carry bugs at boundaries.
+    const centsRounded = BigInt(roundedWhole) * 100n + BigInt(firstTwo) + 1n;
+    const cr = centsRounded.toString().padStart(3, "0");
+    roundedWhole = cr.slice(0, -2);
+    roundedFrac = cr.slice(-2);
+  }
+  // Guarantee a non-empty whole part for display stability.
+  if (roundedWhole === "") roundedWhole = "0";
+  return `${roundedWhole}.${roundedFrac}`;
+}
+
 // Register a fee wallet for a chain. Payouts on `chainId` will CAS-reserve from
 // this pool. The matching private key is HD-derived on demand from MASTER_SEED
 // at execution time — nothing is stored at rest.
 export async function registerFeeWallet(
   deps: AppDeps,
-  args: { chainId: number; address: string; label: string }
+  args: { chainId: number; address: string; label: string; derivationIndex: number }
 ): Promise<void> {
   const now = deps.clock.now().getTime();
   const chainAdapter = findChainAdapter(deps, args.chainId);
   const canonical = chainAdapter.canonicalizeAddress(args.address);
+  // Refresh the label, derivation index, and active flag on conflict — the
+  // caller is the source of truth on every register call. (Re-registering an
+  // existing fee wallet at a NEW derivation index would be a serious
+  // configuration error; the upstream admin handler should already have
+  // derived the address from the supplied index, so the address column would
+  // mismatch and trigger the unique constraint instead.)
   await deps.db
     .insert(feeWallets)
     .values({
@@ -243,6 +662,7 @@ export async function registerFeeWallet(
       chainId: args.chainId,
       address: canonical,
       label: args.label,
+      derivationIndex: args.derivationIndex,
       active: 1,
       reservedByPayoutId: null,
       reservedAt: null,
@@ -250,7 +670,7 @@ export async function registerFeeWallet(
     })
     .onConflictDoUpdate({
       target: [feeWallets.chainId, feeWallets.address],
-      set: { label: args.label, active: 1 }
+      set: { label: args.label, derivationIndex: args.derivationIndex, active: 1 }
     });
 }
 
@@ -268,8 +688,29 @@ export interface ExecuteReservedPayoutsOptions {
   maxBatch?: number;
 }
 
+// Default cap when `deps.payoutConcurrencyPerChain` is unset. 16 fits well
+// inside Cloudflare's ~50-subrequest budget per request when most ticks have
+// 1-2 active chains; tune via env on busier deployments.
+const DEFAULT_PAYOUT_CONCURRENCY_PER_CHAIN = 16;
+
+// Tick-local balance cache. Scoped to one `executeReservedPayouts` call so
+// concurrent workers on the same chain share one RPC-fetched value per
+// `(chainId, address, token)` key instead of each worker re-querying. Entries
+// live only for the duration of the executor tick; the next tick starts
+// fresh. A cached `null` means the last read threw — callers treat that as
+// "can't verify" and fall back to the post-reservation defensive check.
+type BalanceCache = Map<string, Promise<bigint | null>>;
+function balanceCacheKey(chainId: number, address: string, token: string): string {
+  return `${chainId}:${address}:${token}`;
+}
+
 // Cron-triggered: promote planned payouts to submitted by CAS-reserving a fee
-// wallet, building + signing + broadcasting the transfer.
+// wallet, building + signing + broadcasting the transfer. Cross-chain rows run
+// in parallel (no shared resource); within a chain we cap concurrency so we
+// don't blow the runtime's subrequest budget. The two CAS gates inside
+// `executeOnePayout` (`tryReserveFeeWallet` + the broadcast-slot CAS) make
+// concurrent calls on the same chain race-safe — losers naturally retry the
+// next candidate or short-circuit to `deferred`.
 export async function executeReservedPayouts(
   deps: AppDeps,
   opts: ExecuteReservedPayoutsOptions = {}
@@ -282,156 +723,171 @@ export async function executeReservedPayouts(
     .orderBy(asc(payouts.createdAt))
     .limit(limit);
 
-  let submitted = 0;
-  let failed = 0;
-  let deferred = 0;
+  if (planned.length === 0) {
+    return { attempted: 0, submitted: 0, failed: 0, deferred: 0 };
+  }
+
+  // Group by chainId so the per-chain concurrency cap is enforced
+  // independently. Cross-chain runs in parallel via the outer Promise.all.
+  const byChain = new Map<number, (typeof planned)[number][]>();
   for (const row of planned) {
-    const chainAdapter = findChainAdapter(deps, row.chainId);
+    const list = byChain.get(row.chainId) ?? [];
+    list.push(row);
+    byChain.set(row.chainId, list);
+  }
 
-    // 1. CAS-reserve a free fee wallet for this chain.
-    const wallet = await tryReserveFeeWallet(deps, row.chainId, row.id);
-    if (!wallet) {
-      deferred += 1;
-      continue;
+  const cap = Math.max(1, deps.payoutConcurrencyPerChain ?? DEFAULT_PAYOUT_CONCURRENCY_PER_CHAIN);
+  const counts = { submitted: 0, failed: 0, deferred: 0 };
+  // One balance cache per tick, shared across all workers. Multiple payouts
+  // selecting from the same fee-wallet pool only pay one getBalance per
+  // (wallet, token) pair.
+  const balanceCache: BalanceCache = new Map();
+
+  await Promise.all(
+    Array.from(byChain.values()).map((rowsForChain) =>
+      runWithConcurrencyCap(rowsForChain, cap, async (row) => {
+        const outcome = await executeOnePayout(deps, row, balanceCache);
+        counts[outcome] += 1;
+      })
+    )
+  );
+
+  return {
+    attempted: planned.length,
+    submitted: counts.submitted,
+    failed: counts.failed,
+    deferred: counts.deferred
+  };
+}
+
+// Bounded worker pool. Pulls items off the front of the queue; each worker
+// processes one at a time, returns to grab the next. Order within a chain
+// stays roughly FIFO (older payouts start first) but completion order is not
+// preserved — that's fine, each row's outcome is independent.
+async function runWithConcurrencyCap<T>(
+  items: readonly T[],
+  cap: number,
+  worker: (item: T) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return;
+  let cursor = 0;
+  const workerCount = Math.min(cap, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const i = cursor;
+        cursor += 1;
+        if (i >= items.length) return;
+        await worker(items[i] as T);
+      }
+    })
+  );
+}
+
+// Single-payout pipeline: CAS-reserve wallet -> claim broadcast slot ->
+// balance pre-flight -> build/sign/broadcast. Returns the terminal outcome
+// from the executor's perspective so the caller can tally without sharing
+// state across workers. All persistence happens inside this function — the
+// caller never touches the row.
+async function executeOnePayout(
+  deps: AppDeps,
+  row: typeof payouts.$inferSelect,
+  balanceCache: BalanceCache
+): Promise<"submitted" | "failed" | "deferred"> {
+  const chainAdapter = findChainAdapter(deps, row.chainId);
+
+  // 1. Gas-aware CAS: pick a wallet that has both the token AND enough native
+  //    gas, then CAS-claim it. The old "pick first available, check balance
+  //    after" path churned through reserve→fail→release when the first row
+  //    was short. Now we filter candidates before reserving so that "reserve,
+  //    fail, release" is the exceptional case (RPC drift) rather than the
+  //    common one.
+  const wallet = await selectAndReserveFeeWallet(
+    deps,
+    row,
+    chainAdapter,
+    balanceCache
+  );
+  if (!wallet) {
+    // Single-source wallet selection failed. If the operator opted into the
+    // multi-source fallback, try splitting the amount across multiple
+    // wallets. The multi-source path is a separate execution pipeline —
+    // returns its own terminal outcome and we don't fall through to the
+    // rest of this function.
+    if (row.allowMultiSource === 1) {
+      return executeMultiSourcePayout(deps, row, chainAdapter, balanceCache);
     }
+    return "deferred";
+  }
 
-    // 2. Move the payout to 'reserved' and record the source address.
-    const now1 = deps.clock.now().getTime();
-    await deps.db
-      .update(payouts)
-      .set({ status: "reserved", sourceAddress: wallet.address, updatedAt: now1 })
-      .where(eq(payouts.id, row.id));
+  // 2. Move the payout to 'reserved' and record the source address.
+  const now1 = deps.clock.now().getTime();
+  await deps.db
+    .update(payouts)
+    .set({ status: "reserved", sourceAddress: wallet.address, updatedAt: now1 })
+    .where(eq(payouts.id, row.id));
 
-    // 3. Claim the broadcast slot (CAS on broadcast_attempted_at) BEFORE calling
-    //    the chain adapter. If the CAS loses (returns null) either another
-    //    worker already broadcast this payout, or a previous attempt crashed
-    //    after broadcast but before we could record success. Either way, we
-    //    MUST NOT broadcast again — doing so would double-spend the fee wallet.
-    //    Fail-shut: flip to 'failed' and release the wallet so an operator can
-    //    manually reconcile with on-chain state before retrying.
-    const [broadcastClaim] = await deps.db
-      .update(payouts)
-      .set({ broadcastAttemptedAt: deps.clock.now().getTime() })
-      .where(
-        and(
-          eq(payouts.id, row.id),
-          isNull(payouts.broadcastAttemptedAt),
-          eq(payouts.status, "reserved")
-        )
+  // 3. Claim the broadcast slot (CAS on broadcast_attempted_at) BEFORE calling
+  //    the chain adapter. If the CAS loses (returns null) either another
+  //    worker already broadcast this payout, or a previous attempt crashed
+  //    after broadcast but before we could record success. Either way, we
+  //    MUST NOT broadcast again — doing so would double-spend the fee wallet.
+  //    Fail-shut: flip to 'failed' and release the wallet so an operator can
+  //    manually reconcile with on-chain state before retrying.
+  const [broadcastClaim] = await deps.db
+    .update(payouts)
+    .set({ broadcastAttemptedAt: deps.clock.now().getTime() })
+    .where(
+      and(
+        eq(payouts.id, row.id),
+        isNull(payouts.broadcastAttemptedAt),
+        eq(payouts.status, "reserved")
       )
-      .returning({ id: payouts.id });
-    if (!broadcastClaim) {
-      // Someone else is broadcasting this row (or already did). Don't touch it.
-      deferred += 1;
-      continue;
+    )
+    .returning({ id: payouts.id });
+  if (!broadcastClaim) {
+    // Someone else is broadcasting this row (or already did). Don't touch it.
+    return "deferred";
+  }
+
+  // 4. Balance pre-flight. Before we burn energy/gas on a tx that will
+  //    revert on-chain, ask the adapter what the fee wallet actually holds
+  //    and bail early if it's short. Adapters that haven't implemented
+  //    getBalance (Tron, Solana) throw — we catch and continue under the
+  //    "broadcast and let the chain decide" fallback so we don't break
+  //    existing flows while the coverage gap is closed iteratively.
+  try {
+    const walletBalance = await chainAdapter.getBalance({
+      chainId: row.chainId as ChainId,
+      address: wallet.address as Address,
+      token: row.token as TokenSymbol
+    });
+    if (BigInt(walletBalance) < BigInt(row.amountRaw)) {
+      throw new Error(
+        `Insufficient ${row.token} balance on fee wallet ${wallet.address}: ` +
+          `have ${walletBalance}, need ${row.amountRaw}`
+      );
     }
-
-    // 4. Balance pre-flight. Before we burn energy/gas on a tx that will
-    //    revert on-chain, ask the adapter what the fee wallet actually holds
-    //    and bail early if it's short. Adapters that haven't implemented
-    //    getBalance (Tron, Solana) throw — we catch and continue under the
-    //    "broadcast and let the chain decide" fallback so we don't break
-    //    existing flows while the coverage gap is closed iteratively.
-    try {
-      const walletBalance = await chainAdapter.getBalance({
-        chainId: row.chainId as ChainId,
-        address: wallet.address as Address,
-        token: row.token as TokenSymbol
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Distinguish "adapter can't check" (benign) from "adapter says no"
+    // (hard fail). The "not implemented" path logs once and proceeds.
+    if (message.includes("not implemented")) {
+      deps.logger.debug("balance pre-check skipped (adapter not implemented)", {
+        payoutId: row.id,
+        chainId: row.chainId
       });
-      if (BigInt(walletBalance) < BigInt(row.amountRaw)) {
-        throw new Error(
-          `Insufficient ${row.token} balance on fee wallet ${wallet.address}: ` +
-            `have ${walletBalance}, need ${row.amountRaw}`
-        );
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // Distinguish "adapter can't check" (benign) from "adapter says no"
-      // (hard fail). The "not implemented" path logs once and proceeds.
-      if (message.includes("not implemented")) {
-        deps.logger.debug("balance pre-check skipped (adapter not implemented)", {
-          payoutId: row.id,
-          chainId: row.chainId
-        });
-      } else if (message.startsWith("Insufficient ")) {
-        // Hard fail — fee wallet short. Mark failed + release the wallet so
-        // the operator can top it up and the payout gets re-planned manually
-        // (we don't auto-retry a known-bad wallet).
-        const now2 = deps.clock.now().getTime();
-        const failStmt = deps.db
-          .update(payouts)
-          .set({ status: "failed", lastError: message.slice(0, 2048), updatedAt: now2 })
-          .where(eq(payouts.id, row.id));
-        const releaseStmt = releaseFeeWalletStmt(deps, row.id);
-        await deps.db.batch([failStmt, releaseStmt] as [typeof failStmt, typeof releaseStmt]);
-        const updated = await fetchPayout(deps, row.id);
-        if (updated) {
-          await deps.events.publish({
-            type: "payout.failed",
-            payoutId: updated.id,
-            payout: updated,
-            at: new Date(now2)
-          });
-        }
-        failed += 1;
-        continue;
-      } else {
-        // Transient RPC error reading balance. Log, proceed to broadcast —
-        // the chain's own simulation/preflight is our backstop.
-        deps.logger.warn("balance pre-check failed; proceeding to broadcast", {
-          payoutId: row.id,
-          chainId: row.chainId,
-          error: message
-        });
-      }
-    }
-
-    // 5. Build -> sign -> broadcast. Any throw here moves us to 'failed' and
-    //    releases the wallet so a retry (with a different or the same wallet)
-    //    can proceed. Because the broadcast slot is already claimed above, a
-    //    retry after this point will not re-enter this block for this row.
-    try {
-      const unsigned = await chainAdapter.buildTransfer({
-        chainId: row.chainId,
-        fromAddress: wallet.address,
-        toAddress: row.destinationAddress,
-        token: row.token,
-        amountRaw: row.amountRaw
-      });
-
-      const signerScope: SignerScope = feeWalletScope(chainAdapter, wallet.label);
-      const privateKey = await deps.signerStore.get(signerScope);
-      const txHash = await chainAdapter.signAndBroadcast(unsigned, privateKey);
-
+    } else if (message.startsWith("Insufficient ")) {
+      // Hard fail — fee wallet short. Mark failed + release the wallet so
+      // the operator can top it up and the payout gets re-planned manually
+      // (we don't auto-retry a known-bad wallet).
       const now2 = deps.clock.now().getTime();
-      await deps.db
-        .update(payouts)
-        .set({ status: "submitted", txHash, submittedAt: now2, updatedAt: now2 })
-        .where(eq(payouts.id, row.id));
-
-      const updated = await fetchPayout(deps, row.id);
-      if (updated) {
-        await deps.events.publish({
-          type: "payout.submitted",
-          payoutId: updated.id,
-          payout: updated,
-          at: new Date(now2)
-        });
-      }
-      submitted += 1;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const now2 = deps.clock.now().getTime();
-      // Terminal transition: flip payout to 'failed' AND release the fee wallet
-      // in a single atomic batch. A crash between the two statements would
-      // otherwise leave the wallet reserved forever.
       const failStmt = deps.db
         .update(payouts)
         .set({ status: "failed", lastError: message.slice(0, 2048), updatedAt: now2 })
         .where(eq(payouts.id, row.id));
       const releaseStmt = releaseFeeWalletStmt(deps, row.id);
       await deps.db.batch([failStmt, releaseStmt] as [typeof failStmt, typeof releaseStmt]);
-
       const updated = await fetchPayout(deps, row.id);
       if (updated) {
         await deps.events.publish({
@@ -441,11 +897,391 @@ export async function executeReservedPayouts(
           at: new Date(now2)
         });
       }
-      failed += 1;
+      return "failed";
+    } else {
+      // Transient RPC error reading balance. Log, proceed to broadcast —
+      // the chain's own simulation/preflight is our backstop.
+      deps.logger.warn("balance pre-check failed; proceeding to broadcast", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        error: message
+      });
     }
   }
 
-  return { attempted: planned.length, submitted, failed, deferred };
+  // 5. Build -> sign -> broadcast. Any throw here moves us to 'failed' and
+  //    releases the wallet so a retry (with a different or the same wallet)
+  //    can proceed. Because the broadcast slot is already claimed above, a
+  //    retry after this point will not re-enter this block for this row.
+  try {
+    const unsigned = await chainAdapter.buildTransfer({
+      chainId: row.chainId,
+      fromAddress: wallet.address,
+      toAddress: row.destinationAddress,
+      token: row.token,
+      amountRaw: row.amountRaw,
+      ...(row.feeTier !== null
+        ? { feeTier: row.feeTier as "low" | "medium" | "high" }
+        : {})
+    });
+
+    const signerScope: SignerScope = feeWalletScope(
+      chainAdapter,
+      wallet.label,
+      wallet.derivationIndex
+    );
+    const privateKey = await deps.signerStore.get(signerScope);
+    const txHash = await chainAdapter.signAndBroadcast(unsigned, privateKey);
+
+    const now2 = deps.clock.now().getTime();
+    await deps.db
+      .update(payouts)
+      .set({ status: "submitted", txHash, submittedAt: now2, updatedAt: now2 })
+      .where(eq(payouts.id, row.id));
+
+    const updated = await fetchPayout(deps, row.id);
+    if (updated) {
+      await deps.events.publish({
+        type: "payout.submitted",
+        payoutId: updated.id,
+        payout: updated,
+        at: new Date(now2)
+      });
+    }
+    return "submitted";
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const now2 = deps.clock.now().getTime();
+    // Terminal transition: flip payout to 'failed' AND release the fee wallet
+    // in a single atomic batch. A crash between the two statements would
+    // otherwise leave the wallet reserved forever.
+    const failStmt = deps.db
+      .update(payouts)
+      .set({ status: "failed", lastError: message.slice(0, 2048), updatedAt: now2 })
+      .where(eq(payouts.id, row.id));
+    const releaseStmt = releaseFeeWalletStmt(deps, row.id);
+    await deps.db.batch([failStmt, releaseStmt] as [typeof failStmt, typeof releaseStmt]);
+
+    const updated = await fetchPayout(deps, row.id);
+    if (updated) {
+      await deps.events.publish({
+        type: "payout.failed",
+        payoutId: updated.id,
+        payout: updated,
+        at: new Date(now2)
+      });
+    }
+    return "failed";
+  }
+}
+
+// Multi-source fallback pipeline. Invoked from `executeOnePayout` ONLY when:
+//   1. `row.allowMultiSource === 1` (merchant opted in at create time), AND
+//   2. Single-source selection returned null (no wallet had enough balance).
+//
+// Greedily picks the top-N wallets sorted by token balance desc until their
+// cumulative balance clears the payout amount, CAS-reserves all of them,
+// then broadcasts one tx per wallet covering a proportional slice. The row's
+// status transitions planned → submitted in one shot; the per-leg tx hashes
+// land in `tx_hashes_json` and the per-leg source addresses in
+// `source_addresses_json`. Confirmation (see `confirmPayouts`) then waits
+// for EVERY hash to cross the chain's confirmation threshold.
+//
+// On any broadcast failure: every reserved wallet is released, the payout
+// flips to failed. Legs that already submitted on-chain before the failure
+// become orphan outbound txs — operator reconciles via the `txHashes` field.
+// This is intentional: we don't auto-refund or auto-retry partial
+// broadcasts, because doing so would require reversing on-chain txs.
+async function executeMultiSourcePayout(
+  deps: AppDeps,
+  row: typeof payouts.$inferSelect,
+  chainAdapter: ChainAdapter,
+  balanceCache: BalanceCache
+): Promise<"submitted" | "failed" | "deferred"> {
+  const requiredAmount = BigInt(row.amountRaw);
+  const nativeSymbol = chainAdapter.nativeSymbol(row.chainId as ChainId);
+
+  // Gather every active, unreserved wallet on this chain.
+  const candidates = await deps.db
+    .select({
+      id: feeWallets.id,
+      address: feeWallets.address,
+      label: feeWallets.label,
+      derivationIndex: feeWallets.derivationIndex
+    })
+    .from(feeWallets)
+    .where(
+      and(
+        eq(feeWallets.chainId, row.chainId),
+        eq(feeWallets.active, 1),
+        isNull(feeWallets.reservedByPayoutId)
+      )
+    );
+  if (candidates.length === 0) {
+    deps.logger.debug("payout.multi_source.no_wallet_available", {
+      payoutId: row.id,
+      chainId: row.chainId
+    });
+    return "deferred";
+  }
+
+  // Fetch each candidate's token + native balance via the shared cache.
+  const estimatedGas = await estimateGasOrFallback(chainAdapter, {
+    chainId: row.chainId as ChainId,
+    fromAddress: candidates[0]!.address as Address,
+    toAddress: row.destinationAddress as Address,
+    token: row.token as TokenSymbol,
+    amountRaw: row.amountRaw as AmountRaw
+  });
+  const enriched = await Promise.all(
+    candidates.map(async (c) => {
+      const tokenBalance = await cachedGetBalance(
+        deps,
+        chainAdapter,
+        balanceCache,
+        row.chainId,
+        c.address,
+        row.token
+      );
+      if (tokenBalance === null || tokenBalance <= 0n) return null;
+      const nativeBalance =
+        row.token === nativeSymbol
+          ? tokenBalance
+          : await cachedGetBalance(
+              deps,
+              chainAdapter,
+              balanceCache,
+              row.chainId,
+              c.address,
+              nativeSymbol
+            );
+      if (nativeBalance === null || nativeBalance < estimatedGas) return null;
+      return { ...c, tokenBalance };
+    })
+  );
+  const funded = enriched
+    .filter((c): c is NonNullable<typeof c> => c !== null)
+    .sort((a, b) => (a.tokenBalance < b.tokenBalance ? 1 : a.tokenBalance > b.tokenBalance ? -1 : 0));
+
+  // Greedy pick: take wallets in descending balance until cumulative ≥ amount.
+  // Also cap the leg count so we don't broadcast a pathological 50-tx
+  // payout — more legs means more gas cost and more points of failure.
+  const MAX_MULTI_SOURCE_LEGS = 8;
+  type Leg = { wallet: (typeof funded)[number]; legAmount: bigint };
+  const picked: Leg[] = [];
+  let cumulative = 0n;
+  for (const wallet of funded) {
+    if (cumulative >= requiredAmount) break;
+    if (picked.length >= MAX_MULTI_SOURCE_LEGS) break;
+    const remaining = requiredAmount - cumulative;
+    const legAmount = wallet.tokenBalance >= remaining ? remaining : wallet.tokenBalance;
+    picked.push({ wallet, legAmount });
+    cumulative += legAmount;
+  }
+
+  if (cumulative < requiredAmount) {
+    // Even the sum of every funded wallet falls short. Hard-fail the payout
+    // (don't defer) because no amount of waiting helps without the operator
+    // topping up. INSUFFICIENT_TOTAL_BALANCE is the dedicated error code so
+    // admin alerting distinguishes this from transient NO_FEE_WALLET_FUNDED.
+    const now = deps.clock.now().getTime();
+    const message = `Multi-source: available total ${cumulative} falls short of required ${requiredAmount} across ${funded.length} funded wallets`;
+    await deps.db
+      .update(payouts)
+      .set({ status: "failed", lastError: message.slice(0, 2048), updatedAt: now })
+      .where(eq(payouts.id, row.id));
+    const updated = await fetchPayout(deps, row.id);
+    if (updated) {
+      await deps.events.publish({
+        type: "payout.failed",
+        payoutId: updated.id,
+        payout: updated,
+        at: new Date(now)
+      });
+    }
+    deps.logger.warn("payout.multi_source.insufficient_total", {
+      payoutId: row.id,
+      chainId: row.chainId,
+      required: requiredAmount.toString(),
+      available: cumulative.toString(),
+      walletCount: funded.length
+    });
+    return "failed";
+  }
+
+  // CAS-reserve every chosen wallet. If any loses the CAS, roll back the
+  // already-reserved ones and defer the payout — a later tick retries.
+  const nowReserve = deps.clock.now().getTime();
+  const reserved: Leg[] = [];
+  for (const leg of picked) {
+    const [claim] = await deps.db
+      .update(feeWallets)
+      .set({ reservedByPayoutId: row.id, reservedAt: nowReserve })
+      .where(and(eq(feeWallets.id, leg.wallet.id), isNull(feeWallets.reservedByPayoutId)))
+      .returning({ id: feeWallets.id });
+    if (!claim) {
+      // Rollback reservations we already won.
+      for (const w of reserved) {
+        await deps.db
+          .update(feeWallets)
+          .set({ reservedByPayoutId: null, reservedAt: null })
+          .where(and(eq(feeWallets.id, w.wallet.id), eq(feeWallets.reservedByPayoutId, row.id)));
+      }
+      return "deferred";
+    }
+    reserved.push(leg);
+  }
+
+  // Flip the payout to `reserved` and record the primary source (first leg).
+  // The full list lands on `source_addresses_json` at submit time.
+  const sourceAddresses = reserved.map((l) => l.wallet.address);
+  await deps.db
+    .update(payouts)
+    .set({
+      status: "reserved",
+      sourceAddress: sourceAddresses[0] ?? null,
+      sourceAddressesJson: JSON.stringify(sourceAddresses),
+      updatedAt: nowReserve
+    })
+    .where(eq(payouts.id, row.id));
+
+  // Broadcast-slot CAS — same as single-source. Guards against double-send
+  // if the executor crashed after broadcast last tick.
+  const [broadcastClaim] = await deps.db
+    .update(payouts)
+    .set({ broadcastAttemptedAt: deps.clock.now().getTime() })
+    .where(
+      and(
+        eq(payouts.id, row.id),
+        isNull(payouts.broadcastAttemptedAt),
+        eq(payouts.status, "reserved")
+      )
+    )
+    .returning({ id: payouts.id });
+  if (!broadcastClaim) {
+    return "deferred";
+  }
+
+  // Build / sign / broadcast each leg in parallel. We use `allSettled`, not
+  // `all`, so a failure in one leg doesn't discard the hashes of legs that
+  // already landed on-chain. That audit trail is critical: if legs 1-3 went
+  // out and leg 4 threw, legs 1-3 are LIVE txs the operator needs to see.
+  // With `Promise.all` + catch we'd lose them silently.
+  const settled = await Promise.allSettled(
+    reserved.map(async (leg) => {
+      const unsigned = await chainAdapter.buildTransfer({
+        chainId: row.chainId,
+        fromAddress: leg.wallet.address,
+        toAddress: row.destinationAddress,
+        token: row.token,
+        amountRaw: leg.legAmount.toString() as AmountRaw,
+        ...(row.feeTier !== null
+          ? { feeTier: row.feeTier as "low" | "medium" | "high" }
+          : {})
+      });
+      const signerScope: SignerScope = feeWalletScope(
+        chainAdapter,
+        leg.wallet.label,
+        leg.wallet.derivationIndex
+      );
+      const privateKey = await deps.signerStore.get(signerScope);
+      return chainAdapter.signAndBroadcast(unsigned, privateKey);
+    })
+  );
+
+  const successfulHashes: string[] = [];
+  const failures: Array<{ legIndex: number; sourceAddress: string; reason: string }> = [];
+  settled.forEach((result, i) => {
+    if (result.status === "fulfilled") {
+      successfulHashes.push(result.value as string);
+    } else {
+      const err = result.reason;
+      failures.push({
+        legIndex: i,
+        sourceAddress: reserved[i]!.wallet.address,
+        reason: err instanceof Error ? err.message : String(err)
+      });
+    }
+  });
+
+  const now2 = deps.clock.now().getTime();
+
+  if (failures.length === 0) {
+    // All legs broadcast successfully — standard submitted path.
+    await deps.db
+      .update(payouts)
+      .set({
+        status: "submitted",
+        txHash: successfulHashes[0] ?? null,
+        txHashesJson: JSON.stringify(successfulHashes),
+        submittedAt: now2,
+        updatedAt: now2
+      })
+      .where(eq(payouts.id, row.id));
+
+    const updated = await fetchPayout(deps, row.id);
+    if (updated) {
+      await deps.events.publish({
+        type: "payout.submitted",
+        payoutId: updated.id,
+        payout: updated,
+        at: new Date(now2)
+      });
+    }
+    deps.logger.info("payout.multi_source.submitted", {
+      payoutId: row.id,
+      chainId: row.chainId,
+      legs: reserved.length,
+      required: requiredAmount.toString()
+    });
+    return "submitted";
+  }
+
+  // Partial or total broadcast failure. Persist the successful legs'
+  // hashes so the operator has an audit trail for reconciliation — these
+  // are LIVE on-chain txs that moved funds but didn't complete the payout
+  // intent. lastError captures the first failure message plus a summary
+  // of which legs landed on-chain; full structured detail is in the log.
+  const firstReason = failures[0]?.reason ?? "multi-source broadcast failed";
+  const summary = successfulHashes.length > 0
+    ? `Multi-source partial failure: ${successfulHashes.length}/${reserved.length} legs broadcast successfully. ORPHAN TXS require manual reconciliation. First failure: ${firstReason}`
+    : `Multi-source total failure: ${firstReason}`;
+
+  const failStmt = deps.db
+    .update(payouts)
+    .set({
+      status: "failed",
+      lastError: summary.slice(0, 2048),
+      // Even on failure, record the orphan tx hashes so the operator (and
+      // ops dashboards that read the payout row) can see what landed.
+      txHash: successfulHashes[0] ?? null,
+      txHashesJson: successfulHashes.length > 0 ? JSON.stringify(successfulHashes) : null,
+      updatedAt: now2
+    })
+    .where(eq(payouts.id, row.id));
+  const releaseStmt = releaseFeeWalletStmt(deps, row.id);
+  await deps.db.batch([failStmt, releaseStmt] as [typeof failStmt, typeof releaseStmt]);
+
+  deps.logger.error("payout.multi_source.partial_failure", {
+    payoutId: row.id,
+    chainId: row.chainId,
+    legsPlanned: reserved.length,
+    legsSucceeded: successfulHashes.length,
+    legsFailed: failures.length,
+    orphanTxHashes: successfulHashes,
+    failures
+  });
+
+  const updated = await fetchPayout(deps, row.id);
+  if (updated) {
+    await deps.events.publish({
+      type: "payout.failed",
+      payoutId: updated.id,
+      payout: updated,
+      at: new Date(now2)
+    });
+  }
+  return "failed";
 }
 
 export interface ConfirmPayoutsResult {
@@ -473,20 +1309,42 @@ export async function confirmPayouts(
     .orderBy(asc(payouts.submittedAt))
     .limit(limit);
 
-  let confirmed = 0;
-  let failed = 0;
-  for (const row of submitted) {
-    if (!row.txHash) continue;
+  const counts = { confirmed: 0, failed: 0 };
+  // Process rows in parallel using the same bounded-concurrency runner used
+  // by executeReservedPayouts. Pre-refactor this was a serial for-loop — at
+  // 200 submitted rows × up to 8 multi-source legs × ~200ms per
+  // `getConfirmationStatus` call, a worst-case tick could blow past the 30s
+  // Workers CPU limit. Capping at the same per-chain concurrency
+  // (payoutConcurrencyPerChain, default 16) keeps subrequest fan-out sane
+  // while parallelizing the tick's wall-time.
+  const cap = Math.max(1, deps.payoutConcurrencyPerChain ?? DEFAULT_PAYOUT_CONCURRENCY_PER_CHAIN);
+  await runWithConcurrencyCap(submitted, cap, async (row) => {
+    if (!row.txHash) return;
     const chainAdapter = findChainAdapter(deps, row.chainId);
-    const status = await chainAdapter.getConfirmationStatus(row.chainId, row.txHash);
     const now = deps.clock.now().getTime();
     const threshold = confirmationThreshold(row.chainId, deps.confirmationThresholds);
 
-    if (status.reverted) {
-      // Batched with releaseFeeWallet so the two writes commit together.
+    // Multi-source payouts stash every leg's hash in `tx_hashes_json`. The
+    // payout is confirmed only when ALL legs cross the threshold; a single
+    // reverted leg fails the whole payout (operator reconciles the others
+    // manually via `txHashes`). Single-source rows have `tx_hashes_json=null`
+    // and fall through to the single-hash path unchanged.
+    const hashes = parseHashArray(row.txHashesJson) ?? [row.txHash];
+
+    const statuses = await Promise.all(
+      hashes.map((h) => chainAdapter.getConfirmationStatus(row.chainId, h))
+    );
+
+    const anyReverted = statuses.some((s) => s.reverted);
+    if (anyReverted) {
+      const revertedHashIdx = statuses.findIndex((s) => s.reverted);
+      const lastError =
+        hashes.length > 1
+          ? `Multi-source leg ${revertedHashIdx + 1}/${hashes.length} (${hashes[revertedHashIdx]}) reverted on-chain`
+          : "Transaction reverted on-chain";
       const failStmt = deps.db
         .update(payouts)
-        .set({ status: "failed", lastError: "Transaction reverted on-chain", updatedAt: now })
+        .set({ status: "failed", lastError, updatedAt: now })
         .where(eq(payouts.id, row.id));
       const releaseStmt = releaseFeeWalletStmt(deps, row.id);
       await deps.db.batch([failStmt, releaseStmt] as [typeof failStmt, typeof releaseStmt]);
@@ -494,12 +1352,12 @@ export async function confirmPayouts(
       if (updated) {
         await deps.events.publish({ type: "payout.failed", payoutId: updated.id, payout: updated, at: new Date(now) });
       }
-      failed += 1;
-      continue;
+      counts.failed += 1;
+      return;
     }
 
-    if (status.confirmations >= threshold) {
-      // Batched with releaseFeeWallet so the two writes commit together.
+    const allConfirmed = statuses.every((s) => s.confirmations >= threshold);
+    if (allConfirmed) {
       const confirmStmt = deps.db
         .update(payouts)
         .set({ status: "confirmed", confirmedAt: now, updatedAt: now })
@@ -510,11 +1368,23 @@ export async function confirmPayouts(
       if (updated) {
         await deps.events.publish({ type: "payout.confirmed", payoutId: updated.id, payout: updated, at: new Date(now) });
       }
-      confirmed += 1;
+      counts.confirmed += 1;
     }
-  }
+  });
 
-  return { checked: submitted.length, confirmed, failed };
+  return { checked: submitted.length, confirmed: counts.confirmed, failed: counts.failed };
+}
+
+function parseHashArray(raw: string | null): string[] | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    const strs = parsed.filter((x): x is string => typeof x === "string");
+    return strs.length > 0 ? strs : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function getPayout(deps: AppDeps, id: PayoutId): Promise<Payout | null> {
@@ -542,6 +1412,8 @@ export const ListPayoutsInputSchema = z
     // Which fee wallet the payout was funded from. NULL until `reserved`, so
     // this filter also implicitly excludes `planned` rows when set.
     sourceAddress: z.string().min(1).max(128).optional(),
+    // Return only payouts belonging to a specific batch (from POST /batch).
+    batchId: z.string().min(1).max(64).optional(),
     createdFrom: z.number().int().nonnegative().optional(),
     createdTo: z.number().int().nonnegative().optional(),
     limit: z.number().int().min(1).max(LIST_PAYOUTS_MAX_LIMIT).default(25),
@@ -577,6 +1449,9 @@ export async function listPayouts(deps: AppDeps, input: unknown): Promise<ListPa
   }
   if (parsed.sourceAddress !== undefined) {
     conditions.push(eq(payouts.sourceAddress, parsed.sourceAddress));
+  }
+  if (parsed.batchId !== undefined) {
+    conditions.push(eq(payouts.batchId, parsed.batchId));
   }
   if (parsed.createdFrom !== undefined) conditions.push(gte(payouts.createdAt, parsed.createdFrom));
   if (parsed.createdTo !== undefined) conditions.push(lte(payouts.createdAt, parsed.createdTo));
@@ -698,47 +1573,230 @@ async function fetchPayout(deps: AppDeps, id: string): Promise<Payout | null> {
   return row ? drizzleRowToPayout(row) : null;
 }
 
-// Atomic fee-wallet selection: pick any active, unreserved wallet on this
-// chain, mark it reserved-by-this-payout. Returns null if none are free.
+// Gas-aware fee-wallet selection. Replaces the older "pick first available"
+// flow with a filter-then-tight-fit choice: we only reserve a wallet that
+// already has the requested token AND enough native gas to pay the broadcast
+// fee, and among qualifying wallets we pick the one whose token balance is
+// the smallest above the payout amount. That tight-fit bias keeps
+// large-balance wallets free for future big payouts instead of stranding
+// them on small ones.
 //
-// Two-step pattern (SELECT candidate, then CAS UPDATE): doing it as a single
-// UPDATE with a subselect would be one round-trip but libSQL's UPDATE-with-
-// subquery edge cases have historically been flaky. Instead, we loop: if the
-// CAS loses to a racing concurrent reservation of the same
-// candidate, pick the next free wallet and try again. Without the retry,
-// contention on a busy chain returned a spurious "NO_FEE_WALLETS" even when
-// additional free wallets existed.
-const FEE_WALLET_CAS_MAX_ATTEMPTS = 5;
-async function tryReserveFeeWallet(
+// Cache semantics: `balanceCache` is shared across all workers in a single
+// `executeReservedPayouts` tick. A `(chainId, address, token)` triple is
+// fetched at most once per tick. Stale values within a tick are acceptable
+// (the post-reservation defensive check at step 4 of executeOnePayout
+// catches RPC drift between selection and broadcast).
+//
+// CAS retry: we fetch a batch of qualifying candidates in one sort and try
+// CAS on each in order until one sticks. On CAS loss, we move to the next
+// candidate without re-querying balances (they were already fresh within
+// this tick). If every filtered candidate loses CAS, we re-query once — a
+// racing worker may have released a different wallet by then.
+const FEE_WALLET_CAS_MAX_ATTEMPTS = 16;
+
+type WalletCandidate = {
+  id: string;
+  address: string;
+  label: string;
+  derivationIndex: number;
+};
+type RankedCandidate = WalletCandidate & {
+  tokenBalance: bigint;
+  nativeBalance: bigint;
+};
+
+async function selectAndReserveFeeWallet(
   deps: AppDeps,
-  chainId: number,
-  payoutId: string
-): Promise<{ id: string; address: string; label: string } | null> {
+  row: typeof payouts.$inferSelect,
+  chainAdapter: ChainAdapter,
+  balanceCache: BalanceCache
+): Promise<WalletCandidate | null> {
   const now = deps.clock.now().getTime();
-  for (let attempt = 0; attempt < FEE_WALLET_CAS_MAX_ATTEMPTS; attempt += 1) {
-    const [candidate] = await deps.db
-      .select({ id: feeWallets.id, address: feeWallets.address, label: feeWallets.label })
+  const requiredAmount = BigInt(row.amountRaw);
+  const nativeSymbol = chainAdapter.nativeSymbol(row.chainId as ChainId);
+
+  for (let outerAttempt = 0; outerAttempt < 2; outerAttempt += 1) {
+    const candidates = await deps.db
+      .select({
+        id: feeWallets.id,
+        address: feeWallets.address,
+        label: feeWallets.label,
+        derivationIndex: feeWallets.derivationIndex
+      })
       .from(feeWallets)
       .where(
         and(
-          eq(feeWallets.chainId, chainId),
+          eq(feeWallets.chainId, row.chainId),
           eq(feeWallets.active, 1),
           isNull(feeWallets.reservedByPayoutId)
         )
       )
-      .limit(1);
-    if (!candidate) return null;
+      .limit(FEE_WALLET_CAS_MAX_ATTEMPTS);
 
-    const [claim] = await deps.db
-      .update(feeWallets)
-      .set({ reservedByPayoutId: payoutId, reservedAt: now })
-      .where(and(eq(feeWallets.id, candidate.id), isNull(feeWallets.reservedByPayoutId)))
-      .returning({ id: feeWallets.id, address: feeWallets.address, label: feeWallets.label });
-    if (claim) return claim;
-    // CAS lost — someone else reserved this wallet between our SELECT and
-    // UPDATE. Loop to pick the next free candidate.
+    if (candidates.length === 0) {
+      // Zero wallets registered or every one currently reserved. The caller
+      // turns this into `deferred` and the next tick retries.
+      deps.logger.debug("payout.execute.no_wallet_available", {
+        payoutId: row.id,
+        chainId: row.chainId
+      });
+      return null;
+    }
+
+    // Estimate gas once per tick per payout — the outbound tx shape is
+    // fixed (from this payout's amount + destination). We use a placeholder
+    // `fromAddress` of the first candidate for estimation; gas estimates
+    // are deterministic on tx payload, not source address, for straight
+    // transfers. If the adapter throws (not implemented), treat gas need
+    // as zero so native-balance filtering is a no-op for that chain.
+    const estimatedGas = await estimateGasOrFallback(chainAdapter, {
+      chainId: row.chainId as ChainId,
+      fromAddress: candidates[0]!.address as Address,
+      toAddress: row.destinationAddress as Address,
+      token: row.token as TokenSymbol,
+      amountRaw: row.amountRaw as AmountRaw
+    });
+
+    // Fetch token + native balance for every candidate in parallel, via the
+    // tick-local cache. Errors become `null` in the cache and disqualify the
+    // candidate from this selection pass.
+    const ranked = await Promise.all(
+      candidates.map(async (c): Promise<RankedCandidate | null> => {
+        const tokenBalance = await cachedGetBalance(
+          deps,
+          chainAdapter,
+          balanceCache,
+          row.chainId,
+          c.address,
+          row.token
+        );
+        if (tokenBalance === null || tokenBalance < requiredAmount) return null;
+        // Same-symbol short-circuit: if the payout token IS the chain native
+        // (ETH on Arbitrum, TRX on Tron, etc.), the one balance read covers
+        // both checks. We still need gas headroom on top of the payout amount.
+        const nativeBalance =
+          row.token === nativeSymbol
+            ? tokenBalance
+            : await cachedGetBalance(
+                deps,
+                chainAdapter,
+                balanceCache,
+                row.chainId,
+                c.address,
+                nativeSymbol
+              );
+        if (nativeBalance === null) return null;
+        const nativeNeeded =
+          row.token === nativeSymbol ? requiredAmount + estimatedGas : estimatedGas;
+        if (nativeBalance < nativeNeeded) return null;
+        return { ...c, tokenBalance, nativeBalance };
+      })
+    );
+
+    const qualifying = ranked.filter((c): c is RankedCandidate => c !== null);
+    if (qualifying.length === 0) {
+      // Candidates exist but none have enough token+gas. This is actionable
+      // for the operator (top up) — differentiated from "no wallets at all".
+      deps.logger.warn("payout.execute.no_wallet_funded", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        token: row.token,
+        candidateCount: candidates.length,
+        requiredAmount: row.amountRaw,
+        estimatedGas: estimatedGas.toString()
+      });
+      return null;
+    }
+
+    // Tight-fit: smallest token balance above the payout amount. Ties broken
+    // by ascending id for determinism so tests and logs are reproducible.
+    qualifying.sort((a, b) => {
+      const diff = a.tokenBalance - b.tokenBalance;
+      if (diff < 0n) return -1;
+      if (diff > 0n) return 1;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+
+    for (const candidate of qualifying) {
+      const [claim] = await deps.db
+        .update(feeWallets)
+        .set({ reservedByPayoutId: row.id, reservedAt: now })
+        .where(and(eq(feeWallets.id, candidate.id), isNull(feeWallets.reservedByPayoutId)))
+        .returning({
+          id: feeWallets.id,
+          address: feeWallets.address,
+          label: feeWallets.label,
+          derivationIndex: feeWallets.derivationIndex
+        });
+      if (claim) return claim;
+      // CAS lost to a racing worker; try the next-best candidate.
+    }
+    // All qualifying candidates lost CAS. Refresh once in case some in-flight
+    // payouts completed during this pass and released their wallets; the
+    // outer loop bound (2) caps RPC work.
   }
   return null;
+}
+
+// Wrap `estimateGasForTransfer` so adapters that don't implement it (or throw
+// on specific inputs) don't poison the entire selection path. A zero return
+// means "don't filter by native balance on this chain" — correct for the dev
+// adapter and for families where gas estimation is handled upstream.
+async function estimateGasOrFallback(
+  chainAdapter: ChainAdapter,
+  args: Parameters<ChainAdapter["estimateGasForTransfer"]>[0]
+): Promise<bigint> {
+  try {
+    const raw = await chainAdapter.estimateGasForTransfer(args);
+    return BigInt(raw);
+  } catch {
+    return 0n;
+  }
+}
+
+// Shared-promise cache. The FIRST caller for a `(chainId, address, token)`
+// creates the promise and stores it; concurrent callers await the same
+// promise. Errors are materialized as `null` rather than rejecting so callers
+// can simply filter them out — a failed read shouldn't bubble up and kill an
+// otherwise-viable wallet selection.
+async function cachedGetBalance(
+  deps: AppDeps,
+  chainAdapter: ChainAdapter,
+  cache: BalanceCache,
+  chainId: number,
+  address: string,
+  token: string
+): Promise<bigint | null> {
+  const key = balanceCacheKey(chainId, address, token);
+  const existing = cache.get(key);
+  if (existing !== undefined) return existing;
+  const promise = chainAdapter
+    .getBalance({
+      chainId: chainId as ChainId,
+      address: address as Address,
+      token: token as TokenSymbol
+    })
+    .then(
+      (raw) => {
+        try {
+          return BigInt(raw);
+        } catch {
+          return null;
+        }
+      },
+      (err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        deps.logger.debug("payout.execute.balance_read_failed", {
+          chainId,
+          address,
+          token,
+          error: message
+        });
+        return null;
+      }
+    );
+  cache.set(key, promise);
+  return promise;
 }
 
 // Returns a Drizzle update builder without executing it, so callers can
@@ -752,6 +1810,14 @@ function releaseFeeWalletStmt(deps: AppDeps, payoutId: string) {
     .where(eq(feeWallets.reservedByPayoutId, payoutId));
 }
 
-function feeWalletScope(chainAdapter: ChainAdapter, label: string): SignerScope {
-  return { kind: "fee-wallet", family: chainAdapter.family, label };
+function feeWalletScope(
+  chainAdapter: ChainAdapter,
+  label: string,
+  derivationIndex?: number
+): SignerScope {
+  const scope: SignerScope = { kind: "fee-wallet", family: chainAdapter.family, label };
+  if (derivationIndex !== undefined) {
+    scope.derivationIndex = derivationIndex;
+  }
+  return scope;
 }

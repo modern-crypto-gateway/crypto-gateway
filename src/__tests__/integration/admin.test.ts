@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { feeWallets } from "../../db/schema.js";
 import { feeWalletIndex } from "../../adapters/signer-store/hd.adapter.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
@@ -149,6 +150,87 @@ describe("POST /admin/fee-wallets", () => {
           label: "broken",
           family: "tron"
         })
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("FAMILY_MISMATCH");
+  });
+
+  it("explicit chainIds[] fans out one row per chainId with the same address", async () => {
+    // The dev adapter only serves chainId 999 in the test boot, so we can't
+    // exercise the multi-chain EVM fanout end-to-end here without wiring a
+    // real adapter. Instead, prove the schema-level fanout: pass chainIds:[999]
+    // as a single-element array. The handler treats it the same as chainId:999
+    // and the response carries the array form back.
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ chainIds: [999], label: "fanout-1", family: "evm" })
+      })
+    );
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as {
+      feeWallet: { address: string; label: string; family: string; chainIds: number[] };
+    };
+    expect(body.feeWallet.family).toBe("evm");
+    expect(body.feeWallet.chainIds).toEqual([999]);
+    expect(body.feeWallet.label).toBe("fanout-1");
+
+    const rows = await booted.deps.db
+      .select({ chainId: feeWallets.chainId, address: feeWallets.address, label: feeWallets.label })
+      .from(feeWallets)
+      .where(eq(feeWallets.label, "fanout-1"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.chainId).toBe(999);
+    // Address matches what the adapter derives at the deterministic
+    // fee-wallet index — proves the fanout's address-derivation path is
+    // identical to the legacy single-chain path.
+    const adapter = booted.deps.chains.find((c) => c.family === "evm")!;
+    const { address } = adapter.deriveAddress(TEST_MASTER_SEED, feeWalletIndex("evm", "fanout-1"));
+    expect(rows[0]?.address).toBe(adapter.canonicalizeAddress(address));
+  });
+
+  it("rejects when both chainId and chainIds are supplied", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({
+          chainId: 999,
+          chainIds: [999],
+          label: "ambiguous",
+          family: "evm"
+        })
+      })
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects fanout-default when family is non-EVM (operator must pick mainnet vs testnet)", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ label: "no-default", family: "tron" })
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("MISSING_CHAIN_ID");
+  });
+
+  it("rejects chainIds[] containing a chainId of a different family", async () => {
+    // The dev test boot has only chainId 999 (EVM family). A chainId outside
+    // the loaded adapters would throw a different error (no adapter found)
+    // before the family check, so we simulate the family-mismatch case by
+    // passing family:"tron" with chainIds containing 999 (an EVM chain).
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/fee-wallets", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ chainIds: [999], label: "wrong-family", family: "tron" })
       })
     );
     expect(res.status).toBe(400);
@@ -706,6 +788,7 @@ describe("GET /admin/fee-wallets", () => {
       chainId: 8453,
       address: "0x0000000000000000000000000000000000000001",
       label: "base-hot",
+      derivationIndex: 0x40000000,
       active: 1,
       createdAt: Date.now()
     });

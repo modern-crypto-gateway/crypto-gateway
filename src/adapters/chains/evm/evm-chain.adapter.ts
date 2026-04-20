@@ -11,7 +11,7 @@ import {
 } from "viem";
 import { mnemonicToAccount, privateKeyToAccount } from "viem/accounts";
 import { bytesToHex } from "../../crypto/subtle.js";
-import type { ChainAdapter } from "../../../core/ports/chain.port.ts";
+import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
@@ -271,6 +271,43 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         chainId: args.chainId
       };
 
+      // Bind the fee tier when the caller asked for one. We compute the per-
+      // tier maxFeePerGas / maxPriorityFeePerGas the same way `quoteFeeTiers`
+      // does, so what the operator was quoted is what gets broadcast (modulo
+      // baseFee drift between estimate and broadcast — the 2× baseFee margin
+      // absorbs typical pending-pool variance).
+      if (args.feeTier !== undefined) {
+        try {
+          const client = getClient(args.chainId);
+          const fees = await client.estimateFeesPerGas();
+          // EIP-1559 guard: if either field is undefined, the chain isn't
+          // returning 1559-shaped fee data (legacy chains, some dev nodes,
+          // certain sidechains). Falling through to viem's default at send
+          // time is safer than computing `baseFee = 0n - 0n` and binding a
+          // maxFeePerGas that equals only the priority fee — which on a
+          // congested chain would land the tx at zero or revert. The tier
+          // request is silently ignored in this case; operators on legacy
+          // chains see no tier effect, which matches the adapter's
+          // tieringSupported=false surface on those chains.
+          if (fees.maxFeePerGas === undefined || fees.maxPriorityFeePerGas === undefined) {
+            // No-op: non-1559 chain, viem's sendTransaction will pick a
+            // legacy gasPrice on broadcast.
+          } else {
+            const priorityMid = fees.maxPriorityFeePerGas;
+            const baseFee = fees.maxFeePerGas - priorityMid;
+            let priority: bigint;
+            if (args.feeTier === "low") priority = (priorityMid * 4n) / 5n;
+            else if (args.feeTier === "high") priority = (priorityMid * 3n) / 2n;
+            else priority = priorityMid;
+            raw.maxFeePerGas = 2n * baseFee + priority;
+            raw.maxPriorityFeePerGas = priority;
+          }
+        } catch {
+          // estimateFeesPerGas threw entirely (network error, unsupported
+          // method on the RPC). Fall back to viem's default at sendTransaction.
+        }
+      }
+
       return {
         chainId: args.chainId as ChainId,
         raw,
@@ -291,6 +328,9 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         data: raw.data,
         value: raw.value,
         ...(raw.gas !== undefined ? { gas: raw.gas } : {}),
+        ...(raw.maxFeePerGas !== undefined && raw.maxPriorityFeePerGas !== undefined
+          ? { maxFeePerGas: raw.maxFeePerGas, maxPriorityFeePerGas: raw.maxPriorityFeePerGas }
+          : {}),
         // viem requires a chain; build a minimal stub since we only need the id.
         chain: { id: chainId, name: `evm-${chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [] } } }
       });
@@ -328,6 +368,69 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         data
       });
       return gas.toString() as AmountRaw;
+    },
+
+    async quoteFeeTiers(args: EstimateArgs): Promise<FeeTierQuote> {
+      const client = getClient(args.chainId);
+      const gasUnits = BigInt(await this.estimateGasForTransfer(args));
+      const fees = await client.estimateFeesPerGas();
+      const nativeSymbol = this.nativeSymbol(args.chainId as ChainId);
+
+      // Non-EIP1559 chains (legacy BSC, some dev nodes, older sidechains)
+      // return `{ gasPrice }` only, with `maxFeePerGas` / `maxPriorityFeePerGas`
+      // undefined. Our tier math needs both to mean anything. Fall back to a
+      // single-tier quote: `gasUnits × gasPrice` (or `maxFeePerGas` if only
+      // that is defined), and tell the caller tiering isn't available.
+      if (fees.maxFeePerGas === undefined || fees.maxPriorityFeePerGas === undefined) {
+        const legacyGasPrice =
+          fees.maxFeePerGas ?? (fees as unknown as { gasPrice?: bigint }).gasPrice ?? 0n;
+        const flat = (gasUnits * legacyGasPrice).toString() as AmountRaw;
+        return {
+          low: { tier: "low", nativeAmountRaw: flat },
+          medium: { tier: "medium", nativeAmountRaw: flat },
+          high: { tier: "high", nativeAmountRaw: flat },
+          tieringSupported: false,
+          nativeSymbol
+        };
+      }
+
+      const priorityMid = fees.maxPriorityFeePerGas;
+      const baseFee = fees.maxFeePerGas - priorityMid;
+      // Zero-priority edge case: when the chain returns `priorityFee: 0n`
+      // (some L2s, quiet networks), scaling 0 by any factor stays 0, and
+      // all three tiers collapse to `2 × baseFee`. Flag `tieringSupported:
+      // false` so the frontend renders a single option instead of three
+      // identical ones.
+      if (priorityMid === 0n) {
+        const flat = (gasUnits * (2n * baseFee)).toString() as AmountRaw;
+        return {
+          low: { tier: "low", nativeAmountRaw: flat },
+          medium: { tier: "medium", nativeAmountRaw: flat },
+          high: { tier: "high", nativeAmountRaw: flat },
+          tieringSupported: false,
+          nativeSymbol
+        };
+      }
+
+      // Tier multipliers scale the priority fee: cheaper = slower inclusion,
+      // more = faster. maxFeePerGas at each tier = 2 × baseFee + tieredPriority
+      // (2× baseFee is viem's default safety margin to absorb baseFee growth
+      // during the pending-pool wait).
+      const tierPriority = (mulNumerator: bigint, mulDenominator: bigint): bigint =>
+        (priorityMid * mulNumerator) / mulDenominator;
+      const priorityLow = tierPriority(4n, 5n); // 0.8×
+      const priorityMidT = priorityMid; // 1.0×
+      const priorityHigh = tierPriority(3n, 2n); // 1.5×
+      const maxPerGasAt = (priority: bigint): bigint => 2n * baseFee + priority;
+      const nativeAt = (priority: bigint): AmountRaw =>
+        (gasUnits * maxPerGasAt(priority)).toString() as AmountRaw;
+      return {
+        low: { tier: "low", nativeAmountRaw: nativeAt(priorityLow) },
+        medium: { tier: "medium", nativeAmountRaw: nativeAt(priorityMidT) },
+        high: { tier: "high", nativeAmountRaw: nativeAt(priorityHigh) },
+        tieringSupported: true,
+        nativeSymbol
+      };
     },
 
     async getBalance(args): Promise<AmountRaw> {
@@ -450,4 +553,8 @@ interface EvmUnsignedTxRaw {
   from: Hex;
   chainId: number;
   gas?: bigint;
+  // EIP-1559 fee binding from the chosen tier. Both must be present together;
+  // viem's sendTransaction rejects partial sets.
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
 }

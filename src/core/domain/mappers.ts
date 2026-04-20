@@ -116,6 +116,12 @@ export function drizzleRowToPayout(row: typeof payouts.$inferSelect): Payout {
     amountRaw: row.amountRaw,
     quotedAmountUsd: row.quotedAmountUsd,
     quotedRate: row.quotedRate,
+    feeTier: (row.feeTier as "low" | "medium" | "high" | null) ?? null,
+    feeQuotedNative: row.feeQuotedNative,
+    batchId: row.batchId,
+    allowMultiSource: row.allowMultiSource === 1,
+    sourceAddresses: parseJsonArray(row.sourceAddressesJson),
+    txHashes: parseJsonArray(row.txHashesJson),
     destinationAddress: row.destinationAddress,
     sourceAddress: row.sourceAddress,
     txHash: row.txHash,
@@ -125,6 +131,21 @@ export function drizzleRowToPayout(row: typeof payouts.$inferSelect): Payout {
     createdAt: new Date(row.createdAt),
     submittedAt: row.submittedAt === null ? null : new Date(row.submittedAt),
     confirmedAt: row.confirmedAt === null ? null : new Date(row.confirmedAt),
+    broadcastAttemptedAt:
+      row.broadcastAttemptedAt === null ? null : new Date(row.broadcastAttemptedAt),
     updatedAt: new Date(row.updatedAt)
   };
+}
+
+// Parse a JSON-array column into a string[] or null. Tolerates invalid JSON
+// by returning null — a malformed column shouldn't crash the row fetch.
+function parseJsonArray(raw: string | null): string[] | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((x): x is string => typeof x === "string");
+  } catch {
+    return null;
+  }
 }

@@ -25,6 +25,11 @@ export interface BuildTransferArgs {
   // Optional explicit gas hints; adapters may ignore.
   gasPriceHint?: AmountRaw;
   nonceHint?: number;
+  // Fee tier the caller wants bound on the broadcast tx. EVM binds
+  // maxFeePerGas / maxPriorityFeePerGas from the tier's quote; Tron and
+  // Solana ignore (no priority concept in the current adapters). Absent =
+  // defaults to "medium" where supported.
+  feeTier?: "low" | "medium" | "high";
 }
 
 export interface EstimateArgs {

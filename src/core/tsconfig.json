@@ -7,10 +7,23 @@
     // NOT include Node/Workers-specific types (process, D1Database,
     // KVNamespace, etc.), so portability enforcement stays intact.
     "lib": ["ES2022", "WebWorker"],
-    "rootDir": ".",
+    // rootDir widened to `src/` because domain services legitimately reference
+    // types from `src/db/schema.ts` (Drizzle table definitions are part of
+    // the domain model) and `src/db/client.ts` (the `Db` type). Leaving
+    // rootDir unset would auto-compute it to `src/core` (the common parent of
+    // `include`) and the IDE's Language Service emits TS6059 on every
+    // `../db/*` import even though the CLI under `noEmit: true` stays quiet.
+    // The architectural boundary is enforced elsewhere: `types: []` blocks
+    // platform-specific globals, and the ESLint `import/no-restricted-paths`
+    // rule prevents `core/**` from reaching into `adapters/**`,
+    // `entrypoints/**`, or `http/**`. Those catch the real leaks.
+    "rootDir": "..",
     "outDir": "../../dist/core",
     "noEmit": true
   },
-  "include": ["./**/*.ts"],
+  // Include db alongside core so the Language Service sees both under the
+  // same program. Without this, a core file importing from `../db/*` would
+  // pull it into the program lazily and TS6059 fires from the IDE path.
+  "include": ["./**/*.ts", "../db/**/*.ts"],
   "exclude": ["../../node_modules", "../../dist"]
 }

@@ -25,7 +25,12 @@ async function seedFeeWallet(
   const index = feeWalletIndex("evm", args.label);
   const { address } = adapter.deriveAddress(TEST_MASTER_SEED, index);
   const canonical = adapter.canonicalizeAddress(address);
-  await registerFeeWallet(booted.deps, { chainId: 999, address: canonical, label: args.label });
+  await registerFeeWallet(booted.deps, {
+    chainId: 999,
+    address: canonical,
+    label: args.label,
+    derivationIndex: index
+  });
   return { address: canonical };
 }
 

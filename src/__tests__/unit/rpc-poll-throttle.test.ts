@@ -27,6 +27,13 @@ function spyChainAdapter(spy: (args: Parameters<ChainAdapter["scanIncoming"]>[0]
     },
     nativeSymbol: () => "ETH" as never,
     estimateGasForTransfer: async () => "0" as never,
+    quoteFeeTiers: async () => ({
+      low: { tier: "low", nativeAmountRaw: "0" as never },
+      medium: { tier: "medium", nativeAmountRaw: "0" as never },
+      high: { tier: "high", nativeAmountRaw: "0" as never },
+      tieringSupported: false,
+      nativeSymbol: "ETH" as never
+    }),
     getBalance: async () => "0" as never,
     getAccountBalances: async () => []
   };

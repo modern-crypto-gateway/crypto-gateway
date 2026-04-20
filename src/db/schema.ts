@@ -207,7 +207,19 @@ export const transactions = sqliteTable(
 );
 
 // ---- fee_wallets (gateway-owned outbound payout sources) ----
-
+//
+// One row per (chainId, address). For EVM, the same HD-derived address is
+// reused across every wired EVM chain (deriveAddress ignores chainId), so a
+// single label commonly produces N rows differing only in chainId. The
+// per-chain row is intentional: CAS reservations are chain-scoped because
+// gas is paid in the chain's native token.
+//
+// Index-space disjointness with the address pool: HD-derived fee-wallet
+// addresses live at indices in [0x40000000, 0x7EFFFFFF] (top bit set), while
+// the receive-address pool occupies [0x00000000, 0x3FFFFFFF] (top bit
+// cleared). Addresses cannot collide naturally — a transfer arriving at a
+// fee wallet's address can never be misattributed to an invoice via the
+// `invoice_receive_addresses` join. See `hd.adapter.ts` for the index map.
 export const feeWallets = sqliteTable(
   "fee_wallets",
   {
@@ -215,6 +227,14 @@ export const feeWallets = sqliteTable(
     chainId: integer("chain_id").notNull(),
     address: text("address").notNull(),
     label: text("label").notNull(),
+    // HD derivation index this row's address was derived at. For wallets
+    // registered via the legacy (family, label) path, this is the deterministic
+    // hash `feeWalletIndex(family, label)` in the [0x40000000, 0x7EFFFFFF]
+    // region. For wallets promoted from the address pool, this is the pool
+    // row's `address_index` in [0x00000000, 0x3FFFFFFF]. The signer reads this
+    // to derive the matching private key at exec time — required for promoted
+    // pool addresses since their index isn't recoverable from the label alone.
+    derivationIndex: integer("derivation_index").notNull(),
     active: integer("active").notNull().default(1),
     // CAS reservation: set to the payout id while a single in-flight payout
     // holds the wallet; released on status transition.
@@ -224,7 +244,12 @@ export const feeWallets = sqliteTable(
   },
   (t) => [
     uniqueIndex("uq_fee_wallets_chain_address").on(t.chainId, t.address),
-    index("idx_fee_wallets_available").on(t.chainId, t.active, t.reservedByPayoutId)
+    index("idx_fee_wallets_available").on(t.chainId, t.active, t.reservedByPayoutId),
+    check(
+      "fee_wallets_derivation_index_check",
+      sql`${t.derivationIndex} >= 0 AND ${t.derivationIndex} <= 2147483647`
+    ),
+    check("fee_wallets_active_check", sql`${t.active} IN (0, 1)`)
   ]
 );
 
@@ -250,6 +275,34 @@ export const payouts = sqliteTable(
     // without having to replay the price oracle.
     quotedAmountUsd: text("quoted_amount_usd"),
     quotedRate: text("quoted_rate"),
+    // Fee tier bound on the broadcast tx ("low" | "medium" | "high"). Defaults
+    // to "medium" when unset. Adapters that don't support tiers (Tron) ignore.
+    feeTier: text("fee_tier"),
+    // Native-units fee at quote time, captured from the chosen tier's
+    // `nativeAmountRaw`. Lets operators compare quoted vs. on-chain actual
+    // after broadcast.
+    feeQuotedNative: text("fee_quoted_native"),
+    // Optional grouping id for mass-payout batches. NULL for single-payout
+    // creates; set to the same value across every row of a `POST /payouts/batch`
+    // request. Used as a list filter so operators can pull "all payouts in
+    // batch X" in one query.
+    batchId: text("batch_id"),
+    // Opt-in flag: when 1, the executor falls back to splitting the payout
+    // across multiple fee wallets if no single wallet has enough balance.
+    // Default 0 — the executor defers with NO_FEE_WALLET_FUNDED and the
+    // operator either tops up a wallet or explicitly retries with the flag.
+    allowMultiSource: integer("allow_multi_source").notNull().default(0),
+    // JSON-encoded array of source addresses when a multi-source broadcast
+    // was used. Null for single-source payouts (the `sourceAddress` field
+    // holds the one wallet). When set, `sourceAddress` = the first entry for
+    // backward compat with single-source queries.
+    sourceAddressesJson: text("source_addresses_json"),
+    // JSON-encoded array of tx hashes when a multi-source broadcast was
+    // used (one hash per leg). Null for single-source payouts (the `txHash`
+    // field holds the one hash). When set, `txHash` = the first entry.
+    // Confirmation treats the payout as confirmed only when every hash in
+    // the array is ≥ the chain's threshold.
+    txHashesJson: text("tx_hashes_json"),
     destinationAddress: text("destination_address").notNull(),
     // NULL until planned → reserved picks a fee wallet.
     sourceAddress: text("source_address"),
@@ -276,9 +329,21 @@ export const payouts = sqliteTable(
   (t) => [
     index("idx_payouts_merchant").on(t.merchantId, sql`${t.createdAt} DESC`),
     index("idx_payouts_status").on(t.status, t.chainId),
+    // Partial index on batch_id: most rows have batch_id=NULL (only set by
+    // POST /payouts/batch), so a partial index keeps storage minimal while
+    // making ?batchId=<uuid> list filters O(log n) instead of full-scan.
+    index("idx_payouts_batch_id").on(t.batchId).where(sql`${t.batchId} IS NOT NULL`),
     check(
       "payouts_status_check",
       sql`${t.status} IN ('planned','reserved','submitted','confirmed','failed','canceled')`
+    ),
+    check(
+      "payouts_allow_multi_source_check",
+      sql`${t.allowMultiSource} IN (0, 1)`
+    ),
+    check(
+      "payouts_fee_tier_check",
+      sql`${t.feeTier} IS NULL OR ${t.feeTier} IN ('low','medium','high')`
     )
   ]
 );

@@ -1,7 +1,7 @@
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { mnemonicToSeedSync } from "@scure/bip39";
 import { base58 } from "@scure/base";
-import type { ChainAdapter } from "../../../core/ports/chain.port.ts";
+import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
@@ -385,6 +385,24 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       // the fee is a fixed 5000 lamports. For SPL transfers the signer count
       // is still 1 (the fee payer) so the base fee is the same.
       return SIGNATURE_FEE_LAMPORTS.toString() as AmountRaw;
+    },
+
+    async quoteFeeTiers(_args: EstimateArgs): Promise<FeeTierQuote> {
+      // Solana's base fee (5000 lamports) is always paid. Priority fees add
+      // `computeUnits × microLamports ÷ 1_000_000` on top. We'd call
+      // `getRecentPrioritizationFees` and bucket by percentile (25/50/75),
+      // but the RPC client wrapper doesn't expose it yet — for now quote
+      // the base fee at all three tiers with `tieringSupported=false` so the
+      // frontend renders a single option. This can be tightened when the
+      // client grows the method.
+      const base = SIGNATURE_FEE_LAMPORTS.toString() as AmountRaw;
+      return {
+        low: { tier: "low", nativeAmountRaw: base },
+        medium: { tier: "medium", nativeAmountRaw: base },
+        high: { tier: "high", nativeAmountRaw: base },
+        tieringSupported: false,
+        nativeSymbol: "SOL" as TokenSymbol
+      };
     },
 
     async getBalance(args): Promise<AmountRaw> {
