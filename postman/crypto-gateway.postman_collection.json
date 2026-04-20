@@ -321,7 +321,39 @@
               "mode": "raw",
               "raw": "{\n  \"chainId\": 999,\n  \"family\": \"evm\",\n  \"label\": \"dev-hot-1\"\n}"
             },
-            "description": "Registers a fee wallet for payouts. The gateway HD-derives the `(address, privateKey)` pair from `MASTER_SEED` at a deterministic index keyed by `(family, label)` and returns the derived address in `feeWallet.address`. No private key is accepted here — the operator funds the returned address out-of-band. The same `label` always derives to the same address across redeploys. Use `chainId: 999` + `family: evm` for local runs; for real chains use the appropriate chainId from the table in the README."
+            "description": "Registers a fee wallet for payouts. The gateway HD-derives the `(address, privateKey)` pair from `MASTER_SEED` at a deterministic index keyed by `(family, label)` and returns the derived address in `feeWallet.address`. No private key is accepted here — the operator funds the returned address out-of-band. The same `label` always derives to the same address across redeploys.\n\n**EVM family fanout:** on real EVM deployments, omit `chainId` and pass `family: \"evm\"` alone to register the same address across every wired EVM chain in `CHAIN_REGISTRY` (one row per chainId). For Tron/Solana, supply `chainId` or `chainIds` explicitly — mainnet and testnet have distinct chainIds."
+          }
+        },
+        {
+          "name": "3c. Promote pool address to fee wallet",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/admin/fee-wallets/from-pool-address", "host": ["{{baseUrl}}"], "path": ["admin", "fee-wallets", "from-pool-address"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"family\": \"evm\",\n  \"address\": \"0xREPLACE_WITH_POOL_ADDRESS\",\n  \"label\": \"promoted-hot-1\",\n  \"chainIds\": [42161],\n  \"deactivatePoolSlot\": true\n}"
+            },
+            "description": "Promote an HD-derived pool address (that holds funds from a settled invoice) into a fee wallet WITHOUT transferring funds. The gateway already knows the private key (pool's `address_index` is reused as the fee wallet's `derivation_index`), so nothing is stored at rest.\n\n**Race protection:** the pool row is CAS-quarantined on `status='available'`; if the allocator raced and already handed it to a new invoice between SELECT and UPDATE, the response returns `poolDeactivated: false` — the fee wallet is still created, but operator should retry quarantine after the active invoice settles.\n\nIn-flight invoices already pointed at the address continue to resolve correctly via `invoice_receive_addresses` — late payments credit the original invoice."
+          }
+        },
+        {
+          "name": "3d. Register fee wallet at explicit HD index (escape hatch)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/admin/fee-wallets/from-index", "host": ["{{baseUrl}}"], "path": ["admin", "fee-wallets", "from-index"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"family\": \"evm\",\n  \"derivationIndex\": 1073741824,\n  \"label\": \"manual-ix-0x40000000\",\n  \"chainIds\": [42161]\n}"
+            },
+            "description": "Advanced: register a fee wallet at an operator-supplied HD index. Used for sweep-master promotion, debugging, or recovery.\n\n**Range is HARDENED** to the fee-wallet region `[0x40000000, 0x7EFFFFFF]` (1073741824 to 2130706431 decimal):\n- `< 0x40000000` (pool region) — REJECTED, would share a private key with an invoice receive address. Use `/from-pool-address` instead.\n- `>= 0x7F000000` (sweep-master region) — REJECTED, would shadow the family sweep master.\n\nThe derived address is computed from `MASTER_SEED` at the supplied index; no key is accepted or stored. Operator funds the returned address out-of-band."
           }
         },
         {
@@ -1060,6 +1092,65 @@
               "path": ["api", "v1", "payouts", "{{payoutId}}"]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }]
+          }
+        },
+        {
+          "name": "Estimate fees (tiers)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts/estimate", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts", "estimate"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 42161,\n  \"token\": \"USDC\",\n  \"amountRaw\": \"1000000\",\n  \"destinationAddress\": \"0x16214769e25a97256419aeea44b35b4a72ddc4c1\"\n}"
+            },
+            "description": "Quotes low/medium/high fee tiers for a hypothetical payout WITHOUT planning anything. Call this before `Plan payout` to show the operator cost options; they then pick a tier on the real POST via the `feeTier` field.\n\n**EVM**: priority-fee multipliers on `estimateFeesPerGas` (0.8× / 1.0× / 1.5×). `tieringSupported: true` except on legacy non-EIP-1559 chains.\n**Solana**: 25th / 50th / 75th percentile of recent `getRecentPrioritizationFees` samples; falls back to conservative defaults when samples are empty.\n**Tron**: single tier (no priority concept); `tieringSupported: false`."
+          }
+        },
+        {
+          "name": "Mass payouts (batch up to 100)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/api/v1/payouts/batch", "host": ["{{baseUrl}}"], "path": ["api", "v1", "payouts", "batch"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"payouts\": [\n    { \"chainId\": 42161, \"token\": \"USDC\", \"amount\": \"1.5\", \"destinationAddress\": \"0x1111111111111111111111111111111111111111\" },\n    { \"chainId\": 42161, \"token\": \"USDC\", \"amount\": \"2.0\", \"destinationAddress\": \"0x2222222222222222222222222222222222222222\" },\n    { \"chainId\": 1, \"token\": \"ETH\", \"amount\": \"0.01\", \"destinationAddress\": \"0x3333333333333333333333333333333333333333\" }\n  ]\n}"
+            },
+            "description": "Mass-create up to 100 payouts in one call. Per-row errors do NOT abort the batch — partial success is normal. Every planned row carries the same `batchId` (top-level in response) so you can `GET /api/v1/payouts?batchId=<uuid>` to list them.\n\n**Rate limit:** costs N tokens from the merchant's per-minute quota (not 1). A 100-row batch against a 60-per-minute merchant will 429 on the 61st row; cap batches to what your quota can afford.\n\n**HTTP 200** on partial success. Inspect `results[i].status` + `.error` / `.payout` per row. `400` only when the whole array fails schema (oversize, missing `payouts`, etc.)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "if (body.batchId) { pm.environment.set('batchId', body.batchId); console.log('saved batchId =', body.batchId); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List payouts — filter by batchId",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payouts?batchId={{batchId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payouts"],
+              "query": [{ "key": "batchId", "value": "{{batchId}}" }]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
+            "description": "List every payout belonging to a specific batch (uses `batchId` saved by the `Mass payouts` request). Useful for reconciliation after a partial-success batch."
           }
         }
       ]

@@ -276,6 +276,12 @@ paths:
             Fee wallet that funded the payout. Populated only after reservation,
             so this filter implicitly excludes `planned` rows.
           schema: { type: string }
+        - name: batchId
+          in: query
+          description: |
+            Return only payouts belonging to a specific batch (the `batchId`
+            returned by `POST /payouts/batch`). Null-matched rows are excluded.
+          schema: { type: string }
         - name: createdFrom
           in: query
           description: Inclusive lower bound on `createdAt`. ISO-8601 or unix-ms.
@@ -331,6 +337,80 @@ paths:
                 properties:
                   payout: { $ref: "#/components/schemas/Payout" }
         "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/payouts/estimate:
+    post:
+      tags: [payouts]
+      summary: Quote three fee tiers for a hypothetical payout
+      description: |
+        Returns low/medium/high fee quotes WITHOUT planning anything or
+        reserving a fee wallet. Call this BEFORE `POST /api/v1/payouts` to
+        show the operator per-tier cost options; the operator then submits
+        the real payout with their chosen `feeTier` bound.
+
+        Tier semantics by chain family:
+          - **EVM**: priority-fee multipliers on viem's `estimateFeesPerGas`
+            (0.8× / 1.0× / 1.5×). `tieringSupported=true` except on legacy
+            non-EIP-1559 chains, which return the three tiers identical.
+          - **Solana**: 25th / 50th / 75th percentile of recent
+            `getRecentPrioritizationFees` samples, combined with a fixed
+            200k-CU allocation. `tieringSupported=false` when no recent
+            samples — conservative fallback prices are used instead.
+          - **Tron**: three tiers always identical; Tron has no priority
+            concept. `tieringSupported=false`.
+
+        Amount resolution is identical to `POST /api/v1/payouts` (raw /
+        decimal / USD-pegged via oracle). Oracle outage: `503 ORACLE_FAILED`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlanPayoutInput" }
+      responses:
+        "200":
+          description: Fee-tier quote
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PayoutFeeEstimate" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/payouts/batch:
+    post:
+      tags: [payouts]
+      summary: Plan up to 100 payouts in one call
+      description: |
+        Mass-create endpoint. Each row is validated and planned independently
+        — per-row errors DO NOT abort the batch. Every successfully-planned
+        row carries the same `batchId` so operators can list them together
+        via `GET /payouts?batchId=<id>`.
+
+        **Rate limit:** consumes N tokens from the merchant's `merchantPerMinute`
+        quota (proportional, not per-request). A 100-row batch costs 100
+        quota; exceeding available quota returns 429 with `retry-after`.
+
+        **Atomicity:** per-row. Batches never half-commit at the DB level;
+        each successful row is its own `INSERT`. The whole request is HTTP
+        200 on partial success — the client inspects `results[]` for per-row
+        outcomes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PayoutBatchInput" }
+      responses:
+        "200":
+          description: Batch processed (may include per-row failures)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PayoutBatchResponse" }
+        "400":
+          description: Batch-level validation error (oversize, wrong body shape, all-row schema failure)
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/MerchantInactive" }
         "429": { $ref: "#/components/responses/RateLimited" }
@@ -1122,6 +1202,15 @@ paths:
         No private key is accepted over the admin API — fund the returned
         derived address out-of-band. The same label always derives to the
         same address across redeploys.
+
+        **EVM family fanout:** when `family: "evm"` and neither `chainId` nor
+        `chainIds` is supplied, one row is created per wired EVM chain in
+        `CHAIN_REGISTRY` (the synthetic dev chain 999 is excluded). The
+        derived address is IDENTICAL across those rows because EVM
+        `deriveAddress` ignores chainId. For Tron/Solana, supply `chainId`
+        or `chainIds` explicitly (mainnet vs testnet).
+
+        Schema is strict — unknown fields are rejected.
       security:
         - AdminKey: []
       requestBody:
@@ -1130,9 +1219,17 @@ paths:
           application/json:
             schema:
               type: object
-              required: [chainId, label, family]
+              required: [label, family]
               properties:
-                chainId: { type: integer }
+                chainId:
+                  type: integer
+                  description: Single-chain registration (legacy). Mutually exclusive with `chainIds`.
+                chainIds:
+                  type: array
+                  items: { type: integer }
+                  minItems: 1
+                  maxItems: 20
+                  description: Multi-chain fanout — one row per chainId, same address. Mutually exclusive with `chainId`.
                 label:
                   type: string
                   maxLength: 64
@@ -1151,16 +1248,155 @@ paths:
                   feeWallet:
                     type: object
                     properties:
-                      chainId: { type: integer }
-                      address:
-                        type: string
-                        description: Derived address the operator must fund.
+                      address: { type: string, description: Derived address the operator must fund. }
                       label: { type: string }
+                      family: { type: string, enum: [evm, tron, solana] }
+                      chainIds:
+                        type: array
+                        items: { type: integer }
+                        description: Every chainId the address was registered on.
         "400":
           description: Family mismatch, MASTER_SEED missing, or validation error
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/fee-wallets/from-pool-address:
+    post:
+      tags: [admin]
+      summary: Promote an HD-derived pool address to a fee wallet (no key storage)
+      description: |
+        Common use: a pool address received invoice payments (now settled),
+        and the operator wants to use its accumulated balance for outbound
+        payouts WITHOUT first transferring funds to a separate fee wallet.
+        The gateway already knows the private key (HD-derived at the pool
+        row's `address_index`), so no key is stored at rest — the fee-wallet
+        row just carries the pool's `derivation_index`.
+
+        **Race window:** by default (`deactivatePoolSlot: true`) the pool
+        row is CAS-quarantined so no new invoices are allocated against it.
+        In-flight invoices still resolve via `invoice_receive_addresses` —
+        late payments credit the original invoice correctly. The CAS on
+        `status='available'` prevents race conditions with the allocator;
+        if the pool row was already reallocated between SELECT and UPDATE,
+        `poolDeactivated: false` is returned and the operator retries after
+        the active invoice settles.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [family, address, label]
+              properties:
+                family: { type: string, enum: [evm, tron, solana] }
+                address:
+                  type: string
+                  description: Canonical address (must exist as a row in `address_pool`).
+                label: { type: string, maxLength: 64 }
+                chainIds:
+                  type: array
+                  items: { type: integer }
+                  minItems: 1
+                  maxItems: 20
+                  description: Omit for EVM fanout; required for Tron/Solana.
+                deactivatePoolSlot:
+                  type: boolean
+                  default: true
+      responses:
+        "201":
+          description: Promoted. Operator now owns the address as a fee wallet.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallet:
+                    type: object
+                    properties:
+                      address: { type: string }
+                      label: { type: string }
+                      family: { type: string }
+                      chainIds:
+                        type: array
+                        items: { type: integer }
+                      derivationIndex:
+                        type: integer
+                        description: |
+                          Pool's `address_index`. Signer uses this directly
+                          at execution time; operator reference only.
+                      poolDeactivated: { type: boolean }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No pool row matches `(family, address)`
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/fee-wallets/from-index:
+    post:
+      tags: [admin]
+      summary: Register a fee wallet at an explicit HD derivation index (escape hatch)
+      description: |
+        Advanced endpoint for registering at an operator-supplied HD index.
+        Used for sweep-master promotion, debugging, and recovery of
+        orphaned addresses.
+
+        **Index range is RESTRICTED** to the fee-wallet region
+        `[0x40000000, 0x7EFFFFFF]`:
+          - `< 0x40000000` (pool region): rejected — would share a private
+            key with an invoice receive address. Use `/from-pool-address`
+            instead (it validates the pool row exists).
+          - `>= 0x7F000000` (sweep-master region): rejected — would shadow
+            the per-family sweep master.
+
+        The derived address is computed from `MASTER_SEED` at the supplied
+        index; no key is accepted or stored.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [family, derivationIndex, label]
+              properties:
+                family: { type: string, enum: [evm, tron, solana] }
+                derivationIndex:
+                  type: integer
+                  minimum: 1073741824 # 0x40000000
+                  maximum: 2130706431 # 0x7EFFFFFF
+                  description: HD index in the fee-wallet region only.
+                label: { type: string, maxLength: 64 }
+                chainIds:
+                  type: array
+                  items: { type: integer }
+                  minItems: 1
+                  maxItems: 20
+      responses:
+        "201":
+          description: Fee wallet registered at the supplied index.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallet:
+                    type: object
+                    properties:
+                      address: { type: string }
+                      label: { type: string }
+                      family: { type: string }
+                      chainIds:
+                        type: array
+                        items: { type: integer }
+                      derivationIndex: { type: integer }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
   /admin/pool/initialize:
     post:
@@ -2123,6 +2359,47 @@ components:
           pattern: "^(0|[1-9]\\d*)(\\.\\d+)?$"
           description: Fiat-pegged decimal. Mutually exclusive with `amountRaw` / `amount`.
         destinationAddress: { type: string, minLength: 1, maxLength: 128 }
+        feeTier:
+          type: string
+          enum: [low, medium, high]
+          description: |
+            Optional fee tier for the broadcast tx. Meaningful today on chains
+            whose `tieringSupported` flag (from `GET /admin/chains` or
+            `POST /payouts/estimate`) is `true` — **EVM** binds
+            maxFeePerGas/maxPriorityFeePerGas at this tier via
+            `estimateFeesPerGas`-scaled multipliers (0.8× / 1.0× / 1.5×);
+            **Solana** binds a `setComputeUnitPrice` instruction at the 25th
+            / 50th / 75th percentile of recent prioritization fees. **Tron**
+            has no tier concept — the field is accepted for uniformity but
+            has no effect on broadcast.
+            When omitted, the chain's default (viem's default on EVM; no
+            priority fee on Solana) applies.
+        allowMultiSource:
+          type: boolean
+          default: false
+          description: |
+            Opt-in fallback: if no single fee wallet has enough token balance,
+            split the payout across multiple wallets (N parallel on-chain txs
+            from N different wallets, all to the same destination). Without
+            this flag, an underfunded single-source attempt defers to the
+            next executor tick with `NO_FEE_WALLET_FUNDED`; with the flag,
+            the executor greedily picks up to 8 wallets by balance
+            descending until cumulative balance clears the payout amount.
+            The per-leg tx hashes end up in `txHashes` on the response row.
+            Hard-fails with `INSUFFICIENT_TOTAL_BALANCE` (503) when even the
+            sum of every funded wallet falls short. On partial broadcast
+            failure (some legs land on-chain, some throw), the payout ends
+            in `failed` but `txHashes` preserves the successful legs for
+            manual reconciliation — do NOT auto-retry those.
+        batchId:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            Optional grouping id. Set automatically by `POST /payouts/batch`
+            to the same UUID on every row of a batch. Accepted on the
+            single-create path for uniformity but ignored there. Filter list
+            responses with `GET /payouts?batchId=<id>`.
         webhookUrl:
           type: string
           format: uri
@@ -2131,7 +2408,9 @@ components:
             this payout's events goes here instead of the merchant-account
             webhook. Must be supplied together with `webhookSecret` — passing
             one without the other is a 400. Echoed in responses; the secret is
-            never returned.
+            never returned. SSRF-guarded: URLs pointing at loopback /
+            link-local / cloud-metadata addresses are rejected with
+            `INVALID_DESTINATION` at plan time.
         webhookSecret:
           type: string
           minLength: 16
@@ -2140,6 +2419,102 @@ components:
           description: |
             HMAC secret paired with `webhookUrl`. Encrypted at rest and never
             echoed back. Required if `webhookUrl` is set.
+
+    PayoutFeeEstimate:
+      type: object
+      description: |
+        Fee-tier quote for a hypothetical payout. Returned by
+        `POST /api/v1/payouts/estimate`. Each tier carries the total native
+        cost (signature base + priority component, in the chain's smallest
+        unit) plus a best-effort USD conversion via the price oracle.
+        `tieringSupported=false` → the three tiers are identical (Tron, and
+        Solana when the RPC has no recent prioritization samples).
+      required: [amountRaw, tiers]
+      properties:
+        amountRaw:
+          type: string
+          description: Resolved raw amount for the quoted payout, in the token's smallest unit.
+        quotedAmountUsd: { type: [string, "null"] }
+        quotedRate: { type: [string, "null"] }
+        tiers:
+          type: object
+          required: [tieringSupported, nativeSymbol, low, medium, high]
+          properties:
+            tieringSupported: { type: boolean }
+            nativeSymbol: { type: string, description: "ETH / POL / BNB / AVAX / TRX / SOL." }
+            low:
+              $ref: "#/components/schemas/PayoutFeeQuoteTier"
+            medium:
+              $ref: "#/components/schemas/PayoutFeeQuoteTier"
+            high:
+              $ref: "#/components/schemas/PayoutFeeQuoteTier"
+
+    PayoutFeeQuoteTier:
+      type: object
+      required: [tier, nativeAmountRaw, usdAmount]
+      properties:
+        tier: { type: string, enum: [low, medium, high] }
+        nativeAmountRaw:
+          type: string
+          description: Total fee in native smallest units (wei on EVM, sun on Tron, lamports on Solana).
+        usdAmount:
+          type: [string, "null"]
+          description: |
+            USD value of the tier amount via the price oracle. Null when the
+            oracle is unavailable for the chain's native symbol — the fee is
+            still quoted in native; USD display degrades gracefully.
+
+    PayoutBatchInput:
+      type: object
+      required: [payouts]
+      properties:
+        payouts:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/PlanPayoutInput"
+      description: |
+        Up to 100 `PlanPayoutInput` rows. Each row is validated and inserted
+        independently — per-row errors do NOT abort the batch. The request
+        consumes N tokens from the merchant's `merchantPerMinute` quota
+        (proportional rate limit, not a single-request charge).
+
+    PayoutBatchResponse:
+      type: object
+      required: [batchId, results, summary]
+      properties:
+        batchId:
+          type: string
+          description: |
+            UUID shared across every successfully-planned row in the batch.
+            Filter list responses with `GET /payouts?batchId=<id>`.
+        results:
+          type: array
+          items:
+            oneOf:
+              - type: object
+                required: [index, status, payout]
+                properties:
+                  index: { type: integer }
+                  status: { type: string, enum: [planned] }
+                  payout: { $ref: "#/components/schemas/Payout" }
+              - type: object
+                required: [index, status, error]
+                properties:
+                  index: { type: integer }
+                  status: { type: string, enum: [failed] }
+                  error:
+                    type: object
+                    properties:
+                      code: { type: string }
+                      message: { type: string }
+        summary:
+          type: object
+          required: [planned, failed]
+          properties:
+            planned: { type: integer }
+            failed: { type: integer }
 
     BalanceSnapshot:
       type: object
@@ -2262,6 +2637,48 @@ components:
             Populated only when the create used `amountUSD`. For non-stable
             tokens the broadcast may happen later — this is the create-time
             rate, not the executed-time rate.
+        feeTier:
+          type: [string, "null"]
+          enum: [low, medium, high, null]
+          description: |
+            Fee tier bound at create time (echo of the `feeTier` input). Null
+            when the create didn't specify one. EVM binds this into
+            `maxFeePerGas` / `maxPriorityFeePerGas` at broadcast; Solana
+            binds a matching `setComputeUnitPrice`; Tron ignores.
+        feeQuotedNative:
+          type: [string, "null"]
+          description: |
+            Native-unit fee cost quoted at plan time for the chosen `feeTier`,
+            captured from `quoteFeeTiers().{tier}.nativeAmountRaw`. Lets
+            operators compare quoted vs. actual (post-confirm) for drift
+            analysis. Null when no tier was requested.
+        batchId:
+          type: [string, "null"]
+          description: |
+            Grouping id for mass-payout batches. Same UUID across every row
+            of a `POST /payouts/batch` call; null for single-create payouts.
+        allowMultiSource:
+          type: boolean
+          description: |
+            Echo of the opt-in flag. When true AND single-source selection
+            failed at execution time, the executor broadcasts N parallel
+            txs from N distinct wallets; their hashes land in `txHashes`.
+        sourceAddresses:
+          type: [array, "null"]
+          items: { type: string }
+          description: |
+            Multi-source only — the ordered list of source wallets used
+            (first entry also appears in `sourceAddress` for backward
+            compat). Null for single-source payouts.
+        txHashes:
+          type: [array, "null"]
+          items: { type: string }
+          description: |
+            Multi-source only — the ordered list of broadcast tx hashes
+            (first entry also appears in `txHash` for backward compat).
+            On partial broadcast failure the successful legs ARE preserved
+            here even though the payout status is `failed` — operator uses
+            this to reconcile orphan on-chain txs. Null for single-source.
         destinationAddress: { type: string }
         sourceAddress: { type: [string, "null"] }
         txHash: { type: [string, "null"] }
@@ -2277,4 +2694,13 @@ components:
         createdAt: { type: string, format: date-time }
         submittedAt: { type: [string, "null"], format: date-time }
         confirmedAt: { type: [string, "null"], format: date-time }
+        broadcastAttemptedAt:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            Set by the broadcast-slot CAS the first time the executor tried
+            to broadcast. Distinguishes "never attempted" (still planned /
+            reserved, cron hasn't picked it up) from "attempted at least
+            once" (crashed mid-broadcast → stuck reservation candidate for
+            the sweeper). Handy for operator triage of stuck payouts.
         updatedAt: { type: string, format: date-time }

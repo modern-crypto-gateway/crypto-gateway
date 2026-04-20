@@ -609,6 +609,97 @@ operator queue at `GET /admin/webhook-deliveries?status=dead` and can be
 manually replayed via `POST /admin/webhook-deliveries/{id}/replay` once
 the merchant endpoint is healthy again.
 
+## Payouts
+
+Outbound transfers. Every payout goes through `planned → reserved → submitted → confirmed` (or `→ failed`). Execution is cron-driven; the HTTP create returns immediately with `planned`.
+
+### Amount inputs (pick exactly one)
+
+```
+amountRaw: "1000000"      // uint256 smallest units (1 USDC = "1000000")
+amount:    "1.5"          // human decimal, converted against token.decimals
+amountUSD: "10.00"        // fiat-pegged via price oracle; rate snapshotted on the row
+```
+
+### Fee tiers
+
+`POST /api/v1/payouts/estimate` quotes **low / medium / high** before the operator commits. The same `feeTier` field on `POST /api/v1/payouts` binds the chosen tier at broadcast time.
+
+| Chain | Tier semantics | `tieringSupported` |
+|---|---|---|
+| EVM | priority-fee multipliers on viem's `estimateFeesPerGas` (0.8× / 1.0× / 1.5×), binds `maxFeePerGas` + `maxPriorityFeePerGas` | `true` on EIP-1559 chains, `false` on legacy |
+| Solana | 25th / 50th / 75th percentile of recent `getRecentPrioritizationFees`, binds a `ComputeBudget` `setComputeUnitPrice` instruction | `true` when samples available, `false` on fallback |
+| Tron | flat (no priority concept) | `false` |
+
+On Solana, omitting `feeTier` skips the priority-fee RPC call entirely — zero overhead on the quiet path. Set it to `"medium"` or `"high"` when the mainnet network is congested to actually land.
+
+### Multi-source fallback (opt-in)
+
+When a payout's amount exceeds any single fee wallet's balance, the default behavior is to defer the payout with `NO_FEE_WALLET_FUNDED` (operator tops up). Pass `"allowMultiSource": true` to instead split across wallets:
+
+```
+POST /api/v1/payouts
+{
+  "chainId": 42161,
+  "token": "USDC",
+  "amount": "1000",
+  "destinationAddress": "0x...",
+  "allowMultiSource": true
+}
+```
+
+The executor picks up to 8 wallets by balance descending, CAS-reserves all of them, then broadcasts N parallel txs via `Promise.allSettled`. All succeed → `status=submitted`, `txHashes` and `sourceAddresses` carry every leg. Any leg fails → `status=failed` BUT successful-leg hashes are preserved in `txHashes` for manual reconciliation (DO NOT auto-retry them — those txs are live on-chain). Sum of every funded wallet still short → `INSUFFICIENT_TOTAL_BALANCE` (503), hard-fail.
+
+### Mass (batch) payouts
+
+`POST /api/v1/payouts/batch` with up to 100 rows:
+
+```json
+{
+  "payouts": [
+    { "chainId": 42161, "token": "USDC", "amount": "1.5", "destinationAddress": "0x1111..." },
+    { "chainId": 42161, "token": "USDC", "amount": "2.0", "destinationAddress": "0x2222..." }
+  ]
+}
+```
+
+- Per-row errors DON'T abort the batch — response is HTTP 200 with `results[i].status` per row.
+- Every successful row gets the same `batchId` (UUID, returned top-level). Filter later with `GET /api/v1/payouts?batchId=<id>`.
+- **Rate limit is proportional**: a 100-row batch costs 100 tokens from the merchant's per-minute quota, not 1.
+
+### Pre-flight gas-aware wallet selection
+
+The executor filters candidates by token + native-gas balance before CAS-reserving. Tight-fit selection: among qualifying wallets, the one with the smallest excess token balance wins — keeps large-balance wallets free for future big payouts. Tick-local balance cache dedupes RPC reads across parallel workers. `NO_FEE_WALLET_FUNDED` distinguishes "wallets exist but none have token + gas" from "no wallets registered" for operator alerting.
+
+### Fee wallet management
+
+Three ways to register:
+
+| Endpoint | When to use |
+|---|---|
+| `POST /admin/fee-wallets` (default) | Fresh HD-derived address via `feeWalletIndex(family, label)`. EVM fanout: omit `chainId` to auto-register across every wired EVM chain |
+| `POST /admin/fee-wallets/from-pool-address` | Pool address already holds funds from a settled invoice. Reuses its HD index as the fee wallet's; quarantines the pool slot with a CAS on `status='available'` to avoid races with the allocator |
+| `POST /admin/fee-wallets/from-index` | Advanced escape hatch — operator supplies an explicit HD index. Hardened to `[0x40000000, 0x7EFFFFFF]` (fee-wallet region only) to prevent key collision with pool or sweep-master |
+
+No private keys ever touch the admin API. Everything is HD-derived from `MASTER_SEED` at execution time.
+
+### Payout error codes
+
+| Code | Status | Meaning |
+|---|---|---|
+| `MERCHANT_NOT_FOUND` | 404 | API key didn't resolve to a merchant |
+| `MERCHANT_INACTIVE` | 403 | Merchant was deactivated |
+| `TOKEN_NOT_SUPPORTED` | 400 | `(chainId, token)` not in `TOKEN_REGISTRY` |
+| `INVALID_DESTINATION` | 400 | Address validation failed OR per-payout `webhookUrl` pointed at loopback/metadata (SSRF guard) |
+| `BAD_AMOUNT` | 400 | `amount` had more decimal places than `token.decimals` |
+| `ORACLE_FAILED` | 503 | Price oracle outage during `amountUSD` conversion |
+| `INVALID_FEE_TIER` | 400 | `feeTier` outside the `low`/`medium`/`high` enum |
+| `FEE_ESTIMATE_FAILED` | 503 | Chain adapter's `quoteFeeTiers` threw (RPC outage) |
+| `BATCH_TOO_LARGE` | 400 | Batch > 100 rows |
+| `NO_FEE_WALLET_AVAILABLE` | — | (Internal, single-source) Defers to next tick |
+| `NO_FEE_WALLET_FUNDED` | — | (Internal) Candidates exist but none have token + gas. Defers |
+| `INSUFFICIENT_TOTAL_BALANCE` | 503 | Multi-source attempted; sum of every funded wallet falls short |
+
 ## Payment tolerance (slippage)
 
 Real-world rate jitter, exchange spreads, and dust rounding mean the USD value

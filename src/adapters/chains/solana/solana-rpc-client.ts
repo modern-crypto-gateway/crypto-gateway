@@ -80,6 +80,15 @@ export interface SolanaParsedTokenAccount {
   decimals: number;
 }
 
+// Per-slot prioritization-fee sample from `getRecentPrioritizationFees`.
+// One entry per recent slot that included a tx touching any of the queried
+// writable accounts (empty `accountKeys` asks for global samples).
+export interface SolanaPrioritizationFeeSample {
+  slot: number;
+  // Price the lander paid — micro-lamports per compute unit.
+  prioritizationFee: number;
+}
+
 export interface SolanaRpcClient {
   getSlot(): Promise<number>;
   getLatestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }>;
@@ -93,6 +102,14 @@ export interface SolanaRpcClient {
   // owner holds (including zero-balance ATAs). Caller filters by mint to map
   // back to registry tokens.
   getTokenAccountsByOwner(address: string): Promise<readonly SolanaParsedTokenAccount[]>;
+  // Recent per-slot prioritization-fee samples. `accountKeys` narrows to slots
+  // that included a tx touching any of the given writable accounts; an empty
+  // array returns a global network-wide sample. Validators return up to ~150
+  // recent slots. Used by the fee-tier quote path to bucket 25th/50th/75th
+  // percentiles into low/medium/high tiers.
+  getRecentPrioritizationFees(
+    accountKeys: readonly string[]
+  ): Promise<readonly SolanaPrioritizationFeeSample[]>;
 }
 
 export function solanaRpcClient(config: SolanaRpcConfig): SolanaRpcClient {
@@ -169,6 +186,21 @@ export function solanaRpcClient(config: SolanaRpcConfig): SolanaRpcClient {
     async getBalance(address) {
       const result = await rpc<{ context: unknown; value: number }>("getBalance", [address]);
       return result.value;
+    },
+
+    async getRecentPrioritizationFees(accountKeys) {
+      // Solana RPC returns an array of { slot, prioritizationFee } — no
+      // context wrapper. Some validators reject the call entirely (e.g. when
+      // the RPC is configured without the extension); we catch and return an
+      // empty array so the caller falls back to a sensible default.
+      try {
+        return await rpc<readonly SolanaPrioritizationFeeSample[]>(
+          "getRecentPrioritizationFees",
+          [accountKeys as string[]]
+        );
+      } catch {
+        return [];
+      }
     },
 
     async getTokenAccountsByOwner(address) {

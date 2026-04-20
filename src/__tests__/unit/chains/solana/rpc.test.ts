@@ -30,6 +30,9 @@ function fakeClient(overrides: Partial<SolanaRpcClient>): SolanaRpcClient {
     },
     async getTokenAccountsByOwner() {
       throw new Error("unexpected getTokenAccountsByOwner");
+    },
+    async getRecentPrioritizationFees() {
+      return [];
     }
   };
   return { ...base, ...overrides };

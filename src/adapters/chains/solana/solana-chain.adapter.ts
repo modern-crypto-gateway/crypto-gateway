@@ -39,6 +39,24 @@ export const SOLANA_DEVNET_CHAIN_ID = 901;
 // that's the whole fee. We don't query getFeeForMessage for such a hot-path op.
 const SIGNATURE_FEE_LAMPORTS = 5_000n;
 
+// Fixed CU allocation we bind on every payout when priority fees are in use.
+// Generous upper bound: native transfer uses ~200 CU, SPL CreateIdempotent +
+// TransferChecked combined uses ~20k CU. 200k leaves comfortable headroom
+// for future SPL variants without making the operator overpay — the chain
+// charges for CU * price, not for the allocation ceiling.
+const DEFAULT_COMPUTE_UNIT_LIMIT = 200_000;
+
+// Fallback per-CU priority fee samples when `getRecentPrioritizationFees`
+// returns an empty array (validator doesn't support the method, or no recent
+// slots touched the writable accounts). These values are conservative low /
+// medium / high for late-2024 mainnet conditions: a quiet network needs zero,
+// a busy one needs 50k+ microLamports/CU to land in 1-2 slots.
+const FALLBACK_PRIORITY_MICROLAMPORTS = {
+  low: 10_000n,
+  medium: 50_000n,
+  high: 200_000n
+} as const;
+
 // Phantom-compatible derivation path: m/44'/501'/{account}'/0'.
 const DEFAULT_ACCOUNT_INDEX = 0;
 
@@ -313,6 +331,25 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       const client = getClient(args.chainId);
       const { blockhash } = await client.getLatestBlockhash();
 
+      // Translate the caller's fee tier into a ComputeBudget config. We only
+      // bind ComputeBudget when a tier is requested — without it, the tx
+      // uses Solana's default (200k CU limit, no priority fee) and pays
+      // only the base 5k-lamport signature fee. Safe on quiet networks,
+      // insufficient under congestion.
+      const computeBudget =
+        args.feeTier === undefined
+          ? undefined
+          : {
+              computeUnitLimit: DEFAULT_COMPUTE_UNIT_LIMIT,
+              computeUnitPriceMicroLamports: await resolveSolanaPriorityMicroLamports(
+                client,
+                args.feeTier,
+                token.contractAddress !== null
+                  ? [args.fromAddress, args.toAddress] // SPL: writable are sender+recipient owners
+                  : [args.fromAddress, args.toAddress]
+              )
+            };
+
       if (token.contractAddress !== null) {
         // SPL path. Derive both ATAs client-side and build a single tx that
         // idempotently creates the destination ATA (no-op if it already
@@ -329,7 +366,8 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
           mintAddress: token.contractAddress,
           amount: BigInt(args.amountRaw),
           decimals: token.decimals,
-          recentBlockhash: blockhash
+          recentBlockhash: blockhash,
+          ...(computeBudget !== undefined ? { computeBudget } : {})
         });
         return {
           chainId: args.chainId as ChainId,
@@ -342,7 +380,8 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
         sourceAddress: args.fromAddress,
         destinationAddress: args.toAddress,
         lamports: BigInt(args.amountRaw),
-        recentBlockhash: blockhash
+        recentBlockhash: blockhash,
+        ...(computeBudget !== undefined ? { computeBudget } : {})
       });
 
       return {
@@ -387,20 +426,32 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       return SIGNATURE_FEE_LAMPORTS.toString() as AmountRaw;
     },
 
-    async quoteFeeTiers(_args: EstimateArgs): Promise<FeeTierQuote> {
-      // Solana's base fee (5000 lamports) is always paid. Priority fees add
-      // `computeUnits × microLamports ÷ 1_000_000` on top. We'd call
-      // `getRecentPrioritizationFees` and bucket by percentile (25/50/75),
-      // but the RPC client wrapper doesn't expose it yet — for now quote
-      // the base fee at all three tiers with `tieringSupported=false` so the
-      // frontend renders a single option. This can be tightened when the
-      // client grows the method.
-      const base = SIGNATURE_FEE_LAMPORTS.toString() as AmountRaw;
+    async quoteFeeTiers(args: EstimateArgs): Promise<FeeTierQuote> {
+      // Real fee tiers for Solana.
+      //
+      //   total = base_signature_fee + (compute_unit_limit * microLamportsPerCu / 1e6)
+      //
+      // Priority per-CU prices come from `getRecentPrioritizationFees` —
+      // bucketed to 25th/50th/75th percentile for low/medium/high. Empty
+      // samples fall back to hard-coded defaults (see constants above).
+      // CU limit is fixed at DEFAULT_COMPUTE_UNIT_LIMIT — plenty of headroom
+      // for any transfer we actually build today, and operators only pay for
+      // units consumed, not units allocated.
+      const client = getClient(args.chainId);
+      const tierPrices = await solanaTierPrices(client, [
+        args.fromAddress,
+        args.toAddress
+      ]);
+      const cuLimit = BigInt(DEFAULT_COMPUTE_UNIT_LIMIT);
+      const totalFor = (microLamports: bigint): AmountRaw => {
+        const priorityLamports = (cuLimit * microLamports) / 1_000_000n;
+        return (SIGNATURE_FEE_LAMPORTS + priorityLamports).toString() as AmountRaw;
+      };
       return {
-        low: { tier: "low", nativeAmountRaw: base },
-        medium: { tier: "medium", nativeAmountRaw: base },
-        high: { tier: "high", nativeAmountRaw: base },
-        tieringSupported: false,
+        low: { tier: "low", nativeAmountRaw: totalFor(tierPrices.low) },
+        medium: { tier: "medium", nativeAmountRaw: totalFor(tierPrices.medium) },
+        high: { tier: "high", nativeAmountRaw: totalFor(tierPrices.high) },
+        tieringSupported: true,
         nativeSymbol: "SOL" as TokenSymbol
       };
     },
@@ -493,3 +544,56 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 // Silence "unused import" for the base58 re-export.
 void base58;
+
+// ---- Priority-fee helpers ----
+
+// Fetch recent priority-fee samples and bucket them into low/medium/high
+// (25th/50th/75th percentiles). On an empty sample set (validator without
+// the extension, or no recent slots touching these accounts), fall back to
+// the conservative baseline defined above.
+async function solanaTierPrices(
+  client: SolanaRpcClient,
+  writableAccounts: readonly string[]
+): Promise<{ low: bigint; medium: bigint; high: bigint }> {
+  const samples = await client.getRecentPrioritizationFees(writableAccounts);
+  if (samples.length === 0) {
+    return {
+      low: FALLBACK_PRIORITY_MICROLAMPORTS.low,
+      medium: FALLBACK_PRIORITY_MICROLAMPORTS.medium,
+      high: FALLBACK_PRIORITY_MICROLAMPORTS.high
+    };
+  }
+  const sorted = [...samples]
+    .map((s) => s.prioritizationFee)
+    .filter((n) => Number.isFinite(n) && n >= 0)
+    .sort((a, b) => a - b);
+  if (sorted.length === 0) {
+    return {
+      low: FALLBACK_PRIORITY_MICROLAMPORTS.low,
+      medium: FALLBACK_PRIORITY_MICROLAMPORTS.medium,
+      high: FALLBACK_PRIORITY_MICROLAMPORTS.high
+    };
+  }
+  const percentile = (p: number): number => {
+    const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+    return sorted[idx] ?? 0;
+  };
+  return {
+    low: BigInt(percentile(0.25)),
+    medium: BigInt(percentile(0.5)),
+    high: BigInt(percentile(0.75))
+  };
+}
+
+// Resolve the microLamports-per-CU price to bind when a specific feeTier was
+// requested at build time. Same source as `quoteFeeTiers` so the broadcast
+// fee matches the quote the operator saw (within drift of the recent-slot
+// window rolling between the two calls).
+async function resolveSolanaPriorityMicroLamports(
+  client: SolanaRpcClient,
+  feeTier: "low" | "medium" | "high",
+  writableAccounts: readonly string[]
+): Promise<bigint> {
+  const tiers = await solanaTierPrices(client, writableAccounts);
+  return tiers[feeTier];
+}

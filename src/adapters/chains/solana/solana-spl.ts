@@ -2,7 +2,15 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { base58 } from "@scure/base";
 import { addressToPublicKeyBytes } from "./solana-address.js";
-import { concatBytes, encodeCompactU16, u64le } from "./solana-message.js";
+import {
+  COMPUTE_BUDGET_PROGRAM_ID,
+  computeBudgetInstructionBytes,
+  concatBytes,
+  encodeCompactU16,
+  encodeSetComputeUnitLimit,
+  encodeSetComputeUnitPrice,
+  u64le
+} from "./solana-message.js";
 
 // SPL / Associated Token Account support for Solana payouts.
 //
@@ -17,8 +25,12 @@ import { concatBytes, encodeCompactU16, u64le } from "./solana-message.js";
 //     are on the classic Token program today.
 //   - Multi-signer fee payers / arbitrary payer != owner. The source wallet
 //     always pays its own rent + fee.
-//   - ComputeBudget instructions. Default CU limit (200k) is ample for
-//     one CreateIdempotent + one TransferChecked (~20k CU combined).
+//
+// ComputeBudget instructions ARE supported (optional). Pass
+// `{ computeUnitLimit, computeUnitPriceMicroLamports }` to bind priority
+// fees so the tx actually lands during congestion. Without it, the tx uses
+// the Solana default (200k CU limit, zero priority) and may sit in the
+// pending pool while higher-priority txs land first.
 
 // Classic SPL Token program.
 export const SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -99,6 +111,10 @@ export function buildSplTransferMessage(args: {
   amount: bigint;
   decimals: number;
   recentBlockhash: string;
+  computeBudget?: {
+    computeUnitLimit?: number;
+    computeUnitPriceMicroLamports?: bigint;
+  };
 }): Uint8Array {
   if (args.decimals < 0 || args.decimals > 255) {
     throw new Error(`SPL decimals must fit in u8: ${args.decimals}`);
@@ -113,6 +129,11 @@ export function buildSplTransferMessage(args: {
   const tokenProgramPk = addressToPublicKeyBytes(SPL_TOKEN_PROGRAM_ID);
   const assocProgramPk = addressToPublicKeyBytes(SPL_ASSOCIATED_TOKEN_PROGRAM_ID);
 
+  const cb = args.computeBudget;
+  const hasCbLimit = cb?.computeUnitLimit !== undefined;
+  const hasCbPrice = cb?.computeUnitPriceMicroLamports !== undefined;
+  const hasCb = hasCbLimit || hasCbPrice;
+
   const accountKeys = [
     senderOwnerPk,
     senderAtaPk,
@@ -123,10 +144,15 @@ export function buildSplTransferMessage(args: {
     tokenProgramPk,
     assocProgramPk
   ];
+  const computeBudgetIdx = accountKeys.length;
+  if (hasCb) {
+    accountKeys.push(addressToPublicKeyBytes(COMPUTE_BUDGET_PROGRAM_ID));
+  }
 
   // Header: 1 required signature (sender owner), 0 readonly-signed,
-  // 5 readonly-unsigned (mint, recipient owner, system, token, assoc).
-  const header = new Uint8Array([1, 0, 5]);
+  // 5 readonly-unsigned (mint, recipient owner, system, token, assoc) +1
+  // more when ComputeBudget is bound.
+  const header = new Uint8Array([1, 0, hasCb ? 6 : 5]);
 
   const blockhashBytes = base58.decode(args.recentBlockhash);
   if (blockhashBytes.length !== 32) {
@@ -171,13 +197,34 @@ export function buildSplTransferMessage(args: {
     transferData
   );
 
+  // ComputeBudget instructions go FIRST. SetComputeUnitLimit and
+  // SetComputeUnitPrice are both optional — include each only when the
+  // caller supplied the corresponding value.
+  const prefixInstructions: Uint8Array[] = [];
+  if (hasCbLimit) {
+    prefixInstructions.push(
+      computeBudgetInstructionBytes(
+        computeBudgetIdx,
+        encodeSetComputeUnitLimit(cb!.computeUnitLimit!)
+      )
+    );
+  }
+  if (hasCbPrice) {
+    prefixInstructions.push(
+      computeBudgetInstructionBytes(
+        computeBudgetIdx,
+        encodeSetComputeUnitPrice(cb!.computeUnitPriceMicroLamports!)
+      )
+    );
+  }
+  const allInstructions = [...prefixInstructions, createAtaIx, transferIx];
+
   return concatBytes(
     header,
     encodeCompactU16(accountKeys.length),
     ...accountKeys,
     blockhashBytes,
-    encodeCompactU16(2), // two instructions: create-idempotent, then transfer
-    createAtaIx,
-    transferIx
+    encodeCompactU16(allInstructions.length),
+    ...allInstructions
   );
 }

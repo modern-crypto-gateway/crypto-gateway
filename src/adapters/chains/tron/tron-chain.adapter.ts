@@ -487,6 +487,17 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
         fee_limit: feeLimit,
         call_value: 0
       });
+      // Revert detection — TronGrid returns HTTP 200 even when the simulated
+      // call reverts (insufficient balance, frozen/blacklisted account,
+      // destination-contract reject). On revert `result.result` is false and
+      // `result.message` carries the reason bytes; `energy_used` may be 0 or
+      // partial. Without this check, a pre-flight `estimate` would quote $0
+      // fees for a doomed tx — parity with `buildTransfer` at line 349-360
+      // where the same check already exists.
+      if (resp.result.result !== true) {
+        const message = resp.result.message ?? "unknown";
+        throw new Error(`Tron simulation failed: ${message}`);
+      }
       const energy = resp.energy_used ?? 0;
       return energy.toString() as AmountRaw;
     },

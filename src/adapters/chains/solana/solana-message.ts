@@ -7,6 +7,11 @@ import { addressToPublicKeyBytes } from "./solana-address.js";
 
 // System Program — the built-in program that handles native SOL transfers.
 export const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
+// ComputeBudget — the built-in program that raises/lowers compute-unit caps
+// and sets per-compute-unit priority fees. Every SLIP/SPL tx that wants to
+// influence landing priority on congested mainnet prepends one or two
+// ComputeBudget instructions before its real work.
+export const COMPUTE_BUDGET_PROGRAM_ID = "ComputeBudget111111111111111111111111111111";
 
 // "Compact-u16" / "shortvec" length prefix used pervasively in Solana's wire
 // format. Integers 0..127 fit in one byte; 128..16383 in two; 16384..65535 in three.
@@ -39,6 +44,50 @@ export function concatBytes(...chunks: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
+// Little-endian u32 encoding for instruction fields that take a compute-unit
+// count (ComputeBudget SetComputeUnitLimit).
+export function u32le(n: number): Uint8Array {
+  if (n < 0 || n > 0xffffffff) throw new Error(`u32 out of range: ${n}`);
+  const out = new Uint8Array(4);
+  out[0] = n & 0xff;
+  out[1] = (n >>> 8) & 0xff;
+  out[2] = (n >>> 16) & 0xff;
+  out[3] = (n >>> 24) & 0xff;
+  return out;
+}
+
+// Build the raw instruction bytes for a ComputeBudget instruction. Takes
+// `programIdIndex` (the index of ComputeBudget in the tx's accountKeys) and
+// a discriminator+payload pair. ComputeBudget instructions take NO account
+// inputs, so the account-indices array is always empty.
+export function computeBudgetInstructionBytes(
+  programIdIndex: number,
+  data: Uint8Array
+): Uint8Array {
+  return concatBytes(
+    new Uint8Array([programIdIndex]),
+    encodeCompactU16(0), // zero account indices
+    encodeCompactU16(data.length),
+    data
+  );
+}
+
+// ComputeBudget SetComputeUnitLimit — discriminator 2, u32 LE limit.
+export function encodeSetComputeUnitLimit(units: number): Uint8Array {
+  const out = new Uint8Array(5);
+  out[0] = 2;
+  out.set(u32le(units), 1);
+  return out;
+}
+
+// ComputeBudget SetComputeUnitPrice — discriminator 3, u64 LE micro-lamports.
+export function encodeSetComputeUnitPrice(microLamports: bigint): Uint8Array {
+  const out = new Uint8Array(9);
+  out[0] = 3;
+  out.set(u64le(microLamports), 1);
+  return out;
+}
+
 // Little-endian u64 encoding for instruction amount fields.
 export function u64le(n: bigint): Uint8Array {
   if (n < 0n) throw new Error(`u64 must be non-negative: ${n}`);
@@ -54,11 +103,25 @@ export function u64le(n: bigint): Uint8Array {
 
 // Build the raw-message bytes for a single native SOL transfer.
 // `sourceAddress` is the payer + signer; `destinationAddress` is the recipient.
+//
+// Optional `computeBudget` binds priority fees via ComputeBudget instructions
+// prepended to the tx. When set, ComputeBudget is added to accountKeys (as a
+// readonly program) and one or two instructions precede the transfer:
+//   - SetComputeUnitLimit(limit) — caps the tx's CU allocation
+//   - SetComputeUnitPrice(microLamportsPerCu) — binds the priority fee paid
+//     per CU consumed. Validators prioritize txs with higher prices during
+//     congestion. When omitted, the Solana default (null price, ~200k CU
+//     limit) applies and the tx only pays the base signature fee (5k
+//     lamports) — fine on quiet networks, risky during congestion.
 export function buildNativeTransferMessage(args: {
   sourceAddress: string;
   destinationAddress: string;
   lamports: bigint;
   recentBlockhash: string; // base58-encoded 32 bytes
+  computeBudget?: {
+    computeUnitLimit?: number;
+    computeUnitPriceMicroLamports?: bigint;
+  };
 }): Uint8Array {
   const sourcePubkey = addressToPublicKeyBytes(args.sourceAddress);
   const destPubkey = addressToPublicKeyBytes(args.destinationAddress);
@@ -68,15 +131,26 @@ export function buildNativeTransferMessage(args: {
     throw new Error(`recentBlockhash must decode to 32 bytes, got ${blockhashBytes.length}`);
   }
 
+  const cb = args.computeBudget;
+  const hasCbLimit = cb?.computeUnitLimit !== undefined;
+  const hasCbPrice = cb?.computeUnitPriceMicroLamports !== undefined;
+  const hasCb = hasCbLimit || hasCbPrice;
+
   // Account ordering: signer(s) first, then read-write non-signers, then
   // read-only non-signers (which programs fall under). For a transfer:
   //   [0] source        — signer, writable
   //   [1] destination   — non-signer, writable
   //   [2] system program — non-signer, read-only (invoked as program)
+  //   [3] compute-budget program — non-signer, read-only (optional)
   const accountKeys = [sourcePubkey, destPubkey, systemProgramPubkey];
+  const computeBudgetIdx = accountKeys.length;
+  if (hasCb) {
+    accountKeys.push(addressToPublicKeyBytes(COMPUTE_BUDGET_PROGRAM_ID));
+  }
 
   // Header: num_required_signatures, num_readonly_signed, num_readonly_unsigned.
-  const header = new Uint8Array([1, 0, 1]);
+  // Adding ComputeBudget adds one more readonly-unsigned account.
+  const header = new Uint8Array([1, 0, hasCb ? 2 : 1]);
 
   // Instruction: transfer = discriminator 2 (u32 LE), followed by lamports (u64 LE).
   const instructionData = new Uint8Array(12);
@@ -84,7 +158,7 @@ export function buildNativeTransferMessage(args: {
   // bytes 1-3 stay zero (u32 LE, only LSB used)
   instructionData.set(u64le(args.lamports), 4);
 
-  const instructionBytes = concatBytes(
+  const transferInstructionBytes = concatBytes(
     new Uint8Array([2]), // program_id_index (systemProgramPubkey at index 2)
     encodeCompactU16(2), // account-index count
     new Uint8Array([0, 1]), // account indices: source, destination
@@ -92,13 +166,34 @@ export function buildNativeTransferMessage(args: {
     instructionData
   );
 
+  // ComputeBudget instructions go FIRST in the tx. Build each optional one.
+  const prefixInstructions: Uint8Array[] = [];
+  if (hasCbLimit) {
+    prefixInstructions.push(
+      computeBudgetInstructionBytes(
+        computeBudgetIdx,
+        encodeSetComputeUnitLimit(cb!.computeUnitLimit!)
+      )
+    );
+  }
+  if (hasCbPrice) {
+    prefixInstructions.push(
+      computeBudgetInstructionBytes(
+        computeBudgetIdx,
+        encodeSetComputeUnitPrice(cb!.computeUnitPriceMicroLamports!)
+      )
+    );
+  }
+
+  const allInstructions = [...prefixInstructions, transferInstructionBytes];
+
   return concatBytes(
     header,
     encodeCompactU16(accountKeys.length),
     ...accountKeys,
     blockhashBytes,
-    encodeCompactU16(1), // one instruction
-    instructionBytes
+    encodeCompactU16(allInstructions.length),
+    ...allInstructions
   );
 }
 

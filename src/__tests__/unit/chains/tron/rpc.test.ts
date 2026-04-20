@@ -572,3 +572,57 @@ describe("tronChainAdapter.buildTransfer (TRC-20)", () => {
     expect((unsigned.raw as { txID: string }).txID).toBe("ab".repeat(32));
   });
 });
+
+describe("tronChainAdapter.estimateGasForTransfer — TRC-20 simulation failure", () => {
+  it("throws with the revert reason when the TronGrid simulation reports result.result !== true", async () => {
+    // Audit finding: a reverted simulation returns HTTP 200 with result.result
+    // === false and the reason in result.message. Pre-fix code returned
+    // `energy_used ?? 0`, making quoteFeeTiers show $0 for a doomed tx.
+    const client = fakeClient({
+      async triggerSmartContract() {
+        return {
+          transaction: { raw_data: {}, raw_data_hex: "", txID: "" },
+          energy_used: 0,
+          result: { result: false, message: "VM error: CONTRACT_VALIDATE_ERROR" }
+        };
+      }
+    });
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+    await expect(
+      adapter.estimateGasForTransfer({
+        chainId: TRON_MAINNET_CHAIN_ID,
+        fromAddress: "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7",
+        toAddress: "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL",
+        token: "USDT" as unknown as never,
+        amountRaw: "1000000" as unknown as never
+      })
+    ).rejects.toThrow(/Tron simulation failed: VM error/);
+  });
+
+  it("propagates the revert through quoteFeeTiers (no silent $0 quote)", async () => {
+    const client = fakeClient({
+      async triggerSmartContract() {
+        return {
+          transaction: { raw_data: {}, raw_data_hex: "", txID: "" },
+          result: { result: false, message: "VM error: CALL_VALUE_TRANSFER_FAILED" }
+        };
+      }
+    });
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+    await expect(
+      adapter.quoteFeeTiers({
+        chainId: TRON_MAINNET_CHAIN_ID,
+        fromAddress: "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7",
+        toAddress: "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL",
+        token: "USDT" as unknown as never,
+        amountRaw: "1000000" as unknown as never
+      })
+    ).rejects.toThrow(/Tron simulation failed/);
+  });
+});
