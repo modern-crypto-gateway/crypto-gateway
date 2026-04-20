@@ -349,25 +349,51 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       if (!token) {
         throw new Error(`EVM estimateGas: unknown token ${args.token} on chain ${args.chainId}`);
       }
-      if (token.contractAddress === null) {
+      // Fallback gas units when live estimation can't run (sender has no
+      // balance, RPC flap, etc.). These are industry-standard defaults:
+      // - Native transfer: 21000 (EVM floor)
+      // - ERC-20 transfer: 65000 covers most ERC-20s; USDT's branched impl
+      //   lands around 45k, a first-send-to-new-address USDC around 55k,
+      //   exotic proxy tokens up to 80k. 65000 is the safe middle — any
+      //   single-digit percent overquote at broadcast time is absorbed by
+      //   the 2× baseFee margin in buildTransfer.
+      const FALLBACK_GAS_UNITS = token.contractAddress === null ? 21_000n : 65_000n;
+      const isInsufficientFundsError = (err: unknown): boolean => {
+        const message = err instanceof Error ? err.message : String(err);
+        return /insufficient funds|balance/i.test(message);
+      };
+      try {
+        if (token.contractAddress === null) {
+          const gas = await client.estimateGas({
+            account: args.fromAddress as Hex,
+            to: args.toAddress as Hex,
+            value: BigInt(args.amountRaw)
+          });
+          return gas.toString() as AmountRaw;
+        }
+        const data = encodeFunctionData({
+          abi: ERC20_ABI,
+          functionName: "transfer",
+          args: [args.toAddress as Hex, BigInt(args.amountRaw)]
+        });
         const gas = await client.estimateGas({
           account: args.fromAddress as Hex,
-          to: args.toAddress as Hex,
-          value: BigInt(args.amountRaw)
+          to: token.contractAddress as unknown as Hex,
+          data
         });
         return gas.toString() as AmountRaw;
+      } catch (err) {
+        // A zero-balance fee wallet (just registered, not yet funded) causes
+        // viem's estimateGas to throw "insufficient funds for gas * price +
+        // value". That's a valid operational state — return the safe
+        // fallback so the estimate endpoint can still quote a tier and tell
+        // the operator how much to fund. Real broadcasts re-run estimation
+        // against the actual reserved wallet, which by then has funds.
+        if (isInsufficientFundsError(err)) {
+          return FALLBACK_GAS_UNITS.toString() as AmountRaw;
+        }
+        throw err;
       }
-      const data = encodeFunctionData({
-        abi: ERC20_ABI,
-        functionName: "transfer",
-        args: [args.toAddress as Hex, BigInt(args.amountRaw)]
-      });
-      const gas = await client.estimateGas({
-        account: args.fromAddress as Hex,
-        to: token.contractAddress as unknown as Hex,
-        data
-      });
-      return gas.toString() as AmountRaw;
     },
 
     async quoteFeeTiers(args: EstimateArgs): Promise<FeeTierQuote> {

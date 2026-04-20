@@ -448,6 +448,33 @@ export interface EstimatePayoutFeesResult {
     medium: { tier: "medium"; nativeAmountRaw: string; usdAmount: string | null };
     high: { tier: "high"; nativeAmountRaw: string; usdAmount: string | null };
   };
+  // Current state of the fee wallet the executor is likely to reserve. Null
+  // when NO active fee wallet exists for the chain (operator needs to
+  // register one first via POST /admin/fee-wallets).
+  feeWallet: {
+    address: string;
+    nativeSymbol: string;
+    // Raw smallest-units. Null when the balance read failed (RPC flap).
+    nativeBalance: string | null;
+    tokenSymbol: string;
+    tokenBalance: string | null;
+  } | null;
+  // How much the operator needs to top up the fee wallet for each tier to
+  // land this specific payout. For native-token payouts this includes the
+  // payout amount itself; for ERC-20/SPL/TRC-20 it's just gas. Null entries
+  // mean "balance unknown, can't compute" (RPC flap).
+  fundingRequired: {
+    low: string | null;
+    medium: string | null;
+    high: string | null;
+    nativeSymbol: string;
+    note: string;
+  } | null;
+  // Non-fatal operator-facing notices. Empty when nothing's off-normal.
+  // Examples: "fee_wallet_unfunded_used_fallback_gas" when we had to quote
+  // without a live gas estimate, "no_fee_wallet_registered" when no wallet
+  // exists at all, "rpc_balance_read_failed" when the balance check flapped.
+  warnings: string[];
 }
 
 export async function estimatePayoutFees(
@@ -525,6 +552,8 @@ export async function estimatePayoutFees(
     .limit(1);
   const fromForEstimate = (sampleWallet?.address ?? destination) as Address;
 
+  const warnings: string[] = [];
+
   let tiers: Awaited<ReturnType<ChainAdapter["quoteFeeTiers"]>>;
   try {
     tiers = await chainAdapter.quoteFeeTiers({
@@ -535,10 +564,27 @@ export async function estimatePayoutFees(
       amountRaw: amountRaw as AmountRaw
     });
   } catch (err) {
-    throw new PayoutError(
-      "FEE_ESTIMATE_FAILED",
-      `Fee estimation failed for chain ${parsed.chainId}: ${err instanceof Error ? err.message : String(err)}`
-    );
+    // Soft-fail. We used to throw FEE_ESTIMATE_FAILED (503) here, which
+    // surfaced an unhelpful viem error string to the operator. Now we log
+    // + warn, and return a best-effort tier quote of zero-native so the
+    // frontend can still render a "couldn't quote fees live, fund the fee
+    // wallet and retry" state. The broadcast path re-estimates against a
+    // real funded wallet and succeeds there.
+    deps.logger.warn("payout.estimate.quote_failed", {
+      chainId: parsed.chainId,
+      token: parsed.token,
+      error: err instanceof Error ? err.message : String(err)
+    });
+    warnings.push("fee_quote_unavailable");
+    const zero = "0" as AmountRaw;
+    const nativeSym = chainAdapter.nativeSymbol(parsed.chainId as ChainId);
+    tiers = {
+      low: { tier: "low", nativeAmountRaw: zero },
+      medium: { tier: "medium", nativeAmountRaw: zero },
+      high: { tier: "high", nativeAmountRaw: zero },
+      tieringSupported: false,
+      nativeSymbol: nativeSym
+    };
   }
 
   // Convert each tier's native amount to USD. Best-effort — oracle outage
@@ -564,6 +610,73 @@ export async function estimatePayoutFees(
     toUsd(tiers.high.nativeAmountRaw)
   ]);
 
+  // Fee-wallet context: balance + funding-required calculation. If no
+  // wallet is registered we still return tiers but flag it so the UI shows
+  // "register a fee wallet first". For native-token payouts the required
+  // fund includes the payout amount; for ERC-20/SPL/TRC-20 it's only gas.
+  let feeWalletContext: EstimatePayoutFeesResult["feeWallet"] = null;
+  let fundingRequired: EstimatePayoutFeesResult["fundingRequired"] = null;
+  if (sampleWallet) {
+    const tokenIsNative = parsed.token === tiers.nativeSymbol;
+    const readBalance = async (sym: string): Promise<string | null> => {
+      try {
+        return await chainAdapter.getBalance({
+          chainId: parsed.chainId as ChainId,
+          address: sampleWallet.address as Address,
+          token: sym as TokenSymbol
+        });
+      } catch (err) {
+        deps.logger.debug("payout.estimate.balance_read_failed", {
+          chainId: parsed.chainId,
+          address: sampleWallet.address,
+          token: sym,
+          error: err instanceof Error ? err.message : String(err)
+        });
+        return null;
+      }
+    };
+    const [nativeBalance, tokenBalance] = await Promise.all([
+      readBalance(tiers.nativeSymbol),
+      tokenIsNative ? Promise.resolve(null) : readBalance(parsed.token)
+    ]);
+    if (nativeBalance === null || (!tokenIsNative && tokenBalance === null)) {
+      warnings.push("rpc_balance_read_failed");
+    }
+    if (nativeBalance !== null && BigInt(nativeBalance) === 0n) {
+      warnings.push("fee_wallet_native_balance_zero");
+    }
+    feeWalletContext = {
+      address: sampleWallet.address,
+      nativeSymbol: tiers.nativeSymbol,
+      nativeBalance,
+      tokenSymbol: parsed.token,
+      tokenBalance: tokenIsNative ? nativeBalance : tokenBalance
+    };
+
+    // Compute how much the operator needs to deposit to this wallet.
+    if (nativeBalance !== null) {
+      const currentNative = BigInt(nativeBalance);
+      const amountBig = tokenIsNative ? BigInt(amountRaw) : 0n;
+      const requiredFor = (tier: "low" | "medium" | "high"): string => {
+        const fee = BigInt(tiers[tier].nativeAmountRaw);
+        const totalNeeded = amountBig + fee;
+        const shortfall = totalNeeded > currentNative ? totalNeeded - currentNative : 0n;
+        return shortfall.toString();
+      };
+      fundingRequired = {
+        low: requiredFor("low"),
+        medium: requiredFor("medium"),
+        high: requiredFor("high"),
+        nativeSymbol: tiers.nativeSymbol,
+        note: tokenIsNative
+          ? `Native ${tiers.nativeSymbol} payout — the fee wallet needs payout amount + gas. Values shown are the SHORTFALL ("0" means already funded for that tier).`
+          : `Token payout — the fee wallet needs gas only in native ${tiers.nativeSymbol}. Token balance is reported separately; top it up for the payout amount.`
+      };
+    }
+  } else {
+    warnings.push("no_fee_wallet_registered");
+  }
+
   return {
     amountRaw,
     quotedAmountUsd,
@@ -574,7 +687,10 @@ export async function estimatePayoutFees(
       low: { tier: "low", nativeAmountRaw: tiers.low.nativeAmountRaw, usdAmount: lowUsd },
       medium: { tier: "medium", nativeAmountRaw: tiers.medium.nativeAmountRaw, usdAmount: midUsd },
       high: { tier: "high", nativeAmountRaw: tiers.high.nativeAmountRaw, usdAmount: highUsd }
-    }
+    },
+    feeWallet: feeWalletContext,
+    fundingRequired,
+    warnings
   };
 }
 
