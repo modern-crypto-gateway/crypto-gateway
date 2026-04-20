@@ -21,7 +21,10 @@ export type TronFetch = (input: string, init?: RequestInit) => Promise<Response>
 export interface TrongridTrc20Transfer {
   transaction_id: string;
   block_timestamp: number;
-  block: number;
+  // Undefined for unconfirmed txs — the /trc20 endpoint has no
+  // `only_confirmed` filter (unlike /transactions), so in-flight txs show up
+  // without a block assignment. Callers must tolerate the missing field.
+  block?: number;
   from: string;
   to: string;
   value: string;
@@ -31,11 +34,11 @@ export interface TrongridTrc20Transfer {
 
 // Native TRX transfer surfaced by GET /v1/accounts/{addr}/transactions.
 // The endpoint returns full Tron transactions; we project only what we need.
-// `txID` is the Tron canonical id; `blockNumber` is set when the tx is
-// included; `value` is in sun (1 TRX = 10^6 sun).
+// `txID` is the Tron canonical id; `blockNumber` may be undefined for
+// unconfirmed txs; `value` is in sun (1 TRX = 10^6 sun).
 export interface TrongridTrxTransfer {
   txID: string;
-  blockNumber: number;
+  blockNumber?: number;
   blockTimestamp: number;
   from: string;
   to: string;

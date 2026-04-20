@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { addressPool, invoices, transactions } from "../../db/schema.js";
-import { ingestDetectedTransfer } from "../../core/domain/payment.service.js";
+import { confirmTransactions, ingestDetectedTransfer } from "../../core/domain/payment.service.js";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
 import { bootTestApp, createInvoiceViaApi, type BootedTestApp } from "../helpers/boot.js";
 import type { DetectedTransfer } from "../../core/types/transaction.js";
@@ -141,6 +141,143 @@ describe("PaymentService ingest — orphan write path", () => {
       .limit(1);
     expect(row?.invoiceId).toBeNull();
     expect(row?.status).toBe("orphaned");
+  });
+
+  it("populates amount_usd + usd_rate on orphans via the price oracle at ingest time", async () => {
+    // Default bootTestApp wires the static-peg price oracle which quotes
+    // DEV at exactly 1.0 — simplest fixture that proves the orphan USD
+    // branch runs. A previous version left these NULL and the admin queue
+    // rendered $0.00 for every orphan regardless of actual value.
+    const res = await ingestDetectedTransfer(booted.deps, {
+      chainId: 999,
+      txHash: "0xorphan_usd",
+      logIndex: 0,
+      fromAddress: "0x0000000000000000000000000000000000000001",
+      toAddress: "0x0000000000000000000000000000000000000099",
+      token: "DEV",
+      // DEV has 18 decimals; 1 DEV raw = 10^18. Send half a DEV.
+      amountRaw: "500000000000000000",
+      blockNumber: 100,
+      confirmations: 5,
+      seenAt: new Date()
+    });
+    expect(res.inserted).toBe(true);
+
+    const [row] = await booted.deps.db
+      .select({
+        status: transactions.status,
+        amountUsd: transactions.amountUsd,
+        usdRate: transactions.usdRate
+      })
+      .from(transactions)
+      .where(eq(transactions.txHash, "0xorphan_usd"))
+      .limit(1);
+    expect(row?.status).toBe("orphaned");
+    // 0.5 DEV * $1.00 = $0.50
+    expect(row?.amountUsd).toBe("0.50");
+    expect(row?.usdRate).toBe("1");
+  });
+});
+
+describe("confirmTransactions — orphan enrichment", () => {
+  it("fills in blockNumber + confirmedAt on orphan rows once they cross the threshold, status stays 'orphaned', no events", async () => {
+    const confirmations = new Map<string, { blockNumber: number | null; confirmations: number; reverted: boolean }>();
+    const booted = await bootTestApp({
+      chains: [devChainAdapter({ confirmationStatuses: confirmations })],
+      secretsOverrides: { ADMIN_KEY }
+    });
+
+    try {
+      // Insert an orphan below the confirmation threshold, with NULL
+      // blockNumber (models a pre-fix detector that emitted blockNumber
+      // null — e.g. an unconfirmed Tron TRC-20 tx).
+      await ingestDetectedTransfer(booted.deps, {
+        chainId: 999,
+        txHash: "0xorphan_enrich",
+        logIndex: 0,
+        fromAddress: "0x0000000000000000000000000000000000000001",
+        toAddress: "0x0000000000000000000000000000000000000099",
+        token: "DEV",
+        amountRaw: "1000",
+        blockNumber: null,
+        // Dev chain's threshold is 1; ingesting at 0 leaves status='orphaned'
+        // (ingest still sets status='orphaned' regardless of confs for no-match
+        // transfers, but confirmedAt is NULL at this point).
+        confirmations: 0,
+        seenAt: new Date()
+      });
+
+      // Seed the live status — now confirmed on chain.
+      confirmations.set("0xorphan_enrich", { blockNumber: 424242, confirmations: 10, reverted: false });
+
+      const events: string[] = [];
+      booted.deps.events.subscribeAll((e) => { events.push(e.type); });
+
+      const sweep = await confirmTransactions(booted.deps);
+      // `checked` includes the orphan; `confirmed` does NOT promote
+      // orphan→confirmed (orphans stay orphaned).
+      expect(sweep.checked).toBe(1);
+      expect(sweep.confirmed).toBe(0);
+
+      const [row] = await booted.deps.db
+        .select({
+          status: transactions.status,
+          blockNumber: transactions.blockNumber,
+          confirmations: transactions.confirmations,
+          confirmedAt: transactions.confirmedAt
+        })
+        .from(transactions)
+        .where(eq(transactions.txHash, "0xorphan_enrich"))
+        .limit(1);
+      expect(row?.status).toBe("orphaned");
+      expect(row?.blockNumber).toBe(424242);
+      expect(row?.confirmations).toBe(10);
+      expect(row?.confirmedAt).not.toBeNull();
+
+      // Orphans are admin-private — no merchant-facing events fired by the
+      // enrichment pass.
+      expect(events).not.toContain("tx.confirmed");
+      expect(events).not.toContain("invoice.payment_received");
+      expect(events).not.toContain("tx.detected");
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("skips orphans whose confirmedAt is already set (no redundant re-query)", async () => {
+    const confirmations = new Map<string, { blockNumber: number | null; confirmations: number; reverted: boolean }>();
+    const booted = await bootTestApp({
+      chains: [devChainAdapter({ confirmationStatuses: confirmations })],
+      secretsOverrides: { ADMIN_KEY }
+    });
+
+    try {
+      await ingestDetectedTransfer(booted.deps, {
+        chainId: 999,
+        txHash: "0xorphan_done",
+        logIndex: 0,
+        fromAddress: "0x0000000000000000000000000000000000000001",
+        toAddress: "0x0000000000000000000000000000000000000099",
+        token: "DEV",
+        amountRaw: "1000",
+        blockNumber: 100,
+        confirmations: 5,
+        seenAt: new Date()
+      });
+
+      // Backdate an enriched orphan — the query should pass over it.
+      await booted.deps.db
+        .update(transactions)
+        .set({ confirmedAt: Date.now() - 60_000, blockNumber: 100 })
+        .where(eq(transactions.txHash, "0xorphan_done"));
+
+      // No live entry seeded — if the sweeper tried to re-query, the dev
+      // adapter would throw or return a stale blank.
+      const sweep = await confirmTransactions(booted.deps);
+      expect(sweep.checked).toBe(0);
+    } finally {
+      await booted.close();
+    }
   });
 });
 

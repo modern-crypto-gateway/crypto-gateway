@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
 import type { ChainFamily } from "../types/chain.js";
@@ -131,6 +131,27 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     // usd === null path: token not priced. The transfer still writes to
     // transactions (audit) but doesn't contribute to paid_usd. Operator
     // sees it as an "unpriced payment" row and can follow up.
+  } else if (isOrphanRow) {
+    // Best-effort USD valuation for orphans so the admin reconciliation
+    // queue shows "$12.34 of USDT came in" instead of a blank $0.00 row.
+    // One oracle call per orphan; failure is silently ignored (NULL falls
+    // back to pre-change behavior). Doesn't contribute to any invoice —
+    // just decorates the row for the admin UI + later forensic lookups.
+    try {
+      const rates = await deps.priceOracle.getUsdRates([transfer.token]);
+      const rate = rates[transfer.token];
+      if (rate !== undefined) {
+        const usd = usdValueFor(transfer.amountRaw, transfer.token, transfer.chainId, rates);
+        if (usd !== null) {
+          amountUsd = usd;
+          usdRate = rate;
+        }
+      }
+    } catch {
+      // Oracle outage must not block ingest. Orphan row still writes with
+      // NULL USD fields; a future `/admin/attribute-orphan` will compute
+      // USD against the target invoice's rates.
+    }
   }
 
   const txInsert: typeof transactions.$inferInsert = {
@@ -312,10 +333,24 @@ export async function confirmTransactions(
   opts: ConfirmTransactionsOptions = {}
 ): Promise<ConfirmSweepResult> {
   const limit = opts.maxBatch ?? 200;
+  // Pick up two flavors of in-progress rows:
+  //   - status='detected' — the primary path, detected→confirmed promotion.
+  //   - status='orphaned' AND confirmed_at IS NULL — orphan enrichment.
+  //     Orphans bypass the detected→confirmed track at ingest time (they
+  //     have no invoice to promote for), so their blockNumber +
+  //     confirmations + confirmed_at would otherwise stay at whatever the
+  //     detector emitted. This branch runs getConfirmationStatus on each
+  //     and fills those fields in so the admin queue + forensic lookups
+  //     have a full picture of the tx. Status stays 'orphaned'; no events.
   const pending = await deps.db
     .select()
     .from(transactions)
-    .where(eq(transactions.status, "detected"))
+    .where(
+      or(
+        eq(transactions.status, "detected"),
+        and(eq(transactions.status, "orphaned"), isNull(transactions.confirmedAt))
+      )!
+    )
     .orderBy(asc(transactions.detectedAt))
     .limit(limit);
 
@@ -333,6 +368,11 @@ export async function confirmTransactions(
     const live = await chainAdapter.getConfirmationStatus(row.chainId, row.txHash);
     const now = deps.clock.now().getTime();
     const threshold = confirmationThreshold(row.chainId, deps.confirmationThresholds);
+    // Orphan rows are admin-private: they get the same block/confs
+    // enrichment pass but skip merchant-facing events and invoice
+    // recomputes. The query above already restricts orphan rows to those
+    // with confirmedAt IS NULL so we don't re-enrich enriched orphans.
+    const isOrphanRow = row.status === "orphaned";
 
     if (live.reverted) {
       await deps.db
@@ -346,37 +386,49 @@ export async function confirmTransactions(
         confirmations: live.confirmations,
         blockNumber: live.blockNumber
       });
-      await deps.events.publish({ type: "tx.orphaned", txId: tx.id, tx, at: new Date(now) });
-      if (row.invoiceId !== null) touchedInvoiceIds.add(row.invoiceId);
+      // Orphans are admin-private: skip event + touched-invoice bookkeeping.
+      // The already-NULL invoiceId would no-op anyway, but the event is
+      // merchant-visible on a subscriber and has no meaning for orphans.
+      if (!isOrphanRow) {
+        await deps.events.publish({ type: "tx.orphaned", txId: tx.id, tx, at: new Date(now) });
+        if (row.invoiceId !== null) touchedInvoiceIds.add(row.invoiceId);
+      }
       continue;
     }
 
     if (live.confirmations >= threshold) {
+      // Orphans stay orphaned — we only backfill confirmedAt/block/confs so
+      // the admin queue shows "this is finalized, here's when and where".
+      const newStatus = isOrphanRow ? ("orphaned" as const) : ("confirmed" as const);
       await deps.db
         .update(transactions)
         .set({
-          status: "confirmed",
+          status: newStatus,
           confirmations: live.confirmations,
           blockNumber: live.blockNumber,
           confirmedAt: now
         })
         .where(eq(transactions.id, row.id));
-      confirmed += 1;
-      const tx = drizzleRowToTransaction({
-        ...row,
-        status: "confirmed",
-        confirmations: live.confirmations,
-        blockNumber: live.blockNumber,
-        confirmedAt: now
-      });
-      await deps.events.publish({ type: "tx.confirmed", txId: tx.id, tx, at: new Date(now) });
-      if (row.invoiceId !== null) {
-        touchedInvoiceIds.add(row.invoiceId);
-        promotedTxRows.push(row);
+      if (!isOrphanRow) {
+        confirmed += 1;
+        const tx = drizzleRowToTransaction({
+          ...row,
+          status: "confirmed",
+          confirmations: live.confirmations,
+          blockNumber: live.blockNumber,
+          confirmedAt: now
+        });
+        await deps.events.publish({ type: "tx.confirmed", txId: tx.id, tx, at: new Date(now) });
+        if (row.invoiceId !== null) {
+          touchedInvoiceIds.add(row.invoiceId);
+          promotedTxRows.push(row);
+        }
       }
     } else {
       // Still short of the threshold — just update the confirmation counter
-      // so the admin views see progress. No event for an increment-only update.
+      // (and blockNumber for initial null-block enrichment) so the admin
+      // views see progress. No event for an increment-only update. Same
+      // shape for matched rows and orphans.
       await deps.db
         .update(transactions)
         .set({ confirmations: live.confirmations, blockNumber: live.blockNumber })

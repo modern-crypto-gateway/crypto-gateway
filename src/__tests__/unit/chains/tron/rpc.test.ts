@@ -306,6 +306,52 @@ describe("tronChainAdapter.scanIncoming", () => {
     expect(transfers[0]?.amountRaw).toBe("1000");
   });
 
+  it("coerces missing `block` on unconfirmed TRC-20 txs to null (not undefined) so Zod accepts them", async () => {
+    // TronGrid's /trc20 endpoint has no `only_confirmed` filter — an
+    // in-flight USDT tx (seconds-old, already broadcast, not yet in a
+    // block) comes back without a `block` field. Before the fix, passing
+    // `t.block === undefined` through to DetectedTransfer's Zod schema
+    // (`blockNumber: number().nullable()`) failed with "expected number,
+    // received undefined" — treating undefined ≠ null — and aborted the
+    // entire scan batch. Regression guard for that path.
+    const toAddr = "TK5uF5h3S7UG5VvFPY5akChfMSUwcgsh41";
+    const fromAddr = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
+    const client = fakeClient({
+      async listTrc20Transfers() {
+        return [
+          {
+            transaction_id: "ab".repeat(32),
+            block_timestamp: 1_700_000_000_000,
+            // `block` intentionally omitted — now legal under the optional
+            // typing of TrongridTrc20Transfer.block.
+            from: fromAddr,
+            to: toAddr,
+            value: "8500000", // 8.5 USDT
+            token_info: { address: USDT_TRON_CONTRACT, decimals: 6, name: "Tether USD", symbol: "USDT" },
+            type: "Transfer"
+          }
+        ];
+      }
+    });
+
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+
+    const transfers = await adapter.scanIncoming({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      addresses: [toAddr],
+      tokens: ["USDT"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    expect(transfers).toHaveLength(1);
+    // `null` (not `undefined`) — passes `DetectedTransferSchema.blockNumber`.
+    expect(transfers[0]?.blockNumber).toBeNull();
+    expect(transfers[0]?.amountRaw).toBe("8500000");
+  });
+
   it("drops dust TRC-20 spam (amount=0 and amount=1 USDT base unit) but keeps the real payment", async () => {
     const toAddr = "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL";
     const attackerAddr = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";

@@ -68,7 +68,13 @@ export interface TronChainConfig {
   clients?: Readonly<Record<number, TronRpcBackend>>;
   // BIP44 accountIndex (default 0).
   accountIndex?: number;
-  // Cap on the lookback window for `scanIncoming`, ms. Defaults to 6 hours.
+  // Cap on the lookback window for `scanIncoming`, ms. Defaults to 30 days
+  // so /admin/audit-address (which passes a 30-day sinceMs by default) can
+  // actually see its requested window. The cap exists as a runaway guard
+  // against "rewind to epoch" calls; 30 days still prevents that while
+  // accommodating realistic forensic use. Poll-path callers (rpc-poll) pass
+  // a much shorter sinceMs via the cached checkpoint, so this cap only ever
+  // matters for the audit path.
   maxScanWindowMs?: number;
   // Fee limit in sun for payout txs. Defaults to 100 TRX.
   feeLimitSun?: number;
@@ -78,7 +84,7 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
   const chainIds = (config.chainIds ?? [TRON_MAINNET_CHAIN_ID]) as readonly ChainId[];
   const accountIndex = config.accountIndex ?? DEFAULT_ACCOUNT_INDEX;
   const feeLimit = config.feeLimitSun ?? DEFAULT_FEE_LIMIT_SUN;
-  const maxScanWindowMs = config.maxScanWindowMs ?? 6 * 60 * 60 * 1000;
+  const maxScanWindowMs = config.maxScanWindowMs ?? 30 * 24 * 60 * 60 * 1000;
 
   const clientCache = new Map<number, TronRpcBackend>();
   function getClient(chainId: number): TronRpcBackend {
@@ -200,7 +206,14 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
                     toAddress: t.to,
                     token: symbolByContract.get(t.token_info.address) ?? target.symbol,
                     amountRaw: t.value as AmountRaw,
-                    blockNumber: t.block,
+                    // TronGrid's /trc20 endpoint returns `block` undefined for
+                    // unconfirmed txs (it has no `only_confirmed` filter — that's
+                    // only on /transactions). Coerce to null so DetectedTransfer's
+                    // Zod schema (blockNumber: nullable number) accepts it; the
+                    // sweeper's getConfirmationStatus will fill in the real block
+                    // once the tx confirms. Without this, a single in-flight TRC-20
+                    // tx fails Zod and aborts the entire scan batch.
+                    blockNumber: t.block ?? null,
                     // `v1/.../transactions/trc20` doesn't expose a confirmation count directly.
                     // We record what we can see and let the sweeper call `getConfirmationStatus`
                     // for authoritative depth on each tx.
@@ -247,7 +260,10 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
                     toAddress: toCanonical,
                     token: "TRX" as TokenSymbol,
                     amountRaw: t.value as AmountRaw,
-                    blockNumber: t.blockNumber,
+                    // Parallel to the TRC-20 branch: TronGrid's tx listing can
+                    // return undefined blockNumber for unconfirmed txs. Coerce
+                    // to null so Zod accepts it; sweeper fills later.
+                    blockNumber: t.blockNumber ?? null,
                     confirmations: 0,
                     seenAt: new Date(t.blockTimestamp)
                   }
