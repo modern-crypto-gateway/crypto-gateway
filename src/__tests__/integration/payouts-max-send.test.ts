@@ -39,24 +39,32 @@ describe("native payout MAX-send handling", () => {
     await booted.close();
   });
 
-  it("rejects amount = full native balance with MAX_AMOUNT_EXCEEDS_NET_SPENDABLE + suggestedAmountRaw", async () => {
-    // Asking for the full balance leaves nothing for gas.
-    await expect(
-      estimatePayoutFees(booted.deps, {
+  it("rejects amount = full native balance with MAX_AMOUNT_EXCEEDS_NET_SPENDABLE + suggestedAmount* triple", async () => {
+    // Asking for the full balance leaves nothing for gas. Response
+    // carries raw, human-decimal, AND USD forms so the frontend can
+    // render a "Send X instead?" button without re-computing.
+    try {
+      await estimatePayoutFees(booted.deps, {
         merchantId: MERCHANT_ID,
         chainId: 999,
         token: "DEV",
         amountRaw: TOTAL_BALANCE.toString(),
         feeTier: "medium",
         destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      })
-    ).rejects.toMatchObject({
-      code: "MAX_AMOUNT_EXCEEDS_NET_SPENDABLE",
-      details: {
-        suggestedAmountRaw: (TOTAL_BALANCE - ESTIMATED_GAS).toString(),
-        candidateAddress: sourceAddress
-      }
-    });
+      });
+      throw new Error("expected estimatePayoutFees to throw");
+    } catch (err) {
+      const e = err as { code: string; details: Record<string, unknown> };
+      expect(e.code).toBe("MAX_AMOUNT_EXCEEDS_NET_SPENDABLE");
+      expect(e.details["suggestedAmountRaw"]).toBe((TOTAL_BALANCE - ESTIMATED_GAS).toString());
+      // DEV has 6 decimals; 29000 raw = 0.029 DEV.
+      expect(e.details["suggestedAmount"]).toBe("0.029");
+      // Static-peg oracle prices DEV at $1, so USD = decimal amount.
+      expect(e.details["suggestedAmountUsd"]).toBe("0.03");
+      // Foreign-identity field must NOT appear — the candidate address
+      // is an operator-pool HD address; no business of the merchant.
+      expect(e.details["candidateAddress"]).toBeUndefined();
+    }
   });
 
   it("accepts amount = balance − gas (the suggested value)", async () => {

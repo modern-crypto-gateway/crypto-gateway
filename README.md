@@ -644,7 +644,23 @@ spendable(chainId, address, token)
 1. **Direct** — pick the richest HD address (by token balance) that ALSO has enough native for gas. Reservation rows debit token + gas atomically; concurrent payouts can share a source as long as cumulative debit fits.
 2. **JIT gas top-up** — when a token holder lacks native, find a separate sponsor with enough native to top it up. Broadcast sponsor → source first, wait for it to confirm (status `topping-up`), then broadcast the main payout. The sponsor's debit is captured by an internal `gas_top_up` sibling payout row (hidden from merchant `/payouts` lists).
 
-Native payouts can't be topped up (gas IS the asset). When the only candidate has balance ≈ amount but not enough headroom for gas, the API returns `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` (400) with `details.suggestedAmountRaw` so the dashboard can prompt "send X − gas instead?".
+Native payouts can't be topped up (gas IS the asset). When the only candidate has balance ≈ amount but not enough headroom for gas, the API returns `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` (400) with `details` carrying three presentations of the suggested amount so the dashboard can render "send X − gas instead?" without re-computing:
+
+```json
+{
+  "error": {
+    "code": "MAX_AMOUNT_EXCEEDS_NET_SPENDABLE",
+    "message": "Requested 1600000000000000 BNB ... Try 0.00159895 BNB or less.",
+    "details": {
+      "suggestedAmountRaw": "1598950000000000",
+      "suggestedAmount": "0.00159895",
+      "suggestedAmountUsd": "0.99"
+    }
+  }
+}
+```
+
+`suggestedAmountUsd` is best-effort — `null` when the price oracle is out; the raw + decimal forms are always present.
 
 ### Fee tiers
 
@@ -714,12 +730,12 @@ Native payouts can't be topped up (gas IS the asset). When the only candidate ha
 | `INVALID_FEE_TIER` | 400 | `feeTier` outside the `low`/`medium`/`high` enum |
 | `FEE_ESTIMATE_FAILED` | 503 | Chain adapter's `quoteFeeTiers` threw (RPC outage) |
 | `BATCH_TOO_LARGE` | 400 | Batch > 100 rows |
-| `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` | 400 | Native payout requested ≈ source balance with no gas headroom. `details.suggestedAmountRaw` carries the safe amount |
+| `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` | 400 | Native payout requested ≈ source balance with no gas headroom. `details` carries `suggestedAmountRaw` (uint256), `suggestedAmount` (decimal), and `suggestedAmountUsd` (best-effort, may be `null`). |
 | `INSUFFICIENT_BALANCE_ANY_SOURCE` | 503 | Pool addresses exist on the chain but none have enough token (and, where applicable, gas). Operator tops up an HD address |
 | `NO_GAS_SPONSOR_AVAILABLE` | 503 | Token holder exists but no other HD address has enough native to top it up. Operator funds a sponsor |
-| `TOP_UP_BROADCAST_FAILED` | 503 | Sponsor → source top-up tx failed at broadcast (RPC error) |
-| `TOP_UP_REVERTED` | 500 | Top-up tx broadcast but reverted on-chain. Reservations released; the now-spent gas is sponsor's loss |
-| `SOURCE_BROADCAST_FAILED` | 500 | Main payout broadcast failed after a successful top-up. Topped-up gas remains on the source for future payouts |
+| `TOP_UP_BROADCAST_FAILED` | 503 | Sponsor → source top-up tx failed at broadcast. `lastError` carries the chain RPC's reason verbatim (scrubbed for RPC URLs + foreign addresses) — typically "insufficient funds", "nonce too low", etc. |
+| `TOP_UP_REVERTED` | 500 | Top-up tx broadcast but reverted on-chain. Same passthrough: `lastError` carries the chain's revert reason. |
+| `SOURCE_BROADCAST_FAILED` | 500 | Main payout broadcast failed. `lastError` carries the chain's reason — check `/admin/balances?live=true` first (usually ledger/chain drift). |
 | `PAYOUT_NOT_FOUND` | 404 | `POST /payouts/:id/cancel` (or cross-merchant access). Surfaced as 404 rather than 403 to avoid leaking payout ids |
 | `PAYOUT_NOT_CANCELABLE` | 409 | `POST /payouts/:id/cancel` — the payout already broadcast on-chain. Once in `topping-up` / `submitted` / terminal status, the gateway can't recall it |
 

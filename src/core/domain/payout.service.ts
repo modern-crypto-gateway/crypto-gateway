@@ -90,6 +90,42 @@ export type PayoutErrorCode =
   | "PAYOUT_NOT_FOUND"
   | "PAYOUT_NOT_CANCELABLE";
 
+// Codes whose failure reason originates from the chain RPC (not internal
+// gateway state). For these we PASS THROUGH the chain-reported message —
+// "insufficient funds for gas * price + value", "nonce too low",
+// "replacement transaction underpriced" — because these are exactly what
+// the merchant/operator needs to act. A light regex scrubbed foreign
+// addresses + RPC URLs before persistence; everything else flows through.
+//
+// Codes NOT in this set use the stable `MERCHANT_FACING_FAIL_MESSAGES`
+// table — those describe internal gateway state and must not leak raw
+// wrapper/plumbing messages.
+const CHAIN_REPORTED_ERROR_CODES: ReadonlySet<PayoutErrorCode> = new Set([
+  "SOURCE_BROADCAST_FAILED",
+  "TOP_UP_BROADCAST_FAILED",
+  "TOP_UP_REVERTED"
+]);
+
+// Scrub `message` so it carries the chain's diagnostic verbatim but
+// doesn't leak internal-only strings: RPC URLs (provider identity) and
+// any 0x-prefixed addresses that aren't already public on this payout's
+// own row (source/destination/sponsor are already visible via API).
+function sanitizeChainMessage(message: string, row: typeof payouts.$inferSelect): string {
+  const ownAddresses = new Set(
+    [row.sourceAddress, row.destinationAddress, row.topUpSponsorAddress]
+      .filter((a): a is string => a !== null)
+      .map((a) => a.toLowerCase())
+  );
+  return message
+    // Replace http(s)://… URLs — usually the RPC endpoint.
+    .replace(/https?:\/\/\S+/gi, "[rpc-url]")
+    // Redact any foreign 0x-prefixed address; keep addresses that are
+    // already public on this payout row.
+    .replace(/0x[0-9a-fA-F]{40}/g, (m) =>
+      ownAddresses.has(m.toLowerCase()) ? m : "[redacted-address]"
+    );
+}
+
 // Stable, scrubbed strings persisted to `payouts.lastError` and surfaced
 // to merchants via GET /payouts/:id and the payout.failed webhook. The raw
 // underlying error (RPC URLs, addresses, internal libsql wrapper messages)
@@ -346,8 +382,17 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   const now = deps.clock.now().getTime();
   const payoutId = globalThis.crypto.randomUUID();
 
-  const planned = await runWithBusyRetry(deps, () => deps.db.transaction(
-    async (tx) => {
+  // Transaction returns a discriminated result instead of throwing, so
+  // we can do error-enrichment work (oracle call for USD conversion)
+  // OUTSIDE the IMMEDIATE writer lock. Throwing the enriched PayoutError
+  // happens after the transaction rolls back or commits.
+  type PlanResult =
+    | { kind: "committed" }
+    | { kind: "no_candidates" | "insufficient" | "no_sponsor" }
+    | { kind: "max_send_exceeded"; suggestedAmountRaw: string };
+
+  const result = await runWithBusyRetry(deps, () => deps.db.transaction(
+    async (tx): Promise<PlanResult> => {
       // Insert the payout row FIRST so the reservation rows that
       // selectSource writes can satisfy the FK to payouts.id. We patch
       // sourceAddress / topUp* afterward once selection is known.
@@ -391,34 +436,21 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         gasNeeded
       });
 
-      switch (selection.kind) {
-        case "no_candidates":
-          throw new PayoutError(
-            "INSUFFICIENT_BALANCE_ANY_SOURCE",
-            `No HD addresses are registered on chain ${parsed.chainId}. Initialize the address pool via POST /admin/pool/initialize.`
-          );
-        case "insufficient":
-          throw new PayoutError(
-            "INSUFFICIENT_BALANCE_ANY_SOURCE",
-            `No HD address on chain ${parsed.chainId} has enough ${parsed.token} balance to cover the payout.`
-          );
-        case "no_sponsor":
-          // Don't echo the source address — it's an operator-pool HD
-          // address that the merchant has no business knowing about
-          // (cross-merchant pool exposure surface). The error code is
-          // sufficient signal for the merchant to fund a sponsor.
-          throw new PayoutError(
-            "NO_GAS_SPONSOR_AVAILABLE",
-            `Token holder exists on chain ${parsed.chainId} but no other HD address has enough native to top it up. Fund a sponsor address with the chain's native asset.`
-          );
-        case "max_send_exceeded":
-          // Same: don't include the candidate address in `details`.
-          // `suggestedAmountRaw` alone tells the merchant what to send.
-          throw new PayoutError(
-            "MAX_AMOUNT_EXCEEDS_NET_SPENDABLE",
-            `Requested ${amountRaw} ${parsed.token} exceeds spendable native balance after gas. Try ${selection.suggestedAmountRaw} or less.`,
-            { suggestedAmountRaw: selection.suggestedAmountRaw }
-          );
+      if (
+        selection.kind === "no_candidates" ||
+        selection.kind === "insufficient" ||
+        selection.kind === "no_sponsor" ||
+        selection.kind === "max_send_exceeded"
+      ) {
+        // Throw to roll back the tentative payout insert + any
+        // reservations selectSource wrote. The caller below maps the
+        // result kind to a PayoutError after the oracle (USD enrichment)
+        // returns — keeps the writer lock short.
+        const err = new Error("__plan_rejected__") as Error & { planResult?: PlanResult };
+        err.planResult = selection.kind === "max_send_exceeded"
+          ? { kind: "max_send_exceeded", suggestedAmountRaw: selection.suggestedAmountRaw }
+          : { kind: selection.kind };
+        throw err;
       }
 
       // selection.kind === "direct" | "with_sponsor" — reservations are
@@ -434,13 +466,53 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         .set({ sourceAddress: selection.source.address, ...topUpFields, updatedAt: now })
         .where(eq(payouts.id, payoutId));
 
-      return payoutId;
+      return { kind: "committed" };
     },
     { behavior: "immediate" }
-  ));
+  ).catch((err: unknown) => {
+    // Unwrap our tunneled planResult; re-throw anything else (SQLITE_BUSY
+    // etc. are handled by runWithBusyRetry; domain/system errors bubble).
+    if (err && typeof err === "object" && "planResult" in err) {
+      return (err as { planResult: PlanResult }).planResult;
+    }
+    throw err;
+  }));
 
-  const row = await fetchPayout(deps, planned);
-  if (!row) throw new Error(`planPayout: inserted row ${planned} disappeared`);
+  // Post-transaction: map rejection kinds to enriched PayoutErrors.
+  // Oracle calls (for USD) happen here, OUT of the writer lock window.
+  if (result.kind === "no_candidates") {
+    throw new PayoutError(
+      "INSUFFICIENT_BALANCE_ANY_SOURCE",
+      `No HD addresses are registered on chain ${parsed.chainId}. Initialize the address pool via POST /admin/pool/initialize.`
+    );
+  }
+  if (result.kind === "insufficient") {
+    throw new PayoutError(
+      "INSUFFICIENT_BALANCE_ANY_SOURCE",
+      `No HD address on chain ${parsed.chainId} has enough ${parsed.token} balance to cover the payout.`
+    );
+  }
+  if (result.kind === "no_sponsor") {
+    throw new PayoutError(
+      "NO_GAS_SPONSOR_AVAILABLE",
+      `Token holder exists on chain ${parsed.chainId} but no other HD address has enough native to top it up. Fund a sponsor address with the chain's native asset.`
+    );
+  }
+  if (result.kind === "max_send_exceeded") {
+    const details = await buildMaxSendDetails(deps, {
+      token: parsed.token,
+      decimals: token.decimals,
+      suggestedRaw: BigInt(result.suggestedAmountRaw)
+    });
+    throw new PayoutError(
+      "MAX_AMOUNT_EXCEEDS_NET_SPENDABLE",
+      `Requested ${amountRaw} ${parsed.token} exceeds spendable native balance after gas. Try ${details.suggestedAmount} ${parsed.token} or less.`,
+      details
+    );
+  }
+
+  const row = await fetchPayout(deps, payoutId);
+  if (!row) throw new Error(`planPayout: inserted row ${payoutId} disappeared`);
 
   // Emits `payout.planned` for backward compat with existing webhook
   // subscribers — the row's actual on-chain status starts at `reserved`
@@ -820,10 +892,15 @@ export async function estimatePayoutFees(
     if (richest.nativeBalance >= gasNeeded && richest.nativeBalance < directNeed) {
       const suggested = richest.nativeBalance - gasNeeded;
       warnings.push("max_amount_exceeds_net_spendable");
+      const details = await buildMaxSendDetails(deps, {
+        token: parsed.token,
+        decimals: token.decimals,
+        suggestedRaw: suggested
+      });
       throw new PayoutError(
         "MAX_AMOUNT_EXCEEDS_NET_SPENDABLE",
-        `Requested ${requiredAmount} ${parsed.token} would exceed spendable native balance after gas. Try ${suggested} or less.`,
-        { suggestedAmountRaw: suggested.toString(), candidateAddress: richest.address }
+        `Requested ${requiredAmount} ${parsed.token} would exceed spendable native balance after gas. Try ${details.suggestedAmount} ${parsed.token} or less.`,
+        details
       );
     }
   }
@@ -860,6 +937,33 @@ function nativeDecimalsForFamily(family: "evm" | "tron" | "solana"): number {
     case "tron": return 6;
     case "solana": return 9;
   }
+}
+
+// Shape the `details` payload on MAX_AMOUNT_EXCEEDS_NET_SPENDABLE so the
+// frontend can render all three presentations without re-computing on its
+// side: the raw uint256 for programmatic fills, the human-decimal form
+// for the "Send X instead" button text, and (best-effort) USD so the
+// operator can sanity-check the suggestion. USD conversion is wrapped in
+// try/catch — an oracle outage must not replace the useful native info
+// with a 500.
+async function buildMaxSendDetails(
+  deps: AppDeps,
+  args: { token: string; decimals: number; suggestedRaw: bigint }
+): Promise<{ suggestedAmountRaw: string; suggestedAmount: string; suggestedAmountUsd: string | null }> {
+  const suggestedAmountRaw = args.suggestedRaw.toString();
+  const suggestedAmount = formatRawDecimal(suggestedAmountRaw, args.decimals);
+  let suggestedAmountUsd: string | null = null;
+  try {
+    const rates = await deps.priceOracle.getUsdRates([args.token as TokenSymbol]);
+    const rate = rates[args.token];
+    if (typeof rate === "string" && rate !== "") {
+      suggestedAmountUsd = mulDecimal(suggestedAmount, rate);
+    }
+  } catch {
+    // Oracle unavailable — leave USD null, operator-facing hint still has
+    // the raw + decimal forms to act on.
+  }
+  return { suggestedAmountRaw, suggestedAmount, suggestedAmountUsd };
 }
 
 function formatRawDecimal(raw: string, decimals: number): string {
@@ -1434,8 +1538,13 @@ async function failPayout(
     detail: message.slice(0, 4096),
     siblingId: alsoFailSiblingId
   });
-  // Merchant-facing lastError is the sanitized short form.
-  const lastError = `[${code}] ${MERCHANT_FACING_FAIL_MESSAGES[code] ?? "Payout failed."}`;
+  // Merchant-facing lastError. For chain-reported failures we pass the
+  // chain's diagnostic through (scrubbed for foreign addresses/URLs) —
+  // the merchant needs "insufficient funds" vs. "nonce too low" to
+  // act. For internal gateway states we use the stable short string.
+  const lastError = CHAIN_REPORTED_ERROR_CODES.has(code)
+    ? `[${code}] ${sanitizeChainMessage(message, row).slice(0, 512)}`
+    : `[${code}] ${MERCHANT_FACING_FAIL_MESSAGES[code] ?? "Payout failed."}`;
   const failParentStmt = deps.db
     .update(payouts)
     .set({ status: "failed", lastError, updatedAt: now })

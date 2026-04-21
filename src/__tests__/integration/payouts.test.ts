@@ -250,15 +250,66 @@ describe("PayoutService.executeReservedPayouts", () => {
         .from(payouts)
         .limit(1);
       expect(row?.status).toBe("failed");
-      // `lastError` is the sanitized merchant-facing string (the raw
-      // RPC message "simulated broadcast failure" lives in the
-      // operator warn log, not the payout row).
+      // Broadcast failures carry the chain's reason verbatim (scrubbed
+      // only for foreign addresses + RPC URLs) so the merchant sees
+      // actionable info — "insufficient funds" vs. "nonce too low" etc.
+      // — not a stable "Payout failed." string.
       expect(row?.last_error).toContain("SOURCE_BROADCAST_FAILED");
-      // And the operator log carries the detail.
+      expect(row?.last_error).toContain("simulated broadcast failure");
+      // Operator log still carries the full detail for audit.
       const warn = booted.logger.entries.find(
         (e) => e.level === "warn" && e.message === "payout.failed"
       );
       expect(warn?.fields?.["detail"]).toContain("simulated broadcast failure");
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("broadcast failures scrub foreign addresses + RPC URLs but keep chain diagnostics", async () => {
+    // Inject a realistic-looking chain error — includes a foreign address
+    // (simulating the RPC quoting an external contract) and an RPC URL
+    // (the provider endpoint). Both must get redacted; the actionable
+    // text ("insufficient funds for gas * price + value") must pass through.
+    const base = devChainAdapter({ deterministicTxHashes: true });
+    const failing = {
+      ...base,
+      async signAndBroadcast(): Promise<never> {
+        throw new Error(
+          "insufficient funds for gas * price + value at https://bsc.rpc.example/v1/abc123 " +
+            "contract 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef reverted"
+        );
+      }
+    };
+    const booted = await bootTestApp({ chains: [failing] });
+    try {
+      await seedFeeWallet(booted, { label: "scrub-test" });
+      const planned = await planPayout(booted.deps, {
+        merchantId: MERCHANT_ID,
+        chainId: 999,
+        token: "DEV",
+        amountRaw: "1",
+        destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      });
+      await executeReservedPayouts(booted.deps);
+
+      const [row] = await booted.deps.db
+        .select({ lastError: payouts.lastError })
+        .from(payouts)
+        .where(eq(payouts.id, planned.id))
+        .limit(1);
+      const msg = row?.lastError ?? "";
+      // Chain-reported text: kept.
+      expect(msg).toContain("insufficient funds for gas");
+      // RPC URL: redacted.
+      expect(msg).not.toContain("bsc.rpc.example");
+      expect(msg).toContain("[rpc-url]");
+      // Foreign 0x address: redacted.
+      expect(msg).not.toContain("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+      expect(msg).toContain("[redacted-address]");
+      // Payout's own addresses (destination / source) would be kept,
+      // but this error message didn't include them — nothing to assert
+      // beyond the above.
 
       // The fee wallet must be released so future retries can use it.
       const released = await booted.deps.db

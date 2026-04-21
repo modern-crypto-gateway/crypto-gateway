@@ -372,9 +372,13 @@ paths:
         For native payouts (token == chain native), tier B is impossible
         — gas IS the asset. If the only candidate has balance ≈ amount
         but not enough headroom for gas, the endpoint throws
-        `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` (400) with a `suggestedAmountRaw`
-        in the error `details` so the frontend can prompt "send X − gas
-        instead?" instead of failing silently.
+        `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` (400). Error `details` carries:
+        - `suggestedAmountRaw` — uint256 in the token's smallest unit,
+          for programmatic pre-fill.
+        - `suggestedAmount` — human-decimal ("0.029"), for button text.
+        - `suggestedAmountUsd` — best-effort USD ("0.03"), for the
+          operator's sanity check. `null` when the price oracle is
+          unavailable — the raw + decimal forms are still present.
 
         Tier semantics by chain family:
           - **EVM**: priority-fee multipliers on viem's `estimateFeesPerGas`
