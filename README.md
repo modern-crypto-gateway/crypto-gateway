@@ -9,7 +9,7 @@ token registry; adding a whole new family (Solana, Bitcoin, …) is one adapter
 file with no edits to core domain logic or HTTP routes.
 
 Status: pre-1.0. Feature-complete for the primary payment flow (detect → confirm
-→ webhook → payout). Production hardening items (fee-wallet balance pre-checks,
+→ webhook → payout). Production hardening items (ledger-balance picker w/ JIT gas top-up,
 reorg recovery) are tracked as known follow-ups.
 
 ---
@@ -154,7 +154,7 @@ for the full list. Highlights:
 | Var                               | Required        | Default    | Notes                                                |
 | --------------------------------- | --------------- | ---------- | ---------------------------------------------------- |
 | `NODE_ENV`                        | no              | `development` | `production` enables strict boot-time validation |
-| `MASTER_SEED`                     | **prod only**   | —          | BIP39 mnemonic. Every receive address AND every fee-wallet address is HD-derived from this seed — keep it backed up. Rejects the literal `dev-seed` in prod. |
+| `MASTER_SEED`                     | **prod only**   | —          | BIP39 mnemonic. Every HD-derived address — invoice receive addresses, payout sources, gas sponsors — comes from this seed. Keep it backed up. Rejects the literal `dev-seed` in prod. |
 | `ADMIN_KEY`                       | **prod only**   | —          | ≥32 chars required in prod                           |
 | `CRON_SECRET`                     | optional        | —          | Enables `POST /internal/cron/tick`                   |
 | `ALCHEMY_API_KEY`                 | optional        | —          | Auto-wires a real EVM chain adapter + RPC-poll detection across the default mainnet set (ETH, OP, Polygon, Base, Arbitrum). See below. |
@@ -611,7 +611,7 @@ the merchant endpoint is healthy again.
 
 ## Payouts
 
-Outbound transfers. Every payout goes through `planned → reserved → submitted → confirmed` (or `→ failed`). Execution is cron-driven; the HTTP create returns immediately with `planned`.
+Outbound transfers. Every payout goes through `planned → reserved → [topping-up →] submitted → confirmed` (or `→ failed`). Execution is cron-driven; the HTTP create returns immediately with `planned`.
 
 ### Amount inputs (pick exactly one)
 
@@ -621,9 +621,27 @@ amount:    "1.5"          // human decimal, converted against token.decimals
 amountUSD: "10.00"        // fiat-pegged via price oracle; rate snapshotted on the row
 ```
 
+### Source selection (no fee-wallet registration)
+
+There is no separate `fee_wallets` table. Every HD-derived address in `address_pool` is a candidate payout source — the picker treats pool addresses (allocated to invoices or not), historical receivers, anything HD-derivable. Selection is ledger-derived (no RPC in the hot path):
+
+```
+spendable(chainId, address, token)
+  = sum(transactions confirmed inbound to address)
+  − sum(payouts confirmed outbound from address)
+  − sum(active payout_reservations for address)
+```
+
+`selectSource` runs two tiers:
+
+1. **Direct** — pick the richest HD address (by token balance) that ALSO has enough native for gas. Reservation rows debit token + gas atomically; concurrent payouts can share a source as long as cumulative debit fits.
+2. **JIT gas top-up** — when a token holder lacks native, find a separate sponsor with enough native to top it up. Broadcast sponsor → source first, wait for it to confirm (status `topping-up`), then broadcast the main payout. The sponsor's debit is captured by an internal `gas_top_up` sibling payout row (hidden from merchant `/payouts` lists).
+
+Native payouts can't be topped up (gas IS the asset). When the only candidate has balance ≈ amount but not enough headroom for gas, the API returns `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` (400) with `details.suggestedAmountRaw` so the dashboard can prompt "send X − gas instead?".
+
 ### Fee tiers
 
-`POST /api/v1/payouts/estimate` quotes **low / medium / high** before the operator commits. The same `feeTier` field on `POST /api/v1/payouts` binds the chosen tier at broadcast time.
+`POST /api/v1/payouts/estimate` quotes **low / medium / high** before the operator commits AND previews the source the executor will pick (including any required top-up). The same `feeTier` field on `POST /api/v1/payouts` binds the chosen tier at broadcast time.
 
 | Chain | Tier semantics | `tieringSupported` |
 |---|---|---|
@@ -631,24 +649,29 @@ amountUSD: "10.00"        // fiat-pegged via price oracle; rate snapshotted on t
 | Solana | 25th / 50th / 75th percentile of recent `getRecentPrioritizationFees`, binds a `ComputeBudget` `setComputeUnitPrice` instruction | `true` when samples available, `false` on fallback |
 | Tron | flat (no priority concept) | `false` |
 
-On Solana, omitting `feeTier` skips the priority-fee RPC call entirely — zero overhead on the quiet path. Set it to `"medium"` or `"high"` when the mainnet network is congested to actually land.
+### `POST /api/v1/payouts/estimate` response shape
 
-### Multi-source fallback (opt-in)
-
-When a payout's amount exceeds any single fee wallet's balance, the default behavior is to defer the payout with `NO_FEE_WALLET_FUNDED` (operator tops up). Pass `"allowMultiSource": true` to instead split across wallets:
-
-```
-POST /api/v1/payouts
+```jsonc
 {
-  "chainId": 42161,
-  "token": "USDC",
-  "amount": "1000",
-  "destinationAddress": "0x...",
-  "allowMultiSource": true
+  "amountRaw": "30",
+  "tiers": { /* low/medium/high with nativeAmountRaw + usdAmount */ },
+  "source": {
+    "address": "0xabc...",
+    "derivationIndex": 42,
+    "tokenBalance": "100",
+    "nativeBalance": "0"
+  },
+  "topUp": {
+    "required": true,
+    "sponsor": { "address": "0xdef...", "nativeBalance": "1000000" },
+    "amountRaw": "25200"
+  },
+  "alternatives": [ /* next-best candidates, max 4 */ ],
+  "warnings": []
 }
 ```
 
-The executor picks up to 8 wallets by balance descending, CAS-reserves all of them, then broadcasts N parallel txs via `Promise.allSettled`. All succeed → `status=submitted`, `txHashes` and `sourceAddresses` carry every leg. Any leg fails → `status=failed` BUT successful-leg hashes are preserved in `txHashes` for manual reconciliation (DO NOT auto-retry them — those txs are live on-chain). Sum of every funded wallet still short → `INSUFFICIENT_TOTAL_BALANCE` (503), hard-fail.
+`source: null` + `warnings: ["no_source_address_has_sufficient_token_balance"]` when no HD address can fund the payout. `topUp.sponsor: null` + `warnings: ["no_gas_sponsor_available"]` when a token holder exists but no funded sponsor — the plan would fail with `NO_GAS_SPONSOR_AVAILABLE`.
 
 ### Mass (batch) payouts
 
@@ -667,21 +690,9 @@ The executor picks up to 8 wallets by balance descending, CAS-reserves all of th
 - Every successful row gets the same `batchId` (UUID, returned top-level). Filter later with `GET /api/v1/payouts?batchId=<id>`.
 - **Rate limit is proportional**: a 100-row batch costs 100 tokens from the merchant's per-minute quota, not 1.
 
-### Pre-flight gas-aware wallet selection
+### Stuck-reservation watchdog
 
-The executor filters candidates by token + native-gas balance before CAS-reserving. Tight-fit selection: among qualifying wallets, the one with the smallest excess token balance wins — keeps large-balance wallets free for future big payouts. Tick-local balance cache dedupes RPC reads across parallel workers. `NO_FEE_WALLET_FUNDED` distinguishes "wallets exist but none have token + gas" from "no wallets registered" for operator alerting.
-
-### Fee wallet management
-
-Three ways to register:
-
-| Endpoint | When to use |
-|---|---|
-| `POST /admin/fee-wallets` (default) | Fresh HD-derived address via `feeWalletIndex(family, label)`. EVM fanout: omit `chainId` to auto-register across every wired EVM chain |
-| `POST /admin/fee-wallets/from-pool-address` | Pool address already holds funds from a settled invoice. Reuses its HD index as the fee wallet's; quarantines the pool slot with a CAS on `status='available'` to avoid races with the allocator |
-| `POST /admin/fee-wallets/from-index` | Advanced escape hatch — operator supplies an explicit HD index. Hardened to `[0x40000000, 0x7EFFFFFF]` (fee-wallet region only) to prevent key collision with pool or sweep-master |
-
-No private keys ever touch the admin API. Everything is HD-derived from `MASTER_SEED` at execution time.
+`sweepStuckPayoutReservations` (cron-driven) does two things: releases any active reservation whose owning payout is already in a terminal state (defense-in-depth — atomic batches in `confirmPayouts`/`failPayout` make this normally a no-op), and logs WARN for reservations older than 30 minutes whose payout is still in flight (operator triage signal).
 
 ### Payout error codes
 
@@ -696,9 +707,12 @@ No private keys ever touch the admin API. Everything is HD-derived from `MASTER_
 | `INVALID_FEE_TIER` | 400 | `feeTier` outside the `low`/`medium`/`high` enum |
 | `FEE_ESTIMATE_FAILED` | 503 | Chain adapter's `quoteFeeTiers` threw (RPC outage) |
 | `BATCH_TOO_LARGE` | 400 | Batch > 100 rows |
-| `NO_FEE_WALLET_AVAILABLE` | — | (Internal, single-source) Defers to next tick |
-| `NO_FEE_WALLET_FUNDED` | — | (Internal) Candidates exist but none have token + gas. Defers |
-| `INSUFFICIENT_TOTAL_BALANCE` | 503 | Multi-source attempted; sum of every funded wallet falls short |
+| `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` | 400 | Native payout requested ≈ source balance with no gas headroom. `details.suggestedAmountRaw` carries the safe amount |
+| `INSUFFICIENT_BALANCE_ANY_SOURCE` | 503 | Pool addresses exist on the chain but none have enough token (and, where applicable, gas). Operator tops up an HD address |
+| `NO_GAS_SPONSOR_AVAILABLE` | 503 | Token holder exists but no other HD address has enough native to top it up. Operator funds a sponsor |
+| `TOP_UP_BROADCAST_FAILED` | 503 | Sponsor → source top-up tx failed at broadcast (RPC error) |
+| `TOP_UP_REVERTED` | 500 | Top-up tx broadcast but reverted on-chain. Reservations released; the now-spent gas is sponsor's loss |
+| `SOURCE_BROADCAST_FAILED` | 500 | Main payout broadcast failed after a successful top-up. Topped-up gas remains on the source for future payouts |
 
 ## Payment tolerance (slippage)
 
@@ -797,6 +811,24 @@ npx drizzle-kit generate
 #    or push to remote Turso for Workers/Vercel:
 TURSO_URL="libsql://..." TURSO_AUTH_TOKEN="..." npx drizzle-kit push
 ```
+
+### Pre-prod convention: editing `0000_initial.sql` in place
+
+This project is still pre-prod and treats `0000_initial.sql` as a single
+ever-evolving baseline rather than appending `0001_*.sql`, `0002_*.sql`, …
+That keeps the schema readable in one file, but **Drizzle's migrator hashes the
+journal `tag` ("0000_initial"), not the SQL contents** — so a database that
+already journaled `0000_initial` against an older snapshot will keep the older
+schema and silently skip re-applying the edited file. The Node entrypoint
+guards against this by asserting that tables removed from the application
+schema (currently: `fee_wallets`) are NOT present in the live DB, and refuses
+to boot with `Schema drift detected: …` if they are.
+
+**Cutover runbook:** after editing `0000_initial.sql`, drop the local DB file
+(or create a fresh Turso DB) before restarting. Turso has no first-class
+"drop database" UI yet — easiest path is `turso db destroy <name>` then
+`turso db create <name>` and re-bootstrap. Once the project goes prod, switch
+to the additive `0001_*.sql` flow above and remove the in-place edits.
 
 ## Development
 

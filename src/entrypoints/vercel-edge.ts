@@ -223,10 +223,20 @@ async function getDeps(): Promise<AppDeps> {
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
-    confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES"))
+    confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES")),
+    ...(parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN")) !== undefined
+      ? { payoutConcurrencyPerChain: parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN"))! }
+      : {})
   };
   cachedDeps = fresh;
   return fresh;
+}
+
+function parsePayoutConcurrencyEnv(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1 || n > 64 || !Number.isInteger(n)) return undefined;
+  return n;
 }
 
 // Best-effort boot-error reporter. If getDeps throws (missing

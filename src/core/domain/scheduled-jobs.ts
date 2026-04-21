@@ -4,7 +4,7 @@ import { confirmTransactions, recheckConfirmedTransactionsForReorg } from "./pay
 import {
   confirmPayouts,
   executeReservedPayouts,
-  sweepStuckFeeWalletReservations
+  sweepStuckPayoutReservations
 } from "./payout.service.js";
 import { pollPayments } from "./poll-payments.js";
 import { reconcileOrphanedAllocations } from "./pool.service.js";
@@ -32,7 +32,7 @@ export interface ScheduledJobsResult {
   recheckConfirmedForReorg: JobOutcome;
   executeReservedPayouts: JobOutcome;
   confirmPayouts: JobOutcome;
-  sweepStuckFeeWalletReservations: JobOutcome;
+  sweepStuckPayoutReservations: JobOutcome;
   sweepExpiredInvoices: JobOutcome;
   reconcileOrphanedAllocations: JobOutcome;
   sweepWebhookDeliveries: JobOutcome;
@@ -53,7 +53,7 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     recheckConfirmedForReorg: await run(() => recheckConfirmedTransactionsForReorg(deps)),
     executeReservedPayouts: await run(() => executeReservedPayouts(deps)),
     confirmPayouts: await run(() => confirmPayouts(deps)),
-    sweepStuckFeeWalletReservations: await run(() => sweepStuckFeeWalletReservations(deps)),
+    sweepStuckPayoutReservations: await run(() => sweepStuckPayoutReservations(deps)),
     // Expire-then-deliver: must run BEFORE sweepWebhookDeliveries so the
     // invoice.expired events published here insert webhook rows that get
     // picked up in the same tick. (Initial dispatch still happens via

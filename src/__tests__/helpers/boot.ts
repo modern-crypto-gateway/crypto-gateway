@@ -1,5 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { unlink } from "node:fs/promises";
 import { migrate } from "drizzle-orm/libsql/migrator";
 import { buildApp, type App } from "../../app.js";
 import { memoryCacheAdapter } from "../../adapters/cache/memory.adapter.js";
@@ -149,7 +151,13 @@ export async function createInvoiceViaApi(
 // exercise HTTP routes via `app.fetch(new Request(...))` against this bundle.
 
 export async function bootTestApp(options: BootTestAppOptions = {}): Promise<BootedTestApp> {
-  const libsqlClient = createLibsqlClient({ url: ":memory:" });
+  // Avoid `:memory:` — libsql's `transaction()` nulls the cached connection
+  // after BEGIN, so any query on the client (not the tx) after a transaction
+  // completes opens a brand-new empty in-memory DB. Use a unique temp file
+  // per boot instead; schema + rows persist across the connection reset.
+  // The file is deleted in `close()`.
+  const dbFilePath = resolve(tmpdir(), `crypto-gateway-test-${globalThis.crypto.randomUUID()}.db`);
+  const libsqlClient = createLibsqlClient({ url: `file:${dbFilePath}` });
   const db = createDb(libsqlClient);
 
   // src/__tests__/helpers/boot.ts  ->  repo root is three dirs up.
@@ -287,6 +295,14 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     close: async () => {
       await deps.jobs.drain(1_000);
       libsqlClient.close();
+      // Best-effort temp file cleanup. Leaked files in the OS temp dir are
+      // harmless (tmp is swept at reboot) but make `ls /tmp` noisy during
+      // local dev — swallow ENOENT and other transient errors silently.
+      await unlink(dbFilePath).catch(() => {});
+      // WAL/journal siblings.
+      await unlink(`${dbFilePath}-journal`).catch(() => {});
+      await unlink(`${dbFilePath}-shm`).catch(() => {});
+      await unlink(`${dbFilePath}-wal`).catch(() => {});
     }
   };
   if (capturingDispatcher !== undefined) booted.webhookDispatcher = capturingDispatcher;

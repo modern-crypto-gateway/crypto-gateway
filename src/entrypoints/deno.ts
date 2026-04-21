@@ -237,7 +237,10 @@ async function main(): Promise<void> {
     ...(alchemy !== undefined ? { alchemy } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
     migrationsFolder,
-    confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES"))
+    confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES")),
+    ...(parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN")) !== undefined
+      ? { payoutConcurrencyPerChain: parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN"))! }
+      : {})
   };
 
   const app = buildApp(deps);
@@ -262,6 +265,13 @@ async function main(): Promise<void> {
     },
     async (req) => app.fetch(req)
   );
+}
+
+function parsePayoutConcurrencyEnv(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1 || n > 64 || !Number.isInteger(n)) return undefined;
+  return n;
 }
 
 main().catch((err) => {

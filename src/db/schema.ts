@@ -206,50 +206,48 @@ export const transactions = sqliteTable(
   ]
 );
 
-// ---- fee_wallets (gateway-owned outbound payout sources) ----
+// ---- payout_reservations (active debits against an HD source address) ----
 //
-// One row per (chainId, address). For EVM, the same HD-derived address is
-// reused across every wired EVM chain (deriveAddress ignores chainId), so a
-// single label commonly produces N rows differing only in chainId. The
-// per-chain row is intentional: CAS reservations are chain-scoped because
-// gas is paid in the chain's native token.
+// The ledger treats every HD-derived address we control (`address_pool`
+// rows — pool, sweep-master, everything) as a payout source. Spendable
+// balance is computed from confirmed inbound (`transactions`) minus
+// confirmed outbound (`payouts`) minus active reservations on this table.
 //
-// Index-space disjointness with the address pool: HD-derived fee-wallet
-// addresses live at indices in [0x40000000, 0x7EFFFFFF] (top bit set), while
-// the receive-address pool occupies [0x00000000, 0x3FFFFFFF] (top bit
-// cleared). Addresses cannot collide naturally — a transfer arriving at a
-// fee wallet's address can never be misattributed to an invoice via the
-// `invoice_receive_addresses` join. See `hd.adapter.ts` for the index map.
-export const feeWallets = sqliteTable(
-  "fee_wallets",
+// One payout can hold multiple reservation rows:
+//   - `role='source'` on address S for the token being sent (amount_raw =
+//     payout amount).
+//   - `role='source'` on address S for NATIVE when S also needs to fund its
+//     own gas out of its native balance. Omitted when the payout is itself
+//     native — that reservation already covers both legs.
+//   - `role='top_up_sponsor'` on address T for NATIVE when S lacks gas and
+//     another HD address T is tapped to just-in-time top up S.
+//
+// `released_at` is the soft-delete: rows stay forever as audit trail;
+// the index on (chain_id, address, token) WHERE released_at IS NULL
+// scopes the hot query.
+export const payoutReservations = sqliteTable(
+  "payout_reservations",
   {
     id: text("id").primaryKey(),
+    payoutId: text("payout_id")
+      .notNull()
+      .references(() => payouts.id),
+    role: text("role", { enum: ["source", "top_up_sponsor"] }).notNull(),
     chainId: integer("chain_id").notNull(),
     address: text("address").notNull(),
-    label: text("label").notNull(),
-    // HD derivation index this row's address was derived at. For wallets
-    // registered via the legacy (family, label) path, this is the deterministic
-    // hash `feeWalletIndex(family, label)` in the [0x40000000, 0x7EFFFFFF]
-    // region. For wallets promoted from the address pool, this is the pool
-    // row's `address_index` in [0x00000000, 0x3FFFFFFF]. The signer reads this
-    // to derive the matching private key at exec time — required for promoted
-    // pool addresses since their index isn't recoverable from the label alone.
-    derivationIndex: integer("derivation_index").notNull(),
-    active: integer("active").notNull().default(1),
-    // CAS reservation: set to the payout id while a single in-flight payout
-    // holds the wallet; released on status transition.
-    reservedByPayoutId: text("reserved_by_payout_id"),
-    reservedAt: integer("reserved_at"),
-    createdAt: integer("created_at").notNull()
+    // Token symbol (e.g. "USDT", "USDC") or the sentinel "NATIVE" for the
+    // chain's native asset. Matches how `transactions.token` is populated.
+    token: text("token").notNull(),
+    amountRaw: text("amount_raw").notNull(),
+    createdAt: integer("created_at").notNull(),
+    releasedAt: integer("released_at")
   },
   (t) => [
-    uniqueIndex("uq_fee_wallets_chain_address").on(t.chainId, t.address),
-    index("idx_fee_wallets_available").on(t.chainId, t.active, t.reservedByPayoutId),
-    check(
-      "fee_wallets_derivation_index_check",
-      sql`${t.derivationIndex} >= 0 AND ${t.derivationIndex} <= 2147483647`
-    ),
-    check("fee_wallets_active_check", sql`${t.active} IN (0, 1)`)
+    index("idx_reservations_active")
+      .on(t.chainId, t.address, t.token)
+      .where(sql`${t.releasedAt} IS NULL`),
+    index("idx_reservations_payout").on(t.payoutId),
+    check("reservations_role_check", sql`${t.role} IN ('source','top_up_sponsor')`)
   ]
 );
 
@@ -262,8 +260,26 @@ export const payouts = sqliteTable(
     merchantId: text("merchant_id")
       .notNull()
       .references(() => merchants.id),
+    // `standard` = merchant-facing payout row. `gas_top_up` = internal
+    // sibling inserted when the source address lacked native for gas and
+    // a second HD address had to top it up first. gas_top_up rows are
+    // filtered out of merchant-facing lists but still debit the sponsor's
+    // native balance through the normal `payouts.amountRaw` path, which
+    // keeps `computeSpendable` single-sourced.
+    kind: text("kind", { enum: ["standard", "gas_top_up"] }).notNull().default("standard"),
+    // Set on `gas_top_up` rows, pointing at the standard payout that
+    // triggered the top-up. NULL on standard rows.
+    parentPayoutId: text("parent_payout_id"),
     status: text("status", {
-      enum: ["planned", "reserved", "submitted", "confirmed", "failed", "canceled"]
+      enum: [
+        "planned",
+        "reserved",
+        "topping-up",
+        "submitted",
+        "confirmed",
+        "failed",
+        "canceled"
+      ]
     }).notNull(),
 
     chainId: integer("chain_id").notNull(),
@@ -287,28 +303,26 @@ export const payouts = sqliteTable(
     // request. Used as a list filter so operators can pull "all payouts in
     // batch X" in one query.
     batchId: text("batch_id"),
-    // Opt-in flag: when 1, the executor falls back to splitting the payout
-    // across multiple fee wallets if no single wallet has enough balance.
-    // Default 0 — the executor defers with NO_FEE_WALLET_FUNDED and the
-    // operator either tops up a wallet or explicitly retries with the flag.
-    allowMultiSource: integer("allow_multi_source").notNull().default(0),
-    // JSON-encoded array of source addresses when a multi-source broadcast
-    // was used. Null for single-source payouts (the `sourceAddress` field
-    // holds the one wallet). When set, `sourceAddress` = the first entry for
-    // backward compat with single-source queries.
-    sourceAddressesJson: text("source_addresses_json"),
-    // JSON-encoded array of tx hashes when a multi-source broadcast was
-    // used (one hash per leg). Null for single-source payouts (the `txHash`
-    // field holds the one hash). When set, `txHash` = the first entry.
-    // Confirmation treats the payout as confirmed only when every hash in
-    // the array is ≥ the chain's threshold.
-    txHashesJson: text("tx_hashes_json"),
     destinationAddress: text("destination_address").notNull(),
-    // NULL until planned → reserved picks a fee wallet.
+    // NULL until planned → reserved picks a source from the HD pool.
     sourceAddress: text("source_address"),
     // NULL until reserved → submitted broadcasts.
     txHash: text("tx_hash"),
     feeEstimateNative: text("fee_estimate_native"),
+    // When the source lacked native for gas, the executor first broadcasts
+    // a top-up from a sponsor address. These columns hold the audit trail
+    // for that top-up on the parent (standard) row. NULL when no top-up
+    // was needed. See `parentPayoutId` for the sibling gas_top_up row that
+    // owns the actual ledger debit on the sponsor.
+    //
+    // `topUpAmountRaw` is set at PLAN time when the picker decides a top-up
+    // is required: it's the native amount the sponsor will move to the
+    // source (gap + cushion). The sponsor reservation row carries this
+    // PLUS the sponsor's own broadcast gas; we keep the transfer amount
+    // here separately so the executor doesn't have to reverse-derive it.
+    topUpTxHash: text("top_up_tx_hash"),
+    topUpSponsorAddress: text("top_up_sponsor_address"),
+    topUpAmountRaw: text("top_up_amount_raw"),
     lastError: text("last_error"),
 
     createdAt: integer("created_at").notNull(),
@@ -333,13 +347,17 @@ export const payouts = sqliteTable(
     // POST /payouts/batch), so a partial index keeps storage minimal while
     // making ?batchId=<uuid> list filters O(log n) instead of full-scan.
     index("idx_payouts_batch_id").on(t.batchId).where(sql`${t.batchId} IS NOT NULL`),
+    // Pulls every child gas_top_up for a parent in one scan — used by the
+    // executor to re-hydrate the top-up state machine and by the admin
+    // audit view.
+    index("idx_payouts_parent").on(t.parentPayoutId).where(sql`${t.parentPayoutId} IS NOT NULL`),
     check(
       "payouts_status_check",
-      sql`${t.status} IN ('planned','reserved','submitted','confirmed','failed','canceled')`
+      sql`${t.status} IN ('planned','reserved','topping-up','submitted','confirmed','failed','canceled')`
     ),
     check(
-      "payouts_allow_multi_source_check",
-      sql`${t.allowMultiSource} IN (0, 1)`
+      "payouts_kind_check",
+      sql`${t.kind} IN ('standard','gas_top_up')`
     ),
     check(
       "payouts_fee_tier_check",
@@ -517,7 +535,7 @@ export const schema = {
   invoices,
   addressIndexCounters,
   transactions,
-  feeWallets,
+  payoutReservations,
   payouts,
   alchemyWebhookRegistry,
   alchemyAddressSubscriptions,

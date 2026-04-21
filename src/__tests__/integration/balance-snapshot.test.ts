@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { addressPool, feeWallets, merchants, payouts, transactions } from "../../db/schema.js";
+import { addressPool, merchants, payouts, transactions } from "../../db/schema.js";
 import { computeBalanceSnapshot } from "../../core/domain/balance-snapshot.service.js";
 import { initializePool } from "../../core/domain/pool.service.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
@@ -106,53 +106,6 @@ describe("balance-snapshot — db mode (default)", () => {
     expect(snapshot.families).toHaveLength(0);
   });
 
-  it("subtracts confirmed payouts from fee wallet balances and clamps at 0", async () => {
-    const now = Date.now();
-    const feeAddr = "0x0000000000000000000000000000000000000fee";
-    await booted.deps.db.insert(feeWallets).values({
-      id: "fee-1",
-      chainId: 999,
-      address: feeAddr,
-      label: "hot-1",
-      derivationIndex: 0x40000000,
-      active: 1,
-      createdAt: now
-    });
-    await booted.deps.db.insert(transactions).values({
-      id: "tx-in",
-      chainId: 999,
-      txHash: "0xin",
-      logIndex: 0,
-      fromAddress: "0xext",
-      toAddress: feeAddr,
-      token: "DEV",
-      amountRaw: "10000000",
-      status: "confirmed",
-      detectedAt: now
-    });
-    const merchantRow = (await booted.deps.db.select().from(merchants))[0]!;
-    await booted.deps.db.insert(payouts).values({
-      id: "po-1",
-      merchantId: merchantRow.id,
-      status: "confirmed",
-      chainId: 999,
-      token: "DEV",
-      amountRaw: "3000000",
-      destinationAddress: "0xdest",
-      sourceAddress: feeAddr,
-      createdAt: now,
-      updatedAt: now
-    });
-
-    const snapshot = await computeBalanceSnapshot(booted.deps);
-    const chain = snapshot.families[0]!.chains[0]!;
-    const feeRow = chain.addresses.find((a) => a.kind === "fee");
-    expect(feeRow).toBeDefined();
-    expect(feeRow!.feeLabel).toBe("hot-1");
-    // 10 credited − 3 paid out = 7
-    expect(feeRow!.tokens[0]!.amountRaw).toBe("7000000");
-  });
-
   it("rolls up per-token totals across addresses", async () => {
     const poolRows = await booted.deps.db.select().from(addressPool);
     const now = Date.now();
@@ -178,49 +131,6 @@ describe("balance-snapshot — db mode (default)", () => {
     expect(devRoll!.amountRaw).toBe("3000000");
   });
 
-  it("respects kind=fee scope", async () => {
-    const now = Date.now();
-    const feeAddr = "0x0000000000000000000000000000000000000fee";
-    await booted.deps.db.insert(feeWallets).values({
-      id: "fee-scope",
-      chainId: 999,
-      address: feeAddr,
-      label: "hot-1",
-      derivationIndex: 0x40000000,
-      active: 1,
-      createdAt: now
-    });
-    await booted.deps.db.insert(transactions).values({
-      id: "tx-fee",
-      chainId: 999,
-      txHash: "0xf",
-      logIndex: 0,
-      fromAddress: "0xe",
-      toAddress: feeAddr,
-      token: "DEV",
-      amountRaw: "500",
-      status: "confirmed",
-      detectedAt: now
-    });
-    const poolRows = await booted.deps.db.select().from(addressPool);
-    await booted.deps.db.insert(transactions).values({
-      id: "tx-pool",
-      chainId: 999,
-      txHash: "0xp",
-      logIndex: 0,
-      fromAddress: "0xe",
-      toAddress: poolRows[0]!.address,
-      token: "DEV",
-      amountRaw: "500",
-      status: "confirmed",
-      detectedAt: now
-    });
-
-    const snapshot = await computeBalanceSnapshot(booted.deps, { kind: "fee" });
-    const chain = snapshot.families[0]!.chains[0]!;
-    expect(chain.addresses.every((a) => a.kind === "fee")).toBe(true);
-    expect(chain.addresses).toHaveLength(1);
-  });
 });
 
 describe("balance-snapshot — rpc mode (opts.live=true)", () => {
@@ -255,41 +165,6 @@ describe("balance-snapshot — rpc mode (opts.live=true)", () => {
       expect(addr.tokens[0]!.amountRaw).toBe("1000000000000000000000");
     }
     expect(chain.errors).toBe(0);
-  });
-
-  it("surfaces fee wallets under their chain", async () => {
-    const now = Date.now();
-    await booted.deps.db.insert(feeWallets).values({
-      id: "fee-1",
-      chainId: 999,
-      address: "0x0000000000000000000000000000000000000fee",
-      label: "hot-1",
-      derivationIndex: 0x40000000,
-      active: 1,
-      createdAt: now
-    });
-    const snapshot = await computeBalanceSnapshot(booted.deps, { live: true });
-    const chain = snapshot.families[0]!.chains[0]!;
-    const feeRow = chain.addresses.find((a) => a.kind === "fee");
-    expect(feeRow).toBeDefined();
-    expect(feeRow!.feeLabel).toBe("hot-1");
-  });
-
-  it("respects scope filters: kind=fee excludes pool", async () => {
-    const now = Date.now();
-    await booted.deps.db.insert(feeWallets).values({
-      id: "fee-2",
-      chainId: 999,
-      address: "0x0000000000000000000000000000000000000fee",
-      label: "hot-1",
-      derivationIndex: 0x40000000,
-      active: 1,
-      createdAt: now
-    });
-    const snapshot = await computeBalanceSnapshot(booted.deps, { kind: "fee", live: true });
-    const chain = snapshot.families[0]!.chains[0]!;
-    expect(chain.addresses.every((a) => a.kind === "fee")).toBe(true);
-    expect(chain.addresses).toHaveLength(1);
   });
 
   it("returns an empty snapshot when family has no chains wired", async () => {

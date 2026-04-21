@@ -1,5 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
+import { seedFundedPoolAddress } from "../helpers/seed-source.js";
+
+const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
+async function seedDevSource(booted: BootedTestApp, idx: number): Promise<void> {
+  const adapter = booted.deps.chains.find((c) => c.family === "evm")!;
+  const { address } = adapter.deriveAddress(TEST_MASTER_SEED, idx);
+  await seedFundedPoolAddress(booted, {
+    chainId: 999,
+    family: "evm",
+    address: adapter.canonicalizeAddress(address),
+    derivationIndex: idx,
+    balances: { DEV: "1000000000000000000" }
+  });
+}
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
 const OTHER_MERCHANT = "00000000-0000-0000-0000-000000000002";
@@ -65,6 +79,9 @@ describe("GET /api/v1/payouts", () => {
       ]
     });
     apiKey = booted.apiKeys[MERCHANT_ID]!;
+    // planPayout requires a funded HD source; seed a generously-funded one
+    // so every test in the describe block can plan freely.
+    await seedDevSource(booted, 800_001);
   });
 
   afterEach(async () => {
@@ -117,8 +134,10 @@ describe("GET /api/v1/payouts", () => {
   });
 
   it("filters by status", async () => {
+    // planPayout now writes rows at status='reserved' (selection runs at
+    // plan time, skipping the legacy 'planned' state).
     await planPayout(booted, apiKey, {});
-    const { body } = await listPayouts(booted, apiKey, "?status=planned");
+    const { body } = await listPayouts(booted, apiKey, "?status=reserved");
     expect(body.payouts).toHaveLength(1);
 
     const confirmed = await listPayouts(booted, apiKey, "?status=confirmed");

@@ -17,7 +17,6 @@ export {
 export { confirmationThreshold, DEFAULT_CONFIRMATION_THRESHOLDS, FALLBACK_CONFIRMATION_THRESHOLD } from "./payment-config.js";
 export {
   planPayout,
-  registerFeeWallet,
   executeReservedPayouts,
   confirmPayouts,
   getPayout,

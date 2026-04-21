@@ -1,4 +1,3 @@
-import { sha256 } from "@noble/hashes/sha2.js";
 import type { ChainAdapter } from "../../core/ports/chain.port.ts";
 import type { SignerStore } from "../../core/ports/signer-store.port.ts";
 import type { ChainFamily } from "../../core/types/chain.ts";
@@ -13,22 +12,14 @@ import type { SignerScope } from "../../core/types/signer.ts";
 // Derivation-index layout (all within [0, 2^31-1], the non-hardened-safe range
 // that every family's BIP32/SLIP-0010 implementation accepts):
 //
-//   [0x00000000, 0x3FFFFFFF]  — receive-address pool (monotonic from 0,
-//                                managed by pool.service.ts; never hashed).
-//   [0x40000000, 0x7EFFFFFF]  — fee-wallet indices (sha256(family,label) mod
-//                                range, OR'd with the 0x40000000 bit).
+//   [0x00000000, 0x3FFFFFFF]  — HD address pool. Every payout source is
+//                                addressed from here: pool receive addresses,
+//                                gas-top-up sponsors, everything. Indices are
+//                                allocated monotonically by pool.service.ts.
 //   [0x7F000000, 0x7FFFFFFF]  — reserved for gateway-singleton scopes
-//                                (sweep-master per family).
-//
-// Collision probability between a fee-wallet label and the pool is zero (the
-// top bit of the fee-wallet region is set; the pool never reaches there). Collisions
-// within fee wallets are ~100² / 2^31 ≈ 5e-6 for 100 labels — which still
-// manifests safely because `fee_wallets` has a UNIQUE(chain_id, address)
-// constraint, so a colliding label triggers a loud insert error at register
-// time instead of silently sharing a key.
+//                                (sweep-master per family). Not currently
+//                                active in the payout path.
 
-const FEE_WALLET_INDEX_BIT = 0x40000000;
-const FEE_WALLET_INDEX_MASK = 0x3EFFFFFF;
 const SWEEP_MASTER_INDEX_BASE = 0x7F000000;
 
 // Stable family → sweep-master index. Fixed constants, so the derived
@@ -57,7 +48,7 @@ export interface HdSignerStoreOptions {
   // BIP39 mnemonic. Same value passed to chain adapters' `deriveAddress`.
   masterSeed: string;
   // Chain adapters the entrypoint already constructed. We reuse each family's
-  // `deriveAddress` so the fee-wallet private-key ↔ address mapping is
+  // `deriveAddress` so the payout source private-key ↔ address mapping is
   // computed by exactly the same code that pool addresses use.
   chains: readonly ChainAdapter[];
 }
@@ -96,51 +87,33 @@ export function hdSignerStore(opts: HdSignerStoreOptions): SignerStore {
       const { privateKey } = adapter.deriveAddress(masterSeed, index);
       return privateKey;
     }
-    // fee-wallet — prefer the explicit derivationIndex when supplied (used
-    // by wallets promoted from the address pool), else fall back to the
-    // deterministic hash of the label (legacy single-API path).
+    // pool-address — derive at the supplied index directly. Every HD-derived
+    // payout source (pool receive addresses, top-up sponsors) flows through
+    // this arm; the caller looks up `addressPool.addressIndex` before signing.
     const adapter = requireAdapter(scope.family);
-    const index = scope.derivationIndex ?? feeWalletIndex(scope.family, scope.label);
-    const { privateKey } = adapter.deriveAddress(masterSeed, index);
+    const { privateKey } = adapter.deriveAddress(masterSeed, scope.derivationIndex);
     return privateKey;
   }
 
   return {
     async put() {
-      // Importing externally-generated keys is intentionally unsupported. Fund
-      // the address returned by POST /admin/fee-wallets instead; the gateway
-      // derives the matching private key on demand from MASTER_SEED.
+      // Importing externally-generated keys is intentionally unsupported. The
+      // gateway only signs from HD-derived addresses — every payout source
+      // lives in `address_pool` and derives deterministically from
+      // MASTER_SEED.
       throw new UnsupportedSignerOperationError(
-        "hdSignerStore.put: external-key import is not supported. Register fee wallets via POST /admin/fee-wallets and fund the returned derived address."
+        "hdSignerStore.put: external-key import is not supported. Pay out only from HD-derived pool addresses."
       );
     },
     async get(scope) {
       return derivePrivateKey(scope);
     },
     async delete() {
-      // Keys aren't stored, so there's nothing to delete. "Retiring" a
-      // fee-wallet label is a DB concern (set `fee_wallets.active = 0`), not
-      // a signer-store concern — the derived key still exists but won't be
-      // selected for new payouts.
+      // Keys aren't stored, so there's nothing to delete.
     },
     async has(scope) {
       if (scope.kind === "receive-hd") return true;
       return adapterByFamily.has(scope.family);
     }
   };
-}
-
-// Deterministic fee-wallet index from (family, label). Stable across deploys
-// so the same label always derives to the same private key.
-export function feeWalletIndex(family: ChainFamily, label: string): number {
-  const digest = sha256(new TextEncoder().encode(`fee-wallet:${family}:${label}`));
-  // First 4 bytes as a big-endian uint32, masked into the fee-wallet region.
-  const raw =
-    ((digest[0] ?? 0) << 24) |
-    ((digest[1] ?? 0) << 16) |
-    ((digest[2] ?? 0) << 8) |
-    (digest[3] ?? 0);
-  // `>>> 0` coerces to unsigned 32-bit after the OR with a high bit (JS bitwise
-  // ops produce signed ints).
-  return ((raw & FEE_WALLET_INDEX_MASK) | FEE_WALLET_INDEX_BIT) >>> 0;
 }

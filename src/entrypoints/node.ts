@@ -248,8 +248,19 @@ async function main(): Promise<void> {
     ...(alchemy !== undefined ? { alchemy } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
     migrationsFolder,
-    confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES"))
+    confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES")),
+    payoutConcurrencyPerChain: config.payoutConcurrencyPerChain
   };
+
+  // Schema-drift guard. The project's convention is to edit `0000_initial.sql`
+  // in place for pre-prod schema changes — but Drizzle's migrator hashes the
+  // journal `tag`, not the SQL contents, so a database that already journaled
+  // `0000_initial` against an older snapshot keeps the older schema and silently
+  // skips re-applying. The fee_wallets → payout_reservations refactor is the
+  // canonical case: an upgraded code base + a pre-refactor DB boot OK, then
+  // the first reservation insert blows up because the table doesn't exist.
+  // Fail loud at startup so an operator sees the cause, not a per-payout symptom.
+  await assertSchemaInSync(libsqlClient, logger);
 
   const app = buildApp(deps);
 
@@ -266,6 +277,35 @@ async function main(): Promise<void> {
     server.close();
     process.exit(0);
   });
+}
+
+// Schema-drift sentinel. Drizzle's libsql migrator hashes the journal `tag`,
+// not the SQL contents — so editing `0000_initial.sql` in place after a DB has
+// already journaled it leaves the old schema untouched. We can't tell whether
+// the SQL drifted, but we can tell whether tables that no longer exist in the
+// app's schema are still present in the DB. The fee_wallets → payout_reservations
+// refactor is the canonical case; expand this list when a future refactor drops
+// another table.
+async function assertSchemaInSync(
+  client: { execute: (sql: string) => Promise<{ rows: unknown[] }> },
+  logger: AppDeps["logger"]
+): Promise<void> {
+  const droppedTables = ["fee_wallets"];
+  for (const table of droppedTables) {
+    const result = await client.execute(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='${table}'`
+    );
+    if (result.rows.length > 0) {
+      const message =
+        `Schema drift detected: table '${table}' still exists in this database, ` +
+        `but the application schema removed it. The Drizzle migrator only re-applies ` +
+        `migrations whose journal tag is new — editing 0000_initial.sql in place does NOT ` +
+        `re-run on a journaled DB. Pre-prod cutover requires a fresh database (drop the file, ` +
+        `or create a new Turso DB). See README § Database migrations.`;
+      logger.error("startup_schema_drift", { table });
+      throw new Error(message);
+    }
+  }
 }
 
 // Dev-only helper. Guarded at the call site by `if (!production)`; this

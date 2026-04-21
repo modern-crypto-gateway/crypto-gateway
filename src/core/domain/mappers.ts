@@ -110,6 +110,8 @@ export function drizzleRowToPayout(row: typeof payouts.$inferSelect): Payout {
   return {
     id: row.id as PayoutId,
     merchantId: row.merchantId as Payout["merchantId"],
+    kind: row.kind,
+    parentPayoutId: row.parentPayoutId === null ? null : (row.parentPayoutId as PayoutId),
     status: row.status as PayoutStatus,
     chainId: row.chainId,
     token: row.token,
@@ -119,12 +121,12 @@ export function drizzleRowToPayout(row: typeof payouts.$inferSelect): Payout {
     feeTier: (row.feeTier as "low" | "medium" | "high" | null) ?? null,
     feeQuotedNative: row.feeQuotedNative,
     batchId: row.batchId,
-    allowMultiSource: row.allowMultiSource === 1,
-    sourceAddresses: parseJsonArray(row.sourceAddressesJson),
-    txHashes: parseJsonArray(row.txHashesJson),
     destinationAddress: row.destinationAddress,
     sourceAddress: row.sourceAddress,
     txHash: row.txHash,
+    topUpTxHash: row.topUpTxHash,
+    topUpSponsorAddress: row.topUpSponsorAddress,
+    topUpAmountRaw: row.topUpAmountRaw,
     feeEstimateNative: row.feeEstimateNative,
     lastError: row.lastError,
     webhookUrl: row.webhookUrl,
@@ -135,17 +137,4 @@ export function drizzleRowToPayout(row: typeof payouts.$inferSelect): Payout {
       row.broadcastAttemptedAt === null ? null : new Date(row.broadcastAttemptedAt),
     updatedAt: new Date(row.updatedAt)
   };
-}
-
-// Parse a JSON-array column into a string[] or null. Tolerates invalid JSON
-// by returning null — a malformed column shouldn't crash the row fetch.
-function parseJsonArray(raw: string | null): string[] | null {
-  if (raw === null) return null;
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return null;
-    return parsed.filter((x): x is string => typeof x === "string");
-  } catch {
-    return null;
-  }
 }

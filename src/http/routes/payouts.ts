@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { AppDeps } from "../../core/app-deps.js";
 import {
+  cancelPayout,
   estimatePayoutFees,
   getPayout,
   listPayouts,
@@ -209,6 +210,27 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
       return c.json({ error: { code: "NOT_FOUND", message: `Payout ${id} not found` } }, 404);
     }
     return c.json({ payout: serializePayout(payout) });
+  });
+
+  // Cancel a `reserved` payout. Releases the reservation rows so the
+  // source's spendable balance frees up immediately. Idempotent on
+  // already-canceled rows; rejects with 409 PAYOUT_NOT_CANCELABLE once
+  // the payout has broadcast (topping-up / submitted) — chain owns the
+  // funds at that point.
+  app.post("/:id/cancel", async (c) => {
+    const id = parsePayoutIdParam(c.req.param("id"));
+    if (id === null) {
+      return c.json({ error: { code: "NOT_FOUND" } }, 404);
+    }
+    try {
+      const payout = await cancelPayout(deps, {
+        merchantId: c.get("merchantId"),
+        payoutId: id
+      });
+      return c.json({ payout: serializePayout(payout) });
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
   });
 
   return app;

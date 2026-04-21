@@ -268,6 +268,18 @@ export const TOKEN_REGISTRY: readonly TokenInfo[] = [
     isStable: true,
     displayName: "Dev Token"
   },
+  // Synthetic ERC-20-like token on the dev chain — used by integration tests
+  // that need a (token != native) pair to exercise the gas-top-up flow. The
+  // dev chain adapter's native is DEV; this row gives us a separate token
+  // rail so a "source has token but no native" scenario is reachable in tests.
+  {
+    symbol: "DEVT" as TokenSymbol,
+    chainId: 999 as ChainId,
+    contractAddress: "0x0000000000000000000000000000000000000dev" as Address,
+    decimals: 6,
+    isStable: true,
+    displayName: "Dev Test Token"
+  },
   // Solana native asset. chainId 900 = mainnet-beta, 901 = devnet (synthetic ids;
   // Solana has no EVM-style chain id so we assign our own).
   {

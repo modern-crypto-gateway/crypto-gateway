@@ -106,6 +106,14 @@ export const AppConfigSchema = z
     rateLimitWebhookIngestPerMinute: z.coerce.number().int().min(1).default(300),
     rateLimitAdminPerMinute: z.coerce.number().int().min(1).default(30),
 
+    // Cap on concurrent `executeOnePayout` calls per chainId in a single
+    // executor tick. Cross-chain runs are unconditionally parallel; this
+    // bounds the within-chain fan-out so a backlog can't blow past a
+    // runtime's subrequest budget (Cloudflare Workers ~50, Vercel Edge
+    // similar). Default 16 is comfortable for most loads; tune lower on
+    // Workers under heavy backlog.
+    payoutConcurrencyPerChain: z.coerce.number().int().min(1).max(64).default(16),
+
     // Ops alerting: when set, error-level log lines are fan-out POSTed to this
     // URL (Slack/Discord/PagerDuty-compatible JSON body). Normal logs still
     // flow to stdout/stderr; this is the page-the-oncall channel only.
@@ -223,6 +231,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     rateLimitCheckoutPerMinute: env["RATE_LIMIT_CHECKOUT_PER_MINUTE"],
     rateLimitWebhookIngestPerMinute: env["RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE"],
     rateLimitAdminPerMinute: env["RATE_LIMIT_ADMIN_PER_MINUTE"],
+    payoutConcurrencyPerChain: env["PAYOUT_CONCURRENCY_PER_CHAIN"],
     trustedIpHeaders: env["TRUSTED_IP_HEADERS"],
     alertWebhookUrl: env["ALERT_WEBHOOK_URL"],
     alertWebhookAuthHeader: env["ALERT_WEBHOOK_AUTH_HEADER"]

@@ -1,35 +1,37 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { asc, sql } from "drizzle-orm";
-import { feeWallets, payouts } from "../../db/schema.js";
+import { and, asc, eq, isNull, sql } from "drizzle-orm";
+import { payoutReservations, payouts } from "../../db/schema.js";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
 import {
   confirmPayouts,
   executeReservedPayouts,
-  planPayout,
-  registerFeeWallet
+  planPayout
 } from "../../core/domain/payout.service.js";
-import { feeWalletIndex } from "../../adapters/signer-store/hd.adapter.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
+import { seedFundedPoolAddress } from "../helpers/seed-source.js";
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
-// Must match bootTestApp's MASTER_SEED so seeded fee-wallets derive to the
-// same address the PayoutService will resolve via signerStore.get at exec time.
 const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
 
+let nextSeedIndex = 1_000_000;
 async function seedFeeWallet(
   booted: BootedTestApp,
-  args: { label: string }
+  args: { label: string; balanceRaw?: string }
 ): Promise<{ address: string }> {
   const adapter = booted.deps.chains.find((c) => c.family === "evm");
   if (!adapter) throw new Error("seedFeeWallet: no EVM adapter in test deps");
-  const index = feeWalletIndex("evm", args.label);
+  const index = nextSeedIndex++;
   const { address } = adapter.deriveAddress(TEST_MASTER_SEED, index);
   const canonical = adapter.canonicalizeAddress(address);
-  await registerFeeWallet(booted.deps, {
+  // Default to a generously funded source: enough DEV for the largest test
+  // amount plus comfortable native gas headroom.
+  const balanceRaw = args.balanceRaw ?? "1000000000000000000";
+  await seedFundedPoolAddress(booted, {
     chainId: 999,
+    family: "evm",
     address: canonical,
-    label: args.label,
-    derivationIndex: index
+    derivationIndex: index,
+    balances: { DEV: balanceRaw }
   });
   return { address: canonical };
 }
@@ -39,13 +41,18 @@ describe("PayoutService.planPayout", () => {
 
   beforeEach(async () => {
     booted = await bootTestApp();
+    // planPayout now runs source selection synchronously inside an
+    // IMMEDIATE transaction and throws if no HD address has enough
+    // balance. Seed a well-funded source so the "validation path" tests
+    // in this describe block don't trip on source selection.
+    await seedFeeWallet(booted, { label: "plan-test-source" });
   });
 
   afterEach(async () => {
     await booted.close();
   });
 
-  it("creates a planned payout row with the destination canonicalized", async () => {
+  it("creates a reserved payout row with the destination canonicalized and a source picked", async () => {
     const payout = await planPayout(booted.deps, {
       merchantId: MERCHANT_ID,
       chainId: 999,
@@ -54,9 +61,11 @@ describe("PayoutService.planPayout", () => {
       // Uppercase hex — adapter canonicalizes to lowercase.
       destinationAddress: "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     });
-    expect(payout.status).toBe("planned");
+    // Plan-time selection wrote reservations and set the source; status
+    // skips the legacy 'planned' state entirely.
+    expect(payout.status).toBe("reserved");
     expect(payout.destinationAddress).toBe("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    expect(payout.sourceAddress).toBeNull();
+    expect(payout.sourceAddress).not.toBeNull();
     expect(payout.txHash).toBeNull();
   });
 
@@ -135,52 +144,53 @@ describe("PayoutService.executeReservedPayouts", () => {
       expect(row?.tx_hash).toMatch(/^0x[0-9a-f]{64}$/);
       expect(row?.source_address).toBe(feeAddress);
 
-      // Fee wallet is still reserved by this payout (no confirmation yet).
-      const [wallet] = await booted.deps.db
-        .select({ reserved_by_payout_id: feeWallets.reservedByPayoutId })
-        .from(feeWallets)
-        .limit(1);
-      expect(wallet?.reserved_by_payout_id).not.toBeNull();
+      // Source wallet is still reserved by this payout (no confirmation yet).
+      const activeRows = await booted.deps.db
+        .select({ id: payoutReservations.id })
+        .from(payoutReservations)
+        .where(isNull(payoutReservations.releasedAt));
+      expect(activeRows.length).toBeGreaterThan(0);
     } finally {
       await booted.close();
     }
   });
 
-  it("leaves payouts in 'planned' when no fee wallet is available (deferred)", async () => {
+  it("planPayout rejects synchronously when no HD source has enough balance", async () => {
     const booted = await bootTestApp({
       chains: [devChainAdapter({ deterministicTxHashes: true })]
     });
     try {
-      // No fee wallets registered.
-      await planPayout(booted.deps, {
-        merchantId: MERCHANT_ID,
-        chainId: 999,
-        token: "DEV",
-        amountRaw: "1",
-        destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      });
+      // Pool addresses exist (default boot seeds them) but none are funded
+      // with DEV — ledger spendable is 0 for every candidate. Plan-time
+      // source selection rejects with INSUFFICIENT_BALANCE_ANY_SOURCE;
+      // nothing reaches the executor.
+      await expect(
+        planPayout(booted.deps, {
+          merchantId: MERCHANT_ID,
+          chainId: 999,
+          token: "DEV",
+          amountRaw: "1",
+          destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        })
+      ).rejects.toMatchObject({ code: "INSUFFICIENT_BALANCE_ANY_SOURCE" });
 
-      const result = await executeReservedPayouts(booted.deps);
-      expect(result).toEqual({ attempted: 1, submitted: 0, failed: 0, deferred: 1 });
-
-      const [row] = await booted.deps.db
-        .select({ status: payouts.status })
-        .from(payouts)
-        .limit(1);
-      expect(row?.status).toBe("planned");
+      // No payout row was inserted — plan is all-or-nothing.
+      const rows = await booted.deps.db.select().from(payouts);
+      expect(rows.length).toBe(0);
     } finally {
       await booted.close();
     }
   });
 
-  it("CAS: with one fee wallet and two payouts, only one submits per sweep", async () => {
+  it("multiple payouts can share one funded source as long as cumulative balance covers them all", async () => {
     const booted = await bootTestApp({
       chains: [devChainAdapter({ deterministicTxHashes: true })]
     });
     try {
-      await seedFeeWallet(booted, { label: "hot-1" });
+      // Single HD source with comfortably-large balance — both payouts
+      // reserve from it concurrently in the new ledger-based model.
+      await seedFeeWallet(booted, { label: "shared-source", balanceRaw: "1000000000000000000" });
 
-      // Two payouts, two different destinations (so tx hashes differ deterministically).
       await planPayout(booted.deps, {
         merchantId: MERCHANT_ID,
         chainId: 999,
@@ -197,15 +207,15 @@ describe("PayoutService.executeReservedPayouts", () => {
       });
 
       const result = await executeReservedPayouts(booted.deps);
-      // One submitted, one deferred (no free wallet the second time around).
-      expect(result).toEqual({ attempted: 2, submitted: 1, failed: 0, deferred: 1 });
+      expect(result.attempted).toBe(2);
+      expect(result.submitted).toBe(2);
 
       const counts = await booted.deps.db
         .select({ status: payouts.status, n: sql<number>`COUNT(*)` })
         .from(payouts)
         .groupBy(payouts.status);
       const byStatus = Object.fromEntries(counts.map((r) => [r.status, Number(r.n)]));
-      expect(byStatus).toEqual({ planned: 1, submitted: 1 });
+      expect(byStatus).toEqual({ submitted: 2 });
     } finally {
       await booted.close();
     }
@@ -243,11 +253,11 @@ describe("PayoutService.executeReservedPayouts", () => {
       expect(row?.last_error).toContain("simulated broadcast failure");
 
       // The fee wallet must be released so future retries can use it.
-      const [wallet] = await booted.deps.db
-        .select({ reserved_by_payout_id: feeWallets.reservedByPayoutId })
-        .from(feeWallets)
+      const released = await booted.deps.db
+        .select({ id: payoutReservations.id })
+        .from(payoutReservations).where(isNull(payoutReservations.releasedAt))
         .limit(1);
-      expect(wallet?.reserved_by_payout_id).toBeNull();
+      expect(released.length).toBe(0);
     } finally {
       await booted.close();
     }
@@ -292,11 +302,11 @@ describe("PayoutService.confirmPayouts", () => {
       expect(after?.status).toBe("confirmed");
       expect(after?.confirmed_at).not.toBeNull();
 
-      const [wallet] = await booted.deps.db
-        .select({ reserved_by_payout_id: feeWallets.reservedByPayoutId })
-        .from(feeWallets)
+      const released = await booted.deps.db
+        .select({ id: payoutReservations.id })
+        .from(payoutReservations).where(isNull(payoutReservations.releasedAt))
         .limit(1);
-      expect(wallet?.reserved_by_payout_id).toBeNull();
+      expect(released.length).toBe(0);
 
       expect(events).toContain("payout.confirmed");
     } finally {
@@ -335,11 +345,11 @@ describe("PayoutService.confirmPayouts", () => {
       expect(after?.status).toBe("failed");
       expect(after?.last_error).toContain("reverted");
 
-      const [wallet] = await booted.deps.db
-        .select({ reserved_by_payout_id: feeWallets.reservedByPayoutId })
-        .from(feeWallets)
+      const released = await booted.deps.db
+        .select({ id: payoutReservations.id })
+        .from(payoutReservations).where(isNull(payoutReservations.releasedAt))
         .limit(1);
-      expect(wallet?.reserved_by_payout_id).toBeNull();
+      expect(released.length).toBe(0);
     } finally {
       await booted.close();
     }

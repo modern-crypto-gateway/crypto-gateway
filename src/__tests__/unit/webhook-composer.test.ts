@@ -57,9 +57,11 @@ function fixturePayout(overrides: Partial<Payout> = {}): Payout {
     feeTier: null,
     feeQuotedNative: null,
     batchId: null,
-    allowMultiSource: false,
-    sourceAddresses: null,
-    txHashes: null,
+    kind: "standard",
+    parentPayoutId: null,
+    topUpTxHash: null,
+    topUpSponsorAddress: null,
+    topUpAmountRaw: null,
     broadcastAttemptedAt: null,
     destinationAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
     sourceAddress: "0x1111111111111111111111111111111111111111",
@@ -124,6 +126,47 @@ describe("composeWebhook", () => {
       txHash: "0xabc"
     });
     expect(composed!.idempotencyKey).toBe(`payout.confirmed:${payout.id}:confirmed`);
+  });
+
+  // Contract test: webhook payload shape must match the REST `GET /payouts/:id`
+  // shape one-for-one (modulo Date → ISO string serialization). A merchant
+  // building a single deserializer should see the same fields regardless of
+  // ingress. Catches the divergence we hit during the source-picker refactor
+  // when fields were added to the REST shape but missed in the webhook.
+  it("payout webhook data carries every Payout field the REST surface exposes", () => {
+    const payout = fixturePayout({
+      kind: "standard",
+      parentPayoutId: null,
+      feeTier: "medium",
+      feeQuotedNative: "21000",
+      batchId: "batch-abc",
+      topUpTxHash: "0xtopup",
+      topUpSponsorAddress: "0xsponsor"
+    });
+    const composed = composeWebhook({
+      type: "payout.submitted",
+      payoutId: payout.id,
+      payout,
+      at: new Date("2026-04-16T10:05:00Z")
+    });
+    expect(composed).not.toBeNull();
+    const data = composed!.payload.data as Record<string, unknown>;
+    // Every field on the Payout type that's safe for merchant exposure.
+    // (`merchantId`, `webhookUrl`, `broadcastAttemptedAt`, `feeEstimateNative`
+    // intentionally stay out — operator/internal only.)
+    for (const k of [
+      "id", "kind", "parentPayoutId", "status", "chainId", "token", "amountRaw",
+      "feeTier", "feeQuotedNative", "batchId",
+      "destinationAddress", "sourceAddress", "txHash",
+      "topUpTxHash", "topUpSponsorAddress",
+      "lastError", "submittedAt", "confirmedAt"
+    ]) {
+      expect(data, `missing ${k}`).toHaveProperty(k);
+    }
+    expect(data.kind).toBe("standard");
+    expect(data.topUpTxHash).toBe("0xtopup");
+    expect(data.topUpSponsorAddress).toBe("0xsponsor");
+    expect(data.batchId).toBe("batch-abc");
   });
 
   it("maps invoice.overpaid with overpaidUsd in the snapshot data", () => {

@@ -1,5 +1,26 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
+import { seedFundedPoolAddress } from "../helpers/seed-source.js";
+
+// planPayout now runs source selection synchronously at plan time. Tests
+// in this file that exercise the route with valid inputs need a funded
+// HD address to satisfy selection; tests that assert non-source errors
+// (401, invalid destination, etc.) hit their check before selection runs
+// and don't need the seed.
+const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
+async function seedDevSource(booted: BootedTestApp, idx = 900_001): Promise<string> {
+  const adapter = booted.deps.chains.find((c) => c.family === "evm")!;
+  const { address } = adapter.deriveAddress(TEST_MASTER_SEED, idx);
+  const canonical = adapter.canonicalizeAddress(address);
+  await seedFundedPoolAddress(booted, {
+    chainId: 999,
+    family: "evm",
+    address: canonical,
+    derivationIndex: idx,
+    balances: { DEV: "1000000000000000000" }
+  });
+  return canonical;
+}
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
 
@@ -10,6 +31,7 @@ describe("POST /api/v1/payouts", () => {
   beforeEach(async () => {
     booted = await bootTestApp();
     apiKey = booted.apiKeys[MERCHANT_ID]!;
+    await seedDevSource(booted);
   });
 
   afterEach(async () => {
@@ -33,7 +55,7 @@ describe("POST /api/v1/payouts", () => {
     const body = (await res.json()) as { payout: Record<string, unknown> };
     expect(body.payout).toMatchObject({
       merchantId: MERCHANT_ID,
-      status: "planned",
+      status: "reserved",
       destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     });
   });
@@ -222,7 +244,7 @@ describe("POST /api/v1/payouts", () => {
     expect(getRes.status).toBe(200);
     const fetched = (await getRes.json()) as { payout: { id: string; status: string } };
     expect(fetched.payout.id).toBe(payout.id);
-    expect(fetched.payout.status).toBe("planned");
+    expect(fetched.payout.status).toBe("reserved");
   });
 
   it("GET /:id returns 404 when another merchant's key is used", async () => {
@@ -235,6 +257,10 @@ describe("POST /api/v1/payouts", () => {
     try {
       const ownerKey = twoMerchants.apiKeys[MERCHANT_ID]!;
       const intruderKey = twoMerchants.apiKeys["00000000-0000-0000-0000-000000000002"]!;
+
+      // Local boot — needs its own seeded source (the describe-level
+      // beforeEach seeded the `booted` instance, not this one).
+      await seedDevSource(twoMerchants, 950_001);
 
       const createRes = await twoMerchants.app.fetch(
         new Request("http://test.local/api/v1/payouts", {

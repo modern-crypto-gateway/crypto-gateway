@@ -1,26 +1,22 @@
 import { z } from "zod";
 import { ChainFamilySchema } from "./chain.js";
 
-// Scope keys for the SignerStore (encrypted-at-rest private-key store).
+// Scope keys for the SignerStore.
 //
-// "fee-wallet"     : a gateway-owned hot wallet funding payouts on a given family.
+// "pool-address"   : gateway-controlled HD-derived address at a specific
+//                    derivation index. Used as the payout source (both for
+//                    invoice pool addresses and for gas top-up sponsors —
+//                    the picker is blind to the distinction).
 // "sweep-master"   : master key used to derive sweep destination addresses.
 // "receive-hd"     : HD seed used to derive per-order receive addresses.
 //
-// Each scope key is deliberately coarse — individual receive-address private
-// keys are derived on demand from the HD seed, never stored.
-//
-// fee-wallet's `derivationIndex` is optional for backward compatibility with
-// callers that only know the (family, label) pair: when omitted, the signer
-// hashes `feeWalletIndex(family, label)`. When present, the signer derives at
-// the supplied index directly — used by fee wallets promoted from the address
-// pool, whose original index isn't recoverable from the label alone.
+// Individual private keys are derived on demand from MASTER_SEED at the
+// supplied `derivationIndex`; nothing is stored at rest.
 export const SignerScopeSchema = z.discriminatedUnion("kind", [
   z.object({
-    kind: z.literal("fee-wallet"),
+    kind: z.literal("pool-address"),
     family: ChainFamilySchema,
-    label: z.string().min(1).max(64),
-    derivationIndex: z.number().int().nonnegative().optional()
+    derivationIndex: z.number().int().nonnegative()
   }),
   z.object({ kind: z.literal("sweep-master"), family: ChainFamilySchema }),
   z.object({ kind: z.literal("receive-hd") })

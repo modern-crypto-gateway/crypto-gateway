@@ -183,13 +183,20 @@ function serializeInvoice(invoice: Invoice): Record<string, unknown> {
 function serializePayout(payout: Payout): Record<string, unknown> {
   return {
     id: payout.id,
+    kind: payout.kind,
+    parentPayoutId: payout.parentPayoutId,
     status: payout.status,
     chainId: payout.chainId,
     token: payout.token,
     amountRaw: payout.amountRaw,
+    feeTier: payout.feeTier,
+    feeQuotedNative: payout.feeQuotedNative,
+    batchId: payout.batchId,
     destinationAddress: payout.destinationAddress,
     sourceAddress: payout.sourceAddress,
     txHash: payout.txHash,
+    topUpTxHash: payout.topUpTxHash,
+    topUpSponsorAddress: payout.topUpSponsorAddress,
     lastError: payout.lastError,
     submittedAt: payout.submittedAt === null ? null : payout.submittedAt.toISOString(),
     confirmedAt: payout.confirmedAt === null ? null : payout.confirmedAt.toISOString()

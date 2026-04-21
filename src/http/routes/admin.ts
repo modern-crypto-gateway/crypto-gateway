@@ -4,11 +4,10 @@ import { z } from "zod";
 import type { AppDeps } from "../../core/app-deps.js";
 import {
   computeBalanceSnapshot,
+  computeSpendable,
   type BalanceSnapshot
 } from "../../core/domain/balance-snapshot.service.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
-import { registerFeeWallet } from "../../core/domain/payout.service.js";
-import { feeWalletIndex } from "../../adapters/signer-store/hd.adapter.js";
 import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
 import {
   ingestDetectedTransfer,
@@ -31,7 +30,7 @@ import { dbAlchemyRegistryStore } from "../../adapters/detection/alchemy-registr
 import { readAlchemyNotifyToken } from "../../adapters/detection/alchemy-token.js";
 import { assertWebhookUrlSafe } from "../../core/domain/url-safety.js";
 import { migrate as drizzleMigrate } from "drizzle-orm/libsql/migrator";
-import { addressPool, alchemyWebhookRegistry, feeWallets, invoices, merchants, transactions } from "../../db/schema.js";
+import { addressPool, alchemyWebhookRegistry, invoices, merchants, payoutReservations, transactions } from "../../db/schema.js";
 import { renderError } from "../middleware/error-handler.js";
 import { adminAuth } from "../middleware/admin-auth.js";
 import { getClientIp, rateLimit } from "../middleware/rate-limit.js";
@@ -77,72 +76,6 @@ const UpdateMerchantSchema = z
     message: "PATCH body must contain at least one updatable field"
   });
 
-// Promote an existing pool address (that may already hold funds from a
-// completed invoice) into a fee wallet. The pool row's `address_index` is
-// reused as the fee wallet's `derivation_index`, so the signer can sign
-// without any key storage — everything stays HD.
-const PromotePoolAddressSchema = z
-  .object({
-    family: z.enum(["evm", "tron", "solana"] as const),
-    // The canonical address (hex for EVM, base58 for Tron/Solana) that exists
-    // as a row in `address_pool`.
-    address: z.string().min(1).max(128),
-    // Operator-visible label for the new fee wallet.
-    label: z.string().min(1).max(64),
-    // Explicit target chainIds, same shape as RegisterFeeWalletSchema. When
-    // omitted for EVM, fanout to every wired EVM chain.
-    chainIds: z.array(z.number().int().positive()).min(1).max(20).optional(),
-    // When true (default), mark the pool row inactive so it stops receiving
-    // new invoice allocations. Late payments against outstanding invoices on
-    // that address still credit the original invoice via
-    // `invoice_receive_addresses` — nothing is silently lost.
-    deactivatePoolSlot: z.boolean().default(true)
-  })
-  .strict();
-
-// Escape-hatch registration: operator supplies an explicit HD derivation
-// index. The allowed range is DELIBERATELY the fee-wallet region only —
-// [0x40000000, 0x7EFFFFFF] — so an operator (even one with the ADMIN_KEY)
-// cannot accidentally or maliciously register at a pool-space index (would
-// share a private key with an invoice receive address) or at the sweep-
-// master space (would shadow the sweep master). Operators who legitimately
-// need to promote a funded pool address MUST use /from-pool-address, which
-// validates the pool row exists.
-//
-// Hardened range:
-//   min 0x40000000: excludes the pool region [0x00000000, 0x3FFFFFFF]
-//   max 0x7EFFFFFF: excludes the sweep-master region [0x7F000000, 0x7FFFFFFF]
-const RegisterFeeWalletByIndexSchema = z
-  .object({
-    family: z.enum(["evm", "tron", "solana"] as const),
-    derivationIndex: z.number().int().min(0x40000000).max(0x7effffff),
-    label: z.string().min(1).max(64),
-    chainIds: z.array(z.number().int().positive()).min(1).max(20).optional()
-  })
-  .strict();
-
-const RegisterFeeWalletSchema = z
-  .object({
-    // Single-chain registration. Backward-compatible with the legacy 1-call =
-    // 1-row shape. Mutually exclusive with `chainIds`.
-    chainId: z.number().int().positive().optional(),
-    // Multi-chain fanout. One row inserted per chainId. The HD-derived
-    // address is the same across an EVM family (deriveAddress ignores
-    // chainId), so passing `chainIds: [1, 10, 8453, 42161]` registers the
-    // same address on every chain in one call. Mutually exclusive with
-    // `chainId`.
-    chainIds: z.array(z.number().int().positive()).min(1).max(20).optional(),
-    // Human-readable scope key ("hot-1", "cold-archive", ...). Deterministically
-    // hashed into a BIP32 index so the same label always derives to the same
-    // address — stable across redeploys.
-    label: z.string().min(1).max(64),
-    family: z.enum(["evm", "tron", "solana"] as const)
-  })
-  .strict()
-  .refine(
-    (v) => !(v.chainId !== undefined && v.chainIds !== undefined),
-    { message: "Provide `chainId` OR `chainIds`, not both." }
-  );
 
 // Bootstrap input. Every field optional — falls back to env / defaults so the
 // simplest possible call is `POST /admin/bootstrap/alchemy-webhooks {}`.
@@ -704,518 +637,6 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
     );
   });
 
-  // Register a fee wallet. The gateway derives address + private key from
-  // MASTER_SEED at a deterministic index keyed by (family, label). Operator
-  // never supplies a private key (none to leak over the admin API), and funds
-  // the returned derived address out-of-band.
-  app.post("/fee-wallets", async (c) => {
-    const body = (await c.req.json().catch(() => null)) as unknown;
-    if (body === null) {
-      return c.json({ error: { code: "BAD_JSON" } }, 400);
-    }
-    try {
-      const parsed = RegisterFeeWalletSchema.parse(body);
-      const family = parsed.family as ChainFamily;
-
-      // Resolve which chainIds this registration covers:
-      //   chainIds: [...] → exact list
-      //   chainId: N      → single (legacy)
-      //   neither + EVM   → fan out to every EVM chain in CHAIN_REGISTRY
-      //                     (excludes the dev chain; never desirable to
-      //                     auto-register on a synthetic test chainId)
-      //   neither + tron/solana → 400; pick mainnet vs testnet explicitly
-      let targetChainIds: number[];
-      if (parsed.chainIds !== undefined) {
-        targetChainIds = parsed.chainIds;
-      } else if (parsed.chainId !== undefined) {
-        targetChainIds = [parsed.chainId];
-      } else if (family === "evm") {
-        targetChainIds = CHAIN_REGISTRY
-          .filter((e) => e.family === "evm" && e.chainId !== 999)
-          .map((e) => e.chainId as number);
-      } else {
-        return c.json(
-          {
-            error: {
-              code: "MISSING_CHAIN_ID",
-              message:
-                "Pass `chainId` or `chainIds` for non-EVM families — Tron and Solana have separate mainnet/testnet chainIds with no safe default."
-            }
-          },
-          400
-        );
-      }
-
-      // Validate each chainId belongs to the supplied family AND has an
-      // adapter loaded. We resolve the adapter via the FIRST chainId, then
-      // assert every other chainId resolves to the same family-equivalent
-      // adapter (in EVM, all chains share the adapter; in other families,
-      // chainId per row is family-scoped already).
-      const firstAdapter = findChainAdapter(deps, targetChainIds[0]!);
-      if (firstAdapter.family !== family) {
-        return c.json(
-          {
-            error: {
-              code: "FAMILY_MISMATCH",
-              message: `chainId ${targetChainIds[0]} is ${firstAdapter.family}, not ${family}`
-            }
-          },
-          400
-        );
-      }
-      for (const cid of targetChainIds.slice(1)) {
-        const a = findChainAdapter(deps, cid);
-        if (a.family !== family) {
-          return c.json(
-            {
-              error: {
-                code: "FAMILY_MISMATCH",
-                message: `chainId ${cid} is ${a.family}, not ${family}`
-              }
-            },
-            400
-          );
-        }
-      }
-
-      const masterSeed = deps.secrets.getOptional("MASTER_SEED");
-      if (masterSeed === undefined || masterSeed === "") {
-        return c.json(
-          {
-            error: {
-              code: "MISSING_MASTER_SEED",
-              message:
-                "MASTER_SEED secret is not set. Fee-wallet addresses are HD-derived from MASTER_SEED; configure it before registering fee wallets."
-            }
-          },
-          400
-        );
-      }
-
-      // HD derivation is family-scoped (deriveAddress ignores chainId for
-      // EVM and for the same-family Tron/Solana), so the same canonical
-      // address serves every chainId in the fanout.
-      const index = feeWalletIndex(family, parsed.label);
-      const { address: derived } = firstAdapter.deriveAddress(masterSeed, index);
-      const canonical = firstAdapter.canonicalizeAddress(derived);
-
-      // Insert one row per chainId. `registerFeeWallet` is idempotent via
-      // the (chainId, address) unique index: re-registering an existing
-      // fee wallet just refreshes its label and re-activates it. The
-      // `derivationIndex` is persisted so the signer can reproduce the
-      // private key at exec time without re-hashing the label — necessary
-      // for wallets promoted from the address pool (PR 4's from-pool-address
-      // endpoint), whose index doesn't come from the label hash.
-      for (const cid of targetChainIds) {
-        await registerFeeWallet(deps, {
-          chainId: cid,
-          address: canonical,
-          label: parsed.label,
-          derivationIndex: index
-        });
-      }
-
-      return c.json(
-        {
-          feeWallet: {
-            address: canonical,
-            label: parsed.label,
-            family,
-            chainIds: targetChainIds
-          }
-        },
-        201
-      );
-    } catch (err) {
-      return renderError(c, err, deps.logger);
-    }
-  });
-
-  // Promote an existing HD-derived pool address to a fee wallet. Common use
-  // case: a pool address received customer payments against a now-settled
-  // invoice and the operator wants to use that accumulated balance for
-  // outbound payouts rather than transferring to a separate fee wallet
-  // (which would cost gas and leave a trail of intra-gateway txs).
-  //
-  // Safety: the address is looked up in `address_pool` by (family, address).
-  // The row's `address_index` is reused as the fee wallet's
-  // `derivation_index`, so the gateway can sign without storing any key.
-  // The `deactivatePoolSlot` flag (default true) marks the pool row
-  // inactive so no new invoices get allocated against it; in-flight
-  // invoices that map to this address still resolve correctly via the
-  // `invoice_receive_addresses` join, so late payments land on the right
-  // invoice even after promotion.
-  app.post("/fee-wallets/from-pool-address", async (c) => {
-    const body = (await c.req.json().catch(() => null)) as unknown;
-    if (body === null) {
-      return c.json({ error: { code: "BAD_JSON" } }, 400);
-    }
-    try {
-      const parsed = PromotePoolAddressSchema.parse(body);
-      const family = parsed.family as ChainFamily;
-
-      // 1. Find the pool row. Canonicalize via a WIRED adapter for this
-      //    family (any chainId works — canonicalizeAddress is family-scoped).
-      //    Using `deps.chains` instead of `CHAIN_REGISTRY` avoids looking up
-      //    a chainId the test boot hasn't loaded.
-      const familyAdapter = deps.chains.find((a) => a.family === family);
-      if (!familyAdapter) {
-        return c.json(
-          { error: { code: "UNKNOWN_FAMILY", message: `No adapter loaded for family='${family}'` } },
-          400
-        );
-      }
-      const canonical = familyAdapter.canonicalizeAddress(parsed.address);
-
-      const [poolRow] = await deps.db
-        .select({
-          id: addressPool.id,
-          addressIndex: addressPool.addressIndex,
-          status: addressPool.status
-        })
-        .from(addressPool)
-        .where(and(eq(addressPool.family, family), eq(addressPool.address, canonical)))
-        .limit(1);
-
-      if (!poolRow) {
-        return c.json(
-          {
-            error: {
-              code: "POOL_ADDRESS_NOT_FOUND",
-              message: `No pool row found for family=${family} address=${canonical}. Only HD-derived pool addresses can be promoted; external addresses are not supported.`
-            }
-          },
-          404
-        );
-      }
-
-      // 2. Resolve target chainIds. Same resolution rules as the standard
-      //    register endpoint: explicit chainIds, or EVM fanout, or error
-      //    for non-EVM with neither supplied.
-      let targetChainIds: number[];
-      if (parsed.chainIds !== undefined) {
-        targetChainIds = parsed.chainIds;
-      } else if (family === "evm") {
-        targetChainIds = CHAIN_REGISTRY
-          .filter((e) => e.family === "evm" && e.chainId !== 999)
-          .map((e) => e.chainId as number);
-      } else {
-        return c.json(
-          {
-            error: {
-              code: "MISSING_CHAIN_ID",
-              message: "Pass `chainIds` for non-EVM families — Tron and Solana have separate mainnet/testnet chainIds with no safe default."
-            }
-          },
-          400
-        );
-      }
-
-      for (const cid of targetChainIds) {
-        const a = findChainAdapter(deps, cid);
-        if (a.family !== family) {
-          return c.json(
-            { error: { code: "FAMILY_MISMATCH", message: `chainId ${cid} is ${a.family}, not ${family}` } },
-            400
-          );
-        }
-      }
-
-      // 3. Insert the fee_wallets rows. derivationIndex = pool row's index.
-      for (const cid of targetChainIds) {
-        await registerFeeWallet(deps, {
-          chainId: cid,
-          address: canonical,
-          label: parsed.label,
-          derivationIndex: poolRow.addressIndex
-        });
-      }
-
-      // 4. Optionally deactivate the pool slot. We do NOT delete the row:
-      //    keeping it preserves the audit trail, and the unique index on
-      //    `(family, address)` would block a future re-add anyway.
-      //    The allocator filters on status='available', so flipping to
-      //    'quarantined' stops new allocations. Existing allocations
-      //    (status='allocated') continue to resolve on the invoice side.
-      //
-      // CAS on `status='available'`: between step 1's SELECT and here, the
-      // allocator could have handed this address to an invoice. If so, we
-      // MUST NOT quarantine (quarantining under an active allocation would
-      // leak a receive address into an orphaned state). The CAS returning
-      // zero rows signals the race; we report `poolDeactivated: false` and
-      // let the operator's retry flow after the invoice settles.
-      let poolDeactivated = false;
-      if (parsed.deactivatePoolSlot && poolRow.status === "available") {
-        const result = await deps.db
-          .update(addressPool)
-          .set({ status: "quarantined" })
-          .where(and(eq(addressPool.id, poolRow.id), eq(addressPool.status, "available")))
-          .returning({ id: addressPool.id });
-        poolDeactivated = result.length > 0;
-        if (!poolDeactivated) {
-          deps.logger.warn("fee_wallet.promoted.pool_quarantine_raced", {
-            family,
-            address: canonical,
-            poolId: poolRow.id,
-            note: "Pool row was reallocated between promotion SELECT and quarantine UPDATE. Fee wallet created; operator should retry quarantine after the active invoice settles."
-          });
-        }
-      }
-
-      deps.logger.info("fee_wallet.promoted", {
-        family,
-        address: canonical,
-        fromPoolIndex: poolRow.addressIndex,
-        chainIds: targetChainIds,
-        poolDeactivated
-      });
-
-      return c.json(
-        {
-          feeWallet: {
-            address: canonical,
-            label: parsed.label,
-            family,
-            chainIds: targetChainIds,
-            derivationIndex: poolRow.addressIndex,
-            poolDeactivated
-          }
-        },
-        201
-      );
-    } catch (err) {
-      return renderError(c, err, deps.logger);
-    }
-  });
-
-  // Escape-hatch: register a fee wallet at an operator-supplied HD
-  // derivation index. Used for edge cases (sweep-master promotion, tooling,
-  // recovery of an orphaned address) where the pool-address flow doesn't
-  // apply. The derived address is computed from MASTER_SEED at the supplied
-  // index; no key is accepted or stored.
-  app.post("/fee-wallets/from-index", async (c) => {
-    const body = (await c.req.json().catch(() => null)) as unknown;
-    if (body === null) {
-      return c.json({ error: { code: "BAD_JSON" } }, 400);
-    }
-    try {
-      const parsed = RegisterFeeWalletByIndexSchema.parse(body);
-      const family = parsed.family as ChainFamily;
-
-      let targetChainIds: number[];
-      if (parsed.chainIds !== undefined) {
-        targetChainIds = parsed.chainIds;
-      } else if (family === "evm") {
-        targetChainIds = CHAIN_REGISTRY
-          .filter((e) => e.family === "evm" && e.chainId !== 999)
-          .map((e) => e.chainId as number);
-      } else {
-        return c.json(
-          {
-            error: {
-              code: "MISSING_CHAIN_ID",
-              message: "Pass `chainIds` for non-EVM families — Tron and Solana have separate mainnet/testnet chainIds with no safe default."
-            }
-          },
-          400
-        );
-      }
-
-      const firstAdapter = findChainAdapter(deps, targetChainIds[0]!);
-      if (firstAdapter.family !== family) {
-        return c.json(
-          { error: { code: "FAMILY_MISMATCH", message: `chainId ${targetChainIds[0]} is ${firstAdapter.family}, not ${family}` } },
-          400
-        );
-      }
-      for (const cid of targetChainIds.slice(1)) {
-        const a = findChainAdapter(deps, cid);
-        if (a.family !== family) {
-          return c.json(
-            { error: { code: "FAMILY_MISMATCH", message: `chainId ${cid} is ${a.family}, not ${family}` } },
-            400
-          );
-        }
-      }
-
-      const masterSeed = deps.secrets.getOptional("MASTER_SEED");
-      if (masterSeed === undefined || masterSeed === "") {
-        return c.json(
-          { error: { code: "MISSING_MASTER_SEED", message: "MASTER_SEED not set" } },
-          400
-        );
-      }
-
-      const { address: derived } = firstAdapter.deriveAddress(masterSeed, parsed.derivationIndex);
-      const canonical = firstAdapter.canonicalizeAddress(derived);
-
-      for (const cid of targetChainIds) {
-        await registerFeeWallet(deps, {
-          chainId: cid,
-          address: canonical,
-          label: parsed.label,
-          derivationIndex: parsed.derivationIndex
-        });
-      }
-
-      return c.json(
-        {
-          feeWallet: {
-            address: canonical,
-            label: parsed.label,
-            family,
-            chainIds: targetChainIds,
-            derivationIndex: parsed.derivationIndex
-          }
-        },
-        201
-      );
-    } catch (err) {
-      return renderError(c, err, deps.logger);
-    }
-  });
-
-  // List fee wallets with their reservation state. The `reservedByPayoutId`
-  // field is what operators care about most: a wallet stuck with the same
-  // reservation for longer than the payout's broadcast window is the
-  // classic "payout stuck" signal. Filters (chainId, active, reserved) are
-  // AND-combined so `?reserved=true` on its own surfaces every in-flight
-  // reservation across the fleet in one call.
-  app.get("/fee-wallets", async (c) => {
-    const chainIdParam = c.req.query("chainId");
-    const activeParam = c.req.query("active");
-    const reservedParam = c.req.query("reserved");
-    const includeBalance = c.req.query("includeBalance") === "true";
-    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "100"), 1), 500);
-    const offset = Math.max(Number(c.req.query("offset") ?? "0"), 0);
-
-    const conds: SQL[] = [];
-    if (chainIdParam !== undefined) {
-      const n = Number(chainIdParam);
-      if (!Number.isFinite(n) || n <= 0) {
-        return c.json(
-          { error: { code: "BAD_CHAIN_ID", message: "chainId must be a positive integer" } },
-          400
-        );
-      }
-      conds.push(eq(feeWallets.chainId, n));
-    }
-    if (activeParam === "true") conds.push(eq(feeWallets.active, 1));
-    else if (activeParam === "false") conds.push(eq(feeWallets.active, 0));
-    else if (activeParam !== undefined) {
-      return c.json(
-        { error: { code: "BAD_ACTIVE", message: "active must be 'true' or 'false'" } },
-        400
-      );
-    }
-    if (reservedParam === "true") conds.push(isNotNull(feeWallets.reservedByPayoutId));
-    else if (reservedParam === "false") conds.push(isNull(feeWallets.reservedByPayoutId));
-    else if (reservedParam !== undefined) {
-      return c.json(
-        { error: { code: "BAD_RESERVED", message: "reserved must be 'true' or 'false'" } },
-        400
-      );
-    }
-
-    const base = deps.db
-      .select({
-        id: feeWallets.id,
-        chainId: feeWallets.chainId,
-        address: feeWallets.address,
-        label: feeWallets.label,
-        active: feeWallets.active,
-        reservedByPayoutId: feeWallets.reservedByPayoutId,
-        reservedAt: feeWallets.reservedAt,
-        createdAt: feeWallets.createdAt
-      })
-      .from(feeWallets)
-      .orderBy(asc(feeWallets.chainId), asc(feeWallets.label))
-      .limit(limit)
-      .offset(offset);
-    const rows = conds.length === 0 ? await base : await base.where(and(...conds));
-
-    const baseRows = rows.map((r) => ({
-      id: r.id,
-      chainId: r.chainId,
-      chain: chainSlug(r.chainId as ChainId) ?? null,
-      address: r.address,
-      label: r.label,
-      active: r.active === 1,
-      reservedByPayoutId: r.reservedByPayoutId,
-      reservedAt: r.reservedAt === null ? null : new Date(r.reservedAt).toISOString(),
-      createdAt: new Date(r.createdAt).toISOString()
-    }));
-
-    if (!includeBalance) {
-      return c.json({ feeWallets: baseRows, limit, offset }, 200);
-    }
-
-    // Opt-in path: one RPC per row to fetch the native gas balance. Per-row
-    // failures are swallowed into `nativeBalanceError` so a single dead RPC
-    // doesn't fail the whole list. Native decimals are fixed per family —
-    // EVM=18, Tron=6 (sun), Solana=9 (lamports) — so the frontend can format
-    // without a second registry lookup.
-    const NATIVE_DECIMALS_BY_FAMILY: Record<ChainFamily, number> = {
-      evm: 18,
-      tron: 6,
-      solana: 9
-    };
-
-    type EnrichedRow = (typeof baseRows)[number] & {
-      nativeSymbol: string | null;
-      nativeDecimals: number | null;
-      nativeBalance: string | null;
-      nativeBalanceError: string | null;
-    };
-
-    const enriched = await Promise.all(
-      baseRows.map(async (row): Promise<EnrichedRow> => {
-        let adapter;
-        try {
-          adapter = findChainAdapter(deps, row.chainId as ChainId);
-        } catch {
-          return {
-            ...row,
-            nativeSymbol: null,
-            nativeDecimals: null,
-            nativeBalance: null,
-            nativeBalanceError: "chain_not_wired"
-          };
-        }
-        const sym = adapter.nativeSymbol(row.chainId as ChainId);
-        const decimals = NATIVE_DECIMALS_BY_FAMILY[adapter.family];
-        try {
-          const raw = await adapter.getBalance({
-            chainId: row.chainId as ChainId,
-            address: row.address as Address,
-            token: sym
-          });
-          return {
-            ...row,
-            nativeSymbol: sym as string,
-            nativeDecimals: decimals,
-            nativeBalance: raw as string,
-            nativeBalanceError: null
-          };
-        } catch (err) {
-          deps.logger.warn("admin.fee-wallets.balance_fetch_failed", {
-            chainId: row.chainId,
-            address: row.address,
-            err: err instanceof Error ? err.message : String(err)
-          });
-          return {
-            ...row,
-            nativeSymbol: sym as string,
-            nativeDecimals: decimals,
-            nativeBalance: null,
-            nativeBalanceError: "rpc_error"
-          };
-        }
-      })
-    );
-
-    return c.json({ feeWallets: enriched, limit, offset }, 200);
-  });
 
   app.post("/bootstrap/alchemy-webhooks", async (c) => {
     const authToken = readAlchemyNotifyToken(deps.secrets, deps.logger);
@@ -1401,11 +822,13 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       .from(alchemyWebhookRegistry);
     const webhookChainIds = new Set(webhookRows.map((r) => r.chainId));
 
-    const feeWalletRows = await deps.db
-      .selectDistinct({ chainId: feeWallets.chainId })
-      .from(feeWallets)
-      .where(eq(feeWallets.active, 1));
-    const feeWalletChainIds = new Set(feeWalletRows.map((r) => r.chainId));
+    // Pool addresses are family-scoped; per-chain "has at least one source"
+    // = "the family has at least one pool row AND the chain is wired". We
+    // pre-compute the set of families with any pool address.
+    const poolFamilyRows = await deps.db
+      .selectDistinct({ family: addressPool.family })
+      .from(addressPool);
+    const poolFamilies = new Set(poolFamilyRows.map((r) => r.family));
 
     // Per-family alchemy subscription set, flattened so per-chainId lookups
     // are O(1). Empty when the entrypoint didn't supply Alchemy config.
@@ -1457,7 +880,11 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       if (wiredParam === "true" && !wired) continue;
       if (wiredParam === "false" && wired) continue;
       const hasWebhook = webhookChainIds.has(id);
-      const hasFeeWallet = feeWalletChainIds.has(id);
+      // Per-chain "has at least one funded source" reduces to "the family has
+// any pool address" — the picker treats every pool row as a candidate.
+const hasFeeWallet = poolFamilies.has(
+  (deps.chains.find((a) => a.supportedChainIds.includes(id as ChainId))?.family) ?? "evm"
+);
       const webhooksSupported = ALCHEMY_FAMILY_BY_CHAIN_ID[id] !== undefined;
       const alchemyConfigured = alchemyConfiguredChainIds.has(id);
       out.push({
@@ -1490,7 +917,11 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       if (familyParam !== undefined && family !== familyParam) continue;
       if (wiredParam === "false") continue;
       const hasWebhook = webhookChainIds.has(id);
-      const hasFeeWallet = feeWalletChainIds.has(id);
+      // Per-chain "has at least one funded source" reduces to "the family has
+// any pool address" — the picker treats every pool row as a candidate.
+const hasFeeWallet = poolFamilies.has(
+  (deps.chains.find((a) => a.supportedChainIds.includes(id as ChainId))?.family) ?? "evm"
+);
       const webhooksSupported = ALCHEMY_FAMILY_BY_CHAIN_ID[id] !== undefined;
       const alchemyConfigured = alchemyConfiguredChainIds.has(id);
       out.push({
@@ -2058,10 +1489,12 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         opts.chainId = n as ChainId;
       }
       if (kindParam !== undefined) {
+        // The legacy "fee" kind is silently coerced to "pool" — every HD
+        // address is a payout source now, no separate fee-wallet kind exists.
         if (kindParam !== "pool" && kindParam !== "fee") {
-          return c.json({ error: { code: "BAD_KIND", message: "kind must be 'pool' or 'fee'" } }, 400);
+          return c.json({ error: { code: "BAD_KIND", message: "kind must be 'pool'" } }, 400);
         }
-        opts.kind = kindParam;
+        opts.kind = "pool";
       }
       if (addressParam !== undefined) {
         opts.address = addressParam;

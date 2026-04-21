@@ -274,8 +274,21 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
     confirmationThresholds: parseFinalityOverridesEnv(
       typeof env["FINALITY_OVERRIDES"] === "string" ? env["FINALITY_OVERRIDES"] : undefined
-    )
+    ),
+    ...(parsePayoutConcurrency(env["PAYOUT_CONCURRENCY_PER_CHAIN"]) !== undefined
+      ? { payoutConcurrencyPerChain: parsePayoutConcurrency(env["PAYOUT_CONCURRENCY_PER_CHAIN"])! }
+      : {})
   };
+}
+
+// Parse the env-string into a positive integer. Returns undefined to fall
+// back to the in-code default (16) — keeps Workers' ~50-subrequest budget
+// from blowing up if an operator misconfigures the env.
+function parsePayoutConcurrency(raw: unknown): number | undefined {
+  if (typeof raw !== "string" || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1 || n > 64 || !Number.isInteger(n)) return undefined;
+  return n;
 }
 
 function envNumber(env: WorkerEnv, key: string, fallback: number): number {

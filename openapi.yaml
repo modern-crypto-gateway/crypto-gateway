@@ -258,7 +258,10 @@ paths:
           in: query
           description: |
             Comma-separated list of statuses. Any of:
-            `planned,reserved,submitted,confirmed,failed,canceled`.
+            `planned,reserved,topping-up,submitted,confirmed,failed,canceled`.
+            `topping-up` indicates the source address lacked native gas and
+            the executor is waiting for a sponsor → source top-up tx to
+            confirm before broadcasting the main payout.
           schema: { type: string }
         - name: chainId
           in: query
@@ -273,8 +276,9 @@ paths:
         - name: sourceAddress
           in: query
           description: |
-            Fee wallet that funded the payout. Populated only after reservation,
-            so this filter implicitly excludes `planned` rows.
+            HD address that funded the payout. Populated only after
+            `selectSource` runs, so this filter implicitly excludes `planned`
+            rows.
           schema: { type: string }
         - name: batchId
           in: query
@@ -319,9 +323,12 @@ paths:
       summary: Plan a payout
       description: |
         Creates a payout in `planned` state. A background job
-        (`executeReservedPayouts`) reserves a fee wallet, signs, and
-        broadcasts. Confirmation is surfaced via `payout.*` webhooks or a
-        subsequent GET.
+        (`executeReservedPayouts`) picks an HD source by ledger balance,
+        writes reservations, and either broadcasts directly or — if the
+        source lacks native for gas — first broadcasts a sponsor → source
+        top-up (transitioning the parent through `topping-up`) before
+        broadcasting the main payout. Confirmation is surfaced via
+        `payout.*` webhooks or a subsequent GET.
       requestBody:
         required: true
         content:
@@ -344,12 +351,30 @@ paths:
   /api/v1/payouts/estimate:
     post:
       tags: [payouts]
-      summary: Quote three fee tiers for a hypothetical payout
+      summary: Quote fee tiers + preview the source the executor will pick
       description: |
-        Returns low/medium/high fee quotes WITHOUT planning anything or
-        reserving a fee wallet. Call this BEFORE `POST /api/v1/payouts` to
-        show the operator per-tier cost options; the operator then submits
-        the real payout with their chosen `feeTier` bound.
+        Returns low/medium/high fee quotes AND the HD source address the
+        executor would pick from, all WITHOUT planning anything or writing
+        a reservation. The operator can preview where the payout will come
+        from, see whether a JIT gas top-up is required, and pick a tier
+        before committing the real `POST /api/v1/payouts`.
+
+        Source selection follows the same algorithm as the executor:
+          1. Tier A — pick the richest HD address (by token balance) that
+             ALSO has enough native for gas. No top-up, no `topUp` field.
+          2. Tier B — if no address has both, pick the richest token holder
+             and propose a sponsor with native to cover the gas top-up.
+             `topUp.required=true` is set; `topUp.sponsor` is non-null when
+             a funded sponsor exists, null when none does.
+          3. If no token holder has enough, `source` is null and `warnings`
+             carries `no_source_address_has_sufficient_token_balance`.
+
+        For native payouts (token == chain native), tier B is impossible
+        — gas IS the asset. If the only candidate has balance ≈ amount
+        but not enough headroom for gas, the endpoint throws
+        `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` (400) with a `suggestedAmountRaw`
+        in the error `details` so the frontend can prompt "send X − gas
+        instead?" instead of failing silently.
 
         Tier semantics by chain family:
           - **EVM**: priority-fee multipliers on viem's `estimateFeesPerGas`
@@ -1121,283 +1146,6 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Admin surface not enabled (ADMIN_KEY not set) }
 
-  /admin/fee-wallets:
-    get:
-      tags: [admin]
-      summary: List fee wallets with reservation state
-      description: |
-        Operator view of the fee-wallet fleet. The `reservedByPayoutId` field
-        surfaces the current CAS reservation (set while a payout holds the
-        wallet; released on status transition). Use `?reserved=true` to list
-        every in-flight reservation across every chain — the fastest way to
-        spot payouts stuck in `reserved`/`submitted` status.
-
-        **Native balance enrichment** — pass `?includeBalance=true` to add
-        `nativeSymbol` / `nativeDecimals` / `nativeBalance` to every row. This
-        costs **one RPC per row** (cap response with `limit` accordingly), so
-        it's opt-in. Per-row failures are isolated: a single dead RPC sets
-        `nativeBalance: null` and `nativeBalanceError: "rpc_error"` for that
-        row only, the rest of the page still returns. Chains without a loaded
-        adapter return `nativeBalanceError: "chain_not_wired"`.
-      security:
-        - AdminKey: []
-      parameters:
-        - in: query
-          name: chainId
-          schema: { type: integer, minimum: 1 }
-        - in: query
-          name: active
-          schema: { type: string, enum: [true, false] }
-        - in: query
-          name: reserved
-          schema: { type: string, enum: [true, false] }
-        - in: query
-          name: includeBalance
-          description: |
-            When `true`, fetch the native gas balance per row via one RPC each.
-            Off by default to keep listing cheap.
-          schema: { type: string, enum: [true, false] }
-        - in: query
-          name: limit
-          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
-        - in: query
-          name: offset
-          schema: { type: integer, minimum: 0, default: 0 }
-      responses:
-        "200":
-          description: Fee-wallet page
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  feeWallets:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id: { type: string }
-                        chainId: { type: integer }
-                        chain: { type: [string, "null"], description: "Stable slug like 'arbitrum'; null when chainId isn't in the static registry." }
-                        address: { type: string }
-                        label: { type: string }
-                        active: { type: boolean }
-                        reservedByPayoutId: { type: [string, "null"] }
-                        reservedAt: { type: [string, "null"], format: date-time }
-                        createdAt: { type: string, format: date-time }
-                        nativeSymbol: { type: [string, "null"], description: "Only present when ?includeBalance=true. e.g. 'ETH', 'MATIC', 'TRX', 'SOL'." }
-                        nativeDecimals: { type: [integer, "null"], description: "Only present when ?includeBalance=true. EVM=18, Tron=6, Solana=9." }
-                        nativeBalance: { type: [string, "null"], description: "Only present when ?includeBalance=true. Raw integer string in smallest units (wei/sun/lamports). Divide by 10^nativeDecimals to display." }
-                        nativeBalanceError: { type: [string, "null"], description: "Only present when ?includeBalance=true. Null on success; 'chain_not_wired' or 'rpc_error' on failure." }
-                  limit: { type: integer }
-                  offset: { type: integer }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-    post:
-      tags: [admin]
-      summary: Register a fee wallet — address is HD-derived from MASTER_SEED
-      description: |
-        The gateway derives the fee-wallet's `(address, privateKey)` pair
-        from `MASTER_SEED` at a deterministic index keyed by `(family, label)`.
-        No private key is accepted over the admin API — fund the returned
-        derived address out-of-band. The same label always derives to the
-        same address across redeploys.
-
-        **EVM family fanout:** when `family: "evm"` and neither `chainId` nor
-        `chainIds` is supplied, one row is created per wired EVM chain in
-        `CHAIN_REGISTRY` (the synthetic dev chain 999 is excluded). The
-        derived address is IDENTICAL across those rows because EVM
-        `deriveAddress` ignores chainId. For Tron/Solana, supply `chainId`
-        or `chainIds` explicitly (mainnet vs testnet).
-
-        Schema is strict — unknown fields are rejected.
-      security:
-        - AdminKey: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [label, family]
-              properties:
-                chainId:
-                  type: integer
-                  description: Single-chain registration (legacy). Mutually exclusive with `chainIds`.
-                chainIds:
-                  type: array
-                  items: { type: integer }
-                  minItems: 1
-                  maxItems: 20
-                  description: Multi-chain fanout — one row per chainId, same address. Mutually exclusive with `chainId`.
-                label:
-                  type: string
-                  maxLength: 64
-                  description: Scope key (e.g. "hot-1", "cold-archive"). Hashed into a BIP32 index.
-                family:
-                  type: string
-                  enum: [evm, tron, solana]
-      responses:
-        "201":
-          description: Fee wallet registered; fund the returned address externally.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  feeWallet:
-                    type: object
-                    properties:
-                      address: { type: string, description: Derived address the operator must fund. }
-                      label: { type: string }
-                      family: { type: string, enum: [evm, tron, solana] }
-                      chainIds:
-                        type: array
-                        items: { type: integer }
-                        description: Every chainId the address was registered on.
-        "400":
-          description: Family mismatch, MASTER_SEED missing, or validation error
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-
-  /admin/fee-wallets/from-pool-address:
-    post:
-      tags: [admin]
-      summary: Promote an HD-derived pool address to a fee wallet (no key storage)
-      description: |
-        Common use: a pool address received invoice payments (now settled),
-        and the operator wants to use its accumulated balance for outbound
-        payouts WITHOUT first transferring funds to a separate fee wallet.
-        The gateway already knows the private key (HD-derived at the pool
-        row's `address_index`), so no key is stored at rest — the fee-wallet
-        row just carries the pool's `derivation_index`.
-
-        **Race window:** by default (`deactivatePoolSlot: true`) the pool
-        row is CAS-quarantined so no new invoices are allocated against it.
-        In-flight invoices still resolve via `invoice_receive_addresses` —
-        late payments credit the original invoice correctly. The CAS on
-        `status='available'` prevents race conditions with the allocator;
-        if the pool row was already reallocated between SELECT and UPDATE,
-        `poolDeactivated: false` is returned and the operator retries after
-        the active invoice settles.
-      security:
-        - AdminKey: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [family, address, label]
-              properties:
-                family: { type: string, enum: [evm, tron, solana] }
-                address:
-                  type: string
-                  description: Canonical address (must exist as a row in `address_pool`).
-                label: { type: string, maxLength: 64 }
-                chainIds:
-                  type: array
-                  items: { type: integer }
-                  minItems: 1
-                  maxItems: 20
-                  description: Omit for EVM fanout; required for Tron/Solana.
-                deactivatePoolSlot:
-                  type: boolean
-                  default: true
-      responses:
-        "201":
-          description: Promoted. Operator now owns the address as a fee wallet.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  feeWallet:
-                    type: object
-                    properties:
-                      address: { type: string }
-                      label: { type: string }
-                      family: { type: string }
-                      chainIds:
-                        type: array
-                        items: { type: integer }
-                      derivationIndex:
-                        type: integer
-                        description: |
-                          Pool's `address_index`. Signer uses this directly
-                          at execution time; operator reference only.
-                      poolDeactivated: { type: boolean }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404":
-          description: No pool row matches `(family, address)`
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-
-  /admin/fee-wallets/from-index:
-    post:
-      tags: [admin]
-      summary: Register a fee wallet at an explicit HD derivation index (escape hatch)
-      description: |
-        Advanced endpoint for registering at an operator-supplied HD index.
-        Used for sweep-master promotion, debugging, and recovery of
-        orphaned addresses.
-
-        **Index range is RESTRICTED** to the fee-wallet region
-        `[0x40000000, 0x7EFFFFFF]`:
-          - `< 0x40000000` (pool region): rejected — would share a private
-            key with an invoice receive address. Use `/from-pool-address`
-            instead (it validates the pool row exists).
-          - `>= 0x7F000000` (sweep-master region): rejected — would shadow
-            the per-family sweep master.
-
-        The derived address is computed from `MASTER_SEED` at the supplied
-        index; no key is accepted or stored.
-      security:
-        - AdminKey: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [family, derivationIndex, label]
-              properties:
-                family: { type: string, enum: [evm, tron, solana] }
-                derivationIndex:
-                  type: integer
-                  minimum: 1073741824 # 0x40000000
-                  maximum: 2130706431 # 0x7EFFFFFF
-                  description: HD index in the fee-wallet region only.
-                label: { type: string, maxLength: 64 }
-                chainIds:
-                  type: array
-                  items: { type: integer }
-                  minItems: 1
-                  maxItems: 20
-      responses:
-        "201":
-          description: Fee wallet registered at the supplied index.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  feeWallet:
-                    type: object
-                    properties:
-                      address: { type: string }
-                      label: { type: string }
-                      family: { type: string }
-                      chainIds:
-                        type: array
-                        items: { type: integer }
-                      derivationIndex: { type: integer }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
   /admin/pool/initialize:
     post:
       tags: [admin]
@@ -1819,16 +1567,15 @@ paths:
 
         Computes balances from recorded activity only — no RPC traffic:
 
-          * pool address balance = SUM(`transactions.amountRaw` WHERE
-            `toAddress = addr` AND `status = 'confirmed'`)
-          * fee wallet balance = SUM(confirmed transactions in) −
-            SUM(confirmed `payouts.amountRaw` FROM `sourceAddress = addr`),
+          * spendable = SUM(`transactions.amountRaw` confirmed inbound)
+            − SUM(`payouts.amountRaw` confirmed outbound from this address)
+            − SUM(active `payout_reservations.amountRaw` for this address),
             clamped at 0.
 
         Returns in ~50ms regardless of pool size. Addresses with no
         recorded activity are omitted. **Caveat:** off-system movements
-        are invisible (external fee-wallet topups, dust sent to
-        unsubscribed pool addresses). Use `?live=true` when reconciling.
+        are invisible (rare on chains with Alchemy webhooks; dust sent to
+        unsubscribed addresses). Use `?live=true` when reconciling.
 
         ### Mode — `source="rpc"` (opts-in via `?live=true`)
 
@@ -1863,8 +1610,11 @@ paths:
           description: Narrow to one chainId. Implicitly narrows family.
         - in: query
           name: kind
-          schema: { type: string, enum: [pool, fee] }
-          description: Narrow to one address kind. Default returns both.
+          schema: { type: string, enum: [pool] }
+          description: |
+            Address kind filter. Only `pool` exists today — every HD address
+            is a payout source. The legacy `fee` value is silently coerced
+            to `pool` for backward compatibility with old clients.
         - in: query
           name: address
           schema: { type: string }
@@ -2374,23 +2124,6 @@ components:
             has no effect on broadcast.
             When omitted, the chain's default (viem's default on EVM; no
             priority fee on Solana) applies.
-        allowMultiSource:
-          type: boolean
-          default: false
-          description: |
-            Opt-in fallback: if no single fee wallet has enough token balance,
-            split the payout across multiple wallets (N parallel on-chain txs
-            from N different wallets, all to the same destination). Without
-            this flag, an underfunded single-source attempt defers to the
-            next executor tick with `NO_FEE_WALLET_FUNDED`; with the flag,
-            the executor greedily picks up to 8 wallets by balance
-            descending until cumulative balance clears the payout amount.
-            The per-leg tx hashes end up in `txHashes` on the response row.
-            Hard-fails with `INSUFFICIENT_TOTAL_BALANCE` (503) when even the
-            sum of every funded wallet falls short. On partial broadcast
-            failure (some legs land on-chain, some throw), the payout ends
-            in `failed` but `txHashes` preserves the successful legs for
-            manual reconciliation — do NOT auto-retry those.
         batchId:
           type: string
           minLength: 1
@@ -2423,13 +2156,12 @@ components:
     PayoutFeeEstimate:
       type: object
       description: |
-        Fee-tier quote for a hypothetical payout. Returned by
-        `POST /api/v1/payouts/estimate`. Each tier carries the total native
-        cost (signature base + priority component, in the chain's smallest
-        unit) plus a best-effort USD conversion via the price oracle.
-        `tieringSupported=false` → the three tiers are identical (Tron, and
-        Solana when the RPC has no recent prioritization samples).
-      required: [amountRaw, tiers]
+        Fee-tier quote + source preview for a hypothetical payout. Returned
+        by `POST /api/v1/payouts/estimate`. The executor's `selectSource`
+        runs in dry-run mode here so the response shows EXACTLY what would
+        happen on a real plan: which HD address would fund the payout,
+        whether a JIT gas top-up is needed, and what alternatives exist.
+      required: [amountRaw, tiers, source, alternatives, warnings]
       properties:
         amountRaw:
           type: string
@@ -2442,12 +2174,63 @@ components:
           properties:
             tieringSupported: { type: boolean }
             nativeSymbol: { type: string, description: "ETH / POL / BNB / AVAX / TRX / SOL." }
-            low:
-              $ref: "#/components/schemas/PayoutFeeQuoteTier"
-            medium:
-              $ref: "#/components/schemas/PayoutFeeQuoteTier"
-            high:
-              $ref: "#/components/schemas/PayoutFeeQuoteTier"
+            low: { $ref: "#/components/schemas/PayoutFeeQuoteTier" }
+            medium: { $ref: "#/components/schemas/PayoutFeeQuoteTier" }
+            high: { $ref: "#/components/schemas/PayoutFeeQuoteTier" }
+        source:
+          type: [object, "null"]
+          description: |
+            HD address the executor would pick. Null when no candidate has
+            enough token balance (see `warnings`).
+          required: [address, derivationIndex, tokenBalance, nativeBalance]
+          properties:
+            address: { type: string }
+            derivationIndex: { type: integer }
+            tokenBalance: { type: string, description: "Spendable token balance (smallest units, ledger-derived)." }
+            nativeBalance: { type: string }
+        topUp:
+          type: object
+          description: |
+            Set ONLY when the chosen source lacks native gas and a separate
+            sponsor address must top it up before the main tx. Omitted
+            entirely when the source has both token and gas. `sponsor: null`
+            means a token-holding source exists but no funded sponsor —
+            payout will fail with `NO_GAS_SPONSOR_AVAILABLE` if planned.
+          required: [required, sponsor, amountRaw]
+          properties:
+            required: { type: boolean, enum: [true] }
+            sponsor:
+              type: [object, "null"]
+              required: [address, nativeBalance]
+              properties:
+                address: { type: string }
+                nativeBalance: { type: string }
+            amountRaw: { type: string, description: "Native amount the sponsor would send to the source (gas gap + 20% cushion)." }
+        alternatives:
+          type: array
+          maxItems: 4
+          description: |
+            Next-best HD source candidates by token balance descending,
+            for operator visibility. The picker would only fall back to
+            these on race or when the chosen `source` has insufficient
+            spendable at insert time.
+          items:
+            type: object
+            required: [address, derivationIndex, tokenBalance, nativeBalance]
+            properties:
+              address: { type: string }
+              derivationIndex: { type: integer }
+              tokenBalance: { type: string }
+              nativeBalance: { type: string }
+        warnings:
+          type: array
+          description: |
+            Non-fatal operator-facing notices. Known codes:
+              - `no_source_address_has_sufficient_token_balance` — `source: null`
+              - `no_gas_sponsor_available` — `topUp.sponsor: null`
+              - `fee_quote_unavailable` — chain RPC failed during tier quoting
+              - `max_amount_exceeds_net_spendable` — companion to the 400 error
+          items: { type: string }
 
     PayoutFeeQuoteTier:
       type: object
@@ -2575,21 +2358,19 @@ components:
     AddressBalance:
       type: object
       required: [address, kind, totalUsd, tokens]
+      description: |
+        Every gateway-controlled HD address. The legacy "fee" kind has been
+        removed — `address_pool` is now the single source of payout-source
+        addresses, and the picker treats every pool row as a candidate.
       properties:
         address: { type: string }
-        kind: { type: string, enum: [pool, fee] }
+        kind: { type: string, enum: [pool] }
         poolStatus:
           type: string
           enum: [available, allocated, quarantined]
-          description: Present only on `kind=pool` rows.
         poolAllocatedToInvoiceId:
           type: [string, "null"]
-          description: |
-            Invoice this pool address is currently allocated to (when
-            `poolStatus=allocated`). Present only on `kind=pool` rows.
-        feeLabel:
-          type: string
-          description: Operator label of the fee wallet (e.g. `hot-1`). Present only on `kind=fee` rows.
+          description: Invoice this address is currently allocated to (when `poolStatus=allocated`).
         totalUsd: { type: string }
         tokens:
           type: array
@@ -2619,9 +2400,27 @@ components:
       properties:
         id: { type: string, format: uuid }
         merchantId: { type: string, format: uuid }
+        kind:
+          type: string
+          enum: [standard, gas_top_up]
+          description: |
+            `standard` = merchant-facing payout. `gas_top_up` = internal
+            sibling row inserted when the source needed JIT gas top-up;
+            references the parent via `parentPayoutId`. Merchant-facing
+            list endpoints filter to `standard` by default.
+        parentPayoutId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Set on `gas_top_up` rows to the standard payout that triggered
+            the top-up. Always null on standard rows.
         status:
           type: string
-          enum: [planned, reserved, submitted, confirmed, failed, canceled]
+          enum: [planned, reserved, topping-up, submitted, confirmed, failed, canceled]
+          description: |
+            `topping-up` indicates the source lacked native gas and the
+            executor is waiting for the sponsor → source top-up tx
+            (`topUpTxHash`) to confirm before broadcasting the main payout.
         chainId: { type: integer }
         token: { type: string }
         amountRaw: { type: string }
@@ -2657,31 +2456,26 @@ components:
           description: |
             Grouping id for mass-payout batches. Same UUID across every row
             of a `POST /payouts/batch` call; null for single-create payouts.
-        allowMultiSource:
-          type: boolean
-          description: |
-            Echo of the opt-in flag. When true AND single-source selection
-            failed at execution time, the executor broadcasts N parallel
-            txs from N distinct wallets; their hashes land in `txHashes`.
-        sourceAddresses:
-          type: [array, "null"]
-          items: { type: string }
-          description: |
-            Multi-source only — the ordered list of source wallets used
-            (first entry also appears in `sourceAddress` for backward
-            compat). Null for single-source payouts.
-        txHashes:
-          type: [array, "null"]
-          items: { type: string }
-          description: |
-            Multi-source only — the ordered list of broadcast tx hashes
-            (first entry also appears in `txHash` for backward compat).
-            On partial broadcast failure the successful legs ARE preserved
-            here even though the payout status is `failed` — operator uses
-            this to reconcile orphan on-chain txs. Null for single-source.
         destinationAddress: { type: string }
-        sourceAddress: { type: [string, "null"] }
+        sourceAddress:
+          type: [string, "null"]
+          description: |
+            HD address that funded the payout. Picked by `selectSource`
+            from `address_pool` (richest token holder first). Null while
+            the payout is still in `planned`.
         txHash: { type: [string, "null"] }
+        topUpTxHash:
+          type: [string, "null"]
+          description: |
+            Hash of the sponsor → source gas top-up tx, when one was
+            needed. Stays set after the main tx confirms — the parent row
+            carries both hashes for audit. Null when no top-up was required.
+        topUpSponsorAddress:
+          type: [string, "null"]
+          description: |
+            HD address that sent the top-up. The actual ledger debit is
+            captured by the sibling `gas_top_up` payout row referenced via
+            `parentPayoutId` lookups.
         feeEstimateNative: { type: [string, "null"] }
         lastError: { type: [string, "null"] }
         webhookUrl:

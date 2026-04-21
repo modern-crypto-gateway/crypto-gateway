@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { payouts } from "../../db/schema.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
+import { seedFundedPoolAddress } from "../helpers/seed-source.js";
+
+const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
 const GOOD_DEST = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -13,6 +16,19 @@ describe("POST /api/v1/payouts/batch", () => {
   beforeEach(async () => {
     booted = await bootTestApp();
     apiKey = booted.apiKeys[MERCHANT_ID]!;
+    // planPayout (and therefore planPayoutBatch) requires a funded HD
+    // source for each row. Seed one with comfortably more than 100 rows'
+    // worth of DEV so the batch tests don't hit INSUFFICIENT_BALANCE_ANY_SOURCE.
+    const adapter = booted.deps.chains.find((c) => c.family === "evm")!;
+    const idx = 700_001;
+    const { address } = adapter.deriveAddress(TEST_MASTER_SEED, idx);
+    await seedFundedPoolAddress(booted, {
+      chainId: 999,
+      family: "evm",
+      address: adapter.canonicalizeAddress(address),
+      derivationIndex: idx,
+      balances: { DEV: "1000000000000000000" }
+    });
   });
 
   afterEach(async () => {

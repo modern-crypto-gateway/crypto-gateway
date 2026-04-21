@@ -1,23 +1,24 @@
-import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { Address, ChainFamily, ChainId } from "../types/chain.js";
 import { formatRawAmount } from "../types/money.js";
 import type { TokenSymbol } from "../types/token.js";
 import { TOKEN_REGISTRY } from "../types/token-registry.js";
-import { addressPool, feeWallets, payouts, transactions } from "../../db/schema.js";
+import { addressPool, payoutReservations, payouts, transactions } from "../../db/schema.js";
 
 // Admin balance snapshot.
 //
+// Every gateway-controlled address lives in `address_pool`. The same row
+// can serve a customer-paid invoice (inbound) AND back outbound payouts
+// (the picker treats every pool row as a candidate source). Spendable
+// balance = confirmed inbound − confirmed outbound − active reservations,
+// per (chainId, address, token).
+//
 // Two modes:
 //
-//   source="db" (default): balances are computed from recorded on-chain
-//     activity. For each pool/fee address we sum confirmed `transactions`
-//     credits by (address, chainId, token) and — for fee wallets only —
-//     subtract confirmed `payouts` debits. No RPC traffic; one Alchemy /
-//     Tron / Solana call per address × chain saved. Returns in ~50ms. Caveat:
-//     off-system movements are invisible (manual topups of fee wallets,
-//     dust to unsubscribed addresses). Sufficient for dashboards; use
-//     source="rpc" when reconciling.
+//   source="db" (default): pure ledger arithmetic. No RPC traffic; runs
+//     in ~50ms. Caveat: deposits the watcher missed are invisible — use
+//     source="rpc" to reconcile.
 //
 //   source="rpc" (opts.live=true): asks every wired chain adapter for the
 //     live on-chain balance of every (address, chainId) pair. Authoritative,
@@ -25,10 +26,9 @@ import { addressPool, feeWallets, payouts, transactions } from "../../db/schema.
 //     cached 60s at the HTTP layer.
 //
 // Tree shape is identical across modes: family → chainId → address → tokens,
-// with per-chain and per-family USD roll-ups. The top-level `source` field
-// tells the caller which math produced the numbers.
+// with per-chain and per-family USD roll-ups.
 
-export type AddressKind = "pool" | "fee";
+export type AddressKind = "pool";
 
 export interface TokenBalance {
   token: TokenSymbol;
@@ -45,11 +45,8 @@ export interface TokenBalance {
 export interface AddressBalance {
   address: string;
   kind: AddressKind;
-  // Pool-only metadata, omitted on fee-wallet rows.
   poolStatus?: "available" | "allocated" | "quarantined";
   poolAllocatedToInvoiceId?: string | null;
-  // Fee-wallet-only metadata, omitted on pool rows.
-  feeLabel?: string;
   totalUsd: string;
   tokens: readonly TokenBalance[];
   // Set (rpc mode only) when getAccountBalances failed for this address —
@@ -90,7 +87,8 @@ export interface BalanceSnapshotOptions {
   family?: ChainFamily;
   // Narrow to a single chainId. Implicitly narrows family too.
   chainId?: ChainId;
-  // Narrow to one address kind. Default: both "pool" and "fee".
+  // Narrow to one address kind. Currently only "pool" exists; option is
+  // kept for API stability with prior callers.
   kind?: AddressKind;
   // Narrow to a single address. Useful when an operator wants to spot-check
   // one row without paying the full sweep cost.
@@ -117,19 +115,11 @@ async function computeBalanceSnapshotDb(
   deps: AppDeps,
   opts: BalanceSnapshotOptions
 ): Promise<BalanceSnapshot> {
-  const wantPool = opts.kind === undefined || opts.kind === "pool";
-  const wantFee = opts.kind === undefined || opts.kind === "fee";
-
-  // 1. Load pool + fee-wallet rows (same filters as the rpc path, minus the
-  //    cross-product with chainIds — chainIds come from the transactions
-  //    table instead).
-  const poolRowsPromise = wantPool ? loadPoolRows(deps, opts) : Promise.resolve([]);
-  const feeRowsPromise = wantFee ? loadFeeRows(deps, opts) : Promise.resolve([]);
-  const [poolRows, feeRows] = await Promise.all([poolRowsPromise, feeRowsPromise]);
-
+  // 1. Load pool rows. Every gateway-controlled HD address lives here; the
+  //    snapshot has no other source.
+  const poolRows = await loadPoolRows(deps, opts);
   const poolAddressSet = new Set(poolRows.map((r) => r.address));
-  const feeAddressKeys = new Set(feeRows.map((r) => key3(r.address, r.chainId)));
-  const allAddresses = [...new Set([...poolRows.map((r) => r.address), ...feeRows.map((r) => r.address)])];
+  const allAddresses = poolRows.map((r) => r.address);
 
   if (allAddresses.length === 0) {
     return {
@@ -140,10 +130,7 @@ async function computeBalanceSnapshotDb(
     };
   }
 
-  // 2. Fetch confirmed incoming transfers for our addresses and aggregate
-  //    in JS with BigInt. We deliberately don't use SQL SUM here: amount_raw
-  //    is TEXT (uint256 values would overflow INT64 and lose precision when
-  //    SQLite coerces TEXT → REAL). See schema comment on TEXT amounts.
+  // 2. Confirmed inbound credits, scoped to our addresses.
   const creditConds: SQL[] = [
     eq(transactions.status, "confirmed"),
     inArray(transactions.toAddress, allAddresses)
@@ -159,35 +146,45 @@ async function computeBalanceSnapshotDb(
     .from(transactions)
     .where(and(...creditConds));
 
-  // 3. Same treatment for confirmed outgoing payouts: fetch, sum in JS.
-  //    Only applies to fee wallets (pool addresses never appear as a payout
-  //    source). Skip the query entirely when there are no fee wallets in
-  //    scope.
+  // 3. Confirmed outbound payouts. Every pool address is a candidate
+  //    source, so we apply this debit to ANY pool row that matches.
   const debitConds: SQL[] = [
     eq(payouts.status, "confirmed"),
     sql`${payouts.sourceAddress} IS NOT NULL`
   ];
   if (opts.chainId !== undefined) debitConds.push(eq(payouts.chainId, opts.chainId));
-  const debitRows = feeRows.length > 0
-    ? await deps.db
-        .select({
-          address: payouts.sourceAddress,
-          chainId: payouts.chainId,
-          token: payouts.token,
-          amountRaw: payouts.amountRaw
-        })
-        .from(payouts)
-        .where(and(...debitConds))
-    : [];
+  const debitRows = await deps.db
+    .select({
+      address: payouts.sourceAddress,
+      chainId: payouts.chainId,
+      token: payouts.token,
+      amountRaw: payouts.amountRaw
+    })
+    .from(payouts)
+    .where(and(...debitConds));
 
-  // 4. Fold credits + debits into per-(address, chainId) buckets. Pool rows
-  //    use credits only; fee rows use credits − debits clamped at 0 (a
-  //    negative result means the fee wallet was topped up externally and
-  //    we don't have the deposit recorded — displayable as "unknown, use
-  //    ?live=true" via clamp).
+  // 4. Active reservations (in-flight debits the operator should see as
+  //    "spoken for, not available to spend"). Same shape as debits.
+  const resConds: SQL[] = [
+    isNull(payoutReservations.releasedAt),
+    inArray(payoutReservations.address, allAddresses)
+  ];
+  if (opts.chainId !== undefined) resConds.push(eq(payoutReservations.chainId, opts.chainId));
+  const reservationRows = await deps.db
+    .select({
+      address: payoutReservations.address,
+      chainId: payoutReservations.chainId,
+      token: payoutReservations.token,
+      amountRaw: payoutReservations.amountRaw
+    })
+    .from(payoutReservations)
+    .where(and(...resConds));
+
+  // 5. Fold credits, debits, and reservations into per-(address, chainId)
+  //    buckets. Negative results clamp to 0 — a negative would mean the
+  //    ledger missed a top-up; flag it via the rpc=true path on demand.
   type Bucket = { token: TokenSymbol; amountRaw: bigint };
   const balances = new Map<string, Map<number, Bucket[]>>();
-  // address → chainId → tokens[]
   const ensure = (addr: string, chainId: number) => {
     let byChain = balances.get(addr);
     if (!byChain) {
@@ -202,13 +199,8 @@ async function computeBalanceSnapshotDb(
     return list;
   };
 
-  // Credits: pool addresses get them outright; fee wallets only if we have
-  // a matching (address, chainId) row (prevents pool-credited transactions
-  // from leaking onto fee wallets that happen to share no chainId scope).
   for (const r of creditRows) {
-    const isPool = poolAddressSet.has(r.address);
-    const isFee = feeAddressKeys.has(key3(r.address, r.chainId));
-    if (!isPool && !isFee) continue;
+    if (!poolAddressSet.has(r.address)) continue;
     if (opts.chainId !== undefined && opts.chainId !== r.chainId) continue;
     const amount = BigInt(r.amountRaw);
     if (amount <= 0n) continue;
@@ -218,10 +210,9 @@ async function computeBalanceSnapshotDb(
     else list.push({ token: r.token as TokenSymbol, amountRaw: amount });
   }
 
-  // Debits: subtract from fee rows only.
   for (const r of debitRows) {
     if (r.address === null) continue;
-    if (!feeAddressKeys.has(key3(r.address, r.chainId))) continue;
+    if (!poolAddressSet.has(r.address)) continue;
     if (opts.chainId !== undefined && opts.chainId !== r.chainId) continue;
     const amount = BigInt(r.amountRaw);
     if (amount <= 0n) continue;
@@ -231,15 +222,21 @@ async function computeBalanceSnapshotDb(
       existing.amountRaw -= amount;
       if (existing.amountRaw < 0n) existing.amountRaw = 0n;
     }
-    // No existing credit means we've paid out funds we never saw arrive —
-    // external topup. Showing it as a negative row is misleading; omit.
   }
 
-  // 5. Shape into the family → chain → address tree. chainId → family
-  //    comes from addressPool rows for pool entries, and from adapter
-  //    lookup for fee wallets.
+  for (const r of reservationRows) {
+    if (opts.chainId !== undefined && opts.chainId !== r.chainId) continue;
+    const amount = BigInt(r.amountRaw);
+    if (amount <= 0n) continue;
+    const list = ensure(r.address, r.chainId);
+    const existing = list.find((e) => e.token === r.token);
+    if (existing) {
+      existing.amountRaw -= amount;
+      if (existing.amountRaw < 0n) existing.amountRaw = 0n;
+    }
+  }
+
   const familyMap = new Map<ChainFamily, Map<ChainId, ChainAggregator>>();
-  const poolFamilyByAddr = new Map(poolRows.map((r) => [r.address, r.family] as const));
 
   const allSymbols = new Set<TokenSymbol>();
   for (const [, byChain] of balances) {
@@ -254,7 +251,7 @@ async function computeBalanceSnapshotDb(
   for (const poolRow of poolRows) {
     if (opts.family !== undefined && poolRow.family !== opts.family) continue;
     const byChain = balances.get(poolRow.address);
-    if (!byChain) continue; // pristine — skip in db mode
+    if (!byChain) continue;
     for (const [chainId, list] of byChain) {
       if (opts.chainId !== undefined && opts.chainId !== chainId) continue;
       if (list.length === 0) continue;
@@ -268,24 +265,80 @@ async function computeBalanceSnapshotDb(
     }
   }
 
-  for (const feeRow of feeRows) {
-    const family = familyForChain(deps, feeRow.chainId);
-    if (family === null) continue;
-    if (opts.family !== undefined && family !== opts.family) continue;
-    const byChain = balances.get(feeRow.address);
-    const list = byChain?.get(feeRow.chainId);
-    if (!list || list.length === 0) continue;
-    if (opts.chainId !== undefined && opts.chainId !== feeRow.chainId) continue;
-    const agg = ensureAggregator(familyMap, family, feeRow.chainId as ChainId);
-    pushAddressRow(agg, {
-      address: feeRow.address,
-      kind: "fee",
-      feeLabel: feeRow.label
-    }, list, feeRow.chainId as ChainId, usdRates);
-  }
-
   return materialize(familyMap, deps.clock.now().toISOString(), "db");
 }
+
+// Spendable balance for a single (chainId, address, token) tuple.
+// Used by the payout source picker.
+//
+// Computation: confirmed inbound − confirmed outbound − active reservations.
+// Negative results clamp to zero (a negative would mean we somehow paid out
+// funds we never observed arriving; treat as zero spendable until reconciled).
+//
+// Accepts EITHER `deps` (the common case) OR a raw `Db`/transaction handle.
+// The transaction overload is what `selectSource`/`planPayout` use to keep
+// the read+insert atomic under a `BEGIN IMMEDIATE` lock — without it, two
+// parallel plans on the same source can both observe "fits" and both insert,
+// over-reserving.
+export async function computeSpendable(
+  depsOrDb: AppDeps | SpendableQueryRunner,
+  args: { chainId: number; address: string; token: string }
+): Promise<bigint> {
+  const db: SpendableQueryRunner =
+    "db" in depsOrDb ? (depsOrDb as AppDeps).db : depsOrDb;
+  const { chainId, address, token } = args;
+
+  const [creditRowsRaw, debitRowsRaw, resRowsRaw] = await Promise.all([
+    db
+      .select({ amountRaw: transactions.amountRaw })
+      .from(transactions)
+      .where(
+        and(
+          eq(transactions.status, "confirmed"),
+          eq(transactions.toAddress, address),
+          eq(transactions.chainId, chainId),
+          eq(transactions.token, token)
+        )
+      ),
+    db
+      .select({ amountRaw: payouts.amountRaw })
+      .from(payouts)
+      .where(
+        and(
+          eq(payouts.status, "confirmed"),
+          eq(payouts.chainId, chainId),
+          eq(payouts.token, token),
+          sql`${payouts.sourceAddress} = ${address}`
+        )
+      ),
+    db
+      .select({ amountRaw: payoutReservations.amountRaw })
+      .from(payoutReservations)
+      .where(
+        and(
+          isNull(payoutReservations.releasedAt),
+          eq(payoutReservations.chainId, chainId),
+          eq(payoutReservations.address, address),
+          eq(payoutReservations.token, token)
+        )
+      )
+  ]);
+
+  let total = 0n;
+  for (const r of creditRowsRaw) total += BigInt(r.amountRaw);
+  for (const r of debitRowsRaw) total -= BigInt(r.amountRaw);
+  for (const r of resRowsRaw) total -= BigInt(r.amountRaw);
+  return total < 0n ? 0n : total;
+}
+
+// Minimal subset of the drizzle Db / transaction surface that
+// `computeSpendable` actually uses. Both `LibSQLDatabase` and the transaction
+// handle returned by `db.transaction()` satisfy this — we type-narrow rather
+// than name-import the transaction type so this stays portable across
+// drizzle-orm minor versions.
+type SpendableQueryRunner = {
+  select: AppDeps["db"]["select"];
+};
 
 async function loadPoolRows(
   deps: AppDeps,
@@ -310,27 +363,6 @@ async function loadPoolRows(
   return conds.length === 0 ? await base : await base.where(and(...conds));
 }
 
-async function loadFeeRows(
-  deps: AppDeps,
-  opts: BalanceSnapshotOptions
-): Promise<readonly { chainId: number; address: string; label: string }[]> {
-  const conds: SQL[] = [sql`${feeWallets.active} = 1`];
-  if (opts.chainId !== undefined) conds.push(eq(feeWallets.chainId, opts.chainId));
-  if (opts.address !== undefined) conds.push(eq(feeWallets.address, opts.address));
-  return await deps.db
-    .select({ chainId: feeWallets.chainId, address: feeWallets.address, label: feeWallets.label })
-    .from(feeWallets)
-    .where(and(...conds));
-}
-
-function familyForChain(deps: AppDeps, chainId: number): ChainFamily | null {
-  const adapter = deps.chains.find((a) => a.supportedChainIds.includes(chainId as ChainId));
-  return adapter ? adapter.family : null;
-}
-
-function key3(address: string, chainId: number): string {
-  return `${address}::${chainId}`;
-}
 
 // ---- RPC path (live reconciliation) ----
 
@@ -395,19 +427,14 @@ async function computeBalanceSnapshotRpc(
     const agg = ensureAggregator(familyMap, target.family, target.chainId);
     if (balances === null) {
       agg.errors += 1;
-      // Still emit the row so the operator can see WHICH address failed
-      // without cross-referencing logs. `tokens: []` + `error: <message>`
-      // distinguishes "un-reconciled" from "really zero".
       pushAddressRow(
         agg,
-        target.kind === "pool"
-          ? {
-              address: target.address,
-              kind: "pool",
-              poolStatus: target.poolStatus,
-              poolAllocatedToInvoiceId: target.poolAllocatedToInvoiceId ?? null
-            }
-          : { address: target.address, kind: "fee", feeLabel: target.feeLabel },
+        {
+          address: target.address,
+          kind: "pool",
+          poolStatus: target.poolStatus,
+          poolAllocatedToInvoiceId: target.poolAllocatedToInvoiceId ?? null
+        },
         [],
         target.chainId,
         usdRates,
@@ -421,14 +448,12 @@ async function computeBalanceSnapshotRpc(
     }));
     pushAddressRow(
       agg,
-      target.kind === "pool"
-        ? {
-            address: target.address,
-            kind: "pool",
-            poolStatus: target.poolStatus,
-            poolAllocatedToInvoiceId: target.poolAllocatedToInvoiceId ?? null
-          }
-        : { address: target.address, kind: "fee", feeLabel: target.feeLabel },
+      {
+        address: target.address,
+        kind: "pool",
+        poolStatus: target.poolStatus,
+        poolAllocatedToInvoiceId: target.poolAllocatedToInvoiceId ?? null
+      },
       tokens,
       target.chainId,
       usdRates
@@ -440,22 +465,14 @@ async function computeBalanceSnapshotRpc(
 
 // ---- Shared aggregation ----
 
-type SnapshotTarget =
-  | {
-      family: ChainFamily;
-      chainId: ChainId;
-      address: string;
-      kind: "pool";
-      poolStatus: "available" | "allocated" | "quarantined";
-      poolAllocatedToInvoiceId: string | null;
-    }
-  | {
-      family: ChainFamily;
-      chainId: ChainId;
-      address: string;
-      kind: "fee";
-      feeLabel: string;
-    };
+type SnapshotTarget = {
+  family: ChainFamily;
+  chainId: ChainId;
+  address: string;
+  kind: "pool";
+  poolStatus: "available" | "allocated" | "quarantined";
+  poolAllocatedToInvoiceId: string | null;
+};
 
 interface ChainAggregator {
   chainId: ChainId;
@@ -489,9 +506,12 @@ function ensureAggregator(
 
 function pushAddressRow(
   agg: ChainAggregator,
-  meta:
-    | { address: string; kind: "pool"; poolStatus: "available" | "allocated" | "quarantined"; poolAllocatedToInvoiceId: string | null }
-    | { address: string; kind: "fee"; feeLabel: string },
+  meta: {
+    address: string;
+    kind: "pool";
+    poolStatus: "available" | "allocated" | "quarantined";
+    poolAllocatedToInvoiceId: string | null;
+  },
   tokens: readonly { token: TokenSymbol; amountRaw: bigint | string }[],
   chainId: ChainId,
   usdRates: Record<string, string>,
@@ -509,27 +529,15 @@ function pushAddressRow(
   let addressTotal = 0;
   for (const t of tokensWithUsd) addressTotal = addUsd(addressTotal, t.usd);
 
-  const baseRow = {
+  const addressRow: AddressBalance = {
+    address: meta.address,
+    kind: "pool",
+    poolStatus: meta.poolStatus,
+    poolAllocatedToInvoiceId: meta.poolAllocatedToInvoiceId,
     totalUsd: addressTotal.toFixed(2),
     tokens: tokensWithUsd,
     ...(errorMessage !== undefined ? { error: errorMessage } : {})
   };
-
-  const addressRow: AddressBalance =
-    meta.kind === "pool"
-      ? {
-          address: meta.address,
-          kind: "pool",
-          poolStatus: meta.poolStatus,
-          poolAllocatedToInvoiceId: meta.poolAllocatedToInvoiceId,
-          ...baseRow
-        }
-      : {
-          address: meta.address,
-          kind: "fee",
-          feeLabel: meta.feeLabel,
-          ...baseRow
-        };
   agg.addresses.push(addressRow);
   agg.totalUsd = addUsd(agg.totalUsd, addressRow.totalUsd);
 
@@ -583,10 +591,6 @@ async function collectTargets(
   deps: AppDeps,
   opts: BalanceSnapshotOptions
 ): Promise<readonly SnapshotTarget[]> {
-  // Group registered chain adapters by family, and per family list the
-  // chainIds we'll snapshot pool addresses against. Tron and Solana have one
-  // chainId each in practice; EVM has 7+. The set is whatever the entrypoint
-  // wired into deps.chains.
   const chainIdsByFamily = new Map<ChainFamily, ChainId[]>();
   for (const adapter of deps.chains) {
     const list = chainIdsByFamily.get(adapter.family) ?? [];
@@ -594,69 +598,34 @@ async function collectTargets(
     chainIdsByFamily.set(adapter.family, list);
   }
 
+  const conds: SQL[] = [];
+  if (opts.family !== undefined) conds.push(eq(addressPool.family, opts.family));
+  if (opts.address !== undefined) conds.push(eq(addressPool.address, opts.address));
+  const baseQuery = deps.db
+    .select({
+      family: addressPool.family,
+      address: addressPool.address,
+      status: addressPool.status,
+      allocatedToInvoiceId: addressPool.allocatedToInvoiceId
+    })
+    .from(addressPool);
+  const poolRows = conds.length === 0 ? await baseQuery : await baseQuery.where(and(...conds));
+
   const targets: SnapshotTarget[] = [];
-  const wantPool = opts.kind === undefined || opts.kind === "pool";
-  const wantFee = opts.kind === undefined || opts.kind === "fee";
-
-  if (wantPool) {
-    const conds: SQL[] = [];
-    if (opts.family !== undefined) conds.push(eq(addressPool.family, opts.family));
-    if (opts.address !== undefined) conds.push(eq(addressPool.address, opts.address));
-    const baseQuery = deps.db
-      .select({
-        family: addressPool.family,
-        address: addressPool.address,
-        status: addressPool.status,
-        allocatedToInvoiceId: addressPool.allocatedToInvoiceId
-      })
-      .from(addressPool);
-    const poolRows = conds.length === 0
-      ? await baseQuery
-      : await baseQuery.where(and(...conds));
-
-    for (const row of poolRows) {
-      const chainsForFamily = chainIdsByFamily.get(row.family) ?? [];
-      for (const chainId of chainsForFamily) {
-        if (opts.chainId !== undefined && opts.chainId !== chainId) continue;
-        targets.push({
-          family: row.family,
-          chainId,
-          address: row.address,
-          kind: "pool",
-          poolStatus: row.status,
-          poolAllocatedToInvoiceId: row.allocatedToInvoiceId
-        });
-      }
-    }
-  }
-
-  if (wantFee) {
-    const conds: SQL[] = [sql`${feeWallets.active} = 1`];
-    if (opts.chainId !== undefined) conds.push(eq(feeWallets.chainId, opts.chainId));
-    if (opts.address !== undefined) conds.push(eq(feeWallets.address, opts.address));
-    const feeRows = await deps.db
-      .select({
-        chainId: feeWallets.chainId,
-        address: feeWallets.address,
-        label: feeWallets.label
-      })
-      .from(feeWallets)
-      .where(and(...conds));
-
-    for (const row of feeRows) {
-      const adapter = deps.chains.find((a) => a.supportedChainIds.includes(row.chainId));
-      if (!adapter) continue;
-      if (opts.family !== undefined && opts.family !== adapter.family) continue;
+  for (const row of poolRows) {
+    const chainsForFamily = chainIdsByFamily.get(row.family) ?? [];
+    for (const chainId of chainsForFamily) {
+      if (opts.chainId !== undefined && opts.chainId !== chainId) continue;
       targets.push({
-        family: adapter.family,
-        chainId: row.chainId as ChainId,
+        family: row.family,
+        chainId,
         address: row.address,
-        kind: "fee",
-        feeLabel: row.label
+        kind: "pool",
+        poolStatus: row.status,
+        poolAllocatedToInvoiceId: row.allocatedToInvoiceId
       });
     }
   }
-
   return targets;
 }
 

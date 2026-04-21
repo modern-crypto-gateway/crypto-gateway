@@ -309,72 +309,31 @@
           }
         },
         {
-          "name": "3. Register fee wallet (dev chain)",
-          "request": {
-            "method": "POST",
-            "url": { "raw": "{{baseUrl}}/admin/fee-wallets", "host": ["{{baseUrl}}"], "path": ["admin", "fee-wallets"] },
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"chainId\": 999,\n  \"family\": \"evm\",\n  \"label\": \"dev-hot-1\"\n}"
-            },
-            "description": "Registers a fee wallet for payouts. The gateway HD-derives the `(address, privateKey)` pair from `MASTER_SEED` at a deterministic index keyed by `(family, label)` and returns the derived address in `feeWallet.address`. No private key is accepted here — the operator funds the returned address out-of-band. The same `label` always derives to the same address across redeploys.\n\n**EVM family fanout:** on real EVM deployments, omit `chainId` and pass `family: \"evm\"` alone to register the same address across every wired EVM chain in `CHAIN_REGISTRY` (one row per chainId). For Tron/Solana, supply `chainId` or `chainIds` explicitly — mainnet and testnet have distinct chainIds."
-          }
-        },
-        {
-          "name": "3c. Promote pool address to fee wallet",
-          "request": {
-            "method": "POST",
-            "url": { "raw": "{{baseUrl}}/admin/fee-wallets/from-pool-address", "host": ["{{baseUrl}}"], "path": ["admin", "fee-wallets", "from-pool-address"] },
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"family\": \"evm\",\n  \"address\": \"0xREPLACE_WITH_POOL_ADDRESS\",\n  \"label\": \"promoted-hot-1\",\n  \"chainIds\": [42161],\n  \"deactivatePoolSlot\": true\n}"
-            },
-            "description": "Promote an HD-derived pool address (that holds funds from a settled invoice) into a fee wallet WITHOUT transferring funds. The gateway already knows the private key (pool's `address_index` is reused as the fee wallet's `derivation_index`), so nothing is stored at rest.\n\n**Race protection:** the pool row is CAS-quarantined on `status='available'`; if the allocator raced and already handed it to a new invoice between SELECT and UPDATE, the response returns `poolDeactivated: false` — the fee wallet is still created, but operator should retry quarantine after the active invoice settles.\n\nIn-flight invoices already pointed at the address continue to resolve correctly via `invoice_receive_addresses` — late payments credit the original invoice."
-          }
-        },
-        {
-          "name": "3d. Register fee wallet at explicit HD index (escape hatch)",
-          "request": {
-            "method": "POST",
-            "url": { "raw": "{{baseUrl}}/admin/fee-wallets/from-index", "host": ["{{baseUrl}}"], "path": ["admin", "fee-wallets", "from-index"] },
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"family\": \"evm\",\n  \"derivationIndex\": 1073741824,\n  \"label\": \"manual-ix-0x40000000\",\n  \"chainIds\": [42161]\n}"
-            },
-            "description": "Advanced: register a fee wallet at an operator-supplied HD index. Used for sweep-master promotion, debugging, or recovery.\n\n**Range is HARDENED** to the fee-wallet region `[0x40000000, 0x7EFFFFFF]` (1073741824 to 2130706431 decimal):\n- `< 0x40000000` (pool region) — REJECTED, would share a private key with an invoice receive address. Use `/from-pool-address` instead.\n- `>= 0x7F000000` (sweep-master region) — REJECTED, would shadow the family sweep master.\n\nThe derived address is computed from `MASTER_SEED` at the supplied index; no key is accepted or stored. Operator funds the returned address out-of-band."
-          }
-        },
-        {
-          "name": "3b. List fee wallets",
+          "name": "3. Inspect HD payout sources (admin balance snapshot)",
           "request": {
             "method": "GET",
             "url": {
-              "raw": "{{baseUrl}}/admin/fee-wallets?limit=100&offset=0",
+              "raw": "{{baseUrl}}/admin/balances?kind=pool",
               "host": ["{{baseUrl}}"],
-              "path": ["admin", "fee-wallets"],
+              "path": ["admin", "balances"],
               "query": [
-                { "key": "limit", "value": "100" },
-                { "key": "offset", "value": "0" },
-                { "key": "chainId", "value": "999", "disabled": true },
-                { "key": "active", "value": "true", "disabled": true },
-                { "key": "reserved", "value": "true", "disabled": true },
-                { "key": "includeBalance", "value": "true", "description": "Add nativeSymbol/nativeDecimals/nativeBalance per row. Costs 1 RPC per row.", "disabled": true }
+                { "key": "kind", "value": "pool", "description": "Only `pool` exists today; the legacy `fee` value is silently coerced." },
+                { "key": "family", "value": "evm", "disabled": true },
+                { "key": "chainId", "value": "42161", "disabled": true },
+                { "key": "live", "value": "true", "disabled": true, "description": "Force RPC reconciliation. Slow (15-30s); off by default." }
               ]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "Lists fee wallets with reservation state. Each row includes `chain` (slug like 'arbitrum').\n\n`reservedByPayoutId` shows the current CAS reservation — set while a payout holds the wallet, released on status transition. Enable the `reserved=true` filter to surface every in-flight reservation across every chain, the fastest way to spot payouts stuck in `reserved`/`submitted`.\n\n**Native balance (opt-in):** enable `includeBalance=true` to add per-row `nativeSymbol` ('ETH'/'MATIC'/'TRX'/'SOL'), `nativeDecimals` (EVM=18, Tron=6, Solana=9), and raw `nativeBalance` (smallest units). Costs **one RPC per row** — keep `limit` reasonable. Per-row failures don't fail the page: a dead RPC returns `nativeBalance: null` + `nativeBalanceError: 'rpc_error'`; chains without a loaded adapter return `'chain_not_wired'`."
+            "description": "There is no separate fee-wallet table any more — every HD-derived address in `address_pool` is a candidate payout source. Use this endpoint to see ledger-derived spendable balances per chain/address (confirmed inbound − confirmed outbound − active reservations). The `selectSource` picker reads the same data when planning payouts, so what you see here is exactly what the picker will see.\n\nFor a quick \"can this chain fund a payout right now?\" check, the per-chain `tokens` rollup is the fastest signal."
+          }
+        },
+        {
+          "name": "3b. (DEPRECATED) Fee-wallet endpoints",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/admin/balances", "host": ["{{baseUrl}}"], "path": ["admin", "balances"] },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "All `/admin/fee-wallets/*` endpoints have been removed. The gateway no longer requires pre-registering fee wallets — the picker auto-discovers funded HD addresses from `address_pool` at execution time. If a payout fails with `INSUFFICIENT_BALANCE_ANY_SOURCE`, fund any HD-derived address from the pool snapshot above; for `NO_GAS_SPONSOR_AVAILABLE`, fund another HD address with native gas.\n\nKeeping this stub in the collection so links from old docs / dashboard buttons land on a clear deprecation message instead of 404."
           }
         },
         {
@@ -391,7 +350,7 @@
               ]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "Discovery endpoint for the dashboard's bootstrap picker. Returns every chain in the static `CHAIN_REGISTRY` (minus the synthetic dev chain `999`) along with three readiness booleans per chain so the dashboard can decide bootstrap state in a single call:\n\n- `wired`             — a `ChainAdapter` for the chainId is loaded in `deps.chains`\n- `webhooksSupported` — chain *can* use Alchemy webhooks (EVM + Solana). **False for Tron** — RPC-poll only, no webhook concept. Frontend should hide the 'register webhook' CTA when this is false.\n- `alchemyConfigured` — operator's `ALCHEMY_CHAINS` env actually includes this chainId.\n- `webhooks`          — row exists in `alchemy_webhook_registry`. Only meaningful when `webhooksSupported=true`.\n- `feeWallets`        — at least one **active** fee wallet exists for this chainId.\n- `detection`         — `alchemy` | `rpc-poll`. Derived from `webhooksSupported`.\n- `bootstrapReady`    — `wired && (!webhooksSupported || webhooks) && feeWallets`. Tron can be ready with just `wired+feeWallets`.\n\nAlso returns the static token list per chain and the confirmation threshold the gateway will apply. The dev chain (chainId 999) is excluded — it's a test-harness chain, never bootstrap real Alchemy webhooks against it.\n\nNever returns secrets (signing keys, seeds, env)."
+            "description": "Discovery endpoint for the dashboard's bootstrap picker. Returns every chain in the static `CHAIN_REGISTRY` (minus the synthetic dev chain `999`) along with three readiness booleans per chain so the dashboard can decide bootstrap state in a single call:\n\n- `wired`             — a `ChainAdapter` for the chainId is loaded in `deps.chains`\n- `webhooksSupported` — chain *can* use Alchemy webhooks (EVM + Solana). **False for Tron** — RPC-poll only, no webhook concept. Frontend should hide the 'register webhook' CTA when this is false.\n- `alchemyConfigured` — operator's `ALCHEMY_CHAINS` env actually includes this chainId.\n- `webhooks`          — row exists in `alchemy_webhook_registry`. Only meaningful when `webhooksSupported=true`.\n- `feeWallets`        — kept for API stability; now reflects \"the chain's family has at least one HD address available as a payout source\".\n- `detection`         — `alchemy` | `rpc-poll`. Derived from `webhooksSupported`.\n- `bootstrapReady`    — `wired && (!webhooksSupported || webhooks) && feeWallets`. Tron can be ready with just `wired+feeWallets`.\n\nAlso returns the static token list per chain and the confirmation threshold the gateway will apply. The dev chain (chainId 999) is excluded — it's a test-harness chain, never bootstrap real Alchemy webhooks against it.\n\nNever returns secrets (signing keys, seeds, env)."
           },
           "event": [
             {
@@ -921,7 +880,7 @@
     },
     {
       "name": "Payouts",
-      "description": "Merchant-scoped payout API. Requires a registered fee wallet on the target chain (see `_Setup / 3. Register fee wallet`).",
+      "description": "Merchant-scoped payout API. Requires at least one funded HD-derived address (visible via `_Setup / 3. Inspect HD payout sources`). The picker automatically falls back to JIT gas top-up when the source has the token but lacks native — no fee-wallet pre-registration needed.",
       "item": [
         {
           "name": "Plan payout (parametric)",
@@ -936,7 +895,7 @@
               "mode": "raw",
               "raw": "{\n  \"chainId\": {{chainId}},\n  \"token\": \"{{token}}\",\n  \"amountRaw\": \"{{amountRaw}}\",\n  \"destinationAddress\": \"{{destinationAddress}}\"\n}"
             },
-            "description": "Creates a `planned` payout. The `executeReservedPayouts` cron job picks it up, CAS-reserves a fee wallet, builds + signs + broadcasts the transfer. Polls `getConfirmationStatus` each tick until finalized.\n\n**Token symbol** can be any registered on the chain — stablecoins (USDC/USDT) **and** native gas (ETH/POL/BNB/AVAX/TRX/SOL). Natives are first-class. Discover valid symbols per chain via `GET /admin/chains`.\n\n**Amount input (pick exactly one):**\n- `amountRaw` — uint256 string in token's smallest unit (e.g. `\"1000000\"` = 1 USDC, `\"1000000000000000000\"` = 1 ETH)\n- `amount` — human decimal string (e.g. `\"1.5\"`); converted via BigInt against `token.decimals`. Too many decimal places → 400 `BAD_AMOUNT`.\n- `amountUSD` — fiat-pegged decimal (e.g. `\"10.00\"`); converted via the price oracle at create time. Resolved rate snapshotted onto `quotedRate` + `quotedAmountUsd` for audit. Supported on **all** tokens (stable + volatile). For non-stable tokens (ETH/POL/...) the broadcast happens later, so the executed payout's market value drifts from `amountUSD`. Oracle outage → 503 `ORACLE_FAILED`; never substitutes a stale rate.\n\nOptional per-payout webhook override: pass `webhookUrl` + `webhookSecret` together to route this payout's events (`payout.submitted`, `payout.confirmed`, `payout.failed`) to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned. Dispatch precedence: payout override → merchant default → skip. See `Plan payout (with per-payout webhook)` for an example."
+            "description": "Creates a `planned` payout. The `executeReservedPayouts` cron job picks an HD source by ledger balance (richest token-holder first), writes reservation rows, and broadcasts. If the chosen source lacks native for gas, the executor first broadcasts a sponsor → source top-up tx (parent transitions through `topping-up`), waits for it to confirm, then broadcasts the main payout. Polls `getConfirmationStatus` each tick until finalized.\n\n**Token symbol** can be any registered on the chain — stablecoins (USDC/USDT) **and** native gas (ETH/POL/BNB/AVAX/TRX/SOL). Natives are first-class. Discover valid symbols per chain via `GET /admin/chains`.\n\n**Amount input (pick exactly one):**\n- `amountRaw` — uint256 string in token's smallest unit (e.g. `\"1000000\"` = 1 USDC, `\"1000000000000000000\"` = 1 ETH)\n- `amount` — human decimal string (e.g. `\"1.5\"`); converted via BigInt against `token.decimals`. Too many decimal places → 400 `BAD_AMOUNT`.\n- `amountUSD` — fiat-pegged decimal (e.g. `\"10.00\"`); converted via the price oracle at create time. Oracle outage → 503 `ORACLE_FAILED`.\n\nOptional per-payout webhook override: pass `webhookUrl` + `webhookSecret` together to route this payout's events (`payout.submitted`, `payout.confirmed`, `payout.failed`) to a URL/secret different from the merchant-account default. Both must be supplied as a pair (one without the other is a 400). The URL is echoed back in the response; the secret is stored encrypted at rest and never returned."
           },
           "event": [
             {
@@ -992,7 +951,7 @@
               "mode": "raw",
               "raw": "{\n  \"chainId\": 42161,\n  \"token\": \"ETH\",\n  \"amount\": \"0.05\",\n  \"destinationAddress\": \"0x16214769e25a97256419aeea44b35b4a72ddc4c1\"\n}"
             },
-            "description": "Sends 0.05 ETH on Arbitrum from a fee wallet. Native gas tokens (ETH/POL/BNB/AVAX/TRX/SOL) are first-class — no separate API, just pass the native symbol as `token`. The adapter takes the `isNative` branch internally (no contract call, value:amount in the tx). The fee wallet must be funded with ETH on the destination chain — check via `GET /admin/fee-wallets?chainId=42161&includeBalance=true`."
+            "description": "Sends 0.05 ETH on Arbitrum from an HD-derived source. Native gas tokens (ETH/POL/BNB/AVAX/TRX/SOL) are first-class — pass the native symbol as `token`. At least one HD address in the pool must hold enough ETH on Arbitrum (check via `GET /admin/balances?chainId=42161`). Native payouts can't use the gas-top-up fallback (gas IS the asset); if no source has `amount + gas` headroom, the call returns `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` with `details.suggestedAmountRaw` for the dashboard to retry against."
           }
         },
         {
@@ -1476,7 +1435,7 @@
     },
     {
       "name": "Admin / Balances",
-      "description": "Operator-only treasury view. Returns per-address + per-chain + per-family token balances with USD totals, shaped token → address → chain → family → grand total. The top-level `source` field tells you which math produced the numbers.\n\n**Mode `source=\"db\"` (default, fast)**\n- Pool address balance = SUM(confirmed `transactions.amountRaw` to that address).\n- Fee wallet balance = SUM(confirmed credits) − SUM(confirmed `payouts` from that source), clamped at 0.\n- No RPC traffic; ~50ms regardless of pool size.\n- Addresses with no recorded activity are omitted.\n- Caveat: off-system movements are invisible (external fee-wallet topups, dust sent to unsubscribed addresses). Use `?live=true` for reconciliation.\n\n**Mode `source=\"rpc\"` (opts-in via `?live=true`)**\n- Fans out one `getAccountBalances` call per (address, chainId) pair across every wired adapter. Authoritative but 15–30s cold.\n- Use for post-topup audit. Not for dashboard auto-refresh.\n\n**Caching**: keyed by mode + query string. DB mode TTL = 5s; RPC mode TTL = 60s. `db` and `rpc` entries do not share a slot. Each response carries `cached: true|false`.",
+      "description": "Operator-only treasury view. Returns per-address + per-chain + per-family token balances with USD totals, shaped token → address → chain → family → grand total. The top-level `source` field tells you which math produced the numbers.\n\n**Mode `source=\"db\"` (default, fast)**\n- Spendable per (chainId, address) = SUM(confirmed `transactions.amountRaw` inbound) − SUM(confirmed `payouts.amountRaw` outbound from this address) − SUM(active `payout_reservations.amountRaw` for this address), clamped at 0.\n- No RPC traffic; ~50ms regardless of pool size.\n- Addresses with no recorded activity are omitted.\n- Caveat: off-system movements are invisible (rare on chains with Alchemy webhooks). Use `?live=true` for reconciliation.\n\n**Mode `source=\"rpc\"` (opts-in via `?live=true`)**\n- Fans out one `getAccountBalances` call per (address, chainId) pair across every wired adapter. Authoritative but 15–30s cold.\n- Use for post-topup audit. Not for dashboard auto-refresh.\n\n**Caching**: keyed by mode + query string. DB mode TTL = 5s; RPC mode TTL = 60s. `db` and `rpc` entries do not share a slot. Each response carries `cached: true|false`.",
       "item": [
         {
           "name": "Snapshot — DB-derived (default, fast)",
@@ -1569,23 +1528,23 @@
               "query": [{ "key": "chainId", "value": "1" }]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "Single-chain snapshot. Use when investigating a specific chain (e.g. after funding a fee wallet on it)."
+            "description": "Single-chain snapshot. Use when investigating a specific chain (e.g. after funding an HD pool address on it)."
           }
         },
         {
-          "name": "Snapshot — fee wallets only",
+          "name": "Snapshot — payout source candidates (richest first)",
           "request": {
             "method": "GET",
             "url": {
-              "raw": "{{baseUrl}}/admin/balances?kind=fee",
+              "raw": "{{baseUrl}}/admin/balances?kind=pool",
               "host": ["{{baseUrl}}"],
               "path": ["admin", "balances"],
               "query": [
-                { "key": "kind", "value": "fee", "description": "pool | fee — default is both" }
+                { "key": "kind", "value": "pool", "description": "Only `pool` exists today; the legacy `fee` value is silently coerced." }
               ]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "Excludes pool addresses entirely — useful for an ops dashboard that just shows hot/cold wallet balances. Each address row includes `feeLabel` so you can identify it."
+            "description": "Every HD-derived pool address with its ledger-derived spendable balances. The payout picker reads exactly this data when planning — what you see here matches what the picker will pick."
           }
         },
         {
@@ -1652,7 +1611,7 @@
               "path": ["internal", "cron", "tick"]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{cronSecret}}" }],
-            "description": "Runs the full scheduled-jobs sequence out of band: `pollPayments → confirmTransactions → executeReservedPayouts → confirmPayouts → sweepStuckFeeWalletReservations (→ alchemySyncAddresses)`.\n\nOutside Cloudflare Workers / Deno Deploy (which have native cron), this is the only way to advance state between invoices. Vercel Cron hits this on a schedule; for local Node runs it's handy to invoke manually after creating an invoice and simulating a webhook.\n\nReturns `{ ok: true, result: { <perJobOutcome> } }`."
+            "description": "Runs the full scheduled-jobs sequence out of band: `pollPayments → confirmTransactions → executeReservedPayouts → confirmPayouts → sweepStuckPayoutReservations (→ alchemySyncAddresses)`.\n\nOutside Cloudflare Workers / Deno Deploy (which have native cron), this is the only way to advance state between invoices. Vercel Cron hits this on a schedule; for local Node runs it's handy to invoke manually after creating an invoice and simulating a webhook.\n\nReturns `{ ok: true, result: { <perJobOutcome> } }`."
           },
           "event": [
             {
