@@ -458,6 +458,45 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /api/v1/payouts/{id}/cancel:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [payouts]
+      summary: Cancel a reserved payout
+      description: |
+        Cancels a payout that's still in `reserved` status — releases its
+        source + (when present) sponsor reservations so the balance is
+        immediately available to a subsequent plan.
+
+        Once a broadcast has started (`topping-up`, `submitted`, or
+        terminal states) the gateway can't recall the on-chain tx; the
+        endpoint returns **409 PAYOUT_NOT_CANCELABLE**. Idempotent on
+        already-canceled rows (returns 200 with the existing canceled row).
+
+        Does NOT currently emit a `payout.canceled` webhook event — the
+        merchant sees the result via the 200 response. If you rely on
+        webhooks, poll `GET /payouts/:id` after issuing cancel until
+        status is terminal.
+      responses:
+        "200":
+          description: Canceled (or idempotent re-cancel of an already-canceled row)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payout: { $ref: "#/components/schemas/Payout" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: |
+            Payout not found, OR cross-merchant access (the gateway returns 404
+            rather than 403 to avoid leaking payout ids across merchants).
+        "409":
+          description: |
+            `PAYOUT_NOT_CANCELABLE` — the payout has already broadcast on-chain
+            (status is `topping-up`, `submitted`, `confirmed`, or `failed`).
+
   /checkout/{id}:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }

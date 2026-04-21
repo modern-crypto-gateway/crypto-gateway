@@ -250,7 +250,15 @@ describe("PayoutService.executeReservedPayouts", () => {
         .from(payouts)
         .limit(1);
       expect(row?.status).toBe("failed");
-      expect(row?.last_error).toContain("simulated broadcast failure");
+      // `lastError` is the sanitized merchant-facing string (the raw
+      // RPC message "simulated broadcast failure" lives in the
+      // operator warn log, not the payout row).
+      expect(row?.last_error).toContain("SOURCE_BROADCAST_FAILED");
+      // And the operator log carries the detail.
+      const warn = booted.logger.entries.find(
+        (e) => e.level === "warn" && e.message === "payout.failed"
+      );
+      expect(warn?.fields?.["detail"]).toContain("simulated broadcast failure");
 
       // The fee wallet must be released so future retries can use it.
       const released = await booted.deps.db

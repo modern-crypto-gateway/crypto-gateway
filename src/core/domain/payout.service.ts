@@ -90,6 +90,30 @@ export type PayoutErrorCode =
   | "PAYOUT_NOT_FOUND"
   | "PAYOUT_NOT_CANCELABLE";
 
+// Stable, scrubbed strings persisted to `payouts.lastError` and surfaced
+// to merchants via GET /payouts/:id and the payout.failed webhook. The raw
+// underlying error (RPC URLs, addresses, internal libsql wrapper messages)
+// stays in the operator log only.
+const MERCHANT_FACING_FAIL_MESSAGES: Readonly<Record<PayoutErrorCode, string>> = {
+  MERCHANT_NOT_FOUND: "Merchant not found.",
+  MERCHANT_INACTIVE: "Merchant is inactive.",
+  TOKEN_NOT_SUPPORTED: "Token not supported on this chain.",
+  INVALID_DESTINATION: "Destination address is invalid for this chain.",
+  BAD_AMOUNT: "Amount has more decimal places than the token supports.",
+  ORACLE_FAILED: "Price oracle is unavailable; retry shortly.",
+  INVALID_FEE_TIER: "Fee tier must be one of low / medium / high.",
+  FEE_ESTIMATE_FAILED: "Could not quote gas; retry shortly.",
+  BATCH_TOO_LARGE: "Batch exceeds the per-call cap.",
+  INSUFFICIENT_BALANCE_ANY_SOURCE: "No HD source has enough balance to cover the payout.",
+  NO_GAS_SPONSOR_AVAILABLE: "Token holder exists but no sponsor has enough native to top it up.",
+  MAX_AMOUNT_EXCEEDS_NET_SPENDABLE: "Requested amount exceeds spendable balance after gas.",
+  TOP_UP_BROADCAST_FAILED: "Gas top-up tx failed to broadcast; retry after operator intervention.",
+  TOP_UP_REVERTED: "Gas top-up tx reverted on-chain.",
+  SOURCE_BROADCAST_FAILED: "Main payout tx failed to broadcast.",
+  PAYOUT_NOT_FOUND: "Payout not found.",
+  PAYOUT_NOT_CANCELABLE: "Payout cannot be canceled in its current status."
+};
+
 const PAYOUT_ERROR_HTTP_STATUS: Readonly<Record<PayoutErrorCode, number>> = {
   MERCHANT_NOT_FOUND: 404,
   MERCHANT_INACTIVE: 403,
@@ -290,6 +314,35 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   // gets an immediate, actionable response (INSUFFICIENT_BALANCE_ANY_SOURCE,
   // NO_GAS_SPONSOR_AVAILABLE, FEE_ESTIMATE_FAILED, MAX_AMOUNT_EXCEEDS_NET_SPENDABLE)
   // rather than a queued payout that fails on the next executor tick.
+
+  // Gas estimate runs OUTSIDE the IMMEDIATE transaction. Adapter calls
+  // hit the chain RPC and can take seconds under load; if that ran
+  // inside the writer-locked transaction, the lock-hold time would
+  // blow `runWithBusyRetry`'s retry budget (hundreds of ms) and starve
+  // concurrent plans. The slight staleness vs. on-chain truth between
+  // here and the broadcast is OK — the executor re-quotes at broadcast
+  // time, and the picker only needs the estimate for relative
+  // headroom comparisons against ledger balances.
+  let gasNeeded: bigint;
+  try {
+    gasNeeded = BigInt(await chainAdapter.estimateGasForTransfer({
+      chainId: parsed.chainId as ChainId,
+      fromAddress: destination as Address,
+      toAddress: destination as Address,
+      token: parsed.token as TokenSymbol,
+      amountRaw: amountRaw as AmountRaw
+    }));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    deps.logger.warn("payout.gas_estimate.failed", {
+      chainId: parsed.chainId, token: parsed.token, error: message
+    });
+    throw new PayoutError(
+      "FEE_ESTIMATE_FAILED",
+      `Could not quote gas for chain ${parsed.chainId}. Retry shortly.`
+    );
+  }
+
   const now = deps.clock.now().getTime();
   const payoutId = globalThis.crypto.randomUUID();
 
@@ -334,7 +387,8 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         destinationAddress: destination,
         token: parsed.token,
         amountRaw,
-        feeTier: parsed.feeTier ?? null
+        feeTier: parsed.feeTier ?? null,
+        gasNeeded
       });
 
       switch (selection.kind) {
@@ -349,20 +403,21 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
             `No HD address on chain ${parsed.chainId} has enough ${parsed.token} balance to cover the payout.`
           );
         case "no_sponsor":
+          // Don't echo the source address — it's an operator-pool HD
+          // address that the merchant has no business knowing about
+          // (cross-merchant pool exposure surface). The error code is
+          // sufficient signal for the merchant to fund a sponsor.
           throw new PayoutError(
             "NO_GAS_SPONSOR_AVAILABLE",
-            `Source ${selection.source.address} holds ${parsed.token} but lacks native gas, and no other HD address has enough native to top it up. Fund a sponsor address with the chain's native asset.`
-          );
-        case "fee_estimate_failed":
-          throw new PayoutError(
-            "FEE_ESTIMATE_FAILED",
-            `Could not quote gas for chain ${parsed.chainId}: ${selection.error}. Retry shortly.`
+            `Token holder exists on chain ${parsed.chainId} but no other HD address has enough native to top it up. Fund a sponsor address with the chain's native asset.`
           );
         case "max_send_exceeded":
+          // Same: don't include the candidate address in `details`.
+          // `suggestedAmountRaw` alone tells the merchant what to send.
           throw new PayoutError(
             "MAX_AMOUNT_EXCEEDS_NET_SPENDABLE",
             `Requested ${amountRaw} ${parsed.token} exceeds spendable native balance after gas. Try ${selection.suggestedAmountRaw} or less.`,
-            { suggestedAmountRaw: selection.suggestedAmountRaw, candidateAddress: selection.candidateAddress }
+            { suggestedAmountRaw: selection.suggestedAmountRaw }
           );
       }
 
@@ -1151,18 +1206,48 @@ async function startTopUpFromReservation(
 // Re-entered when status === "topping-up". Polls the top-up tx via the
 // chain adapter; on confirmation, broadcasts the main payout. On revert,
 // fails the payout and releases reservations.
+// Window between `startTopUpFromReservation`'s status CAS (reserved →
+// topping-up) and the `topUpTxHash` write that follows broadcast. A
+// second executor tick that fires during this window sees `topping-up`
+// + `topUpTxHash IS NULL` and would mistakenly fail the payout. We
+// give the broadcast 30s to finish before treating the null as a
+// genuine crash. Real broadcast latency is sub-second; chain RPC
+// timeouts are usually 10s. 30s is comfortably above both.
+const TOP_UP_BROADCAST_GRACE_MS = 30_000;
+
 async function executeTopUp(
   deps: AppDeps,
   row: typeof payouts.$inferSelect
 ): Promise<"submitted" | "failed" | "deferred"> {
   if (row.topUpTxHash === null) {
-    // Inconsistent state — top-up hash should have been written before
-    // status flipped. Fail safely.
+    // Two cases hit this branch:
+    //   1. Another executor tick is currently mid-broadcast (the status
+    //      flip has committed but the topUpTxHash write hasn't). Defer
+    //      until the grace window expires; the ongoing broadcast will
+    //      either succeed (write topUpTxHash, we recover next tick) or
+    //      crash (we'll see no progress and fail after the grace).
+    //   2. The tick that owned the broadcast actually crashed. After
+    //      the grace window, no further progress is possible and we
+    //      fail the payout cleanly.
+    const ageMs = deps.clock.now().getTime() - row.updatedAt;
+    if (ageMs < TOP_UP_BROADCAST_GRACE_MS) {
+      return "deferred";
+    }
+    // Genuine crash — also fail any sibling that managed to land
+    // before the crash so it doesn't sit in `reserved`/`submitted`
+    // forever. Sibling may not exist if the crash hit before the
+    // sibling insert.
+    const [orphanSibling] = await deps.db
+      .select({ id: payouts.id })
+      .from(payouts)
+      .where(and(eq(payouts.parentPayoutId, row.id), eq(payouts.kind, "gas_top_up")))
+      .limit(1);
     return failPayout(
       deps,
       row,
       "TOP_UP_BROADCAST_FAILED",
-      "Internal: payout in topping-up state with no recorded top-up tx hash"
+      `Top-up broadcast did not complete within ${Math.round(TOP_UP_BROADCAST_GRACE_MS / 1000)}s grace; failing for operator triage.`,
+      orphanSibling?.id
     );
   }
   const chainAdapter = findChainAdapter(deps, row.chainId);
@@ -1259,15 +1344,22 @@ async function broadcastMain(
   chainAdapter: ChainAdapter,
   source: { address: string; derivationIndex: number }
 ): Promise<"submitted" | "failed" | "deferred"> {
-  // Broadcast-slot CAS — guards against double-send if a previous tick
-  // crashed after broadcast but before the status update.
+  // Broadcast-slot CAS — guards against:
+  //   1. Double-send if a previous tick crashed after broadcast but
+  //      before the status update (`broadcastAttemptedAt IS NULL`).
+  //   2. Race against `cancelPayout`: a concurrent cancel that flipped
+  //      status to `canceled` between executor scan and this point. The
+  //      status check (`reserved` for direct path, `topping-up` for
+  //      post-top-up path) ensures we never broadcast against a
+  //      canceled row.
   const [broadcastClaim] = await deps.db
     .update(payouts)
     .set({ broadcastAttemptedAt: deps.clock.now().getTime() })
     .where(
       and(
         eq(payouts.id, row.id),
-        isNull(payouts.broadcastAttemptedAt)
+        isNull(payouts.broadcastAttemptedAt),
+        inArray(payouts.status, ["reserved", "topping-up"])
       )
     )
     .returning({ id: payouts.id });
@@ -1319,6 +1411,13 @@ async function broadcastMain(
 // Move a payout to `failed`, release ALL of its reservation rows (the source
 // reservation AND, when present, the sponsor reservation on a sibling
 // gas_top_up). The sibling row itself is also marked failed if it exists.
+//
+// `lastError` is exposed to the merchant via GET /payouts/:id and the
+// payout.failed webhook, so we sanitize it: persist a stable
+// short message keyed on `code` rather than the raw `message` (which
+// may carry RPC URLs, internal HD-pool addresses, libsql wrapper
+// strings, etc.). The full message is logged at WARN for operator
+// triage, so nothing is lost — it just doesn't leak to the merchant.
 async function failPayout(
   deps: AppDeps,
   row: typeof payouts.$inferSelect,
@@ -1327,7 +1426,16 @@ async function failPayout(
   alsoFailSiblingId?: string
 ): Promise<"failed"> {
   const now = deps.clock.now().getTime();
-  const lastError = `[${code}] ${message}`.slice(0, 2048);
+  // Operator-facing log carries the full, raw message + ids.
+  deps.logger.warn("payout.failed", {
+    payoutId: row.id,
+    chainId: row.chainId,
+    code,
+    detail: message.slice(0, 4096),
+    siblingId: alsoFailSiblingId
+  });
+  // Merchant-facing lastError is the sanitized short form.
+  const lastError = `[${code}] ${MERCHANT_FACING_FAIL_MESSAGES[code] ?? "Payout failed."}`;
   const failParentStmt = deps.db
     .update(payouts)
     .set({ status: "failed", lastError, updatedAt: now })
@@ -1480,13 +1588,49 @@ export async function cancelPayout(
     );
   }
 
+  // Atomic CAS + release. Two concurrency windows are possible between
+  // our SELECT above and the writes below:
+  //   1. Executor flipped reserved → topping-up first. Our cancel CAS
+  //      misses (zero rows changed); we MUST NOT release reservations
+  //      because the broadcast is in flight.
+  //   2. We win the CAS; the executor's broadcastMain CAS (now also
+  //      gated on status='reserved' — see broadcastMain) will lose and
+  //      return "deferred" without broadcasting.
+  // We perform the cancel UPDATE first, check rows-affected, and only
+  // run the release if we actually transitioned the status. The previous
+  // version batched both unconditionally, which silently leaked the
+  // sponsor reservation when the executor won the race.
   const now = deps.clock.now().getTime();
-  const cancelStmt = deps.db
+  const claimed = await deps.db
     .update(payouts)
     .set({ status: "canceled", updatedAt: now })
-    .where(and(eq(payouts.id, existing.id), eq(payouts.status, "reserved")));
-  const releaseStmt = releaseReservationsStmt(deps, existing.id);
-  await deps.db.batch([cancelStmt, releaseStmt] as [typeof cancelStmt, typeof releaseStmt]);
+    .where(and(eq(payouts.id, existing.id), eq(payouts.status, "reserved")))
+    .returning({ id: payouts.id });
+  if (claimed.length === 0) {
+    // Executor moved the row out of `reserved` between our SELECT and
+    // our CAS. Re-read to get the actual current status for a clean
+    // error message; reservations are NOT released — the broadcast that
+    // raced us still owns them.
+    const [now] = await deps.db
+      .select({ status: payouts.status })
+      .from(payouts)
+      .where(eq(payouts.id, existing.id))
+      .limit(1);
+    throw new PayoutError(
+      "PAYOUT_NOT_CANCELABLE",
+      `Payout transitioned to '${now?.status ?? "unknown"}' between read and cancel attempt — broadcast is in flight, cannot recall.`
+    );
+  }
+
+  // CAS won — release reservations.
+  await deps.db.update(payoutReservations)
+    .set({ releasedAt: now })
+    .where(
+      and(
+        eq(payoutReservations.payoutId, existing.id),
+        isNull(payoutReservations.releasedAt)
+      )
+    );
 
   const row = await fetchPayout(deps, existing.id);
   if (!row) throw new Error(`cancelPayout: row ${existing.id} disappeared`);
@@ -1666,13 +1810,20 @@ type SourceSelection =
   | { kind: "no_sponsor"; source: PickedSource }
   | { kind: "insufficient" }
   | { kind: "no_candidates" }
-  | { kind: "fee_estimate_failed"; error: string }
-  | { kind: "max_send_exceeded"; suggestedAmountRaw: string; candidateAddress: string };
+  | { kind: "max_send_exceeded"; suggestedAmountRaw: string };
 
 // Selection input — pulled out of the payout row so plan-time callers (who
 // don't have a row yet) can invoke the picker without building a half-row
 // fixture. payoutId is the reservation owner; selectSource INSERTs reservations
 // against this id inside the supplied transaction.
+//
+// `gasNeeded` is computed by the caller BEFORE entering the IMMEDIATE
+// transaction — gas estimation can be a multi-second RPC call, and holding
+// the writer lock through it would starve concurrent plans (the
+// `runWithBusyRetry` budget is hundreds of ms, not seconds). The trade-off:
+// the estimate may be slightly stale by the time we use it, but the picker
+// only needs it for relative comparison ("does this candidate have enough
+// native?"), and the executor re-quotes at broadcast time anyway.
 type SelectionArgs = {
   payoutId: string;
   chainId: number;
@@ -1680,6 +1831,7 @@ type SelectionArgs = {
   token: string;
   amountRaw: string;
   feeTier: "low" | "medium" | "high" | null;
+  gasNeeded: bigint;
 };
 
 // Drizzle's transaction handle and the top-level Db both implement these
@@ -1708,27 +1860,8 @@ async function selectSource(
   const isNativePayout = args.token === nativeSymbol;
   const tokenSym = args.token;
   const requiredAmount = BigInt(args.amountRaw);
-
-  // Gas estimate. Hard-fail if the estimator throws — proceeding with 0n
-  // would let the picker accept a source with no native, queueing a
-  // payout that's guaranteed to fail at broadcast. The merchant retries
-  // when the chain RPC stops flapping.
-  let gasNeeded: bigint;
-  try {
-    gasNeeded = BigInt(await chainAdapter.estimateGasForTransfer({
-      chainId: args.chainId as ChainId,
-      fromAddress: args.destinationAddress as Address,
-      toAddress: args.destinationAddress as Address,
-      token: args.token as TokenSymbol,
-      amountRaw: args.amountRaw as AmountRaw
-    }));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    deps.logger.warn("payout.gas_estimate.failed", {
-      chainId: args.chainId, token: args.token, error: message
-    });
-    return { kind: "fee_estimate_failed", error: message };
-  }
+  const gasNeeded = args.gasNeeded;
+  void deps; // logger no longer used inside selectSource (gas estimate moved out)
 
   const poolRows = await tx
     .select({ address: addressPool.address, addressIndex: addressPool.addressIndex })
@@ -1785,8 +1918,7 @@ async function selectSource(
     if (richest && richest.nativeBalance >= gasNeeded && richest.nativeBalance < directNeed) {
       return {
         kind: "max_send_exceeded",
-        suggestedAmountRaw: (richest.nativeBalance - gasNeeded).toString(),
-        candidateAddress: richest.address
+        suggestedAmountRaw: (richest.nativeBalance - gasNeeded).toString()
       };
     }
     return { kind: "insufficient" };

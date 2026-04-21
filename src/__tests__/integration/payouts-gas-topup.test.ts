@@ -275,4 +275,89 @@ describe("JIT gas top-up — token payout from a source that lacks native", () =
       .where(isNull(payoutReservations.releasedAt));
     expect(stillActive.length).toBe(0);
   });
+
+  it("top-up confirms, main tx fails → parent='failed', SIBLING STAYS 'confirmed' (sponsor's gas debit is real)", async () => {
+    // Wrap the adapter so signAndBroadcast succeeds on the first call
+    // (the top-up) but throws on the second call (the main tx). This
+    // exercises the SOURCE_BROADCAST_FAILED cascade: the sponsor's
+    // debit to the source ALREADY landed on-chain, so the sibling
+    // gas_top_up must stay 'confirmed' for ledger accuracy — only the
+    // parent's reservations get released.
+    let sigCount = 0;
+    const wrappedAdapter = {
+      ...adapter,
+      async signAndBroadcast(unsigned: Parameters<ChainAdapter["signAndBroadcast"]>[0], pk: string) {
+        sigCount += 1;
+        if (sigCount === 1) return adapter.signAndBroadcast(unsigned, pk);
+        throw new Error("simulated main-tx broadcast failure (post-top-up)");
+      }
+    } as ChainAdapter & { confirmationStatuses: Map<string, { blockNumber: number | null; confirmations: number; reverted: boolean }> };
+    wrappedAdapter.confirmationStatuses = adapter.confirmationStatuses;
+
+    // Re-boot with the wrapped adapter; re-seed sources.
+    await booted.close();
+    booted = await bootTestApp({ chains: [wrappedAdapter] });
+    const a = booted.deps.chains[0]!;
+    sourceAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_INDEX).address);
+    sponsorAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SPONSOR_INDEX).address);
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sourceAddress,
+      derivationIndex: SOURCE_INDEX, balances: { DEVT: "100" }
+    });
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sponsorAddress,
+      derivationIndex: SPONSOR_INDEX, balances: { DEVN: "1000000" }
+    });
+
+    const planned = await planPayout(booted.deps, {
+      merchantId: MERCHANT_ID,
+      chainId: 999,
+      token: "DEVT",
+      amountRaw: "30",
+      destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+
+    // Tick 1: top-up broadcasts.
+    await executeReservedPayouts(booted.deps);
+    const [parentAfterTopUp] = await booted.deps.db
+      .select()
+      .from(payouts)
+      .where(eq(payouts.id, planned.id))
+      .limit(1);
+    expect(parentAfterTopUp?.status).toBe("topping-up");
+
+    // Advance confirmations past threshold.
+    wrappedAdapter.confirmationStatuses.set(parentAfterTopUp!.topUpTxHash!, {
+      blockNumber: 1, confirmations: 30, reverted: false
+    });
+
+    // Tick 2: top-up confirms → main tx broadcast throws.
+    await executeReservedPayouts(booted.deps);
+
+    const [parentAfterFail] = await booted.deps.db
+      .select({ status: payouts.status, lastError: payouts.lastError })
+      .from(payouts)
+      .where(eq(payouts.id, planned.id))
+      .limit(1);
+    expect(parentAfterFail?.status).toBe("failed");
+    expect(parentAfterFail?.lastError).toContain("SOURCE_BROADCAST_FAILED");
+
+    // Sibling MUST stay confirmed — the sponsor's native moved on-chain
+    // and the ledger needs to reflect that. Failing the sibling would
+    // inflate the sponsor's spendable for future plans.
+    const [sibling] = await booted.deps.db
+      .select({ status: payouts.status })
+      .from(payouts)
+      .where(and(eq(payouts.parentPayoutId, planned.id), eq(payouts.kind, "gas_top_up")))
+      .limit(1);
+    expect(sibling?.status).toBe("confirmed");
+
+    // Parent's reservations released. Sibling's sponsor reservation was
+    // released when the top-up confirmed (on the previous tick).
+    const stillActive = await booted.deps.db
+      .select({ id: payoutReservations.id })
+      .from(payoutReservations)
+      .where(isNull(payoutReservations.releasedAt));
+    expect(stillActive.length).toBe(0);
+  });
 });

@@ -164,9 +164,10 @@ for the full list. Highlights:
 | `TURSO_URL`                       | prod-ish        | `file:./local.db` | libSQL URL (Turso over HTTPS or local `file:` URL). `DATABASE_URL` still accepted as a legacy alias for one release cycle. |
 | `TURSO_AUTH_TOKEN`                | Turso only      | —          | libSQL auth token. `DATABASE_TOKEN` still accepted as a legacy alias. |
 | `PORT`                            | no              | `8787`     |                                                      |
-| `RATE_LIMIT_MERCHANT_PER_MINUTE`  | no              | `1000`     | Per-merchant cap on `/api/v1/*`                      |
+| `RATE_LIMIT_MERCHANT_PER_MINUTE`  | no              | `1000`     | Per-merchant cap on `/api/v1/*`. Note: effective throughput is also bounded by per-request latency — concurrent connections may be needed to approach this cap (plan latency is ~100-300ms typical). |
 | `RATE_LIMIT_CHECKOUT_PER_MINUTE`  | no              | `60`       | Per-IP cap on `/checkout/*`                          |
 | `RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE` | no         | `300`      | Per-IP cap on `/webhooks/*`                          |
+| `PAYOUT_CONCURRENCY_PER_CHAIN`    | no              | `16`       | Max concurrent `executeOnePayout` calls per chainId in a single executor tick. Cross-chain runs are unconditionally parallel. Tune lower on Workers under heavy backlog to stay inside the ~50-subrequest budget. Range 1–64. |
 | `PRICE_ADAPTER`                   | no              | (full chain) | `coingecko` (default ordering), `alchemy` (Alchemy-first — requires `ALCHEMY_API_KEY`), or `static-peg` (disable all live sources). See [Price oracle fallback chain](#price-oracle-fallback-chain). |
 | `COINGECKO_API_KEY`               | no              | —          | Raises the CoinGecko rate budget. Keyless free tier also works. |
 | `COINGECKO_PLAN`                  | no              | `demo`     | `demo` → sends `x-cg-demo-api-key`; `pro` → `x-cg-pro-api-key`. |
@@ -611,7 +612,13 @@ the merchant endpoint is healthy again.
 
 ## Payouts
 
-Outbound transfers. Every payout goes through `planned → reserved → [topping-up →] submitted → confirmed` (or `→ failed`). Execution is cron-driven; the HTTP create returns immediately with `planned`.
+Outbound transfers. Every payout goes through `reserved → [topping-up →] submitted → confirmed` (or `→ failed` / `→ canceled`). `POST /api/v1/payouts` runs source selection synchronously inside an `BEGIN IMMEDIATE` transaction and returns **201 with `status: "reserved"`** — the source is picked, reservations are written, and the merchant has immediate go/no-go. Execution (broadcast + confirmations) happens in cron-driven background ticks.
+
+(The `planned` status is a vestigial enum value for backward-compat migrations; no row is ever inserted in that state.)
+
+### Latency expectations
+
+`POST /api/v1/payouts` now includes an RPC call (chain gas estimate), per-HD-source ledger reads, and a writer-lock-serialized transaction. Typical latency is 100–300ms, P99 can reach ~1.5s under writer contention or slow chain RPC. Set client timeouts ≥5s; retry on 503 with exponential backoff starting at 1s.
 
 ### Amount inputs (pick exactly one)
 
@@ -713,6 +720,10 @@ Native payouts can't be topped up (gas IS the asset). When the only candidate ha
 | `TOP_UP_BROADCAST_FAILED` | 503 | Sponsor → source top-up tx failed at broadcast (RPC error) |
 | `TOP_UP_REVERTED` | 500 | Top-up tx broadcast but reverted on-chain. Reservations released; the now-spent gas is sponsor's loss |
 | `SOURCE_BROADCAST_FAILED` | 500 | Main payout broadcast failed after a successful top-up. Topped-up gas remains on the source for future payouts |
+| `PAYOUT_NOT_FOUND` | 404 | `POST /payouts/:id/cancel` (or cross-merchant access). Surfaced as 404 rather than 403 to avoid leaking payout ids |
+| `PAYOUT_NOT_CANCELABLE` | 409 | `POST /payouts/:id/cancel` — the payout already broadcast on-chain. Once in `topping-up` / `submitted` / terminal status, the gateway can't recall it |
+
+Retry hints: 503 codes are transient — retry with exponential backoff starting at 1s. 400/404/409 are not retryable; fix the request or operator state first.
 
 ## Payment tolerance (slippage)
 

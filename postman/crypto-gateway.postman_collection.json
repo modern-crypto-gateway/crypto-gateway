@@ -1054,6 +1054,19 @@
           }
         },
         {
+          "name": "Cancel payout (reserved only)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payouts/{{payoutId}}/cancel",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payouts", "{{payoutId}}", "cancel"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
+            "description": "Cancel a payout still in `reserved` status. Releases the source + (when present) sponsor reservations so the ledger balance frees up immediately for the next plan.\n\nOnce a broadcast has started (`topping-up`, `submitted`, or terminal states) the gateway can't recall the on-chain tx; this returns **409 PAYOUT_NOT_CANCELABLE**.\n\nIdempotent on already-canceled rows — a re-cancel returns the existing canceled row with 200. Cross-merchant access returns 404 (not 403) to avoid leaking payout ids.\n\nNo `payout.canceled` webhook event is emitted today; inspect the 200 response body or poll `GET /payouts/:id`."
+          }
+        },
+        {
           "name": "Estimate fees (tiers)",
           "request": {
             "method": "POST",

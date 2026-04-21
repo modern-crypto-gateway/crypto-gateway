@@ -286,7 +286,7 @@ async function main(): Promise<void> {
 // app's schema are still present in the DB. The fee_wallets → payout_reservations
 // refactor is the canonical case; expand this list when a future refactor drops
 // another table.
-async function assertSchemaInSync(
+export async function assertSchemaInSync(
   client: { execute: (sql: string) => Promise<{ rows: unknown[] }> },
   logger: AppDeps["logger"]
 ): Promise<void> {
