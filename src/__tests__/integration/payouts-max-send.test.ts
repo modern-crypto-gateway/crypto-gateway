@@ -17,7 +17,10 @@ describe("native payout MAX-send handling", () => {
   let sourceAddress: string;
   const SEED_INDEX = 9_876_543;
   const TOTAL_BALANCE = 50_000n;
-  const ESTIMATED_GAS = 21_000n; // dev adapter's flat quote
+  // Picker reserves `quoteFeeTiers.{tier}.nativeAmountRaw × 1.5` to cover
+  // baseFee growth between plan and broadcast. Dev adapter quotes 21000
+  // flat across tiers, so safety-padded gas = 21000 × 150/100 = 31500.
+  const RESERVED_GAS = 31_500n;
 
   beforeEach(async () => {
     booted = await bootTestApp({
@@ -56,11 +59,11 @@ describe("native payout MAX-send handling", () => {
     } catch (err) {
       const e = err as { code: string; details: Record<string, unknown> };
       expect(e.code).toBe("MAX_AMOUNT_EXCEEDS_NET_SPENDABLE");
-      expect(e.details["suggestedAmountRaw"]).toBe((TOTAL_BALANCE - ESTIMATED_GAS).toString());
-      // DEV has 6 decimals; 29000 raw = 0.029 DEV.
-      expect(e.details["suggestedAmount"]).toBe("0.029");
+      expect(e.details["suggestedAmountRaw"]).toBe((TOTAL_BALANCE - RESERVED_GAS).toString());
+      // DEV has 6 decimals; 18500 raw = 0.0185 DEV.
+      expect(e.details["suggestedAmount"]).toBe("0.0185");
       // Static-peg oracle prices DEV at $1, so USD = decimal amount.
-      expect(e.details["suggestedAmountUsd"]).toBe("0.03");
+      expect(e.details["suggestedAmountUsd"]).toBe("0.02");
       // Foreign-identity field must NOT appear — the candidate address
       // is an operator-pool HD address; no business of the merchant.
       expect(e.details["candidateAddress"]).toBeUndefined();
@@ -68,7 +71,7 @@ describe("native payout MAX-send handling", () => {
   });
 
   it("accepts amount = balance − gas (the suggested value)", async () => {
-    const safeAmount = (TOTAL_BALANCE - ESTIMATED_GAS).toString();
+    const safeAmount = (TOTAL_BALANCE - RESERVED_GAS).toString();
     const result = await estimatePayoutFees(booted.deps, {
       merchantId: MERCHANT_ID,
       chainId: 999,
@@ -96,7 +99,7 @@ describe("native payout MAX-send handling", () => {
       })
     ).rejects.toMatchObject({
       code: "MAX_AMOUNT_EXCEEDS_NET_SPENDABLE",
-      details: { suggestedAmountRaw: (TOTAL_BALANCE - ESTIMATED_GAS).toString() }
+      details: { suggestedAmountRaw: (TOTAL_BALANCE - RESERVED_GAS).toString() }
     });
   });
 });

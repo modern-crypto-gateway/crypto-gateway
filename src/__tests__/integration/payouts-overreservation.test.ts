@@ -24,7 +24,6 @@ const TEST_MASTER_SEED = "test test test test test test test test test test test
 describe("plan-time over-reservation race", () => {
   let booted: BootedTestApp;
   const SOURCE_INDEX = 7_000_001;
-  const TOTAL_BALANCE = 100n;
 
   beforeEach(async () => {
     booted = await bootTestApp({
@@ -32,21 +31,16 @@ describe("plan-time over-reservation race", () => {
     });
     const adapter = booted.deps.chains.find((c) => c.family === "evm")!;
     const { address } = adapter.deriveAddress(TEST_MASTER_SEED, SOURCE_INDEX);
-    // Source has just enough for 2 of 3 payouts. Native rail is the same
-    // (DEV is the dev adapter's native), so gas + amount fold onto the
-    // same balance — keep gas estimate small (dev = 21000) but the test
-    // amounts are small too so we exercise the per-amount-rail logic.
-    // Reserved sums: 21000 (gas) + 40 = 21040 per payout — too much for
-    // 100 total. Bump the seeded balance for clarity, then size the
-    // payout amounts to make 2 fit and 3 not.
-    void TOTAL_BALANCE;
+    // Per-payout reservation = amount(100) + gas(31500). Gas comes from
+    // quoteFeeTiers.medium × 1.5 safety multiplier; dev adapter quotes
+    // a flat 21000, so safety-padded gas = 31500. Two payouts = 63200,
+    // three would be 94800. Seed 70000 → exactly 2 fit, 3rd rejects.
     await seedFundedPoolAddress(booted, {
       chainId: 999,
       family: "evm",
       address: adapter.canonicalizeAddress(address),
       derivationIndex: SOURCE_INDEX,
-      // 2 × (40 + 21000 gas) = 42080. 3rd would be 63120, source has 50000.
-      balances: { DEV: "50000" }
+      balances: { DEV: "70000" }
     });
   });
 
@@ -55,9 +49,9 @@ describe("plan-time over-reservation race", () => {
   });
 
   it("3 sequential plans with a source that only fits 2 — the third rejects with INSUFFICIENT_BALANCE_ANY_SOURCE", async () => {
-    // Each plan reserves 40 (amount) + 21000 (gas) = 21040. Source has
-    // 50000 ledger balance. Two reservations = 42080 (fits). Third would
-    // be 63120 (exceeds 50000 by 13120) → rejected.
+    // Each plan reserves 100 (amount) + 31500 (safety-padded gas) =
+    // 31600. Source has 70000 ledger balance. Two = 63200 (fits).
+    // Third would be 94800 (exceeds 70000) → rejected.
     //
     // Sequential rather than parallel because libsql's `BEGIN IMMEDIATE`
     // throws SQLITE_BUSY on contended in-process tests faster than the
@@ -69,7 +63,7 @@ describe("plan-time over-reservation race", () => {
       merchantId: MERCHANT_ID,
       chainId: 999,
       token: "DEV",
-      amountRaw: "40",
+      amountRaw: "100",
       destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     });
     expect(first.status).toBe("reserved");
@@ -78,7 +72,7 @@ describe("plan-time over-reservation race", () => {
       merchantId: MERCHANT_ID,
       chainId: 999,
       token: "DEV",
-      amountRaw: "40",
+      amountRaw: "100",
       destinationAddress: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     });
     expect(second.status).toBe("reserved");
@@ -89,7 +83,7 @@ describe("plan-time over-reservation race", () => {
         merchantId: MERCHANT_ID,
         chainId: 999,
         token: "DEV",
-        amountRaw: "40",
+        amountRaw: "100",
         destinationAddress: "0xcccccccccccccccccccccccccccccccccccccccc"
       })
     ).rejects.toMatchObject({ code: "INSUFFICIENT_BALANCE_ANY_SOURCE" } satisfies { code: PayoutErrorCode });

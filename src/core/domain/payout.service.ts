@@ -314,70 +314,61 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
     quotedRate = conversion.rate;
   }
 
-  let feeQuotedNative: string | null = null;
-  if (parsed.feeTier !== undefined) {
-    try {
-      const tiers = await chainAdapter.quoteFeeTiers({
-        chainId: parsed.chainId as ChainId,
-        fromAddress: destination as Address,
-        toAddress: destination as Address,
-        token: parsed.token as TokenSymbol,
-        amountRaw: amountRaw as AmountRaw
-      });
-      feeQuotedNative = tiers[parsed.feeTier].nativeAmountRaw;
-    } catch (err) {
-      deps.logger.warn("payout.plan.fee_tier_quote_failed", {
-        chainId: parsed.chainId,
-        token: parsed.token,
-        feeTier: parsed.feeTier,
-        error: err instanceof Error ? err.message : String(err)
-      });
-    }
-  }
-
   const webhookSecretCiphertext =
     parsed.webhookSecret !== undefined
       ? await deps.secretsCipher.encrypt(parsed.webhookSecret)
       : null;
 
-  // Run source selection + reservation insert + payout insert atomically
-  // under BEGIN IMMEDIATE. Without the immediate write lock, two parallel
-  // plans on the same source can both observe "fits" and both insert,
-  // over-reserving. The lock serializes reservation inserts globally —
-  // OK because reservations are infrequent and millisecond-scale.
+  // Fee quote runs OUTSIDE the IMMEDIATE transaction so the writer lock
+  // doesn't span chain RPC. We use `quoteFeeTiers().{tier}.nativeAmountRaw`
+  // (NOT `estimateGasForTransfer`) for the picker's headroom check —
+  // the former is the actual native-wei budget viem will reserve at
+  // broadcast (`gasUnits × maxFeePerGas`); the latter returns gas UNITS
+  // only (e.g. "21000"), which when treated as wei undercounts the real
+  // budget by ~9 orders of magnitude. Real prod failure mode: picker
+  // accepts a source with milligrams of headroom, viem broadcast fails
+  // with "insufficient funds for gas * price + value".
   //
-  // Selection failures throw PayoutError synchronously; the merchant
-  // gets an immediate, actionable response (INSUFFICIENT_BALANCE_ANY_SOURCE,
-  // NO_GAS_SPONSOR_AVAILABLE, FEE_ESTIMATE_FAILED, MAX_AMOUNT_EXCEEDS_NET_SPENDABLE)
-  // rather than a queued payout that fails on the next executor tick.
-
-  // Gas estimate runs OUTSIDE the IMMEDIATE transaction. Adapter calls
-  // hit the chain RPC and can take seconds under load; if that ran
-  // inside the writer-locked transaction, the lock-hold time would
-  // blow `runWithBusyRetry`'s retry budget (hundreds of ms) and starve
-  // concurrent plans. The slight staleness vs. on-chain truth between
-  // here and the broadcast is OK — the executor re-quotes at broadcast
-  // time, and the picker only needs the estimate for relative
-  // headroom comparisons against ledger balances.
-  let gasNeeded: bigint;
+  // When `feeTier` is unset we use "medium" for the budget check;
+  // `feeQuotedNative` on the row stays null in that case (audit trail
+  // reflects "no tier requested by merchant").
+  const targetTier: "low" | "medium" | "high" = parsed.feeTier ?? "medium";
+  let tierQuotes: Awaited<ReturnType<ChainAdapter["quoteFeeTiers"]>>;
   try {
-    gasNeeded = BigInt(await chainAdapter.estimateGasForTransfer({
+    tierQuotes = await chainAdapter.quoteFeeTiers({
       chainId: parsed.chainId as ChainId,
       fromAddress: destination as Address,
       toAddress: destination as Address,
       token: parsed.token as TokenSymbol,
       amountRaw: amountRaw as AmountRaw
-    }));
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    deps.logger.warn("payout.gas_estimate.failed", {
-      chainId: parsed.chainId, token: parsed.token, error: message
+    deps.logger.warn("payout.fee_quote.failed", {
+      chainId: parsed.chainId, token: parsed.token, feeTier: targetTier, error: message
     });
     throw new PayoutError(
       "FEE_ESTIMATE_FAILED",
       `Could not quote gas for chain ${parsed.chainId}. Retry shortly.`
     );
   }
+  const feeQuotedNative = parsed.feeTier !== undefined
+    ? tierQuotes[parsed.feeTier].nativeAmountRaw
+    : null;
+
+  // Picker budget = chosen tier's native cost × safety multiplier (1.5×).
+  // The multiplier absorbs:
+  //   - baseFee growth between plan time and broadcast time (EVM EIP-1559
+  //     baseFee can rise ~12.5% per block; over a few blocks this adds up).
+  //   - small per-tx variance when gas estimation's `from` placeholder
+  //     doesn't match the actual source.
+  // Document this margin operator-side: a 1.5× cushion means a source
+  // with exactly amount+gas worth of native won't qualify, and that's
+  // intended — it would fail at broadcast under any baseFee tick.
+  const GAS_SAFETY_NUM = 150n;
+  const GAS_SAFETY_DEN = 100n;
+  const gasNeeded =
+    (BigInt(tierQuotes[targetTier].nativeAmountRaw) * GAS_SAFETY_NUM) / GAS_SAFETY_DEN;
 
   const now = deps.clock.now().getTime();
   const payoutId = globalThis.crypto.randomUUID();
@@ -760,8 +751,14 @@ export async function estimatePayoutFees(
   }
 
   // Tier we'll plan against. Defaults to medium when unspecified.
+  // Apply the same 1.5× safety multiplier `planPayout` uses so the
+  // estimate's source preview matches what the real plan would actually
+  // accept. Without this, /estimate would show "qualifying" sources that
+  // /payouts then rejects because the picker reserves more than estimate
+  // shows. See planPayout for rationale on the multiplier value.
   const targetTier = parsed.feeTier ?? "medium";
-  const gasNeeded = BigInt(tiers[targetTier].nativeAmountRaw);
+  const gasNeeded =
+    (BigInt(tiers[targetTier].nativeAmountRaw) * 150n) / 100n;
 
   // Discover candidate HD addresses on this chain's family.
   const family = chainAdapter.family;

@@ -69,9 +69,13 @@ describe("ledger-derived spendable balance", () => {
       address: sourceAddress,
       token: "DEV"
     });
-    // 1_000_000 inbound − 21030 reserved (amount + flat gas estimate, both
-    // on the same DEV symbol since DEV is its own native here).
-    expect(remaining.toString()).toBe((1_000_000n - 21_030n).toString());
+    // 1_000_000 inbound − reserved. Reservation = amount(30) + gasNeeded.
+    // gasNeeded = quoteFeeTiers.medium.nativeAmountRaw × 1.5 safety
+    // multiplier. Dev adapter's quoteFeeTiers returns "21000" for all
+    // tiers, so gasNeeded = 21000 × 150/100 = 31500. Total reserved =
+    // 30 + 31500 = 31530. Both reservation rows fold onto the DEV
+    // symbol because DEV is its own native here.
+    expect(remaining.toString()).toBe((1_000_000n - 30n - 31_500n).toString());
 
     const active = await booted.deps.db
       .select({ id: payoutReservations.id })
