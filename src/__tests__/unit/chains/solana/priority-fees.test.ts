@@ -26,6 +26,7 @@ function fakeClient(overrides: Partial<SolanaRpcClient>): SolanaRpcClient {
     async sendTransaction() { throw new Error("unexpected sendTransaction"); },
     async getBalance() { throw new Error("unexpected getBalance"); },
     async getTokenAccountsByOwner() { throw new Error("unexpected getTokenAccountsByOwner"); },
+    async accountExists() { return true; },
     async getRecentPrioritizationFees() { return []; }
   };
   return { ...base, ...overrides };

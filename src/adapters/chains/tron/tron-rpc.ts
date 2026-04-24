@@ -101,6 +101,82 @@ export interface TrongridTriggerConstantContractResponse {
   energy_used?: number;
 }
 
+// Flat key/value of the chain-parameter set returned by
+// /wallet/getchainparameters. Keys are Tron's own camelCase names
+// (`getEnergyFee`, `getTransactionFee`, etc.). Values are integers
+// expressed in SUN or seconds depending on the parameter. We only read
+// `getEnergyFee` today; the wider shape is typed as Record<string, number>
+// so adding another param later (e.g. `getTransactionFee` for bandwidth)
+// doesn't need a port change.
+export interface TrongridChainParameters {
+  readonly params: Readonly<Record<string, number>>;
+}
+
+// Account-resource state for a Tron address. Covers the effective energy /
+// bandwidth budgets (own stake + delegated in) as read from a single
+// /wallet/getaccountresource call. From these, the planner can decide
+// whether a source has enough energy to skip a TRX burn.
+//
+// Tron meters two resources separately:
+//   - ENERGY: consumed by TRC-20 / smart-contract calls (our primary payout)
+//   - BANDWIDTH: consumed by every tx's raw bytes (~345 for a transfer);
+//                every account gets 600 free/day on top of whatever staking
+//                provides.
+// Both accumulate daily; anything over the allowance burns TRX at fixed
+// rates (see `getChainParameters.getEnergyFee` for the energy rate).
+//
+// Per-delegation direction accounting (out to X pool addresses, in from
+// this fee wallet) requires a separate /wallet/getaccount call — not
+// surfaced here to keep the fast-path read small. The admin status
+// endpoint composes it separately when the operator explicitly asks.
+export interface TronAccountResources {
+  // Current free energy this account can still consume today (own stake +
+  // delegated in, minus what's already used this day).
+  readonly energyAvailable: number;
+  // Total energy this account can consume per day from all sources.
+  readonly energyLimit: number;
+  // Free bandwidth this account can still consume today, INCLUDING the
+  // ~600/day free allowance Tron grants every account.
+  readonly bandwidthAvailable: number;
+  readonly bandwidthLimit: number;
+}
+
+// Resource kind for freeze / delegate operations. Tron's on-the-wire enum
+// uses 0 for BANDWIDTH and 1 for ENERGY; we expose string labels at the
+// port and translate internally.
+export type TronResourceKind = "ENERGY" | "BANDWIDTH";
+
+export interface FreezeBalanceV2Params {
+  owner_address: string;       // hex 0x41... form
+  frozen_balance: number;      // sun to freeze
+  resource: TronResourceKind;
+}
+
+export interface UnfreezeBalanceV2Params {
+  owner_address: string;
+  unfreeze_balance: number;
+  resource: TronResourceKind;
+}
+
+export interface DelegateResourceParams {
+  owner_address: string;       // fee wallet (delegator)
+  receiver_address: string;    // pool address (delegatee)
+  balance: number;             // TRX-stake-equivalent in sun
+  resource: TronResourceKind;
+  // When true, the delegation is "locked" for 3 days (cannot be undelegated
+  // earlier than 3d from now). Reduces churn when delegations are long-lived.
+  lock?: boolean;
+  // Optional lock period in seconds; defaults to 3 days when `lock: true`.
+  lock_period?: number;
+}
+
+export interface UndelegateResourceParams {
+  owner_address: string;
+  receiver_address: string;
+  balance: number;
+  resource: TronResourceKind;
+}
+
 // Native TRX transfer build response. TronGrid returns the fully-formed
 // unsigned transaction; shape matches triggerSmartContract's `transaction`
 // field so downstream sign+broadcast handles both identically.
@@ -162,6 +238,28 @@ export interface TronRpcBackend {
   // `/v1/accounts/{addr}` indexed TRC-20 list is known to lag or omit
   // balances for addresses without recent outbound activity).
   triggerConstantContract(params: TriggerConstantContractParams): Promise<TrongridTriggerConstantContractResponse>;
+  // Current network chain parameters (/wallet/getchainparameters). The only
+  // field we consume today is `getEnergyFee` — the SUN-per-energy-unit rate
+  // validators charge when an account burns TRX for energy. Hardcoding this
+  // is a bug risk: Tron halved the rate from 420 to 210 SUN/unit during the
+  // 2024 network vote, silently doubling the fee quotes of any tool that
+  // didn't track the change. Reading it live means our quotes always match
+  // the chain's actual cost.
+  getChainParameters(): Promise<TrongridChainParameters>;
+  // Account-resource state (energy / bandwidth budgets + delegation
+  // accounting). Underpins both the admin "fee wallet status" view and the
+  // planner's decision to skip a TRX-burn reservation when the source has
+  // enough delegated energy.
+  getAccountResources(address: string): Promise<TronAccountResources>;
+  // Build-only endpoints for Stake 2.0 resource operations. Each returns
+  // an unsigned tx that the caller signs + broadcasts via signAndBroadcast
+  // (same flow as createTransaction for native TRX transfers). The fee-
+  // wallet admin endpoints compose these into operator actions (stake,
+  // unstake, delegate-to-pool, reclaim-from-pool).
+  freezeBalanceV2(params: FreezeBalanceV2Params): Promise<TrongridCreateTransactionResponse>;
+  unfreezeBalanceV2(params: UnfreezeBalanceV2Params): Promise<TrongridCreateTransactionResponse>;
+  delegateResource(params: DelegateResourceParams): Promise<TrongridCreateTransactionResponse>;
+  undelegateResource(params: UndelegateResourceParams): Promise<TrongridCreateTransactionResponse>;
   createTransaction(params: CreateTransactionParams): Promise<TrongridCreateTransactionResponse>;
   broadcastTransaction(params: {
     raw_data_hex: string;
@@ -291,6 +389,95 @@ export function tronGridBackend(config: TronGridBackendConfig): TronRpcBackend {
         body: JSON.stringify(params)
       });
     },
+    async getChainParameters() {
+      const resp = await base.request<{ chainParameter?: ReadonlyArray<{ key: string; value?: number }> }>(
+        "/wallet/getchainparameters",
+        { method: "POST" }
+      );
+      const params: Record<string, number> = {};
+      for (const entry of resp.chainParameter ?? []) {
+        if (typeof entry.value === "number") params[entry.key] = entry.value;
+      }
+      return { params };
+    },
+    async getAccountResources(address) {
+      // /wallet/getaccountresource — `visible: true` keeps addresses in
+      // base58 on the wire. Uninitialized accounts come back as `{}` with
+      // every field absent; treat as uniformly zero.
+      const resp = await base.request<{
+        EnergyLimit?: number;
+        EnergyUsed?: number;
+        NetLimit?: number;
+        NetUsed?: number;
+        freeNetLimit?: number;
+        freeNetUsed?: number;
+      }>("/wallet/getaccountresource", {
+        method: "POST",
+        body: JSON.stringify({ address, visible: true })
+      });
+      const energyLimit = resp.EnergyLimit ?? 0;
+      const energyUsed = resp.EnergyUsed ?? 0;
+      const stakedBandwidthLimit = resp.NetLimit ?? 0;
+      const stakedBandwidthUsed = resp.NetUsed ?? 0;
+      const freeBandwidthLimit = resp.freeNetLimit ?? 0;
+      const freeBandwidthUsed = resp.freeNetUsed ?? 0;
+      return {
+        energyAvailable: Math.max(0, energyLimit - energyUsed),
+        energyLimit,
+        bandwidthAvailable:
+          Math.max(0, stakedBandwidthLimit - stakedBandwidthUsed) +
+          Math.max(0, freeBandwidthLimit - freeBandwidthUsed),
+        bandwidthLimit: stakedBandwidthLimit + freeBandwidthLimit
+      };
+    },
+    async freezeBalanceV2(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/freezebalancev2", {
+        method: "POST",
+        body: JSON.stringify({
+          owner_address: params.owner_address,
+          frozen_balance: params.frozen_balance,
+          resource: params.resource,
+          visible: true
+        })
+      });
+    },
+    async unfreezeBalanceV2(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/unfreezebalancev2", {
+        method: "POST",
+        body: JSON.stringify({
+          owner_address: params.owner_address,
+          unfreeze_balance: params.unfreeze_balance,
+          resource: params.resource,
+          visible: true
+        })
+      });
+    },
+    async delegateResource(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/delegateresource", {
+        method: "POST",
+        body: JSON.stringify({
+          owner_address: params.owner_address,
+          receiver_address: params.receiver_address,
+          balance: params.balance,
+          resource: params.resource,
+          ...(params.lock === true ? { lock: true } : {}),
+          ...(params.lock_period !== undefined ? { lock_period: params.lock_period } : {}),
+          visible: true
+        })
+      });
+    },
+    async undelegateResource(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/undelegateresource", {
+        method: "POST",
+        body: JSON.stringify({
+          owner_address: params.owner_address,
+          receiver_address: params.receiver_address,
+          balance: params.balance,
+          resource: params.resource,
+          visible: true
+        })
+      });
+    },
     async createTransaction(params) {
       return base.request<TrongridCreateTransactionResponse>("/wallet/createtransaction", {
         method: "POST",
@@ -386,6 +573,95 @@ export function alchemyTronBackend(config: AlchemyTronBackendConfig): TronRpcBac
       return base.request<TrongridTriggerConstantContractResponse>("/wallet/triggerconstantcontract", {
         method: "POST",
         body: JSON.stringify(params)
+      });
+    },
+    async getChainParameters() {
+      const resp = await base.request<{ chainParameter?: ReadonlyArray<{ key: string; value?: number }> }>(
+        "/wallet/getchainparameters",
+        { method: "POST" }
+      );
+      const params: Record<string, number> = {};
+      for (const entry of resp.chainParameter ?? []) {
+        if (typeof entry.value === "number") params[entry.key] = entry.value;
+      }
+      return { params };
+    },
+    async getAccountResources(address) {
+      // /wallet/getaccountresource — `visible: true` keeps addresses in
+      // base58 on the wire. Uninitialized accounts come back as `{}` with
+      // every field absent; treat as uniformly zero.
+      const resp = await base.request<{
+        EnergyLimit?: number;
+        EnergyUsed?: number;
+        NetLimit?: number;
+        NetUsed?: number;
+        freeNetLimit?: number;
+        freeNetUsed?: number;
+      }>("/wallet/getaccountresource", {
+        method: "POST",
+        body: JSON.stringify({ address, visible: true })
+      });
+      const energyLimit = resp.EnergyLimit ?? 0;
+      const energyUsed = resp.EnergyUsed ?? 0;
+      const stakedBandwidthLimit = resp.NetLimit ?? 0;
+      const stakedBandwidthUsed = resp.NetUsed ?? 0;
+      const freeBandwidthLimit = resp.freeNetLimit ?? 0;
+      const freeBandwidthUsed = resp.freeNetUsed ?? 0;
+      return {
+        energyAvailable: Math.max(0, energyLimit - energyUsed),
+        energyLimit,
+        bandwidthAvailable:
+          Math.max(0, stakedBandwidthLimit - stakedBandwidthUsed) +
+          Math.max(0, freeBandwidthLimit - freeBandwidthUsed),
+        bandwidthLimit: stakedBandwidthLimit + freeBandwidthLimit
+      };
+    },
+    async freezeBalanceV2(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/freezebalancev2", {
+        method: "POST",
+        body: JSON.stringify({
+          owner_address: params.owner_address,
+          frozen_balance: params.frozen_balance,
+          resource: params.resource,
+          visible: true
+        })
+      });
+    },
+    async unfreezeBalanceV2(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/unfreezebalancev2", {
+        method: "POST",
+        body: JSON.stringify({
+          owner_address: params.owner_address,
+          unfreeze_balance: params.unfreeze_balance,
+          resource: params.resource,
+          visible: true
+        })
+      });
+    },
+    async delegateResource(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/delegateresource", {
+        method: "POST",
+        body: JSON.stringify({
+          owner_address: params.owner_address,
+          receiver_address: params.receiver_address,
+          balance: params.balance,
+          resource: params.resource,
+          ...(params.lock === true ? { lock: true } : {}),
+          ...(params.lock_period !== undefined ? { lock_period: params.lock_period } : {}),
+          visible: true
+        })
+      });
+    },
+    async undelegateResource(params) {
+      return base.request<TrongridCreateTransactionResponse>("/wallet/undelegateresource", {
+        method: "POST",
+        body: JSON.stringify({
+          owner_address: params.owner_address,
+          receiver_address: params.receiver_address,
+          balance: params.balance,
+          resource: params.resource,
+          visible: true
+        })
       });
     },
     async createTransaction(params) {
@@ -490,6 +766,17 @@ export function tronCompositeClient(
       tryEach("triggerSmartContract", (b) => b.triggerSmartContract(params)),
     triggerConstantContract: (params) =>
       tryEach("triggerConstantContract", (b) => b.triggerConstantContract(params)),
+    getChainParameters: () => tryEach("getChainParameters", (b) => b.getChainParameters()),
+    getAccountResources: (address) =>
+      tryEach("getAccountResources", (b) => b.getAccountResources(address)),
+    freezeBalanceV2: (params) =>
+      tryEach("freezeBalanceV2", (b) => b.freezeBalanceV2(params)),
+    unfreezeBalanceV2: (params) =>
+      tryEach("unfreezeBalanceV2", (b) => b.unfreezeBalanceV2(params)),
+    delegateResource: (params) =>
+      tryEach("delegateResource", (b) => b.delegateResource(params)),
+    undelegateResource: (params) =>
+      tryEach("undelegateResource", (b) => b.undelegateResource(params)),
     createTransaction: (params) =>
       tryEach("createTransaction", (b) => b.createTransaction(params)),
     broadcastTransaction: (params) =>

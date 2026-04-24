@@ -356,22 +356,30 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
     ? tierQuotes[parsed.feeTier].nativeAmountRaw
     : null;
 
-  // Picker budget = chosen tier's native cost × safety multiplier (1.5×).
-  // The multiplier absorbs:
-  //   - baseFee growth between plan time and broadcast time (EVM EIP-1559
-  //     baseFee can rise ~12.5% per block; over a few blocks this adds up).
-  //   - small per-tx variance when gas estimation's `from` placeholder
-  //     doesn't match the actual source.
-  // Document this margin operator-side: a 1.5× cushion means a source
-  // with exactly amount+gas worth of native won't qualify, and that's
-  // intended — it would fail at broadcast under any baseFee tick.
-  const GAS_SAFETY_NUM = 150n;
-  const GAS_SAFETY_DEN = 100n;
+  // Picker budget = chosen tier's native cost × chain-specific safety
+  // multiplier. EVM uses 1.5× to absorb EIP-1559 baseFee drift between plan
+  // and broadcast; Tron uses 1.1× (energyFee only changes on SR vote);
+  // Solana uses 1.2× (fixed 5000 lamport signature fee, reserved for future
+  // priority-fee support). Using a global 1.5× on every chain over-reserved
+  // TRX on Tron by ~40% on every payout, which was why a source funded to
+  // cover the real quote still tripped `no_gas_sponsor_available`.
+  const safety = chainAdapter.gasSafetyFactor(parsed.chainId as ChainId);
   const gasNeeded =
-    (BigInt(tierQuotes[targetTier].nativeAmountRaw) * GAS_SAFETY_NUM) / GAS_SAFETY_DEN;
+    (BigInt(tierQuotes[targetTier].nativeAmountRaw) * safety.num) / safety.den;
 
   const now = deps.clock.now().getTime();
   const payoutId = globalThis.crypto.randomUUID();
+
+  // Check fee-wallet availability BEFORE the IMMEDIATE transaction opens,
+  // so the picker can factor it in without doing a DB read inside the
+  // writer-locked window. The check is cheap (single row lookup) and the
+  // value is read-only from the picker's POV — a concurrent admin DELETE
+  // between this check and the reservation doesn't corrupt anything; the
+  // worst case is we reserve on the fee-wallet topology and then the
+  // broadcast-time feeWallet lookup sees null, at which point broadcastMain
+  // falls back to self-pay (and likely fails at the rent check if the
+  // source wasn't funded — same as it does today without any fee wallet).
+  const feeWalletAvailable = await deps.feeWalletStore.has(chainAdapter.family);
 
   // Transaction returns a discriminated result instead of throwing, so
   // we can do error-enrichment work (oracle call for USD conversion)
@@ -424,7 +432,8 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         token: parsed.token,
         amountRaw,
         feeTier: parsed.feeTier ?? null,
-        gasNeeded
+        gasNeeded,
+        feeWalletAvailable
       });
 
       if (
@@ -751,14 +760,15 @@ export async function estimatePayoutFees(
   }
 
   // Tier we'll plan against. Defaults to medium when unspecified.
-  // Apply the same 1.5× safety multiplier `planPayout` uses so the
+  // Apply the same chain-specific safety multiplier `planPayout` uses so the
   // estimate's source preview matches what the real plan would actually
   // accept. Without this, /estimate would show "qualifying" sources that
   // /payouts then rejects because the picker reserves more than estimate
   // shows. See planPayout for rationale on the multiplier value.
   const targetTier = parsed.feeTier ?? "medium";
+  const safety = chainAdapter.gasSafetyFactor(parsed.chainId as ChainId);
   const gasNeeded =
-    (BigInt(tiers[targetTier].nativeAmountRaw) * 150n) / 100n;
+    (BigInt(tiers[targetTier].nativeAmountRaw) * safety.num) / safety.den;
 
   // Discover candidate HD addresses on this chain's family.
   const family = chainAdapter.family;
@@ -808,12 +818,34 @@ export async function estimatePayoutFees(
 
   const requiredAmount = BigInt(amountRaw);
 
+  // Chain-specific minimum native reserve that must stay in the source after
+  // the payout. Solana's rent-exempt floor (890 880 lamports) lives here;
+  // EVM/Tron return 0. Including it in the picker budget mirrors what
+  // `selectSource` does at plan time, so /payouts/estimate and POST /payouts
+  // agree on whether a source is usable.
+  const minNativeReserve = chainAdapter.minimumNativeReserve(parsed.chainId as ChainId);
+
+  // Same fee-wallet gate the planner uses — keeps estimate in sync with plan.
+  // For token payouts where a fee wallet is registered AND the chain has
+  // a fee-wallet topology (Solana co-sign OR Tron delegate), source drops
+  // its native-gas requirement entirely (only rent-exempt keeper remains).
+  const estimateCapability = chainAdapter.feeWalletCapability(parsed.chainId as ChainId);
+  const estimateFeeWalletAvailable = await deps.feeWalletStore.has(chainAdapter.family);
+  const estimateFeeWalletCovers =
+    (estimateCapability === "co-sign" || estimateCapability === "delegate") &&
+    estimateFeeWalletAvailable &&
+    !isNativePayout;
+
   // Sort by token balance descending; richest token holder first.
   enriched.sort((a, b) => (a.tokenBalance < b.tokenBalance ? 1 : a.tokenBalance > b.tokenBalance ? -1 : 0));
 
-  // Tier A: source has both token + native gas.
-  const directNeed = isNativePayout ? requiredAmount + gasNeeded : requiredAmount;
-  const directNative = isNativePayout ? requiredAmount + gasNeeded : gasNeeded;
+  // Tier A: source has both token + native gas (and retains the reserve).
+  const directNeed = isNativePayout ? requiredAmount + gasNeeded + minNativeReserve : requiredAmount;
+  const directNative = isNativePayout
+    ? requiredAmount + gasNeeded + minNativeReserve
+    : estimateFeeWalletCovers
+      ? minNativeReserve
+      : gasNeeded + minNativeReserve;
   const direct = enriched.find(
     (e) => e.tokenBalance >= directNeed && e.nativeBalance >= directNative
   );
@@ -836,13 +868,17 @@ export async function estimatePayoutFees(
   if (!isNativePayout) {
     const tokenHolder = enriched.find((e) => e.tokenBalance >= requiredAmount);
     if (tokenHolder) {
-      const gap = gasNeeded - tokenHolder.nativeBalance;
+      const holderNeedNative = gasNeeded + minNativeReserve;
+      const gap = holderNeedNative - tokenHolder.nativeBalance;
       const cushion = (gasNeeded * 20n) / 100n;
       const topUpAmount = gap + cushion;
-      // Sponsor needs enough native to send `topUpAmount` AND its own gas.
-      const sponsorOwnGas = gasNeeded; // approximate the simple-transfer gas at the same tier
+      // Sponsor needs native to send `topUpAmount` AND its own gas AND keep
+      // its own rent-exempt reserve.
+      const sponsorOwnGas = gasNeeded;
       const sponsor = enriched.find(
-        (e) => e.address !== tokenHolder.address && e.nativeBalance >= topUpAmount + sponsorOwnGas
+        (e) =>
+          e.address !== tokenHolder.address &&
+          e.nativeBalance >= topUpAmount + sponsorOwnGas + minNativeReserve
       );
       if (sponsor) {
         return {
@@ -883,11 +919,14 @@ export async function estimatePayoutFees(
 
   // No qualifying candidate.
   // Native MAX-send hint: when a candidate has native ≈ amount but not
-  // enough headroom for gas, suggest the spendable amount minus gas.
+  // enough headroom for gas + reserve, suggest the amount that WOULD fit
+  // (spendable − gas − reserve). The reserve subtraction is what made this
+  // useful on Solana — previously the suggestion could still trip rent.
   if (isNativePayout && enriched.length > 0) {
     const richest = enriched[0]!;
-    if (richest.nativeBalance >= gasNeeded && richest.nativeBalance < directNeed) {
-      const suggested = richest.nativeBalance - gasNeeded;
+    const minViableNative = gasNeeded + minNativeReserve;
+    if (richest.nativeBalance >= minViableNative && richest.nativeBalance < directNeed) {
+      const suggested = richest.nativeBalance - gasNeeded - minNativeReserve;
       warnings.push("max_amount_exceeds_net_spendable");
       const details = await buildMaxSendDetails(deps, {
         token: parsed.token,
@@ -1469,6 +1508,31 @@ async function broadcastMain(
   }
 
   try {
+    // Decide the fee-wallet topology for this specific payout. We route
+    // through the co-sign path when:
+    //   1. The chain's `feeWalletCapability` is "co-sign" (Solana today).
+    //   2. A fee wallet is actually registered for this family.
+    //   3. The fee wallet is distinct from the source (Solana requires two
+    //      distinct signing keys; a sanity check that also prevents booting
+    //      a degenerate tx if someone registered the source itself as fee
+    //      wallet).
+    // Any of these false → fall back to the original self-pay path.
+    // The planner is also aware of capability + registration and will have
+    // sized reservations appropriately, so this branch here is a pure
+    // signing-topology selector — no balance logic lives in it.
+    const capability = chainAdapter.feeWalletCapability(row.chainId as ChainId);
+    let feePayerAddress: string | undefined;
+    let feePayerPrivateKey: string | undefined;
+    if (capability === "co-sign") {
+      const feeWallet = await deps.feeWalletStore.get(chainAdapter.family);
+      if (feeWallet !== null && feeWallet.address !== source.address) {
+        feePayerAddress = feeWallet.address;
+        feePayerPrivateKey = await deps.signerStore.get({
+          kind: "fee-wallet",
+          family: chainAdapter.family
+        });
+      }
+    }
     const unsigned = await chainAdapter.buildTransfer({
       chainId: row.chainId,
       fromAddress: source.address,
@@ -1477,7 +1541,8 @@ async function broadcastMain(
       amountRaw: row.amountRaw as AmountRaw,
       ...(row.feeTier !== null
         ? { feeTier: row.feeTier as "low" | "medium" | "high" }
-        : {})
+        : {}),
+      ...(feePayerAddress !== undefined ? { feePayerAddress: feePayerAddress as Address } : {})
     });
     const scope: SignerScope = {
       kind: "pool-address",
@@ -1485,7 +1550,11 @@ async function broadcastMain(
       derivationIndex: source.derivationIndex
     };
     const privateKey = await deps.signerStore.get(scope);
-    const txHash = await chainAdapter.signAndBroadcast(unsigned, privateKey);
+    const txHash = await chainAdapter.signAndBroadcast(
+      unsigned,
+      privateKey,
+      feePayerPrivateKey !== undefined ? { feePayerPrivateKey } : undefined
+    );
 
     const now2 = deps.clock.now().getTime();
     await deps.db
@@ -1539,8 +1608,15 @@ async function failPayout(
   // chain's diagnostic through (scrubbed for foreign addresses/URLs) —
   // the merchant needs "insufficient funds" vs. "nonce too low" to
   // act. For internal gateway states we use the stable short string.
+  // Truncation: 2048 characters is enough to preserve viem's full "Request
+  // Arguments" block (which includes the actual gas / maxFeePerGas / value
+  // the RPC checked against), without letting a degenerate multi-MB node
+  // error bloat the payout row. 512 was too tight — the most diagnostic
+  // fields (gas + price + value) live past the first 512 chars and used
+  // to be silently stripped, forcing every failure diagnosis to hit
+  // operator logs rather than being self-contained on the payout row.
   const lastError = CHAIN_REPORTED_ERROR_CODES.has(code)
-    ? `[${code}] ${sanitizeChainMessage(message, row).slice(0, 512)}`
+    ? `[${code}] ${sanitizeChainMessage(message, row).slice(0, 2048)}`
     : `[${code}] ${MERCHANT_FACING_FAIL_MESSAGES[code] ?? "Payout failed."}`;
   const failParentStmt = deps.db
     .update(payouts)
@@ -1938,6 +2014,13 @@ type SelectionArgs = {
   amountRaw: string;
   feeTier: "low" | "medium" | "high" | null;
   gasNeeded: bigint;
+  // Whether a fee wallet is registered AND usable for this family's
+  // capability. When true AND the chain's capability is "co-sign", the
+  // picker drops the source's gas-headroom requirement (fee wallet covers
+  // it) — only the rent-exempt keeper remains. Computed by the caller
+  // from `deps.feeWalletStore.has(family)` so we don't DB-query here
+  // inside the IMMEDIATE-transaction path.
+  feeWalletAvailable: boolean;
 };
 
 // Drizzle's transaction handle and the top-level Db both implement these
@@ -2002,9 +2085,40 @@ async function selectSource(
   // Richest token holder first.
   enriched.sort((a, b) => (a.tokenBalance < b.tokenBalance ? 1 : a.tokenBalance > b.tokenBalance ? -1 : 0));
 
-  // Tier A: source has both.
-  const directNeed = isNativePayout ? requiredAmount + gasNeeded : requiredAmount;
-  const directNative = isNativePayout ? requiredAmount + gasNeeded : gasNeeded;
+  // Chain-specific minimum native reserve. Solana's 0-byte SystemProgram
+  // accounts must hold ~890 880 lamports to remain rent-exempt; letting a
+  // payout drain below that fails at broadcast with "Transaction results in
+  // an account (0) with insufficient funds for rent". EVM and Tron return 0.
+  const minNativeReserve = chainAdapter.minimumNativeReserve(args.chainId as ChainId);
+
+  // Fee-wallet path. Two distinct topologies, both with the same planner
+  // effect: drop the source's native-gas requirement for TOKEN payouts.
+  //   - "co-sign"  (Solana): fee wallet signs as feePayer; source spends 0 SOL
+  //     for sig fee + ATA rent. Token-holder still keeps its own rent-exempt.
+  //   - "delegate" (Tron):   fee wallet pre-delegated energy via
+  //     DelegateResource; the source's TRC-20 tx consumes delegated energy
+  //     without burning TRX. We trust the operator set the delegation up;
+  //     the dedicated status endpoint /admin/fee-wallets/tron/resources
+  //     is the tool for verifying that ahead of payouts.
+  // Both paths are gated on `feeWalletAvailable` (a row exists in
+  // fee_wallets for the family), and BOTH only apply to token payouts —
+  // native payouts still need the source to fund the amount itself.
+  const capability = chainAdapter.feeWalletCapability(args.chainId as ChainId);
+  const feeWalletCovers =
+    (capability === "co-sign" || capability === "delegate") &&
+    args.feeWalletAvailable === true &&
+    !isNativePayout;
+
+  // Tier A: source has both. For native payouts the source must retain
+  // `minNativeReserve` after the transfer + gas, so add it to the need.
+  // When fee wallet covers gas, drop gasNeeded from the native requirement —
+  // only the rent-exempt keeper remains.
+  const directNeed = isNativePayout ? requiredAmount + gasNeeded + minNativeReserve : requiredAmount;
+  const directNative = isNativePayout
+    ? requiredAmount + gasNeeded + minNativeReserve
+    : feeWalletCovers
+      ? minNativeReserve
+      : gasNeeded + minNativeReserve;
   for (const cand of enriched) {
     if (cand.tokenBalance < directNeed) continue;
     if (cand.nativeBalance < directNative) continue;
@@ -2018,13 +2132,15 @@ async function selectSource(
   // Native payouts can't be topped up (gas IS the asset). Surface
   // MAX_AMOUNT_EXCEEDS_NET_SPENDABLE when the richest candidate is close
   // — gives the merchant a concrete suggested amount instead of a vague
-  // "insufficient balance" message.
+  // "insufficient balance" message. The suggestion subtracts both gas AND
+  // the minimum reserve so the returned amount is actually send-safe.
   if (isNativePayout) {
     const richest = enriched[0];
-    if (richest && richest.nativeBalance >= gasNeeded && richest.nativeBalance < directNeed) {
+    const minViableNative = gasNeeded + minNativeReserve;
+    if (richest && richest.nativeBalance >= minViableNative && richest.nativeBalance < directNeed) {
       return {
         kind: "max_send_exceeded",
-        suggestedAmountRaw: (richest.nativeBalance - gasNeeded).toString()
+        suggestedAmountRaw: (richest.nativeBalance - gasNeeded - minNativeReserve).toString()
       };
     }
     return { kind: "insufficient" };
@@ -2034,7 +2150,11 @@ async function selectSource(
   const tokenHolder = enriched.find((e) => e.tokenBalance >= requiredAmount);
   if (!tokenHolder) return { kind: "insufficient" };
 
-  const gap = gasNeeded - tokenHolder.nativeBalance;
+  // Token-holder needs native to cover gas AND the chain's rent-exempt
+  // reserve (Solana: 890 880 lamports; zero on EVM/Tron). Sponsor must cover
+  // the shortfall + its own gas + its own reserve.
+  const holderNeedNative = gasNeeded + minNativeReserve;
+  const gap = holderNeedNative - tokenHolder.nativeBalance;
   if (gap <= 0n) {
     // Token holder actually has enough native — tier A's filter must have
     // found it. We're here only on race or non-determinism; give up this
@@ -2044,10 +2164,11 @@ async function selectSource(
   const cushion = (gasNeeded * 20n) / 100n;
   const topUpAmount = gap + cushion;
   const sponsorOwnGas = gasNeeded;
+  const sponsorMinKeep = minNativeReserve;
 
   for (const sponsor of enriched) {
     if (sponsor.address === tokenHolder.address) continue;
-    if (sponsor.nativeBalance < topUpAmount + sponsorOwnGas) continue;
+    if (sponsor.nativeBalance < topUpAmount + sponsorOwnGas + sponsorMinKeep) continue;
     await insertReservationsForTopUp(
       deps, tx, args.payoutId, args.chainId,
       tokenHolder, sponsor,

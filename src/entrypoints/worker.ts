@@ -23,6 +23,7 @@ import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adap
 import { cloudflareRateLimiter } from "../adapters/rate-limit/cloudflare.adapter.js";
 import { workersEnvSecrets } from "../adapters/secrets/workers-env.js";
 import { hdSignerStore } from "../adapters/signer-store/hd.adapter.js";
+import { dbFeeWalletStore } from "../adapters/fee-wallet-store/db.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import type { AppDeps } from "../core/app-deps.js";
@@ -214,6 +215,7 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
   }
   const libsqlClient = createLibsqlClient({ url: env.TURSO_URL, authToken: env.TURSO_AUTH_TOKEN });
   const db = createDb(libsqlClient);
+  const feeWalletStore = dbFeeWalletStore({ db, secretsCipher, clock: { now: () => new Date() } });
   let alchemy: AppDeps["alchemy"];
   const alchemyNotifyToken = readAlchemyNotifyTokenFromEnv(env as unknown as Record<string, unknown>, logger);
   if (alchemyNotifyToken !== undefined) {
@@ -232,7 +234,14 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     jobs: waitUntilJobs(ctx),
     secrets: workersEnvSecrets(env as unknown as Record<string, unknown>),
     secretsCipher,
-    signerStore: hdSignerStore({ masterSeed: env.MASTER_SEED, chains }),
+    feeWalletStore,
+    signerStore: hdSignerStore({
+      masterSeed: env.MASTER_SEED,
+      chains,
+      feeWalletStore,
+      secretsCipher,
+      db
+    }),
     priceOracle: selectPriceOracle({
       ...(env["PRICE_ADAPTER"] === "coingecko" || env["PRICE_ADAPTER"] === "static-peg" || env["PRICE_ADAPTER"] === "alchemy"
         ? { priceAdapter: env["PRICE_ADAPTER"] as "coingecko" | "static-peg" | "alchemy" }

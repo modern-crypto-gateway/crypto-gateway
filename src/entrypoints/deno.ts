@@ -22,6 +22,7 @@ import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adap
 import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { denoEnvSecrets } from "../adapters/secrets/deno-env.js";
 import { hdSignerStore } from "../adapters/signer-store/hd.adapter.js";
+import { dbFeeWalletStore } from "../adapters/fee-wallet-store/db.adapter.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
 import type { AppDeps } from "../core/app-deps.js";
@@ -165,6 +166,7 @@ async function main(): Promise<void> {
   if (secretsEncryptionKey === undefined) {
     logger.warn("SECRETS_ENCRYPTION_KEY not set; using dev cipher (NOT safe for production)");
   }
+  const feeWalletStore = dbFeeWalletStore({ db, secretsCipher, clock: { now: () => new Date() } });
 
   let alchemy: AppDeps["alchemy"];
   const alchemyNotifyToken = readAlchemyNotifyToken(secrets, logger);
@@ -186,9 +188,13 @@ async function main(): Promise<void> {
     }),
     secrets,
     secretsCipher,
+    feeWalletStore,
     signerStore: hdSignerStore({
       masterSeed: secrets.getOptional("MASTER_SEED") ?? "dev-seed",
-      chains
+      chains,
+      feeWalletStore,
+      secretsCipher,
+      db
     }),
     priceOracle: selectPriceOracle({
       ...(secrets.getOptional("PRICE_ADAPTER") === "coingecko" ||

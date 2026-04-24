@@ -31,6 +31,24 @@ function fakeClient(overrides: Partial<TronRpcBackend>): TronRpcBackend {
     async triggerConstantContract() {
       throw new Error("unexpected triggerConstantContract call");
     },
+    async getChainParameters() {
+      throw new Error("unexpected getChainParameters call");
+    },
+    async getAccountResources() {
+      throw new Error("unexpected getAccountResources call");
+    },
+    async freezeBalanceV2() {
+      throw new Error("unexpected freezeBalanceV2 call");
+    },
+    async unfreezeBalanceV2() {
+      throw new Error("unexpected unfreezeBalanceV2 call");
+    },
+    async delegateResource() {
+      throw new Error("unexpected delegateResource call");
+    },
+    async undelegateResource() {
+      throw new Error("unexpected undelegateResource call");
+    },
     async createTransaction() {
       throw new Error("unexpected createTransaction call");
     },
@@ -574,14 +592,14 @@ describe("tronChainAdapter.buildTransfer (TRC-20)", () => {
 });
 
 describe("tronChainAdapter.estimateGasForTransfer — TRC-20 simulation failure", () => {
+  // Energy estimation now runs via /wallet/triggerconstantcontract (true VM
+  // simulation) rather than /wallet/triggersmartcontract (tx builder, which
+  // returned energy_used=0 and caused the planner to quote ~$0 fees for
+  // txs that actually burned 12-27 TRX of energy and reverted on-chain).
   it("throws with the revert reason when the TronGrid simulation reports result.result !== true", async () => {
-    // Audit finding: a reverted simulation returns HTTP 200 with result.result
-    // === false and the reason in result.message. Pre-fix code returned
-    // `energy_used ?? 0`, making quoteFeeTiers show $0 for a doomed tx.
     const client = fakeClient({
-      async triggerSmartContract() {
+      async triggerConstantContract() {
         return {
-          transaction: { raw_data: {}, raw_data_hex: "", txID: "" },
           energy_used: 0,
           result: { result: false, message: "VM error: CONTRACT_VALIDATE_ERROR" }
         };
@@ -604,9 +622,8 @@ describe("tronChainAdapter.estimateGasForTransfer — TRC-20 simulation failure"
 
   it("propagates the revert through quoteFeeTiers (no silent $0 quote)", async () => {
     const client = fakeClient({
-      async triggerSmartContract() {
+      async triggerConstantContract() {
         return {
-          transaction: { raw_data: {}, raw_data_hex: "", txID: "" },
           result: { result: false, message: "VM error: CALL_VALUE_TRANSFER_FAILED" }
         };
       }
@@ -624,5 +641,70 @@ describe("tronChainAdapter.estimateGasForTransfer — TRC-20 simulation failure"
         amountRaw: "1000000" as unknown as never
       })
     ).rejects.toThrow(/Tron simulation failed/);
+  });
+
+  it("quotes an energy-inclusive fee using the chain's live SUN-per-energy rate", async () => {
+    // Regression for two stacked bugs that caused USDT payouts to revert on
+    // under-funded sources:
+    //   (1) pre-fix we called triggerSmartContract which returned
+    //       energy_used=0, making the fee quote ~345 000 sun (bandwidth only);
+    //   (2) the energy burn rate was hardcoded to 420 SUN/unit — Tron's
+    //       pre-2024 value — and silently doubled quotes after the SR vote
+    //       halved the rate to 210.
+    // Both paths now run via triggerConstantContract (real VM sim) and
+    // getChainParameters (live rate), so the quote tracks what the chain
+    // actually charges.
+    const client = fakeClient({
+      async triggerConstantContract() {
+        return {
+          energy_used: 32_000,
+          result: { result: true },
+          constant_result: []
+        };
+      },
+      async getChainParameters() {
+        return { params: { getEnergyFee: 210 } };
+      }
+    });
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+    const quote = await adapter.quoteFeeTiers({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      fromAddress: "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7",
+      toAddress: "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL",
+      token: "USDT" as unknown as never,
+      amountRaw: "1000000" as unknown as never
+    });
+    // 32 000 energy × 210 SUN + 345 bytes × 1000 SUN = 6 720 000 + 345 000 = 7 065 000 sun.
+    expect(quote.medium.nativeAmountRaw).toBe("7065000");
+    expect(quote.nativeSymbol).toBe("TRX");
+  });
+
+  it("falls back to the 210 SUN/energy default when getChainParameters fails", async () => {
+    // RPC flap on /wallet/getchainparameters must NOT block a fee quote —
+    // degrade to the fallback (also 210 today, so no under-quoting) rather
+    // than erroring out of /payouts/estimate entirely.
+    const client = fakeClient({
+      async triggerConstantContract() {
+        return { energy_used: 32_000, result: { result: true }, constant_result: [] };
+      },
+      async getChainParameters() {
+        throw new Error("trongrid 503");
+      }
+    });
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+    const quote = await adapter.quoteFeeTiers({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      fromAddress: "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7",
+      toAddress: "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL",
+      token: "USDT" as unknown as never,
+      amountRaw: "1000000" as unknown as never
+    });
+    expect(quote.medium.nativeAmountRaw).toBe("7065000");
   });
 });

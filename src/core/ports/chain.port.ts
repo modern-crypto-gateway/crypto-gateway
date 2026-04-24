@@ -73,12 +73,66 @@ export interface ChainAdapter {
 
   // Returns the broadcast tx hash. Private key is passed per-call so keys stay
   // in memory only for the duration of signing.
-  signAndBroadcast(unsignedTx: UnsignedTx, privateKey: string): Promise<TxHash>;
+  //
+  // `options.feePayerPrivateKey` is supplied ONLY when the caller built the
+  // UnsignedTx with `BuildTransferArgs.feePayerAddress` — the adapter uses
+  // it to produce the fee payer's signature (Solana) or ignores it
+  // (EVM / Tron / Dev, whose topologies don't co-sign). Passing a fee-payer
+  // key on a chain whose `feeWalletCapability === "none"` is a caller bug;
+  // adapters MAY throw to surface it.
+  signAndBroadcast(
+    unsignedTx: UnsignedTx,
+    privateKey: string,
+    options?: { readonly feePayerPrivateKey?: string }
+  ): Promise<TxHash>;
 
   // ---- Fees ----
 
   // "ETH" on EVM, "TRX" on Tron, "SOL" on Solana. Used for fee-wallet balance checks.
   nativeSymbol(chainId: ChainId): TokenSymbol;
+
+  // Native-balance amount the source MUST retain after a payout completes.
+  // Solana returns the rent-exempt minimum for a 0-byte SystemProgram account
+  // (~890 880 lamports) — drain a Solana source below this and the tx fails
+  // simulation with "insufficient funds for rent". EVM and Tron have no such
+  // concept; both return 0n. Used by `selectSource` so the picker refuses
+  // payouts that would violate the reserve, and by chain adapters' pre-
+  // broadcast checks for defense in depth.
+  minimumNativeReserve(chainId: ChainId): bigint;
+
+  // Multiplier applied to `quoteFeeTiers` output when the picker decides
+  // whether a candidate source has enough native for gas. A 1.5× margin on
+  // EVM absorbs ~6 blocks of EIP-1559 baseFee growth (baseFee rises at most
+  // 12.5%/block, so 2× baseFee > baseFee × 1.125^6); Tron's energyFee is an
+  // SR-voted chain parameter that changes rarely so 1.1× is ample; Solana's
+  // signature fee is a fixed 5000 lamports with no drift at all, 1.2× covers
+  // tier variance from compute-unit pricing if we later add priority fees.
+  // Returning `{num: 0n, den: 1n}` is not valid — den must be positive.
+  gasSafetyFactor(chainId: ChainId): { readonly num: bigint; readonly den: bigint };
+
+  // Describes whether (and how) this family can use an external fee wallet
+  // to cover the gas for a payout, offloading native-balance requirements
+  // from the source pool address:
+  //   - "none":    no native fee-wallet concept on this chain today. The
+  //                planner uses the self-pay / sponsor-topup flow as
+  //                before. EVM lives here pending account abstraction.
+  //   - "delegate": the fee wallet provides resources out-of-band (Tron's
+  //                DelegateResource). The payout tx is unchanged at sign
+  //                time; the chain substitutes delegated resources for
+  //                native burn. Planner can lower its native requirement
+  //                for eligible sources when `canFeeWalletCover*` returns
+  //                true for the candidate + resource amount.
+  //   - "co-sign":  the fee wallet signs every payout as the tx's feePayer
+  //                (Solana). The planner skips native-balance checks on
+  //                the source entirely when a fee wallet is configured and
+  //                funded; `withFeePayer` rewrites the unsigned tx to
+  //                declare the fee wallet as the fee payer before sign.
+  feeWalletCapability(chainId: ChainId): "none" | "delegate" | "co-sign";
+
+  // (Fee-payer application is now expressed via `BuildTransferArgs.feePayerAddress`
+  // set at build time + `options.feePayerPrivateKey` passed at broadcast. No
+  // separate `withFeePayer` port method is needed — the adapter emits the
+  // correct message layout directly when `feePayerAddress` is present.)
 
   // Raw native units (wei / sun / lamports). Used by source-selection to verify
   // the chosen fee wallet has enough native gas before reserving it.

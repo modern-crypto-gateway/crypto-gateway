@@ -8,6 +8,8 @@ import {
   type BalanceSnapshot
 } from "../../core/domain/balance-snapshot.service.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
+import { isTronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../adapters/chains/tron/tron-chain.adapter.js";
+import type { TronResourceKind } from "../../adapters/chains/tron/tron-rpc.js";
 import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
 import {
   ingestDetectedTransfer,
@@ -1524,8 +1526,502 @@ const hasFeeWallet = poolFamilies.has(
     }
   });
 
+  // ---- fee wallets ----
+  //
+  // Per-family configuration surface for the optional "fee wallet" gas-payer
+  // topology. Registering a fee wallet on a family where the chain adapter
+  // reports capability != "none" (Solana co-sign, Tron delegate) lets the
+  // planner route that family's payouts through the fee-wallet path — source
+  // pool addresses no longer need their own native for gas. EVM is declared
+  // "none" until account-abstraction lands; the endpoints still accept
+  // registration for EVM so operators can pre-register before the capability
+  // flips on, but the planner ignores it.
+
+  // GET — list the configured fee wallets across every family. The response
+  // shape is always the full family set with `configured: null` for unset
+  // families so the frontend can render a complete matrix without a second
+  // "which families does the chain registry know about" call.
+  app.get("/fee-wallets", async (c) => {
+    try {
+      const families: readonly ChainFamily[] = ["evm", "tron", "solana"];
+      const rows = await Promise.all(
+        families.map(async (family) => {
+          const rec = await deps.feeWalletStore.get(family);
+          // Find a chain in this family to query capability (it's the same
+          // across chainIds within a family for every adapter we ship).
+          const adapter = deps.chains.find((a) => a.family === family);
+          const capability = adapter
+            ? adapter.feeWalletCapability(adapter.supportedChainIds[0]!)
+            : "none";
+          return {
+            family,
+            capability,
+            configured: rec === null ? null : { mode: rec.mode, address: rec.address }
+          };
+        })
+      );
+      return c.json({ feeWallets: rows }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // POST .../use-pool — register an existing HD pool address as the fee
+  // wallet for this family. Lowest-friction path: no new secret material,
+  // same derivation pool payouts already rely on. Preferred option for
+  // operators who don't have a pre-existing staked/funded wallet to import.
+  app.post("/fee-wallets/:family/use-pool", async (c) => {
+    const rawFamily = c.req.param("family");
+    const family = ChainFamilySchema.safeParse(rawFamily);
+    if (!family.success) {
+      return c.json(
+        { error: { code: "BAD_FAMILY", message: "family must be one of: evm, tron, solana" } },
+        400
+      );
+    }
+    const body = (await c.req.json().catch(() => null)) as { address?: unknown } | null;
+    if (body === null || typeof body.address !== "string" || body.address.length === 0) {
+      return c.json(
+        { error: { code: "BAD_JSON", message: "Expected { address: string }" } },
+        400
+      );
+    }
+    try {
+      // Resolve the chain adapter so we can canonicalize the address. Without
+      // this, operators could pass "0xABC..." on EVM and "0xabc..." would
+      // mismatch the pool row stored in lowercase — fee-wallet sign path
+      // would then fail its FK lookup at signing time. Canonicalize up front.
+      const adapter = deps.chains.find((a) => a.family === family.data);
+      if (!adapter) {
+        return c.json(
+          { error: { code: "NO_ADAPTER", message: `No chain adapter wired for family='${family.data}'` } },
+          400
+        );
+      }
+      let canonical: string;
+      try {
+        canonical = adapter.canonicalizeAddress(body.address);
+      } catch {
+        return c.json(
+          { error: { code: "INVALID_ADDRESS", message: `Address ${body.address} is not valid for family='${family.data}'` } },
+          400
+        );
+      }
+      // Verify the address actually exists in the pool for this family. A
+      // dangling fee-wallet pointing at a non-existent pool row is a
+      // configuration bug we catch NOW rather than at signing time.
+      const [poolRow] = await deps.db
+        .select({ id: addressPool.id })
+        .from(addressPool)
+        .where(and(eq(addressPool.family, family.data), eq(addressPool.address, canonical)))
+        .limit(1);
+      if (!poolRow) {
+        return c.json(
+          {
+            error: {
+              code: "POOL_ADDRESS_NOT_FOUND",
+              message: `No address_pool row for family='${family.data}', address='${canonical}'. Use /admin/pool/initialize first, or pick an address listed by /admin/balances?family=${family.data}.`
+            }
+          },
+          404
+        );
+      }
+      const saved = await deps.feeWalletStore.put({
+        family: family.data,
+        mode: "hd-pool",
+        address: canonical
+      });
+      return c.json({ feeWallet: saved }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // POST .../import — register an externally-generated wallet by uploading
+  // its private key. Ciphertext is written to the DB; plaintext lives in
+  // memory only during the encrypt call. Intended for operators who have
+  // a pre-existing Tron wallet with accumulated staked TRX (re-staking
+  // loses the 5-14 day unstake cooldown) or a Solana wallet whose key they
+  // already manage via HSM / KMS — not the default recommendation.
+  app.post("/fee-wallets/:family/import", async (c) => {
+    const rawFamily = c.req.param("family");
+    const family = ChainFamilySchema.safeParse(rawFamily);
+    if (!family.success) {
+      return c.json(
+        { error: { code: "BAD_FAMILY", message: "family must be one of: evm, tron, solana" } },
+        400
+      );
+    }
+    const body = (await c.req.json().catch(() => null)) as { privateKey?: unknown } | null;
+    if (body === null || typeof body.privateKey !== "string" || body.privateKey.length === 0) {
+      return c.json(
+        { error: { code: "BAD_JSON", message: "Expected { privateKey: <hex string> }" } },
+        400
+      );
+    }
+    try {
+      const adapter = deps.chains.find((a) => a.family === family.data);
+      if (!adapter) {
+        return c.json(
+          { error: { code: "NO_ADAPTER", message: `No chain adapter wired for family='${family.data}'` } },
+          400
+        );
+      }
+      // Derive the address from the private key so we never trust the caller's
+      // claim of what address their key belongs to. We reuse deriveAddress
+      // indirectly via a temporary index lookup isn't clean — instead each
+      // adapter's address derivation is a different function shape (EVM from
+      // privateKey via viem, Solana/Tron from raw bytes), and we don't have a
+      // uniform "privateKeyToAddress" port method yet. Document this limitation
+      // and defer strict address-derivation to a follow-up — for now, the
+      // operator supplies the address and we trust it, same as Fireblocks
+      // wallet-import flows do at the admin layer. Mismatch surfaces at first
+      // payout attempt via the signer-mismatch guard we added to the EVM
+      // adapter (and parallel guards in other adapters).
+      //
+      // TODO(fee-wallet/import): add `ChainAdapter.addressFromPrivateKey` so
+      // import can verify the declared address before persisting, not after
+      // the first failed payout.
+      const declaredAddress = (body as { address?: unknown }).address;
+      if (typeof declaredAddress !== "string" || declaredAddress.length === 0) {
+        return c.json(
+          {
+            error: {
+              code: "BAD_JSON",
+              message: "Expected { privateKey: <hex>, address: <base58/hex string for family> }"
+            }
+          },
+          400
+        );
+      }
+      let canonical: string;
+      try {
+        canonical = adapter.canonicalizeAddress(declaredAddress);
+      } catch {
+        return c.json(
+          { error: { code: "INVALID_ADDRESS", message: `Address ${declaredAddress} is not valid for family='${family.data}'` } },
+          400
+        );
+      }
+      const saved = await deps.feeWalletStore.put({
+        family: family.data,
+        mode: "imported",
+        address: canonical,
+        privateKey: body.privateKey
+      });
+      return c.json({ feeWallet: saved }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // DELETE — remove the fee wallet for a family. Idempotent (returns
+  // `removed: false` when no row existed). After removal the planner falls
+  // back to the self-pay / sponsor-topup flow immediately; no in-flight
+  // payouts are affected because fee-wallet selection is a per-plan
+  // decision, not a per-payout one.
+  app.delete("/fee-wallets/:family", async (c) => {
+    const rawFamily = c.req.param("family");
+    const family = ChainFamilySchema.safeParse(rawFamily);
+    if (!family.success) {
+      return c.json(
+        { error: { code: "BAD_FAMILY", message: "family must be one of: evm, tron, solana" } },
+        400
+      );
+    }
+    try {
+      const removed = await deps.feeWalletStore.remove(family.data);
+      return c.json({ removed }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // ---- Tron Stake 2.0 resource ops ----
+  //
+  // Operator flow for enabling zero-TRX-burn USDT/USDC payouts on Tron:
+  //   1. POST /fee-wallets/tron/use-pool  { address }     — pick (or create)
+  //      a pool address to serve as the fee wallet, or /import an external.
+  //   2. Fund the fee wallet with TRX (external transfer — operator's choice).
+  //   3. POST /fee-wallets/tron/freeze    { balance, resource=ENERGY }
+  //      Freezes the fee wallet's TRX (via FreezeBalanceV2), converting it
+  //      into daily ENERGY allowance. Staked TRX is reclaimable — this is
+  //      not a burn.
+  //   4. POST /fee-wallets/tron/delegate  { receiver, balance, resource }
+  //      One call per pool address the operator wants to delegate to (or
+  //      a cron/script that fans out). Each delegation gives the receiver
+  //      a permanent share of the fee wallet's energy until undelegated.
+  //   5. (Later, to rebalance)
+  //      POST /fee-wallets/tron/undelegate  { receiver, balance, resource }
+  //      POST /fee-wallets/tron/unfreeze    { balance, resource }  (14-day
+  //        unlock period before withdrawable)
+  //
+  // Every write op here signs with the fee wallet's private key (resolved
+  // via signerStore under `{kind: "fee-wallet", family: "tron"}`) and
+  // broadcasts via the Tron adapter's signAndBroadcast, reusing the same
+  // signing path production payouts already go through.
+
+  async function resolveTronOps(c: import("hono").Context): Promise<
+    | { kind: "ok"; adapter: ReturnType<typeof findChainAdapter> & { tronBackend(chainId: number): ReturnType<ReturnType<typeof findChainAdapter>["getBalance"]> extends infer _ ? import("../../adapters/chains/tron/tron-rpc.js").TronRpcBackend : never }; feeWallet: { address: string } }
+    | { kind: "error"; response: Response }
+  > {
+    // Fee wallet must be registered for this family.
+    const rec = await deps.feeWalletStore.get("tron");
+    if (!rec) {
+      return {
+        kind: "error",
+        response: c.json(
+          {
+            error: {
+              code: "NO_FEE_WALLET",
+              message: "No Tron fee wallet is registered. Use POST /admin/fee-wallets/tron/use-pool or /import first."
+            }
+          },
+          409
+        )
+      };
+    }
+    // Find the Tron adapter.
+    const adapter = findChainAdapter(deps, TRON_MAINNET_CHAIN_ID);
+    if (!isTronChainAdapter(adapter)) {
+      return {
+        kind: "error",
+        response: c.json(
+          {
+            error: {
+              code: "NO_TRON_ADAPTER",
+              message: "Tron chain adapter is not wired on this deployment."
+            }
+          },
+          500
+        )
+      };
+    }
+    return {
+      kind: "ok",
+      adapter: adapter as unknown as ReturnType<typeof findChainAdapter> & { tronBackend(chainId: number): import("../../adapters/chains/tron/tron-rpc.js").TronRpcBackend },
+      feeWallet: { address: rec.address }
+    };
+  }
+
+  // GET — resource snapshot for the Tron fee wallet: energy/bandwidth
+  // limits + currently-available budgets. Operators watch this to decide
+  // when to re-delegate or stake more.
+  app.get("/fee-wallets/tron/resources", async (c) => {
+    try {
+      const resolved = await resolveTronOps(c);
+      if (resolved.kind === "error") return resolved.response;
+      const client = resolved.adapter.tronBackend(TRON_MAINNET_CHAIN_ID);
+      const resources = await client.getAccountResources(resolved.feeWallet.address);
+      return c.json({ feeWallet: resolved.feeWallet.address, resources }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  const ResourceKindSchema = z.enum(["ENERGY", "BANDWIDTH"]);
+
+  const FreezeSchema = z.object({
+    // TRX to freeze, in sun. 1 TRX = 1,000,000 sun. Minimum per Tron rules
+    // is 1 TRX (1_000_000 sun).
+    balance: z.number().int().min(1_000_000),
+    resource: ResourceKindSchema
+  });
+
+  async function signAndBroadcastTronRaw(
+    adapter: TronChainAdapterRet,
+    unsignedRaw: { txID: string; raw_data_hex: string; raw_data: unknown }
+  ): Promise<string> {
+    // Reuse the existing signing path by constructing a minimal UnsignedTx
+    // with the same shape buildTransfer emits. No feePayer is involved —
+    // these admin ops always sign with a single key (the fee wallet's).
+    const unsigned = {
+      chainId: TRON_MAINNET_CHAIN_ID as unknown as import("../../core/types/chain.js").ChainId,
+      raw: unsignedRaw,
+      summary: "tron-admin-op"
+    } as import("../../core/types/unsigned-tx.js").UnsignedTx;
+    const privateKey = await deps.signerStore.get({ kind: "fee-wallet", family: "tron" });
+    return adapter.signAndBroadcast(unsigned, privateKey);
+  }
+
+  app.post("/fee-wallets/tron/freeze", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = FreezeSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            code: "BAD_JSON",
+            message: "Expected { balance: <sun>, resource: 'ENERGY' | 'BANDWIDTH' }. Minimum balance 1_000_000 (1 TRX)."
+          }
+        },
+        400
+      );
+    }
+    try {
+      const resolved = await resolveTronOps(c);
+      if (resolved.kind === "error") return resolved.response;
+      const client = resolved.adapter.tronBackend(TRON_MAINNET_CHAIN_ID);
+      const unsigned = await client.freezeBalanceV2({
+        owner_address: resolved.feeWallet.address,
+        frozen_balance: parsed.data.balance,
+        resource: parsed.data.resource as TronResourceKind
+      });
+      const txHash = await signAndBroadcastTronRaw(resolved.adapter, unsigned);
+      return c.json({ txHash, ...parsed.data }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  app.post("/fee-wallets/tron/unfreeze", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = FreezeSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            code: "BAD_JSON",
+            message: "Expected { balance: <sun>, resource: 'ENERGY' | 'BANDWIDTH' }. A 14-day unlock period begins on broadcast; TRX is withdrawable after that."
+          }
+        },
+        400
+      );
+    }
+    try {
+      const resolved = await resolveTronOps(c);
+      if (resolved.kind === "error") return resolved.response;
+      const client = resolved.adapter.tronBackend(TRON_MAINNET_CHAIN_ID);
+      const unsigned = await client.unfreezeBalanceV2({
+        owner_address: resolved.feeWallet.address,
+        unfreeze_balance: parsed.data.balance,
+        resource: parsed.data.resource as TronResourceKind
+      });
+      const txHash = await signAndBroadcastTronRaw(resolved.adapter, unsigned);
+      return c.json({ txHash, ...parsed.data }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  const DelegateSchema = z.object({
+    // The pool address that will receive delegated resources.
+    receiver: z.string().min(1).max(128),
+    // Stake (in sun) to delegate — NOT the energy amount. 1 sun of stake
+    // produces a network-variable amount of energy per day (query via
+    // /fee-wallets/tron/resources to tune).
+    balance: z.number().int().min(1_000_000),
+    resource: ResourceKindSchema,
+    // Optional 3-day lock so a delegation can't be reclaimed immediately.
+    // Mitigates accidental unDelegate during script churn; for most use
+    // cases leave false.
+    lock: z.boolean().optional()
+  });
+
+  app.post("/fee-wallets/tron/delegate", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = DelegateSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            code: "BAD_JSON",
+            message: "Expected { receiver: <base58 address>, balance: <sun>, resource: 'ENERGY' | 'BANDWIDTH', lock?: boolean }"
+          }
+        },
+        400
+      );
+    }
+    try {
+      const resolved = await resolveTronOps(c);
+      if (resolved.kind === "error") return resolved.response;
+      // Canonicalize + sanity-check receiver: if it's a pool address we
+      // verify it's in address_pool (so the operator doesn't accidentally
+      // delegate to an unrelated wallet). Non-pool receivers are allowed
+      // but warned — use-case covers delegating to sweep-master or sponsor
+      // addresses that don't live in the pool.
+      const canonical = resolved.adapter.canonicalizeAddress(parsed.data.receiver);
+      const [poolRow] = await deps.db
+        .select({ id: addressPool.id })
+        .from(addressPool)
+        .where(and(eq(addressPool.family, "tron"), eq(addressPool.address, canonical)))
+        .limit(1);
+      const receiverIsInPool = poolRow !== undefined;
+
+      const client = resolved.adapter.tronBackend(TRON_MAINNET_CHAIN_ID);
+      const unsigned = await client.delegateResource({
+        owner_address: resolved.feeWallet.address,
+        receiver_address: canonical,
+        balance: parsed.data.balance,
+        resource: parsed.data.resource as TronResourceKind,
+        ...(parsed.data.lock === true ? { lock: true } : {})
+      });
+      const txHash = await signAndBroadcastTronRaw(resolved.adapter, unsigned);
+      return c.json(
+        {
+          txHash,
+          receiver: canonical,
+          balance: parsed.data.balance,
+          resource: parsed.data.resource,
+          lock: parsed.data.lock === true,
+          receiverIsInPool
+        },
+        200
+      );
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  const UndelegateSchema = z.object({
+    receiver: z.string().min(1).max(128),
+    balance: z.number().int().min(1_000_000),
+    resource: ResourceKindSchema
+  });
+
+  app.post("/fee-wallets/tron/undelegate", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = UndelegateSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            code: "BAD_JSON",
+            message: "Expected { receiver: <base58 address>, balance: <sun>, resource: 'ENERGY' | 'BANDWIDTH' }"
+          }
+        },
+        400
+      );
+    }
+    try {
+      const resolved = await resolveTronOps(c);
+      if (resolved.kind === "error") return resolved.response;
+      const canonical = resolved.adapter.canonicalizeAddress(parsed.data.receiver);
+      const client = resolved.adapter.tronBackend(TRON_MAINNET_CHAIN_ID);
+      const unsigned = await client.undelegateResource({
+        owner_address: resolved.feeWallet.address,
+        receiver_address: canonical,
+        balance: parsed.data.balance,
+        resource: parsed.data.resource as TronResourceKind
+      });
+      const txHash = await signAndBroadcastTronRaw(resolved.adapter, unsigned);
+      return c.json(
+        { txHash, receiver: canonical, balance: parsed.data.balance, resource: parsed.data.resource },
+        200
+      );
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
   return app;
 }
+
+// Local alias to narrow the adapter type once `isTronChainAdapter` has
+// already confirmed the shape. Referenced from `signAndBroadcastTronRaw`.
+type TronChainAdapterRet = ReturnType<typeof findChainAdapter> & {
+  tronBackend(chainId: number): import("../../adapters/chains/tron/tron-rpc.js").TronRpcBackend;
+};
 
 const InitializePoolSchema = z.object({
   families: z.array(ChainFamilySchema).min(1).default(["evm", "tron", "solana"] as const),

@@ -26,6 +26,9 @@ function spyChainAdapter(spy: (args: Parameters<ChainAdapter["scanIncoming"]>[0]
       throw new Error("unused");
     },
     nativeSymbol: () => "ETH" as never,
+    minimumNativeReserve: () => 0n,
+    gasSafetyFactor: () => ({ num: 150n, den: 100n }),
+    feeWalletCapability: () => "none" as const,
     estimateGasForTransfer: async () => "0" as never,
     quoteFeeTiers: async () => ({
       low: { tier: "low", nativeAmountRaw: "0" as never },

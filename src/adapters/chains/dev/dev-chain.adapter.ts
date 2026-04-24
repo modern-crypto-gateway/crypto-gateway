@@ -80,7 +80,11 @@ export function devChainAdapter(config: DevChainConfig = {}): ChainAdapter {
       };
     },
 
-    async signAndBroadcast(unsignedTx: UnsignedTx, _privateKey: string): Promise<TxHash> {
+    async signAndBroadcast(
+      unsignedTx: UnsignedTx,
+      _privateKey: string,
+      _options?: { readonly feePayerPrivateKey?: string }
+    ): Promise<TxHash> {
       if (config.deterministicTxHashes === true) {
         const digest = hmacSha256Sync("dev-tx", JSON.stringify(unsignedTx.raw));
         return `0x${bytesToHex(digest)}` as TxHash;
@@ -92,6 +96,21 @@ export function devChainAdapter(config: DevChainConfig = {}): ChainAdapter {
 
     nativeSymbol(_chainId: ChainId): TokenSymbol {
       return "DEV" as TokenSymbol;
+    },
+
+    minimumNativeReserve(_chainId: ChainId): bigint {
+      return 0n;
+    },
+
+    gasSafetyFactor(_chainId: ChainId) {
+      // Match the old global default so existing integration tests that
+      // reserve 1.5× a quoted amount continue to line up.
+      return { num: 150n, den: 100n };
+    },
+
+    feeWalletCapability(_chainId: ChainId) {
+      // Dev chain is a test fixture — no fee-wallet mechanism.
+      return "none" as const;
     },
 
     async estimateGasForTransfer(_args: EstimateArgs): Promise<AmountRaw> {

@@ -122,6 +122,12 @@ export function buildNativeTransferMessage(args: {
     computeUnitLimit?: number;
     computeUnitPriceMicroLamports?: bigint;
   };
+  // When set, the tx becomes a two-signer co-signed transaction with this
+  // address as the fee payer (accountKeys[0], writable signer). The source
+  // becomes a readonly signer (it authorizes the transfer but doesn't pay
+  // the signature fee). Source's SOL balance still drops by `lamports` —
+  // only the ~5000-lamport signature fee shifts to the fee payer.
+  feePayerAddress?: string;
 }): Uint8Array {
   const sourcePubkey = addressToPublicKeyBytes(args.sourceAddress);
   const destPubkey = addressToPublicKeyBytes(args.destinationAddress);
@@ -136,21 +142,51 @@ export function buildNativeTransferMessage(args: {
   const hasCbPrice = cb?.computeUnitPriceMicroLamports !== undefined;
   const hasCb = hasCbLimit || hasCbPrice;
 
-  // Account ordering: signer(s) first, then read-write non-signers, then
-  // read-only non-signers (which programs fall under). For a transfer:
-  //   [0] source        — signer, writable
-  //   [1] destination   — non-signer, writable
-  //   [2] system program — non-signer, read-only (invoked as program)
-  //   [3] compute-budget program — non-signer, read-only (optional)
-  const accountKeys = [sourcePubkey, destPubkey, systemProgramPubkey];
+  const hasFeePayer = args.feePayerAddress !== undefined;
+  if (hasFeePayer && args.feePayerAddress === args.sourceAddress) {
+    throw new Error("buildNativeTransferMessage: feePayerAddress must differ from sourceAddress");
+  }
+
+  // Account ordering: signers (writable then readonly), then non-signers
+  // (writable then readonly). For a transfer:
+  //
+  // Single-signer (no feePayer):
+  //   [0] source         — signer, writable (pays fee + is source of value)
+  //   [1] destination    — non-signer, writable
+  //   [2] system program — non-signer, readonly (program)
+  //
+  // Co-signed (feePayer set):
+  //   [0] fee wallet     — signer, writable (pays signature fee only)
+  //   [1] source         — signer, readonly (transfer authority — wait, source is writable)
+  //
+  // Wait — for a native SOL transfer where source sends SOL, source MUST
+  // be writable (its lamports balance changes). So under co-sign the source
+  // is a writable signer too:
+  //   [0] fee wallet     — signer, writable
+  //   [1] source         — signer, writable (both writable signers)
+  //   [2] destination    — non-signer, writable
+  //   [3] system program — non-signer, readonly
+  // Header = [2, 0, 1] (both signers writable, 1 readonly-unsigned).
+  const accountKeys = hasFeePayer
+    ? [addressToPublicKeyBytes(args.feePayerAddress!), sourcePubkey, destPubkey, systemProgramPubkey]
+    : [sourcePubkey, destPubkey, systemProgramPubkey];
   const computeBudgetIdx = accountKeys.length;
   if (hasCb) {
     accountKeys.push(addressToPublicKeyBytes(COMPUTE_BUDGET_PROGRAM_ID));
   }
 
   // Header: num_required_signatures, num_readonly_signed, num_readonly_unsigned.
-  // Adding ComputeBudget adds one more readonly-unsigned account.
-  const header = new Uint8Array([1, 0, hasCb ? 2 : 1]);
+  //   no feePayer: 1 signer (writable), 0 readonly-signed, 1 readonly-unsigned (+1 CB)
+  //   w/ feePayer: 2 signers (both writable), 0 readonly-signed, 1 readonly-unsigned (+1 CB)
+  const header = hasFeePayer
+    ? new Uint8Array([2, 0, hasCb ? 2 : 1])
+    : new Uint8Array([1, 0, hasCb ? 2 : 1]);
+
+  // Instruction index offsets for the transfer instruction. Source-to-dest
+  // account indices shift by +1 when feePayer is prepended.
+  const sourceIdx = hasFeePayer ? 1 : 0;
+  const destIdx = hasFeePayer ? 2 : 1;
+  const systemIdx = hasFeePayer ? 3 : 2;
 
   // Instruction: transfer = discriminator 2 (u32 LE), followed by lamports (u64 LE).
   const instructionData = new Uint8Array(12);
@@ -159,9 +195,9 @@ export function buildNativeTransferMessage(args: {
   instructionData.set(u64le(args.lamports), 4);
 
   const transferInstructionBytes = concatBytes(
-    new Uint8Array([2]), // program_id_index (systemProgramPubkey at index 2)
-    encodeCompactU16(2), // account-index count
-    new Uint8Array([0, 1]), // account indices: source, destination
+    new Uint8Array([systemIdx]),
+    encodeCompactU16(2),
+    new Uint8Array([sourceIdx, destIdx]),
     encodeCompactU16(instructionData.length),
     instructionData
   );

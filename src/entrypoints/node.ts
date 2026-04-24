@@ -13,6 +13,7 @@ import { httpAlertSink } from "../adapters/logging/http-alert.adapter.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { processEnvSecrets } from "../adapters/secrets/process-env.js";
 import { hdSignerStore } from "../adapters/signer-store/hd.adapter.js";
+import { dbFeeWalletStore } from "../adapters/fee-wallet-store/db.adapter.js";
 import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { inlineFetchDispatcher } from "../adapters/webhook-delivery/inline-fetch.adapter.js";
 import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery-store.js";
@@ -198,6 +199,8 @@ async function main(): Promise<void> {
     alchemy = { syncAddresses: sweep };
   }
 
+  const clock = { now: () => new Date() };
+  const feeWalletStore = dbFeeWalletStore({ db, secretsCipher, clock });
   const deps: AppDeps = {
     db,
     cache,
@@ -206,7 +209,14 @@ async function main(): Promise<void> {
     }),
     secrets,
     secretsCipher,
-    signerStore: hdSignerStore({ masterSeed: config.masterSeed ?? "dev-seed", chains }),
+    feeWalletStore,
+    signerStore: hdSignerStore({
+      masterSeed: config.masterSeed ?? "dev-seed",
+      chains,
+      feeWalletStore,
+      secretsCipher,
+      db
+    }),
     priceOracle: selectPriceOracle({
       ...(config.priceAdapter !== undefined ? { priceAdapter: config.priceAdapter } : {}),
       ...(config.coingeckoApiKey !== undefined ? { coingeckoApiKey: config.coingeckoApiKey } : {}),
@@ -244,7 +254,7 @@ async function main(): Promise<void> {
     // have to run the admin bootstrap (or manual signing-key register) to
     // enable /webhooks/alchemy end-to-end without touching this file.
     pushStrategies: { "alchemy-notify": alchemyNotifyDetection() },
-    clock: { now: () => new Date() },
+    clock,
     ...(alchemy !== undefined ? { alchemy } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
     migrationsFolder,

@@ -39,6 +39,36 @@ function stubBackend(name: string, overrides: Partial<TronRpcBackend>): TronRpcB
       (async () => {
         throw new Error(`${name}.triggerConstantContract: unexpected call`);
       }),
+    getChainParameters:
+      overrides.getChainParameters ??
+      (async () => {
+        throw new Error(`${name}.getChainParameters: unexpected call`);
+      }),
+    getAccountResources:
+      overrides.getAccountResources ??
+      (async () => {
+        throw new Error(`${name}.getAccountResources: unexpected call`);
+      }),
+    freezeBalanceV2:
+      overrides.freezeBalanceV2 ??
+      (async () => {
+        throw new Error(`${name}.freezeBalanceV2: unexpected call`);
+      }),
+    unfreezeBalanceV2:
+      overrides.unfreezeBalanceV2 ??
+      (async () => {
+        throw new Error(`${name}.unfreezeBalanceV2: unexpected call`);
+      }),
+    delegateResource:
+      overrides.delegateResource ??
+      (async () => {
+        throw new Error(`${name}.delegateResource: unexpected call`);
+      }),
+    undelegateResource:
+      overrides.undelegateResource ??
+      (async () => {
+        throw new Error(`${name}.undelegateResource: unexpected call`);
+      }),
     createTransaction:
       overrides.createTransaction ??
       (async () => {

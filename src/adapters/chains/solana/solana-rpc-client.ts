@@ -102,6 +102,15 @@ export interface SolanaRpcClient {
   // owner holds (including zero-balance ATAs). Caller filters by mint to map
   // back to registry tokens.
   getTokenAccountsByOwner(address: string): Promise<readonly SolanaParsedTokenAccount[]>;
+  // True iff there's a system-level account at `address` right now. Used at
+  // SPL-transfer build time to detect when the destination ATA doesn't yet
+  // exist — in that case the payout tx includes a CreateIdempotent step
+  // which needs the source to cover the token-account rent-exempt minimum
+  // (~2 039 280 lamports) on top of the signature fee. Without this check
+  // the planner under-reserves SOL and the chain reverts at CPI-allocation
+  // time with System error 0x1 (ResultWithNegativeLamports), which surfaces
+  // as a cryptic "custom program error: 0x1" at instruction 2.
+  accountExists(address: string): Promise<boolean>;
   // Recent per-slot prioritization-fee samples. `accountKeys` narrows to slots
   // that included a tx touching any of the given writable accounts; an empty
   // array returns a global network-wide sample. Validators return up to ~150
@@ -200,6 +209,27 @@ export function solanaRpcClient(config: SolanaRpcConfig): SolanaRpcClient {
         );
       } catch {
         return [];
+      }
+    },
+
+    async accountExists(address) {
+      // getAccountInfo returns { context, value: null } for a non-existent
+      // account (no system-level record — never allocated, never received
+      // SOL). For an existing account, `value` is a shape with executable,
+      // lamports, owner, etc. We only need the existence signal.
+      try {
+        const result = await rpc<{
+          context: unknown;
+          value: unknown | null;
+        }>("getAccountInfo", [address, { encoding: "base64" }]);
+        return result.value !== null;
+      } catch {
+        // Treat transient failures as "unknown, assume exists" — the
+        // downstream tx will still run CreateIdempotent which handles the
+        // both-exist and neither-exist cases, and the chain's own checks
+        // are authoritative. Better to under-reserve rent on a flap than
+        // block valid payouts.
+        return true;
       }
     },
 

@@ -22,11 +22,21 @@ describe("evmChainAdapter.buildTransfer", () => {
       amountRaw: "1000000"
     });
 
-    const raw = unsigned.raw as { to: string; data: string; value: bigint; chainId: number };
+    const raw = unsigned.raw as {
+      to: string;
+      data: string;
+      value: bigint;
+      chainId: number;
+      gas?: bigint;
+    };
     // `to` is the USDC contract itself (not the recipient) because this is an ERC-20 call.
     expect(raw.to.toLowerCase()).toBe("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
     expect(raw.value).toBe(0n);
     expect(raw.chainId).toBe(1);
+    // ERC-20 gas is pre-bound so viem skips its own eth_estimateGas call at
+    // broadcast (which on BSC Alchemy simulates at an internal gas price
+    // higher than our bound maxFeePerGas and rejects tight-balance txs).
+    expect(raw.gas).toBe(65_000n);
 
     // transfer(address,uint256) selector = keccak256("transfer(address,uint256)")[:4] = 0xa9059cbb
     expect(raw.data.slice(0, 10)).toBe("0xa9059cbb");
@@ -48,10 +58,12 @@ describe("evmChainAdapter.buildTransfer", () => {
       amountRaw: "777"
     });
 
-    const raw = unsigned.raw as { to: string; data: string; value: bigint };
+    const raw = unsigned.raw as { to: string; data: string; value: bigint; gas?: bigint };
     expect(raw.to.toLowerCase()).toBe("0x70997970c51812dc3a010c7d01b50e0d17dc79c8");
     expect(raw.data).toBe("0x");
     expect(raw.value).toBe(777n);
+    // Native transfer pre-bound to the 21_000 EVM floor.
+    expect(raw.gas).toBe(21_000n);
   });
 
   it("throws on an unknown token", async () => {

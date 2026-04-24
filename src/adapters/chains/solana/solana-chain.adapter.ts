@@ -60,6 +60,25 @@ const FALLBACK_PRIORITY_MICROLAMPORTS = {
 // Phantom-compatible derivation path: m/44'/501'/{account}'/0'.
 const DEFAULT_ACCOUNT_INDEX = 0;
 
+// Rent-exempt minimum for a 0-byte SystemProgram account on Solana mainnet.
+// Any tx that would leave the signer's account below this threshold fails
+// simulation with "insufficient funds for rent" (error -32002). The value is
+// stable on mainnet (computed from the rent model constants); we hardcode it
+// to keep the planner offline, but it's also queryable via RPC
+// `getMinimumBalanceForRentExemption(0)` if Solana ever re-prices.
+const SYSTEM_ACCOUNT_RENT_EXEMPT_LAMPORTS = 890_880n;
+
+// Rent-exempt minimum for a 165-byte SPL Token Account on Solana mainnet.
+// An ATA holds token state (mint, owner, amount, delegate, etc.) and is 165
+// bytes — heavier than a plain system account. When the destination of an
+// SPL transfer doesn't yet have an ATA for the target mint, our builder
+// inserts a CreateIdempotent instruction, and the SIGNER (payer of the tx,
+// i.e. the source) must fund this rent from its own SOL. Missing this in
+// the fee quote caused payouts to revert with "custom program error: 0x1"
+// at instruction 2 (System Program's ResultWithNegativeLamports during the
+// ATA-allocation CPI) even though the source's own SOL cleared rent-exempt.
+const SPL_TOKEN_ACCOUNT_RENT_EXEMPT_LAMPORTS = 2_039_280n;
+
 // TTL for the per-chain getSlot() cache used inside getConfirmationStatus.
 // One cron tick fans out one signature-status + slot query per active
 // confirming tx; the slot is identical across all txs in the same tick, so
@@ -353,11 +372,24 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       if (token.contractAddress !== null) {
         // SPL path. Derive both ATAs client-side and build a single tx that
         // idempotently creates the destination ATA (no-op if it already
-        // exists) then does a TransferChecked from sender → recipient. We
-        // don't getAccountInfo the destination because CreateIdempotent is
-        // the whole point of that instruction — one fewer RPC round trip.
+        // exists) then does a TransferChecked from sender → recipient.
+        //
+        // Probe the destination ATA's existence BEFORE building so we can
+        // fold its rent-exempt cost (2 039 280 lamports) into the fee the
+        // source must cover. Without this, CreateIdempotent silently
+        // expects the source to pay ~0.00204 SOL out of band, the planner
+        // under-reserves, and the tx reverts at instruction 2 with the
+        // System Program's "ResultWithNegativeLamports" — surfaced as a
+        // cryptic "custom program error: 0x1" that looks identical to an
+        // SPL InsufficientFunds and takes forever to diagnose. One extra
+        // RPC call at build time is a fine trade for a correct quote.
         const senderAta = deriveAssociatedTokenAccount(args.fromAddress, token.contractAddress);
         const recipientAta = deriveAssociatedTokenAccount(args.toAddress, token.contractAddress);
+        const recipientAtaExists = await client.accountExists(recipientAta);
+        const ataRentLamports = recipientAtaExists
+          ? 0n
+          : SPL_TOKEN_ACCOUNT_RENT_EXEMPT_LAMPORTS;
+        const hasFeePayer = args.feePayerAddress !== undefined;
         const message = buildSplTransferMessage({
           senderOwner: args.fromAddress,
           senderAssociatedTokenAccount: senderAta,
@@ -367,32 +399,95 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
           amount: BigInt(args.amountRaw),
           decimals: token.decimals,
           recentBlockhash: blockhash,
-          ...(computeBudget !== undefined ? { computeBudget } : {})
+          ...(computeBudget !== undefined ? { computeBudget } : {}),
+          ...(hasFeePayer ? { feePayerAddress: args.feePayerAddress! } : {})
         });
         return {
           chainId: args.chainId as ChainId,
-          raw: { message, recentBlockhash: blockhash, fromAddress: args.fromAddress },
-          summary: `SOL: SPL ${args.token} transfer ${args.amountRaw} from ${args.fromAddress} to ${args.toAddress} (ATA=${recipientAta})`
+          raw: {
+            message,
+            recentBlockhash: blockhash,
+            fromAddress: args.fromAddress,
+            // Fee-wallet co-sign offloads the signature fee AND the ATA-
+            // creation rent to the fee payer. The source still doesn't
+            // spend any SOL for the SPL portion (amount is in SPL token).
+            // When no fee payer is set, source pays both sigfee + ATA rent
+            // (the old self-pay flow). Threading both paths through the
+            // same shape keeps the pre-broadcast rent check and planner
+            // reservation math identical regardless of topology.
+            nativeOutLamports: 0n,
+            feeLamports: hasFeePayer ? 0n : BigInt(SIGNATURE_FEE_LAMPORTS) + ataRentLamports,
+            // SPL balance pre-check inputs. signAndBroadcast queries the
+            // source's token holdings for this mint and refuses to broadcast
+            // if the on-chain balance is below `splAmountRaw`.
+            splMintAddress: token.contractAddress,
+            splAmountRaw: BigInt(args.amountRaw),
+            ...(hasFeePayer
+              ? {
+                  // Fee payer's own SOL accounting. Needed at signAndBroadcast
+                  // time to verify the fee wallet can afford the sig fee +
+                  // ATA rent AND stay rent-exempt itself.
+                  feePayerAddress: args.feePayerAddress!,
+                  feePayerSolOut: BigInt(SIGNATURE_FEE_LAMPORTS) + ataRentLamports
+                }
+              : {})
+          },
+          summary:
+            `SOL: SPL ${args.token} transfer ${args.amountRaw} from ${args.fromAddress} to ${args.toAddress} ` +
+            `(ATA=${recipientAta}${recipientAtaExists ? "" : `; creates ATA, ${hasFeePayer ? "fee wallet" : "source"} pays ${SPL_TOKEN_ACCOUNT_RENT_EXEMPT_LAMPORTS} lamports rent`}` +
+            `${hasFeePayer ? `; feePayer=${args.feePayerAddress}` : ""})`
         };
       }
 
+      const hasNativeFeePayer = args.feePayerAddress !== undefined;
       const message = buildNativeTransferMessage({
         sourceAddress: args.fromAddress,
         destinationAddress: args.toAddress,
         lamports: BigInt(args.amountRaw),
         recentBlockhash: blockhash,
-        ...(computeBudget !== undefined ? { computeBudget } : {})
+        ...(computeBudget !== undefined ? { computeBudget } : {}),
+        ...(hasNativeFeePayer ? { feePayerAddress: args.feePayerAddress! } : {})
       });
 
       return {
         chainId: args.chainId as ChainId,
-        raw: { message, recentBlockhash: blockhash, fromAddress: args.fromAddress },
-        summary: `SOL: native transfer ${args.amountRaw} lamports from ${args.fromAddress} to ${args.toAddress}`
+        raw: {
+          message,
+          recentBlockhash: blockhash,
+          fromAddress: args.fromAddress,
+          // Source always sends `lamports` out. Signature fee shifts to the
+          // fee payer only when one is set — source still needs to hold
+          // rent-exempt on its own SystemAccount either way.
+          nativeOutLamports: BigInt(args.amountRaw),
+          feeLamports: hasNativeFeePayer ? 0n : BigInt(SIGNATURE_FEE_LAMPORTS),
+          ...(hasNativeFeePayer
+            ? {
+                feePayerAddress: args.feePayerAddress!,
+                feePayerSolOut: BigInt(SIGNATURE_FEE_LAMPORTS)
+              }
+            : {})
+        },
+        summary:
+          `SOL: native transfer ${args.amountRaw} lamports from ${args.fromAddress} to ${args.toAddress}` +
+          (hasNativeFeePayer ? ` (feePayer=${args.feePayerAddress})` : "")
       };
     },
 
-    async signAndBroadcast(unsignedTx: UnsignedTx, privateKeyHex: string): Promise<TxHash> {
-      const raw = unsignedTx.raw as { message: Uint8Array; fromAddress: string };
+    async signAndBroadcast(
+      unsignedTx: UnsignedTx,
+      privateKeyHex: string,
+      options?: { readonly feePayerPrivateKey?: string }
+    ): Promise<TxHash> {
+      const raw = unsignedTx.raw as {
+        message: Uint8Array;
+        fromAddress: string;
+        nativeOutLamports?: bigint;
+        feeLamports?: bigint;
+        splMintAddress?: string;
+        splAmountRaw?: bigint;
+        feePayerAddress?: string;
+        feePayerSolOut?: bigint;
+      };
       const privateKey = hexToBytes(privateKeyHex);
       if (privateKey.length !== 32) {
         throw new Error(`Solana signing key must be 32 bytes, got ${privateKey.length}`);
@@ -406,9 +501,149 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
         throw new Error("Solana signAndBroadcast: fromAddress does not match the derived public key");
       }
 
-      const signature = ed25519.sign(raw.message, privateKey);
-      const encoded = encodeSignedTransaction(raw.message, [signature]);
+      // When the tx was built with a fee payer (fee-wallet co-sign topology),
+      // the second signer's key must be supplied here — and its address must
+      // match the declared feePayerAddress on the raw tx, same cross-check we
+      // do for the source. Passing a feePayerPrivateKey when the tx was built
+      // without a feePayer (or vice versa) is a caller bug: fail loudly.
+      let feePayerKey: Uint8Array | null = null;
+      if (raw.feePayerAddress !== undefined) {
+        if (!options?.feePayerPrivateKey) {
+          throw new Error(
+            "Solana signAndBroadcast: unsigned tx declares a feePayer but no feePayerPrivateKey was provided"
+          );
+        }
+        const fpKey = hexToBytes(options.feePayerPrivateKey);
+        if (fpKey.length !== 32) {
+          throw new Error(`Solana fee-payer signing key must be 32 bytes, got ${fpKey.length}`);
+        }
+        const fpPublic = publicKeyFromPrivateKey(fpKey);
+        const fpExpected = addressToPublicKeyBytes(raw.feePayerAddress);
+        if (!bytesEqual(fpPublic, fpExpected)) {
+          throw new Error(
+            `Solana signAndBroadcast: feePayer address mismatch — raw.feePayerAddress=${raw.feePayerAddress} but the supplied feePayerPrivateKey derives to a different key. The fee_wallets row is out of sync with MASTER_SEED (hd-pool mode) or was imported against a different pubkey (imported mode).`
+          );
+        }
+        feePayerKey = fpKey;
+      } else if (options?.feePayerPrivateKey !== undefined) {
+        throw new Error(
+          "Solana signAndBroadcast: feePayerPrivateKey was provided but the unsigned tx has no feePayerAddress — this payout was planned as self-pay; do not pass a fee-wallet key"
+        );
+      }
+
       const client = getClient(unsignedTx.chainId);
+
+      // Pre-broadcast rent-exempt check. Solana fails tx simulation with
+      // "Transaction results in an account (0) with insufficient funds for
+      // rent" when the signer would drop below the rent-exempt minimum
+      // (890 880 lamports for a 0-byte SystemProgram account). Surfacing a
+      // clear local error here — with the exact numbers — is strictly better
+      // than relaying the vendor's string from an otherwise unexplained
+      // broadcast failure. Transient getBalance RPC errors are swallowed so a
+      // flap can't block a valid payout; the real sendTransaction still runs
+      // and the chain's own check is authoritative.
+      if (raw.nativeOutLamports !== undefined && raw.feeLamports !== undefined) {
+        try {
+          const balance = BigInt(await client.getBalance(raw.fromAddress));
+          const totalOut = raw.nativeOutLamports + raw.feeLamports;
+          const postBalance = balance - totalOut;
+          if (postBalance < SYSTEM_ACCOUNT_RENT_EXEMPT_LAMPORTS) {
+            throw new Error(
+              `insufficient native balance for broadcast (post-tx balance would be below Solana rent-exempt minimum): ` +
+                `balance=${balance} lamports, amount=${raw.nativeOutLamports}, fee=${raw.feeLamports}, ` +
+                `post=${postBalance}, rent_exempt_min=${SYSTEM_ACCOUNT_RENT_EXEMPT_LAMPORTS}. ` +
+                `Either top up the source or reduce the payout amount by at least ` +
+                `${SYSTEM_ACCOUNT_RENT_EXEMPT_LAMPORTS - postBalance} lamports.`
+            );
+          }
+        } catch (err) {
+          if (err instanceof Error && err.message.startsWith("insufficient native balance for broadcast")) {
+            throw err;
+          }
+          // Fall through for RPC read errors — don't block a valid payout on a flap.
+        }
+      }
+
+      // Pre-broadcast SPL balance check. SPL transfers revert at the chain
+      // with "SPL Token Program error 0x1 (InsufficientFunds)" when the
+      // source's token account holds less than `splAmountRaw`. That error
+      // arrives as a cryptic "custom program error: 0x1" on sendTransaction
+      // simulation, and you can't tell from the error message alone whether
+      // it was SPL InsufficientFunds, the token mint being frozen, or a
+      // destination-ATA creation problem. Reading the source's holdings for
+      // the specific mint lets us fail locally with actual-vs-required
+      // numbers. Classic drift trigger: detection saw an SPL credit that
+      // never actually reached the source's ATA (or the ATA doesn't exist
+      // at all — `getTokenAccountsByOwner` returns an empty entry for that
+      // mint, and we treat it as balance=0).
+      if (raw.splMintAddress !== undefined && raw.splAmountRaw !== undefined) {
+        try {
+          const accounts = await client.getTokenAccountsByOwner(raw.fromAddress);
+          let onChain = 0n;
+          for (const acct of accounts) {
+            if (acct.mint === raw.splMintAddress) {
+              try { onChain += BigInt(acct.amount); } catch { /* skip malformed entry */ }
+            }
+          }
+          if (onChain < raw.splAmountRaw) {
+            throw new Error(
+              `insufficient SPL balance for broadcast: mint=${raw.splMintAddress}, ` +
+                `owner=${raw.fromAddress}, on_chain=${onChain}, required=${raw.splAmountRaw}, ` +
+                `short_by=${raw.splAmountRaw - onChain}. ` +
+                `The DB-tracked spendable (what the planner used) is ahead of the on-chain ` +
+                `ATA balance. Either the source was never funded with this SPL on-chain, or ` +
+                `a detection row is stale. Verify with \`getTokenAccountsByOwner\` for this ` +
+                `owner and reconcile before retrying.`
+            );
+          }
+        } catch (err) {
+          if (err instanceof Error && err.message.startsWith("insufficient SPL balance for broadcast")) {
+            throw err;
+          }
+          // Fall through for RPC read errors — don't block a valid payout on a flap.
+        }
+      }
+
+      // Fee-payer SOL pre-check. The fee payer must have enough SOL to
+      // cover the signature fee (5000 lamports) + any ATA rent
+      // (~2 039 280 lamports when we're creating the recipient's ATA) AND
+      // stay rent-exempt itself. Catching this locally gives the operator
+      // a clear error ("fee wallet is underfunded") instead of the runtime's
+      // generic custom-program-error-0x1 from a CPI allocation that ran out
+      // of SOL at instruction 2.
+      if (raw.feePayerAddress !== undefined && raw.feePayerSolOut !== undefined) {
+        try {
+          const fpBalance = BigInt(await client.getBalance(raw.feePayerAddress));
+          const post = fpBalance - raw.feePayerSolOut;
+          if (post < SYSTEM_ACCOUNT_RENT_EXEMPT_LAMPORTS) {
+            throw new Error(
+              `insufficient fee-wallet balance for broadcast (post-tx fee-wallet balance would be below rent-exempt minimum): ` +
+                `feeWallet=${raw.feePayerAddress}, balance=${fpBalance} lamports, ` +
+                `fee_wallet_outflow=${raw.feePayerSolOut}, post=${post}, ` +
+                `rent_exempt_min=${SYSTEM_ACCOUNT_RENT_EXEMPT_LAMPORTS}. ` +
+                `Top up the Solana fee wallet by at least ` +
+                `${SYSTEM_ACCOUNT_RENT_EXEMPT_LAMPORTS - post} lamports and retry.`
+            );
+          }
+        } catch (err) {
+          if (err instanceof Error && err.message.startsWith("insufficient fee-wallet balance for broadcast")) {
+            throw err;
+          }
+          // Swallow RPC read errors — don't block on a flap; the chain still
+          // performs its own check and we'll surface that verbatim.
+        }
+      }
+
+      // Sign. Two-signer layout when a fee payer key is present: the fee
+      // wallet signs first (accountKeys[0] = writable fee payer), then the
+      // source signs second (accountKeys[1] = transfer authority for SPL, or
+      // writable source for native SOL). The signature array ordering MUST
+      // match accountKeys ordering — Solana validates signatures positionally.
+      const sourceSig = ed25519.sign(raw.message, privateKey);
+      const signatures = feePayerKey !== null
+        ? [ed25519.sign(raw.message, feePayerKey), sourceSig]
+        : [sourceSig];
+      const encoded = encodeSignedTransaction(raw.message, signatures);
       const txHash = await client.sendTransaction(encoded);
       return txHash as TxHash;
     },
@@ -417,6 +652,25 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
 
     nativeSymbol(_chainId: ChainId): TokenSymbol {
       return "SOL" as TokenSymbol;
+    },
+
+    minimumNativeReserve(_chainId: ChainId): bigint {
+      return SYSTEM_ACCOUNT_RENT_EXEMPT_LAMPORTS;
+    },
+
+    gasSafetyFactor(_chainId: ChainId) {
+      // 1.2× covers future priority-fee drift if we wire
+      // getRecentPrioritizationFees into the quote later; the base signature
+      // fee is a fixed 5000 lamports with zero drift at all.
+      return { num: 120n, den: 100n };
+    },
+
+    feeWalletCapability(_chainId: ChainId) {
+      // Solana's native message format has an explicit `feePayer` slot —
+      // any account that co-signs as the first signer pays the signature
+      // fee and funds any CPI rent allocations (including destination ATA
+      // creation). Pool addresses holding only SPL never need SOL.
+      return "co-sign" as const;
     },
 
     async estimateGasForTransfer(_args: EstimateArgs): Promise<AmountRaw> {
@@ -430,6 +684,7 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       // Real fee tiers for Solana.
       //
       //   total = base_signature_fee + (compute_unit_limit * microLamportsPerCu / 1e6)
+      //          + [ATA rent-exempt if destination lacks an ATA for this mint]
       //
       // Priority per-CU prices come from `getRecentPrioritizationFees` —
       // bucketed to 25th/50th/75th percentile for low/medium/high. Empty
@@ -437,7 +692,23 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       // CU limit is fixed at DEFAULT_COMPUTE_UNIT_LIMIT — plenty of headroom
       // for any transfer we actually build today, and operators only pay for
       // units consumed, not units allocated.
+      //
+      // The ATA-rent addition is THE critical correction: for SPL transfers
+      // to a destination without an existing token account for this mint,
+      // the tx inserts a CreateIdempotent that allocates a new 165-byte
+      // token account. The signer pays ~2 039 280 lamports of rent from its
+      // own SOL. Omitting this from the quote makes the planner under-
+      // reserve SOL, and the broadcast fails at instruction 2 with the
+      // System Program's ResultWithNegativeLamports — the error that looks
+      // identical to SPL InsufficientFunds and takes forever to diagnose.
       const client = getClient(args.chainId);
+      const token = findToken(args.chainId as ChainId, args.token);
+      let ataRentLamports = 0n;
+      if (token && token.contractAddress !== null) {
+        const recipientAta = deriveAssociatedTokenAccount(args.toAddress, token.contractAddress);
+        const exists = await client.accountExists(recipientAta);
+        if (!exists) ataRentLamports = SPL_TOKEN_ACCOUNT_RENT_EXEMPT_LAMPORTS;
+      }
       const tierPrices = await solanaTierPrices(client, [
         args.fromAddress,
         args.toAddress
@@ -445,7 +716,7 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       const cuLimit = BigInt(DEFAULT_COMPUTE_UNIT_LIMIT);
       const totalFor = (microLamports: bigint): AmountRaw => {
         const priorityLamports = (cuLimit * microLamports) / 1_000_000n;
-        return (SIGNATURE_FEE_LAMPORTS + priorityLamports).toString() as AmountRaw;
+        return (SIGNATURE_FEE_LAMPORTS + priorityLamports + ataRentLamports).toString() as AmountRaw;
       };
       return {
         low: { tier: "low", nativeAmountRaw: totalFor(tierPrices.low) },

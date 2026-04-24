@@ -33,6 +33,74 @@ const NATIVE_SYMBOLS: Readonly<Record<number, string>> = {
   43114: "AVAX"
 };
 
+// Per-chain gas floors. Guards against RPCs that report implausibly low
+// `eth_maxPriorityFeePerGas` during quiet periods: BSC spot reads of 0.05 gwei
+// (the consensus minimum set by the Oct-2025 validator vote) are routinely
+// returned even though real-world inclusion reliability wants ~1 gwei. When
+// reservation is sized against a quote of 0.05 gwei and a tx broadcasts a few
+// blocks later at 0.1 gwei, viem's sendTransaction fails the balance check
+// with "total cost (gas * gas fee + value) exceeds balance" — which is the
+// failure mode these floors exist to prevent.
+//
+// Values are deliberately conservative (1-3 gwei on chains whose consensus
+// floor is far lower) because payout flows are low-frequency / high-reliability
+// rather than high-frequency / cost-sensitive. The operator funds these
+// wallets and the merchant sees the quoted fee up-front via POST /payouts/
+// estimate, so there's no hidden cost drift — just a small predictable cushion
+// that makes every broadcast succeed.
+interface GasFloor {
+  readonly minPriorityFeePerGas: bigint;
+  readonly minMaxFeePerGas: bigint;
+}
+const CHAIN_GAS_FLOORS: Readonly<Record<number, GasFloor>> = {
+  // Ethereum mainnet: typical priority ~1 gwei; maxFeePerGas floor covers
+  // a single-block baseFee bump.
+  1:     { minPriorityFeePerGas:  1_000_000_000n, minMaxFeePerGas:  2_000_000_000n },
+  // Optimism: L2 priority essentially free, sub-gwei base.
+  10:    { minPriorityFeePerGas:      1_000_000n, minMaxFeePerGas:      1_000_000n },
+  // BSC: consensus floor is 0.05 gwei (Oct-2025 validator vote) and BEP-226
+  // pins baseFee to 0 — but RPC providers (Alchemy BSC in particular) run
+  // their own pre-send balance simulation using `eth_gasPrice` (~1-3 gwei
+  // during normal network activity) rather than the tx's bound maxFeePerGas,
+  // rejecting tight-balance txs at the submission layer even when the math
+  // against our own fee binding is a clear pass. 3 gwei priority / 3 gwei
+  // maxFee matches that provider-side minimum; costs ~$0.04 per native
+  // transfer at BNB $700 (vs ~$0.01 wallet-layer quotes) but is the price
+  // of reliable inclusion via Alchemy/QuickNode/Infura on BSC today. Drop
+  // this to 1 gwei when (and only when) the operator configures a BSC RPC
+  // that honors maxFeePerGas at the submission layer.
+  56:    { minPriorityFeePerGas:  3_000_000_000n, minMaxFeePerGas:  3_000_000_000n },
+  // Polygon PoS: Heimdall v2 enforces a hard 25 gwei mandatory priority fee
+  // at the network layer. Below this, txs are rejected outright.
+  137:   { minPriorityFeePerGas: 25_000_000_000n, minMaxFeePerGas: 30_000_000_000n },
+  // Base: L2 priority essentially free.
+  8453:  { minPriorityFeePerGas:      1_000_000n, minMaxFeePerGas:      1_000_000n },
+  // Arbitrum One: priority tiny (sequencer ordering); keep a small maxFee floor.
+  42161: { minPriorityFeePerGas:     10_000_000n, minMaxFeePerGas:    100_000_000n },
+  // Avalanche C-Chain: post-ACP-125 baseFee floor is 1 nAVAX (gwei); real-
+  // world inclusion often wants more when utilization is non-zero.
+  43114: { minPriorityFeePerGas:  1_000_000_000n, minMaxFeePerGas:  1_000_000_000n }
+};
+
+// The zero-floor lookup lets unknown / dev chains pass through without a
+// floor applied — matches pre-floors behavior for anything not in the map.
+const NO_FLOOR: GasFloor = { minPriorityFeePerGas: 0n, minMaxFeePerGas: 0n };
+function gasFloorFor(chainId: number): GasFloor {
+  return CHAIN_GAS_FLOORS[chainId] ?? NO_FLOOR;
+}
+
+// How many recent blocks `sampleFees` inspects via `eth_feeHistory`. 20 blocks
+// is ~4 minutes on Ethereum, ~1 minute on BSC/Polygon — long enough to smooth
+// a single-block outlier (a quiet block returning priority=0), short enough
+// to track genuine fee-market movement within one minute of the payout.
+const FEE_HISTORY_BLOCK_COUNT = 20;
+
+// Priority-fee percentiles mapped onto our low/medium/high tiers. Using the
+// 75th percentile for "high" is what most production bridges (Hop, Across)
+// use for fast-inclusion quotes; 25/50 give a predictable spread for cheaper
+// tiers. Order must be ascending — `eth_feeHistory` rejects otherwise.
+const FEE_HISTORY_PERCENTILES: readonly number[] = [25, 50, 75];
+
 // Default BIP44 derivation path prefix for EVM. addressIndex is appended.
 // m/44'/60'/0'/0/{index}  — Ethereum coin type = 60.
 const DEFAULT_ACCOUNT_INDEX = 0;
@@ -261,52 +329,53 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         value = 0n;
       }
 
-      // Gas is estimated in `estimateGasForTransfer`; don't pre-bind it here
-      // so a caller can call either method independently.
+      // Pre-bind `gas` so viem's sendTransaction does NOT call eth_estimateGas
+      // at broadcast. The concrete symptom that motivates this pin: Alchemy
+      // BSC's `eth_estimateGas` runs its own balance simulation using an
+      // internal "sane" gas price higher than our bound maxFeePerGas, so a
+      // source funded to exactly `value + our_gas × our_maxFee` still gets
+      // rejected at simulation time with "insufficient funds for gas * price +
+      // value" — before the tx even reaches the mempool. Bypassing viem's
+      // estimateGas call forces the balance check to run at the ACTUAL
+      // mempool level, where our bound maxFeePerGas is what's used.
+      //
+      // 21_000 is the EVM-floor cost of a native transfer and is immutable
+      // for any non-contract destination. 65_000 for ERC-20 covers USDT's
+      // branched impl (~45k), first-send-to-new-address USDC (~55k), and
+      // exotic proxy tokens (up to 80k in the wild) with a modest pad.
+      // Validators only charge for gas actually used, so a small overestimate
+      // on ERC-20 is refunded on-chain and costs the merchant nothing.
       const raw: EvmUnsignedTxRaw = {
         to,
         data,
         value,
         from: args.fromAddress as Hex,
-        chainId: args.chainId
+        chainId: args.chainId,
+        gas: isNative ? 21_000n : 65_000n
       };
 
-      // Bind the fee tier when the caller asked for one. We compute the per-
-      // tier maxFeePerGas / maxPriorityFeePerGas the same way `quoteFeeTiers`
-      // does, so what the operator was quoted is what gets broadcast (modulo
-      // baseFee drift between estimate and broadcast — the 2× baseFee margin
-      // absorbs typical pending-pool variance).
-      if (args.feeTier !== undefined) {
-        try {
-          const client = getClient(args.chainId);
-          const fees = await client.estimateFeesPerGas();
-          // EIP-1559 guard: if either field is undefined, the chain isn't
-          // returning 1559-shaped fee data (legacy chains, some dev nodes,
-          // certain sidechains). Falling through to viem's default at send
-          // time is safer than computing `baseFee = 0n - 0n` and binding a
-          // maxFeePerGas that equals only the priority fee — which on a
-          // congested chain would land the tx at zero or revert. The tier
-          // request is silently ignored in this case; operators on legacy
-          // chains see no tier effect, which matches the adapter's
-          // tieringSupported=false surface on those chains.
-          if (fees.maxFeePerGas === undefined || fees.maxPriorityFeePerGas === undefined) {
-            // No-op: non-1559 chain, viem's sendTransaction will pick a
-            // legacy gasPrice on broadcast.
-          } else {
-            const priorityMid = fees.maxPriorityFeePerGas;
-            const baseFee = fees.maxFeePerGas - priorityMid;
-            let priority: bigint;
-            if (args.feeTier === "low") priority = (priorityMid * 4n) / 5n;
-            else if (args.feeTier === "high") priority = (priorityMid * 3n) / 2n;
-            else priority = priorityMid;
-            raw.maxFeePerGas = 2n * baseFee + priority;
-            raw.maxPriorityFeePerGas = priority;
-          }
-        } catch {
-          // estimateFeesPerGas threw entirely (network error, unsupported
-          // method on the RPC). Fall back to viem's default at sendTransaction.
-        }
+      // Bind maxFeePerGas / maxPriorityFeePerGas on every EIP-1559 broadcast,
+      // not just when the merchant asked for a specific tier. Leaving these
+      // unbound lets viem's sendTransaction fall back to its internal
+      // `estimateFeesPerGas` (baseFeeMultiplier=1.2 + spot priority) which on
+      // BSC happily produces values several-fold above what the planner
+      // reserved — the exact path that failed a native BNB payout with
+      // `feeTier: null` even after the per-tier floor was introduced. When
+      // the merchant didn't specify a tier we default to `medium`, matching
+      // `planPayout`'s picker-budget target tier so broadcast cost can never
+      // exceed the reservation.
+      const broadcastTier: "low" | "medium" | "high" = args.feeTier ?? "medium";
+      const sample = await sampleFees(getClient(args.chainId), args.chainId);
+      if (sample !== null) {
+        const priority = pickPriorityForTier(sample, broadcastTier);
+        const binding = buildFeeBinding(args.chainId, sample.baseFee, priority);
+        raw.maxFeePerGas = binding.maxFeePerGas;
+        raw.maxPriorityFeePerGas = binding.maxPriorityFeePerGas;
       }
+      // sample===null means neither eth_feeHistory nor estimateFeesPerGas gave
+      // us 1559 data — a strictly legacy chain. Leaving fees unbound lets viem
+      // fall back to the legacy gasPrice path, consistent with the
+      // `tieringSupported:false` surface in quoteFeeTiers.
 
       return {
         chainId: args.chainId as ChainId,
@@ -317,11 +386,76 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       };
     },
 
-    async signAndBroadcast(unsignedTx: UnsignedTx, privateKey: string): Promise<TxHash> {
+    async signAndBroadcast(
+      unsignedTx: UnsignedTx,
+      privateKey: string,
+      options?: { readonly feePayerPrivateKey?: string }
+    ): Promise<TxHash> {
+      if (options?.feePayerPrivateKey !== undefined) {
+        // EVM's feeWalletCapability is "none" — receiving a fee-payer key
+        // here means the domain layer bypassed the capability gate. Fail
+        // loudly so the bug doesn't manifest as a silently-ignored key.
+        throw new Error(
+          "EVM signAndBroadcast: feePayerPrivateKey is not supported on EVM (capability='none'). " +
+            "The fee-wallet co-sign pattern only applies to families with native feePayer support (Solana)."
+        );
+      }
       const raw = unsignedTx.raw as EvmUnsignedTxRaw;
       const account = privateKeyToAccount(privateKey as Hex);
       const chainId = raw.chainId;
       const transport = config.transports?.[chainId] ?? buildHttpTransport(config.rpcUrls, chainId);
+
+      // Signer-address invariant: the address derived from the private key
+      // MUST equal the pool-stored source address the payout was planned
+      // against. A mismatch means the HD seed used when the pool row was
+      // created differs from the seed used to sign now — classic fallout
+      // from rotating MASTER_SEED without migrating pool addresses. Without
+      // this check, viem happily signs with the wrong key and broadcasts
+      // a tx from an empty address, which the RPC rejects with a bland
+      // "insufficient funds balance 0" that gives no hint at the root
+      // cause. Raising a specific error here turns hours of debugging into
+      // seconds.
+      const signerAddress = account.address.toLowerCase() as Hex;
+      const expectedFrom = raw.from.toLowerCase() as Hex;
+      if (signerAddress !== expectedFrom) {
+        throw new Error(
+          `Signer-address mismatch: pool row has address=${expectedFrom} but the private key derives to ${signerAddress}. ` +
+            `This indicates MASTER_SEED has rotated since the pool row was populated, or the pool row stores an externally-funded address whose key the gateway does not control. ` +
+            `Fix: restore the original MASTER_SEED, OR migrate funds off ${expectedFrom} and re-plan from a pool address whose derivation matches the current seed.`
+        );
+      }
+
+      // Pre-broadcast balance check: read the actual on-chain balance against
+      // the SIGNER's address (== raw.from per the invariant above) and refuse
+      // to broadcast when the tx can't afford itself. Strictly better than
+      // passing through the vendor's truncated insufficient-funds string, and
+      // catches the case where the pool row's DB-tracked spendable is ahead
+      // of on-chain reality (funds moved out by an external tool / sweep /
+      // failed-tx-not-reconciled).
+      if (raw.gas !== undefined && raw.maxFeePerGas !== undefined) {
+        const maxCost = raw.gas * raw.maxFeePerGas + raw.value;
+        try {
+          const client = getClient(chainId);
+          const balance = await client.getBalance({ address: signerAddress });
+          if (balance < maxCost) {
+            const short = raw.value === 0n
+              ? `balance=${balance} wei, gas_budget=${raw.gas * raw.maxFeePerGas} wei (gas=${raw.gas}, maxFeePerGas=${raw.maxFeePerGas})`
+              : `balance=${balance} wei, value=${raw.value} wei, gas_budget=${raw.gas * raw.maxFeePerGas} wei (gas=${raw.gas}, maxFeePerGas=${raw.maxFeePerGas})`;
+            throw new Error(
+              `insufficient native balance for broadcast (balance < value + gas × maxFeePerGas): ${short}`
+            );
+          }
+        } catch (err) {
+          // The thrown-above insufficient-balance error should propagate.
+          // Everything else (a getBalance RPC flap) we swallow and let the
+          // real broadcast try — we don't want a transient read failure to
+          // block a valid payout.
+          if (err instanceof Error && err.message.startsWith("insufficient native balance for broadcast")) {
+            throw err;
+          }
+        }
+      }
+
       const wallet = createWalletClient({ account, transport });
       const hash = await wallet.sendTransaction({
         to: raw.to,
@@ -341,6 +475,24 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
 
     nativeSymbol(chainId: ChainId): TokenSymbol {
       return (NATIVE_SYMBOLS[chainId] ?? "ETH") as TokenSymbol;
+    },
+
+    minimumNativeReserve(_chainId: ChainId): bigint {
+      // EVM has no rent-exempt concept — an account can hold any balance.
+      return 0n;
+    },
+
+    gasSafetyFactor(_chainId: ChainId) {
+      // 1.5× covers ~6 blocks of EIP-1559 baseFee growth (12.5%/block cap).
+      return { num: 150n, den: 100n };
+    },
+
+    feeWalletCapability(_chainId: ChainId) {
+      // EVM has no native fee-payer separation prior to account abstraction
+      // (EIP-4337 / EIP-3074 aren't universal across every EVM chain we
+      // serve). The current sponsor-topup flow IS the EVM fee-wallet
+      // pattern; a dedicated fee-wallet row adds no mechanism here today.
+      return "none" as const;
     },
 
     async estimateGasForTransfer(args: EstimateArgs): Promise<AmountRaw> {
@@ -399,18 +551,24 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
     async quoteFeeTiers(args: EstimateArgs): Promise<FeeTierQuote> {
       const client = getClient(args.chainId);
       const gasUnits = BigInt(await this.estimateGasForTransfer(args));
-      const fees = await client.estimateFeesPerGas();
       const nativeSymbol = this.nativeSymbol(args.chainId as ChainId);
+      const floor = gasFloorFor(args.chainId);
 
-      // Non-EIP1559 chains (legacy BSC, some dev nodes, older sidechains)
-      // return `{ gasPrice }` only, with `maxFeePerGas` / `maxPriorityFeePerGas`
-      // undefined. Our tier math needs both to mean anything. Fall back to a
-      // single-tier quote: `gasUnits × gasPrice` (or `maxFeePerGas` if only
-      // that is defined), and tell the caller tiering isn't available.
-      if (fees.maxFeePerGas === undefined || fees.maxPriorityFeePerGas === undefined) {
-        const legacyGasPrice =
-          fees.maxFeePerGas ?? (fees as unknown as { gasPrice?: bigint }).gasPrice ?? 0n;
-        const flat = (gasUnits * legacyGasPrice).toString() as AmountRaw;
+      const sample = await sampleFees(client, args.chainId);
+
+      // Non-1559 fallback: the chain doesn't implement eth_feeHistory AND
+      // estimateFeesPerGas didn't return a 1559-shaped pair. Quote a flat
+      // single-tier fee using whatever legacy gasPrice is available (or the
+      // floor, whichever is higher).
+      if (sample === null) {
+        const legacy = await client
+          .estimateFeesPerGas()
+          .then((f) => (f as unknown as { gasPrice?: bigint; maxFeePerGas?: bigint }))
+          .catch(() => ({} as { gasPrice?: bigint; maxFeePerGas?: bigint }));
+        const legacyGasPrice = legacy.maxFeePerGas ?? legacy.gasPrice ?? 0n;
+        const flooredGasPrice =
+          legacyGasPrice > floor.minMaxFeePerGas ? legacyGasPrice : floor.minMaxFeePerGas;
+        const flat = (gasUnits * flooredGasPrice).toString() as AmountRaw;
         return {
           low: { tier: "low", nativeAmountRaw: flat },
           medium: { tier: "medium", nativeAmountRaw: flat },
@@ -420,41 +578,26 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         };
       }
 
-      const priorityMid = fees.maxPriorityFeePerGas;
-      const baseFee = fees.maxFeePerGas - priorityMid;
-      // Zero-priority edge case: when the chain returns `priorityFee: 0n`
-      // (some L2s, quiet networks), scaling 0 by any factor stays 0, and
-      // all three tiers collapse to `2 × baseFee`. Flag `tieringSupported:
-      // false` so the frontend renders a single option instead of three
-      // identical ones.
-      if (priorityMid === 0n) {
-        const flat = (gasUnits * (2n * baseFee)).toString() as AmountRaw;
-        return {
-          low: { tier: "low", nativeAmountRaw: flat },
-          medium: { tier: "medium", nativeAmountRaw: flat },
-          high: { tier: "high", nativeAmountRaw: flat },
-          tieringSupported: false,
-          nativeSymbol
-        };
-      }
+      const nativeAt = (priority: bigint): AmountRaw => {
+        const { maxFeePerGas } = buildFeeBinding(args.chainId, sample.baseFee, priority);
+        return (gasUnits * maxFeePerGas).toString() as AmountRaw;
+      };
+      const lowFee = nativeAt(sample.priorityLow);
+      const midFee = nativeAt(sample.priorityMid);
+      const highFee = nativeAt(sample.priorityHigh);
 
-      // Tier multipliers scale the priority fee: cheaper = slower inclusion,
-      // more = faster. maxFeePerGas at each tier = 2 × baseFee + tieredPriority
-      // (2× baseFee is viem's default safety margin to absorb baseFee growth
-      // during the pending-pool wait).
-      const tierPriority = (mulNumerator: bigint, mulDenominator: bigint): bigint =>
-        (priorityMid * mulNumerator) / mulDenominator;
-      const priorityLow = tierPriority(4n, 5n); // 0.8×
-      const priorityMidT = priorityMid; // 1.0×
-      const priorityHigh = tierPriority(3n, 2n); // 1.5×
-      const maxPerGasAt = (priority: bigint): bigint => 2n * baseFee + priority;
-      const nativeAt = (priority: bigint): AmountRaw =>
-        (gasUnits * maxPerGasAt(priority)).toString() as AmountRaw;
+      // Tiering is meaningful only when the three tiers produce distinct
+      // numbers. When every percentile returned 0 priority AND the chain's
+      // floor is also zero (unknown / dev chains), low/medium/high all collapse
+      // to the baseFee-only value — surface `tieringSupported: false` so the
+      // frontend renders a single option instead of three identical ones.
+      const tieringSupported = lowFee !== midFee || midFee !== highFee;
+
       return {
-        low: { tier: "low", nativeAmountRaw: nativeAt(priorityLow) },
-        medium: { tier: "medium", nativeAmountRaw: nativeAt(priorityMidT) },
-        high: { tier: "high", nativeAmountRaw: nativeAt(priorityHigh) },
-        tieringSupported: true,
+        low: { tier: "low", nativeAmountRaw: lowFee },
+        medium: { tier: "medium", nativeAmountRaw: midFee },
+        high: { tier: "high", nativeAmountRaw: highFee },
+        tieringSupported,
         nativeSymbol
       };
     },
@@ -583,4 +726,113 @@ interface EvmUnsignedTxRaw {
   // viem's sendTransaction rejects partial sets.
   maxFeePerGas?: bigint;
   maxPriorityFeePerGas?: bigint;
+}
+
+// ---- Fee sampling & binding (shared by quoteFeeTiers + buildTransfer) ----
+
+// One rolling-window fee sample for a chain: next-block baseFee + three
+// priority-fee percentiles. Tiered priorities come from `eth_feeHistory` on
+// the happy path (stable across single-block noise), falling back to the
+// single spot value from `eth_maxPriorityFeePerGas` scaled 0.8×/1.0×/1.5×
+// only when feeHistory is unavailable.
+interface FeeSample {
+  readonly baseFee: bigint;
+  readonly priorityLow: bigint;
+  readonly priorityMid: bigint;
+  readonly priorityHigh: bigint;
+}
+
+// Read per-tier fees from the chain. Returns `null` ONLY when neither
+// feeHistory nor estimateFeesPerGas produced a 1559-shaped result — i.e.
+// the chain is strictly legacy-gasPrice. In every other case we return a
+// best-effort sample (floors are applied in `buildFeeBinding`, not here).
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+async function sampleFees(client: PublicClient, chainId: number): Promise<FeeSample | null> {
+  // Happy path: eth_feeHistory gives us per-percentile priority fees + a
+  // "next block" baseFee, both smoothed over a 20-block window.
+  try {
+    const history = await client.getFeeHistory({
+      blockCount: FEE_HISTORY_BLOCK_COUNT,
+      rewardPercentiles: FEE_HISTORY_PERCENTILES as number[]
+    });
+    // `baseFeePerGas` has blockCount+1 entries — last one is the estimated
+    // next-block baseFee. Using that (not an average) matches viem's own
+    // `estimateFeesPerGas` convention and tracks current network conditions
+    // instead of lagging behind a stale average.
+    const baseFeeArr = history.baseFeePerGas ?? [];
+    const baseFee = baseFeeArr.length > 0 ? baseFeeArr[baseFeeArr.length - 1] ?? 0n : 0n;
+    const rewards = history.reward ?? [];
+    if (rewards.length > 0) {
+      // Median across the window per percentile column. Median beats mean
+      // because a single spike block doesn't pull the tier off realistic
+      // values, and beats max because we don't want to overpay on one
+      // outlier either.
+      const median = (column: 0 | 1 | 2): bigint => {
+        const vals: bigint[] = [];
+        for (const row of rewards) {
+          const v = row?.[column];
+          if (v !== undefined && v !== null) vals.push(v);
+        }
+        if (vals.length === 0) return 0n;
+        vals.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+        return vals[Math.floor(vals.length / 2)]!;
+      };
+      return {
+        baseFee,
+        priorityLow: median(0),
+        priorityMid: median(1),
+        priorityHigh: median(2)
+      };
+    }
+    // feeHistory responded but with empty `reward` rows (a fully quiet
+    // window on some RPC implementations). Fall through to spot below.
+  } catch (err) {
+    // eth_feeHistory not implemented on this RPC. Fall through to spot.
+    // Don't propagate — many private RPCs & some sidechains lack it, and
+    // the fallback still produces a usable quote with floors applied.
+    void err;
+  }
+  // Fallback path: spot eth_maxPriorityFeePerGas + latest block baseFee,
+  // scaled into three tiers. Noisier than feeHistory but still floored in
+  // buildFeeBinding, so a bad spot read can't starve the reservation.
+  try {
+    const spot = await client.estimateFeesPerGas();
+    if (spot.maxPriorityFeePerGas === undefined || spot.maxFeePerGas === undefined) {
+      return null;
+    }
+    const priority = spot.maxPriorityFeePerGas;
+    const rawBase = spot.maxFeePerGas - priority;
+    const baseFee = rawBase < 0n ? 0n : rawBase;
+    return {
+      baseFee,
+      priorityLow: (priority * 4n) / 5n,
+      priorityMid: priority,
+      priorityHigh: (priority * 3n) / 2n
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Apply the chain's gas floor to a (baseFee, priority) pair and return the
+// maxPriorityFeePerGas / maxFeePerGas values to bind on the tx. The 2×
+// baseFee multiplier covers ~6 blocks of EIP-1559 baseFee growth (baseFee
+// rises at most 12.5% per block, so `2 × baseFee` > `baseFee × 1.125^6`).
+function buildFeeBinding(
+  chainId: number,
+  baseFee: bigint,
+  priority: bigint
+): { maxPriorityFeePerGas: bigint; maxFeePerGas: bigint } {
+  const floor = gasFloorFor(chainId);
+  const flooredPriority =
+    priority > floor.minPriorityFeePerGas ? priority : floor.minPriorityFeePerGas;
+  const raw = 2n * baseFee + flooredPriority;
+  const maxFeePerGas = raw > floor.minMaxFeePerGas ? raw : floor.minMaxFeePerGas;
+  return { maxPriorityFeePerGas: flooredPriority, maxFeePerGas };
+}
+
+function pickPriorityForTier(sample: FeeSample, tier: "low" | "medium" | "high"): bigint {
+  if (tier === "low") return sample.priorityLow;
+  if (tier === "high") return sample.priorityHigh;
+  return sample.priorityMid;
 }

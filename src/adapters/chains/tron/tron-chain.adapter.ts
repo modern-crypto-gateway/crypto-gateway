@@ -27,6 +27,21 @@ import {
 export const TRON_MAINNET_CHAIN_ID = 728126428;
 export const TRON_NILE_CHAIN_ID = 3448148188;
 
+// Tron-family extension surface. The Tron adapter implements both
+// ChainAdapter (the cross-family contract) and this interface (Tron-only
+// resource / delegation operations). Admin endpoints that touch Stake 2.0
+// look for this shape via `isTronChainAdapter()` and call the backend
+// directly — avoids pushing Tron-specific methods onto the generic
+// ChainAdapter port.
+export interface TronChainAdapter extends ChainAdapter {
+  readonly family: "tron";
+  tronBackend(chainId: number): TronRpcBackend;
+}
+
+export function isTronChainAdapter(adapter: ChainAdapter): adapter is TronChainAdapter {
+  return adapter.family === "tron" && typeof (adapter as unknown as { tronBackend?: unknown }).tronBackend === "function";
+}
+
 const DEFAULT_FEE_LIMIT_SUN = 100_000_000; // 100 TRX cap per payout tx (generous, rarely consumed)
 // Hard energy cap for TRC-20 `transfer(address,uint256)`. Standard SRC-20
 // transfers use 14k-65k energy; 150k leaves headroom for cold-slot writes
@@ -43,6 +58,19 @@ const DEFAULT_CHANGE_INDEX = 0;
 // nowblock is identical for every tx in that tick, so coalesce calls within
 // ~10s. Tron block time is ~3s, so this is at most one stale-by-3-blocks read.
 const NOW_BLOCK_CACHE_TTL_MS = 10_000;
+
+// TTL for the energyFee chain-parameter cache. Tron's energy price only
+// changes via a Super Representative vote (rare — the 420→210 change took
+// years), so caching for a minute keeps quoteFeeTiers from hitting an RPC
+// on every single /payouts/estimate call without meaningfully stale data.
+const CHAIN_PARAM_CACHE_TTL_MS = 60_000;
+
+// Fallback SUN-per-energy rate used when /wallet/getchainparameters is
+// unavailable. 210 SUN/energy is the current mainnet value (post-2024 vote).
+// Using the live rate where possible means we're correct even if Tron votes
+// again to change it; the fallback keeps quotes conservative (round up, not
+// down) during RPC flaps.
+const ENERGY_FEE_FALLBACK_SUN = 210n;
 
 // Dust threshold for address-poisoning spam on Tron. TRX sun and USDT/USDC
 // base units (both 6 decimals on Tron) below this are dropped at scan time.
@@ -80,7 +108,7 @@ export interface TronChainConfig {
   feeLimitSun?: number;
 }
 
-export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
+export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter {
   const chainIds = (config.chainIds ?? [TRON_MAINNET_CHAIN_ID]) as readonly ChainId[];
   const accountIndex = config.accountIndex ?? DEFAULT_ACCOUNT_INDEX;
   const feeLimit = config.feeLimitSun ?? DEFAULT_FEE_LIMIT_SUN;
@@ -115,9 +143,38 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
     return number;
   }
 
+  // Cache the chain's current SUN-per-energy price. Queried from
+  // /wallet/getchainparameters at most once per minute per chain.
+  const energyFeeCache = new Map<number, { value: bigint; fetchedAt: number }>();
+  async function getCachedEnergyFee(chainId: number, client: TronRpcBackend): Promise<bigint> {
+    const now = Date.now();
+    const entry = energyFeeCache.get(chainId);
+    if (entry && now - entry.fetchedAt < CHAIN_PARAM_CACHE_TTL_MS) return entry.value;
+    try {
+      const params = await client.getChainParameters();
+      const raw = params.params["getEnergyFee"];
+      const energyFee = typeof raw === "number" && raw > 0 ? BigInt(raw) : ENERGY_FEE_FALLBACK_SUN;
+      energyFeeCache.set(chainId, { value: energyFee, fetchedAt: now });
+      return energyFee;
+    } catch {
+      // RPC flap — don't poison the cache with the fallback; just return it
+      // for this call and retry next time. A chain-param read failure is
+      // transient; stamping a permanent fallback would mask a real recovery.
+      return ENERGY_FEE_FALLBACK_SUN;
+    }
+  }
+
   return {
     family: "tron",
     supportedChainIds: chainIds,
+
+    // Tron-only extension: exposes the configured RPC backend so admin
+    // endpoints handling Stake 2.0 ops (freeze / delegate / resources) can
+    // talk to it without rebuilding the same backend from scratch. Guarded
+    // at the call site by `isTronChainAdapter`.
+    tronBackend(chainId: number): TronRpcBackend {
+      return getClient(chainId);
+    },
 
     // ---- Addresses ----
 
@@ -382,18 +439,46 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       };
     },
 
-    async signAndBroadcast(unsignedTx: UnsignedTx, privateKey: string): Promise<TxHash> {
+    async signAndBroadcast(
+      unsignedTx: UnsignedTx,
+      privateKey: string,
+      options?: { readonly feePayerPrivateKey?: string }
+    ): Promise<TxHash> {
+      if (options?.feePayerPrivateKey !== undefined) {
+        // Tron uses resource delegation, not co-signing: a fee wallet stakes
+        // TRX and pre-delegates energy via DelegateResource. At broadcast
+        // time the tx has a single signer (the source). Supplying a
+        // feePayerPrivateKey here is a caller bug — the domain layer should
+        // route Tron through the delegation path, not the co-sign path.
+        throw new Error(
+          "Tron signAndBroadcast: feePayerPrivateKey is not supported on Tron (capability='delegate'). " +
+            "Tron fee wallets provide resources via DelegateResource, not co-signing. If you see this " +
+            "error, the domain layer confused capability='delegate' with capability='co-sign'."
+        );
+      }
       const raw = unsignedTx.raw as { txID: string; raw_data_hex: string; raw_data: unknown };
-      // Tron signs the sha256 of the raw_data bytes with secp256k1 (canonical
-      // `recoveryBit` appended). The txID is already sha256(raw_data_hex) per
-      // TronGrid, so we sign that directly.
+      // Tron signs the sha256 of the raw_data bytes with secp256k1. The txID
+      // is already sha256(raw_data_hex) per TronGrid, so we sign that
+      // directly with `prehash: false` (re-hashing would corrupt the sig).
       const privBytes = hexToBytesLocal(privateKey);
       const txIdBytes = hexToBytesLocal(raw.txID);
-      // Noble returns `r || s || recovery` (65 bytes) when format='recovered'.
-      // `prehash: false` tells it the message is already a 32-byte digest (Tron's
-      // txID IS sha256 of raw_data_hex, so re-hashing would corrupt the signature).
-      const sig = secp256k1.sign(txIdBytes, privBytes, { format: "recovered", prehash: false, lowS: true });
-      const signatureHex = bytesToHex(sig);
+      // Noble 2.x returns a 65-byte array in `[recovery, r..., s...]` order
+      // when format='recovered'. Tron's `/wallet/broadcasttransaction`
+      // expects signatures in `r || s || v` order (recovery byte LAST).
+      // Feeding Noble's output directly to Tron makes java-tron's
+      // SignatureValidator read r, s and v from misaligned byte ranges —
+      // surfaced as "Validate signature error: ... Header byte out of range"
+      // where the "header" byte is whatever garbage the misalignment
+      // happens to produce. Rearrange to the layout Tron wants.
+      const nobleSig = secp256k1.sign(txIdBytes, privBytes, { format: "recovered", prehash: false, lowS: true });
+      if (nobleSig.length !== 65) {
+        throw new Error(`Tron signing: unexpected noble signature length ${nobleSig.length}, want 65`);
+      }
+      const tronSig = new Uint8Array(65);
+      tronSig.set(nobleSig.subarray(1, 33), 0);  // r
+      tronSig.set(nobleSig.subarray(33, 65), 32); // s
+      tronSig[64] = nobleSig[0]!;                  // v (recovery)
+      const signatureHex = bytesToHex(tronSig);
 
       const client = getClient(unsignedTx.chainId);
       const resp = await client.broadcastTransaction({
@@ -412,6 +497,41 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
 
     nativeSymbol(_chainId: ChainId): TokenSymbol {
       return "TRX" as TokenSymbol;
+    },
+
+    minimumNativeReserve(_chainId: ChainId): bigint {
+      // Tron has no rent-exempt concept; accounts can hold any balance.
+      return 0n;
+    },
+
+    gasSafetyFactor(_chainId: ChainId) {
+      // 1.05× is the right floor for Tron. energyFee only changes on a
+      // Super-Representative vote (years apart — the last change was the
+      // 2024 halving from 420 to 210 SUN/energy), and the energy_used we
+      // quote comes from a real VM simulation via triggerConstantContract
+      // — it's exact for warm-slot transfers and conservatively pessimistic
+      // for cold-slot transfers (the state flips warm mid-execution, so
+      // the actual on-chain cost is ≤ simulated). 5% is enough to absorb:
+      //   - fractional SUN rounding in the (energy × energyFee) product
+      //   - the unlikely case where a source's own token slot went cold
+      //     between plan and broadcast (would require an admin action)
+      // A tighter value like 1.1× over-reserves native by ~5% on every
+      // payout, which looks harmless but bites at funding boundaries —
+      // a source with 7.30 TRX and a 6.77 TRX real quote was getting
+      // sponsor-gated over a 0.15 TRX phantom shortfall. 1.05× matches
+      // reality.
+      return { num: 105n, den: 100n };
+    },
+
+    feeWalletCapability(_chainId: ChainId) {
+      // Tron uses resource delegation, not co-signing: a fee wallet stakes
+      // TRX and calls DelegateResource to grant energy/bandwidth to pool
+      // addresses. At payout time the tx is unchanged — same single-signer
+      // flow — but consumed energy comes from the delegation rather than
+      // burning the source's TRX. Full integration (admin delegate ops +
+      // planner energy-availability check) lands alongside the capability
+      // value in Phase 4.
+      return "delegate" as const;
     },
 
     async getBalance(args): Promise<AmountRaw> {
@@ -469,9 +589,16 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
     },
 
     async estimateGasForTransfer(args: EstimateArgs): Promise<AmountRaw> {
-      // TronGrid's triggersmartcontract returns `energy_used` for the simulated
-      // call. We invoke a dry-run build and read that field. For a simple TRC-20
-      // `transfer`, energy is roughly 14k-65k depending on cold/warm slots.
+      // Use /wallet/triggerconstantcontract (NOT triggersmartcontract) for
+      // energy estimation. triggerSmartContract BUILDS an unsigned tx and
+      // routinely returns `energy_used: 0` — it's not a true simulation,
+      // so using it here undersells the real energy burn by ~14-65k units.
+      // triggerConstantContract actually executes the call in the VM and
+      // reports the real `energy_used`. Historical regression: we were
+      // quoting ~345 000 sun for USDT transfers (bandwidth only, energy=0),
+      // planner reserved the tiny amount, real broadcast burned ~12-27 TRX
+      // of energy, ran out on under-funded sources, and the tx reverted
+      // on-chain with the source's TRX consumed and the USDT still stuck.
       const token = findToken(args.chainId as ChainId, args.token);
       if (!token || token.contractAddress === null) {
         return "0" as AmountRaw;
@@ -479,21 +606,16 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       const client = getClient(args.chainId);
       const toCoreHex = tronToEvmCoreHex(args.toAddress).slice(2).padStart(64, "0");
       const amountHex = BigInt(args.amountRaw).toString(16).padStart(64, "0");
-      const resp = await client.triggerSmartContract({
+      const resp = await client.triggerConstantContract({
         owner_address: base58ToHex(args.fromAddress),
         contract_address: base58ToHex(token.contractAddress),
         function_selector: "transfer(address,uint256)",
-        parameter: `${toCoreHex}${amountHex}`,
-        fee_limit: feeLimit,
-        call_value: 0
+        parameter: `${toCoreHex}${amountHex}`
       });
-      // Revert detection — TronGrid returns HTTP 200 even when the simulated
+      // Revert detection — same rationale as buildTransfer: if the simulated
       // call reverts (insufficient balance, frozen/blacklisted account,
-      // destination-contract reject). On revert `result.result` is false and
-      // `result.message` carries the reason bytes; `energy_used` may be 0 or
-      // partial. Without this check, a pre-flight `estimate` would quote $0
-      // fees for a doomed tx — parity with `buildTransfer` at line 349-360
-      // where the same check already exists.
+      // destination-contract reject), `result.result` is false. Quoting a
+      // fee for a doomed tx would just mislead the merchant.
       if (resp.result.result !== true) {
         const message = resp.result.message ?? "unknown";
         throw new Error(`Tron simulation failed: ${message}`);
@@ -507,16 +629,16 @@ export function tronChainAdapter(config: TronChainConfig = {}): ChainAdapter {
       // account's staked bandwidth/energy allowance or burn SUN at a fixed
       // rate. We quote the burn-all-SUN worst case so the estimate never
       // undersells what the operator will pay if the account's stake is
-      // insufficient. Energy burn rate is ~420 SUN/unit; bandwidth burn is
-      // ~1000 SUN/byte — both are network parameters that rarely change.
-      // Returning `fee_limit` (the max the operator will spend) as the
-      // conservative upper bound keeps the estimate honest.
+      // insufficient. The SUN-per-energy rate is fetched live from
+      // /wallet/getchainparameters (cached ~1min) so we track Tron's
+      // periodic SR-voted changes — hardcoding 420 silently doubled quotes
+      // after the 2024 halving to 210.
       const energy = BigInt(await this.estimateGasForTransfer(args));
-      // 420 SUN per energy unit is the post-Stake 2.0 burn rate.
-      const ENERGY_BURN_SUN = 420n;
+      const client = getClient(args.chainId);
+      const energyBurnSun = await getCachedEnergyFee(args.chainId, client);
       // Bandwidth for a TRC-20 transfer is ~345 bytes × 1000 SUN/byte.
       const BANDWIDTH_SUN = 345n * 1000n;
-      const totalSun = (energy * ENERGY_BURN_SUN + BANDWIDTH_SUN).toString() as AmountRaw;
+      const totalSun = (energy * energyBurnSun + BANDWIDTH_SUN).toString() as AmountRaw;
       return {
         low: { tier: "low", nativeAmountRaw: totalSun },
         medium: { tier: "medium", nativeAmountRaw: totalSun },

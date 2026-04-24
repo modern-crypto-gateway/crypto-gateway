@@ -13,6 +13,7 @@ import { initializePool } from "../../core/domain/pool.service.js";
 import { promiseSetJobs } from "../../adapters/jobs/promise-set.adapter.js";
 import { staticPegPriceOracle } from "../../adapters/price-oracle/static-peg.adapter.js";
 import { hdSignerStore } from "../../adapters/signer-store/hd.adapter.js";
+import { dbFeeWalletStore } from "../../adapters/fee-wallet-store/db.adapter.js";
 import { capturingWebhookDispatcher, type CapturingDispatcher } from "../../adapters/webhook-delivery/noop.adapter.js";
 import { dbWebhookDeliveryStore } from "../../adapters/webhook-delivery/db-delivery-store.js";
 import { sha256Hex } from "../../adapters/crypto/subtle.js";
@@ -243,15 +244,21 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
 
   const chains = options.chains ?? [devChainAdapter()];
 
+  const testClock = options.clock ?? { now: () => options.now ?? new Date() };
+  const feeWalletStore = dbFeeWalletStore({ db, secretsCipher, clock: testClock });
   const deps: AppDeps = {
     db,
     cache,
     jobs: promiseSetJobs(),
     secrets,
     secretsCipher,
+    feeWalletStore,
     signerStore: hdSignerStore({
       masterSeed: secretsOverrides["MASTER_SEED"]!,
-      chains
+      chains,
+      feeWalletStore,
+      secretsCipher,
+      db
     }),
     priceOracle: options.priceOracle ?? staticPegPriceOracle(),
     webhookDispatcher: options.webhookDispatcher ?? capturingDispatcher!,
@@ -263,7 +270,7 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     chains,
     detectionStrategies: options.detectionStrategies ?? {},
     pushStrategies: options.pushStrategies ?? {},
-    clock: options.clock ?? { now: () => options.now ?? new Date() },
+    clock: testClock,
     ...(options.alchemy !== undefined ? { alchemy: options.alchemy } : {}),
     ...(options.alchemySubscribableChainsByFamily !== undefined
       ? { alchemySubscribableChainsByFamily: options.alchemySubscribableChainsByFamily }

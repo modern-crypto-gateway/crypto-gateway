@@ -2,6 +2,7 @@ import type { CacheStore } from "./ports/cache.port.ts";
 import type { ChainAdapter } from "./ports/chain.port.ts";
 import type { Db } from "../db/client.js";
 import type { DetectionStrategy } from "./ports/detection.port.ts";
+import type { FeeWalletStore } from "./ports/fee-wallet-store.port.ts";
 import type { JobRunner } from "./ports/jobs.port.ts";
 import type { Logger } from "./ports/logger.port.ts";
 import type { PriceOracle } from "./ports/price-oracle.port.ts";
@@ -32,6 +33,13 @@ export interface AppDeps {
   // goes through this port — storing plaintext is a layering violation.
   readonly secretsCipher: SecretsCipher;
   readonly signerStore: SignerStore;
+  // Per-family fee-wallet configuration. Read by the payout planner to
+  // decide whether the fee-wallet path (Solana co-sign / Tron delegation)
+  // is available on a given chain for a given candidate source; written
+  // by the admin endpoints that register or unregister wallets. Always
+  // present — when no wallets are configured, `.has(family)` returns false
+  // everywhere and behavior is identical to pre-fee-wallet deployments.
+  readonly feeWalletStore: FeeWalletStore;
   readonly priceOracle: PriceOracle;
   readonly webhookDispatcher: WebhookDispatcher;
   // Outbox/dead-letter store for merchant webhooks. Every composed webhook is

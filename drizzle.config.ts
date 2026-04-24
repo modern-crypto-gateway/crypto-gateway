@@ -17,8 +17,8 @@ import { defineConfig } from "drizzle-kit";
 // DATABASE_URL / DATABASE_TOKEN are accepted as legacy aliases for one
 // release cycle; TURSO_URL / TURSO_AUTH_TOKEN are canonical.
 
-const url = process.env["TURSO_URL"] ?? process.env["DATABASE_URL"] ?? "file:./local.db";
-const authToken = process.env["TURSO_AUTH_TOKEN"] ?? process.env["DATABASE_TOKEN"];
+const url = process.env["TURSO_URL"];
+const authToken = process.env["TURSO_AUTH_TOKEN"];
 
 export default defineConfig({
   schema: "./src/db/schema.ts",

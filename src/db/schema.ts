@@ -463,6 +463,66 @@ export const addressPool = sqliteTable(
   ]
 );
 
+// ---- fee_wallets (optional per-family gas provider) ----
+//
+// Zero or one row per family. When a row exists, the payout planner prefers
+// the fee-wallet path for that family over the source-pays-own-gas path:
+//   - Solana: fee wallet co-signs every payout as the tx's feePayer. Pool
+//             address never spends SOL. ATA-creation rent and signature fee
+//             both come from the fee wallet.
+//   - Tron:   fee wallet stakes TRX and delegates energy/bandwidth to pool
+//             addresses via DelegateResource. Pool address's tx consumes
+//             delegated resources without burning TRX. Setup is one-time
+//             per pool address via the admin delegation endpoints.
+//   - EVM:    not supported (EIP-1559 has no feePayer separation); the
+//             existing sponsor-topup pattern remains the gas strategy.
+//
+// Two modes:
+//   - mode='hd-pool'   : `address` refers to an existing address_pool row
+//                         in the same family; private key is derived from
+//                         MASTER_SEED on demand (same path as pool payouts
+//                         already take). No new secret material.
+//   - mode='imported' : `address` is an externally-generated wallet the
+//                         operator brought; private key is encrypted at rest
+//                         via secretsCipher (AES-256-GCM). Lets operators
+//                         bring a pre-staked Tron wallet whose stake history
+//                         they don't want to reset.
+export const feeWallets = sqliteTable(
+  "fee_wallets",
+  {
+    id: text("id").primaryKey(),
+    family: text("family", { enum: ["evm", "tron", "solana"] }).notNull(),
+    mode: text("mode", { enum: ["hd-pool", "imported"] }).notNull(),
+    // Canonical address form — matches the corresponding chain adapter's
+    // canonicalizeAddress output. For hd-pool mode this MUST equal an
+    // address_pool.address in the same family (FK enforced application-side
+    // since libSQL doesn't enforce FKs per-connection).
+    address: text("address").notNull(),
+    // Present ONLY for mode='imported'. Self-describing ciphertext from
+    // secretsCipher (`v1:<base64>` format — nonce + auth tag bundled inside
+    // the encoded payload, which is why there's no separate nonce column).
+    // Null for hd-pool mode since that path derives on demand.
+    privateKeyCiphertext: text("private_key_ciphertext"),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull()
+  },
+  (t) => [
+    // At most one fee wallet per family. Operator swaps by DELETE + re-POST.
+    uniqueIndex("uq_fee_wallets_family").on(t.family),
+    check("fee_wallets_family_check", sql`${t.family} IN ('evm','tron','solana')`),
+    check("fee_wallets_mode_check", sql`${t.mode} IN ('hd-pool','imported')`),
+    // mode='imported' REQUIRES ciphertext; mode='hd-pool' must not carry one.
+    // Enforced in SQL so a malformed manual edit can't slip through and
+    // cause a decrypt-time NPE or a confused hd-pool wallet with stale key
+    // material still hanging around.
+    check(
+      "fee_wallets_imported_shape",
+      sql`(${t.mode} = 'hd-pool' AND ${t.privateKeyCiphertext} IS NULL)
+         OR (${t.mode} = 'imported' AND ${t.privateKeyCiphertext} IS NOT NULL)`
+    )
+  ]
+);
+
 // ---- invoice_receive_addresses (per-family address mapping for multi-family invoices) ----
 
 export const invoiceReceiveAddresses = sqliteTable(

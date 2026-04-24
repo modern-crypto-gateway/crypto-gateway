@@ -30,6 +30,14 @@ export interface BuildTransferArgs {
   // Solana ignore (no priority concept in the current adapters). Absent =
   // defaults to "medium" where supported.
   feeTier?: "low" | "medium" | "high";
+  // Optional fee-payer address. Currently meaningful only on Solana (the
+  // one family whose `feeWalletCapability === "co-sign"`): when set, the
+  // built tx lists this address as the fee payer (accountKeys[0], writable
+  // signer), and source's own SOL is not debited for the signature fee or
+  // ATA rent. `signAndBroadcast` must be called with the corresponding
+  // `options.feePayerPrivateKey` to produce the second signature. Ignored
+  // by EVM/Tron/Dev adapters.
+  feePayerAddress?: Address;
 }
 
 export interface EstimateArgs {
