@@ -628,9 +628,9 @@ amount:    "1.5"          // human decimal, converted against token.decimals
 amountUSD: "10.00"        // fiat-pegged via price oracle; rate snapshotted on the row
 ```
 
-### Source selection (no fee-wallet registration)
+### Source selection (HD pool + optional fee wallet)
 
-There is no separate `fee_wallets` table. Every HD-derived address in `address_pool` is a candidate payout source — the picker treats pool addresses (allocated to invoices or not), historical receivers, anything HD-derivable. Selection is ledger-derived (no RPC in the hot path):
+Every HD-derived address in `address_pool` is a candidate payout source — the picker treats pool addresses (allocated to invoices or not), historical receivers, anything HD-derivable. Selection is ledger-derived (no RPC in the hot path):
 
 ```
 spendable(chainId, address, token)
@@ -740,6 +740,126 @@ Native payouts can't be topped up (gas IS the asset). When the only candidate ha
 | `PAYOUT_NOT_CANCELABLE` | 409 | `POST /payouts/:id/cancel` — the payout already broadcast on-chain. Once in `topping-up` / `submitted` / terminal status, the gateway can't recall it |
 
 Retry hints: 503 codes are transient — retry with exponential backoff starting at 1s. 400/404/409 are not retryable; fix the request or operator state first.
+
+## Fee wallets (optional gas offloader)
+
+Pool addresses natively hold tokens AND pay their own gas — that's the default and it always works. But it also means every pool address has to be kept funded in the chain's native coin, and on Tron + Solana that's operationally wasteful: Tron lets a staked wallet delegate energy to any address, and Solana has an explicit `feePayer` field in its tx format. A "fee wallet" is one designated address per family whose job is to cover gas for everyone else, letting pool addresses sit at zero native balance.
+
+The feature is **entirely opt-in per family**. No configuration = current self-pay behavior, identical to before.
+
+### Per-chain capability
+
+| Family | Capability | What the fee wallet does |
+|---|---|---|
+| **EVM** | `none` | EIP-1559 has no feePayer separation; the existing sponsor-topup flow remains the gas strategy. Operators can register an EVM fee wallet anyway (for API symmetry), but the planner ignores it until account-abstraction lands on every chain we serve. |
+| **Tron** | `delegate` | Fee wallet stakes TRX (`FreezeBalanceV2`) and pre-delegates energy to pool addresses (`DelegateResource`). At payout time the tx is a single-signer transfer from the pool address — the chain substitutes delegated energy for TRX burn. One-time setup, no per-tx cost. |
+| **Solana** | `co-sign` | Fee wallet signs every payout as the tx's `feePayer` (accountKeys[0]). Pool address only signs as the SPL transfer authority. Fee wallet pays the signature fee AND the recipient-ATA rent (2,039,280 lamports for new ATAs). Source's SOL is untouched. |
+
+The adapter reports its capability via `ChainAdapter.feeWalletCapability(chainId)`. The planner gates on that + `fee_wallets` row presence; if either is missing, the self-pay / sponsor-topup path still runs.
+
+### Two registration modes
+
+The `fee_wallets` table allows two ways to say "this address is the fee wallet for this family":
+
+| Mode | When to use | Key storage |
+|---|---|---|
+| `hd-pool` | Default recommendation. The fee wallet is an existing HD pool address — no new secret to manage, same `MASTER_SEED` derivation path pool payouts already use. Verified at registration time to exist in `address_pool`. | No stored key. Signer derives on demand. |
+| `imported` | You have an external wallet (common for Tron operators — the staked-TRX unfreeze cooldown is 14 days, so re-staking a fresh address is costly). | Private key encrypted at rest via `secretsCipher` (AES-256-GCM, same primitive as webhook HMAC secrets). Plaintext is only in memory during the encrypt call and each decrypt-to-sign call, then the buffer is zeroed. |
+
+Exactly one row per family is allowed; `DELETE` then re-`POST` to swap.
+
+### Admin surface (all require ADMIN_KEY)
+
+CRUD:
+
+```
+GET    /admin/fee-wallets                        # list per-family state
+POST   /admin/fee-wallets/{family}/use-pool      # register existing pool address
+POST   /admin/fee-wallets/{family}/import        # register external key (encrypted)
+DELETE /admin/fee-wallets/{family}               # unregister (self-pay resumes)
+```
+
+Tron-only resource ops (wrap Stake 2.0 primitives, signed with the fee wallet's key):
+
+```
+GET    /admin/fee-wallets/tron/resources         # energy + bandwidth snapshot
+POST   /admin/fee-wallets/tron/freeze            # stake TRX for resource
+POST   /admin/fee-wallets/tron/unfreeze          # begin 14-day unlock
+POST   /admin/fee-wallets/tron/delegate          # lend staked resource to address
+POST   /admin/fee-wallets/tron/undelegate        # reclaim
+```
+
+Solana has no equivalent management surface — registration alone is enough; the fee wallet's SOL balance is its only ongoing consideration. Top it up when it runs low; the balance is visible via `GET /admin/balances?family=solana&live=true`.
+
+### Setup: Solana
+
+1. Pick an address. Either use an existing well-funded pool address or import an external key.
+   ```bash
+   # Option A: use a pool address (recommended)
+   curl -X POST $GATEWAY/admin/fee-wallets/solana/use-pool \
+     -H "Authorization: Bearer $ADMIN_KEY" \
+     -d '{"address":"<base58 pool address>"}'
+
+   # Option B: import external
+   curl -X POST $GATEWAY/admin/fee-wallets/solana/import \
+     -H "Authorization: Bearer $ADMIN_KEY" \
+     -d '{"privateKey":"<32-byte ed25519 seed hex>","address":"<base58>"}'
+   ```
+2. Fund it with SOL. Cover rent-exempt (0.00089 SOL) + enough for expected ATA creations (~0.00204 SOL each) + signature fees. For a workload of 100 payouts/day where half create new ATAs, ~0.1 SOL covers a week comfortably.
+3. Done. The next payout plan auto-routes USDC/USDT payouts through the co-sign path; pool addresses' SOL balances stop mattering.
+
+### Setup: Tron
+
+1. Register the fee wallet (same as Solana step 1).
+2. Fund the fee wallet with TRX externally.
+3. Stake TRX for ENERGY (~10,000 energy per 100 TRX staked at current network rates — query [tronscan](https://tronscan.org/#/data/stats3/resources) to check today's rate):
+   ```bash
+   curl -X POST $GATEWAY/admin/fee-wallets/tron/freeze \
+     -H "Authorization: Bearer $ADMIN_KEY" \
+     -d '{"balance":10000000000,"resource":"ENERGY"}'   # 10,000 TRX
+   ```
+4. Delegate energy to each pool address you want to pay from:
+   ```bash
+   for addr in $(psql -c "SELECT address FROM address_pool WHERE family='tron'"); do
+     curl -X POST $GATEWAY/admin/fee-wallets/tron/delegate \
+       -H "Authorization: Bearer $ADMIN_KEY" \
+       -d '{"receiver":"'$addr'","balance":200000000,"resource":"ENERGY"}'   # 200 TRX/addr
+   done
+   ```
+5. Verify: `GET /admin/fee-wallets/tron/resources` should show a sizable `energyLimit` consumed as delegations-out. A pool address's own `getaccountresource` will show matching delegations-in.
+
+Typical USDT transfer energy on Tron ≈ 32 000 units; 200 TRX staked → ~20 000 energy/day → ~2/3 of a daily USDT transfer free per address. Scale as needed.
+
+### Teardown
+
+Always **undelegate before unfreeze** on Tron — the chain rejects unstaking that would leave active delegations unfunded:
+
+```bash
+# per delegated address:
+curl -X POST $GATEWAY/admin/fee-wallets/tron/undelegate \
+  -d '{"receiver":"<addr>","balance":200000000,"resource":"ENERGY"}'
+
+# then unstake:
+curl -X POST $GATEWAY/admin/fee-wallets/tron/unfreeze \
+  -d '{"balance":10000000000,"resource":"ENERGY"}'
+
+# 14 days later, the TRX is withdrawable via tronweb withdrawExpireUnfreeze (not currently wrapped — use TronLink/TronScan manually)
+
+# unregister:
+curl -X DELETE $GATEWAY/admin/fee-wallets/tron
+```
+
+Deleting a fee wallet row WITHOUT undelegating/unfreezing strands the TRX on-chain — it still belongs to the fee wallet, but neither the gateway nor the dashboard tracks it anymore. Always teardown in order.
+
+### Planner behavior summary
+
+| Condition | Source's native-gas requirement |
+|---|---|
+| No fee wallet registered | Source must hold `gas × 1.5 safety + minNativeReserve` (rent-exempt on Solana, 0 elsewhere). Unchanged from before. |
+| Fee wallet registered, `capability='none'` (EVM today) | Unchanged — planner ignores the registration. |
+| Fee wallet registered, `capability='co-sign'` (Solana, token payouts) | Source needs only `minNativeReserve` (rent-exempt). Fee wallet covers sig fee + ATA rent. |
+| Fee wallet registered, `capability='delegate'` (Tron, token payouts) | Source needs only `minNativeReserve` (0 on Tron). Delegated energy covers the TRC-20 execution cost. |
+| Any fee wallet + native payout | Source STILL needs the full amount + gas + reserve — native payouts can't co-sign the value itself away. |
 
 ## Payment tolerance (slippage)
 

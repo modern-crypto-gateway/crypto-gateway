@@ -328,12 +328,161 @@
           }
         },
         {
-          "name": "3b. (DEPRECATED) Fee-wallet endpoints",
+          "name": "4a. Fee wallets — list configuration (GET /admin/fee-wallets)",
           "request": {
             "method": "GET",
-            "url": { "raw": "{{baseUrl}}/admin/balances", "host": ["{{baseUrl}}"], "path": ["admin", "balances"] },
+            "url": { "raw": "{{baseUrl}}/admin/fee-wallets", "host": ["{{baseUrl}}"], "path": ["admin", "fee-wallets"] },
             "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
-            "description": "All `/admin/fee-wallets/*` endpoints have been removed. The gateway no longer requires pre-registering fee wallets — the picker auto-discovers funded HD addresses from `address_pool` at execution time. If a payout fails with `INSUFFICIENT_BALANCE_ANY_SOURCE`, fund any HD-derived address from the pool snapshot above; for `NO_GAS_SPONSOR_AVAILABLE`, fund another HD address with native gas.\n\nKeeping this stub in the collection so links from old docs / dashboard buttons land on a clear deprecation message instead of 404."
+            "description": "Returns one row per family (evm, tron, solana) with its adapter capability + current configuration (or null).\n\nCapability values:\n- `none`     — EVM today (no native feePayer separation). Fee wallet can be registered, but the planner won't use it.\n- `delegate` — Tron. Fee wallet stakes TRX and DelegateResources energy to pool addresses.\n- `co-sign`  — Solana. Fee wallet signs every payout as the tx's feePayer, covering sig fee + ATA rent."
+          }
+        },
+        {
+          "name": "4b. Fee wallet — pick existing HD pool address (POST .../use-pool)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/{{family}}/use-pool",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "{{family}}", "use-pool"],
+              "variable": [{ "key": "family", "value": "solana" }]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"address\": \"<base58 / hex address from address_pool>\"\n}"
+            },
+            "description": "Registers an existing HD pool address as the family's fee wallet. Zero new secrets — the address is already derivable from MASTER_SEED at its recorded `address_index`, same path pool payouts use.\n\nThe server verifies the address actually exists in `address_pool` for the family before writing. Returns 404 POOL_ADDRESS_NOT_FOUND if not.\n\nSwap by DELETE then POST again. Path variable `family` must be `evm` | `tron` | `solana`."
+          }
+        },
+        {
+          "name": "4c. Fee wallet — import external private key (POST .../import)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/{{family}}/import",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "{{family}}", "import"],
+              "variable": [{ "key": "family", "value": "tron" }]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"privateKey\": \"<hex, with or without 0x prefix>\",\n  \"address\": \"<canonical form for this family>\"\n}"
+            },
+            "description": "Use when you have an external wallet (common for Tron operators who don't want to re-stake 14 days' cooldown on a fresh address).\n\nPrivate key is encrypted at the boundary via secretsCipher (AES-256-GCM — same primitive used for webhook HMAC secrets). Plaintext is only in-memory for the encrypt call, never logged or stored.\n\nSecurity note: the gateway does NOT yet cross-verify that the supplied address actually matches the private key. Mismatch surfaces on the first payout / admin op as a signer-mismatch error."
+          }
+        },
+        {
+          "name": "4d. Fee wallet — remove (DELETE /admin/fee-wallets/{family})",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/{{family}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "{{family}}"],
+              "variable": [{ "key": "family", "value": "solana" }]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Idempotent. Planner immediately falls back to self-pay on next plan.\n\nIMPORTANT (Tron): removing the registration does NOT unfreeze staked TRX or reverse active delegations. For Tron, always call /undelegate on each active delegation and /unfreeze on staked TRX BEFORE removing, or funds stay locked on-chain."
+          }
+        },
+        {
+          "name": "4e. Tron — fee wallet resource status (GET .../tron/resources)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/resources",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "resources"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Energy + bandwidth snapshot for the Tron fee wallet (via /wallet/getaccountresource). Operators poll this after freeze/delegate to verify the setup.\n\n`energyAvailable` includes both the wallet's own stake AND resources delegated IN — it's what the chain actually lets the account consume today before TRX burn kicks in. `bandwidthAvailable` includes Tron's ~600/day free allowance."
+          }
+        },
+        {
+          "name": "4f. Tron — stake TRX for resources (POST .../tron/freeze)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/freeze",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "freeze"]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"balance\": 100000000,\n  \"resource\": \"ENERGY\"\n}"
+            },
+            "description": "Wraps /wallet/freezebalancev2. `balance` is in sun — 100_000_000 = 100 TRX. `resource` is ENERGY (for TRC-20 execution) or BANDWIDTH (for tx bytes).\n\nStaked TRX is reclaimable via /unfreeze (14-day cooldown). Not a burn.\n\nSigned with the fee wallet's key via signerStore and broadcast through the same path production payouts use."
+          }
+        },
+        {
+          "name": "4g. Tron — delegate resources to a pool address (POST .../tron/delegate)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/delegate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "delegate"]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"receiver\": \"<pool address (base58)>\",\n  \"balance\": 50000000,\n  \"resource\": \"ENERGY\",\n  \"lock\": false\n}"
+            },
+            "description": "Wraps /wallet/delegateresource. `balance` is STAKE in sun (not energy amount) — the delegated stake produces a network-variable energy-per-day rate, see /tron/resources to tune.\n\nResponse includes `receiverIsInPool`: true when the receiver address is an `address_pool` row (typical), false when delegating to an external address (allowed but warned).\n\nScript this across every pool address you want to free from TRX-burn payouts."
+          }
+        },
+        {
+          "name": "4h. Tron — reclaim delegation (POST .../tron/undelegate)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/undelegate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "undelegate"]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"receiver\": \"<pool address (base58)>\",\n  \"balance\": 50000000,\n  \"resource\": \"ENERGY\"\n}"
+            },
+            "description": "Reverses a prior /delegate. Reclaimed stake rejoins the fee wallet's free pool (not immediately withdrawable — it's still staked, just no longer lent out).\n\nMust be called BEFORE /unfreeze on any delegated stake: Tron rejects an unfreeze that would leave active delegations unfunded."
+          }
+        },
+        {
+          "name": "4i. Tron — begin unstake cooldown (POST .../tron/unfreeze)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/fee-wallets/tron/unfreeze",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "fee-wallets", "tron", "unfreeze"]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"balance\": 100000000,\n  \"resource\": \"ENERGY\"\n}"
+            },
+            "description": "Begins the 14-day unlock period on staked TRX. Funds become withdrawable after that (separate withdrawexpireunfreeze call). Used when rebalancing or decommissioning a fee wallet."
           }
         },
         {

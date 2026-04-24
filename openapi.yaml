@@ -56,6 +56,16 @@ tags:
     description: Inbound webhook ingest from on-chain providers
   - name: admin
     description: Operator-only setup
+  - name: fee-wallets
+    description: |
+      Per-family gas provider configuration. Registering a fee wallet on a
+      family whose adapter supports the topology (Solana co-sign, Tron
+      delegate) lets pool addresses stop holding native gas — the fee
+      wallet covers sig fees, ATA rent (Solana), and/or delegated energy
+      (Tron) for every payout. Opt-in per family; EVM is not supported
+      today.
+  - name: tron
+    description: Tron-specific Stake 2.0 resource operations (freeze / delegate / status).
   - name: internal
     description: Scheduler-driven maintenance
   - name: health
@@ -1686,6 +1696,456 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets:
+    get:
+      tags: [admin, fee-wallets]
+      summary: List per-family fee-wallet configuration
+      description: |
+        Returns one entry per chain family (`evm`, `tron`, `solana`). Each
+        entry reports:
+          - `capability`: what the family's adapter supports for offloading
+            payout gas onto a dedicated wallet. Values:
+              - `none`     — family cannot use a fee wallet today (EVM).
+              - `delegate` — fee wallet stakes native + delegates resources
+                             to pool addresses (Tron `DelegateResource`).
+              - `co-sign`  — fee wallet signs every payout as fee payer
+                             (Solana `message.feePayer`).
+          - `configured`: null when no wallet is registered, else
+            `{ mode, address }`. `mode='hd-pool'` means the address is an
+            existing pool row whose key is derived from MASTER_SEED;
+            `mode='imported'` means an external key was uploaded and is
+            encrypted at rest via secretsCipher.
+
+        Operators read this to render a dashboard showing where fee wallets
+        are set vs missing, and to decide whether the selected family is
+        ready for the gas-offload topology.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Per-family configuration matrix
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallets:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        family:
+                          type: string
+                          enum: [evm, tron, solana]
+                        capability:
+                          type: string
+                          enum: [none, delegate, co-sign]
+                        configured:
+                          oneOf:
+                            - type: "null"
+                            - type: object
+                              properties:
+                                mode: { type: string, enum: [hd-pool, imported] }
+                                address: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/{family}/use-pool:
+    post:
+      tags: [admin, fee-wallets]
+      summary: Register an existing HD pool address as the family's fee wallet
+      description: |
+        Zero-new-secret setup. The supplied address must already live in
+        `address_pool` for this family — we verify that before writing the
+        row. Signing still goes through MASTER_SEED + the pool row's
+        `address_index`, identical to how pool payouts already derive keys.
+
+        The planner immediately respects the registration on the next
+        `POST /payouts` or `POST /payouts/estimate`. No restart needed.
+
+        To swap to a different address: `DELETE` then `POST` again. To swap
+        between modes: same — the `fee_wallets` row's uniqueness is per
+        family.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: family
+          in: path
+          required: true
+          schema: { type: string, enum: [evm, tron, solana] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address]
+              properties:
+                address:
+                  type: string
+                  description: Canonical form for the family (hex for EVM, base58 for Tron/Solana).
+      responses:
+        "200":
+          description: Registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallet:
+                    type: object
+                    properties:
+                      family: { type: string }
+                      mode: { type: string, enum: [hd-pool] }
+                      address: { type: string }
+        "400":
+          description: |
+            BAD_FAMILY, BAD_JSON, NO_ADAPTER (family not wired), or
+            INVALID_ADDRESS (not a valid address for this family).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: POOL_ADDRESS_NOT_FOUND — address does not live in address_pool for this family.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/{family}/import:
+    post:
+      tags: [admin, fee-wallets]
+      summary: Import an externally-generated private key as the fee wallet
+      description: |
+        Use when you have an external wallet whose key you want to reuse —
+        for example, a Tron wallet that has already accumulated staked TRX
+        and whose 14-day unfreeze cooldown you don't want to pay to reset.
+
+        The private key is encrypted at the boundary via `secretsCipher`
+        (AES-256-GCM, same primitive used for webhook HMAC secrets and
+        Alchemy signing keys). Plaintext is only in memory for the duration
+        of the encrypt call. At sign time, the ciphertext is decrypted for
+        one `signAndBroadcast` call and the buffer is immediately zeroed.
+
+        **Operational note:** the gateway does not yet cross-check the
+        declared `address` against the `privateKey` at import time (port
+        doesn't expose a `privateKeyToAddress` method yet); a mismatch
+        manifests later as a signer-mismatch error on the first payout or
+        admin op. Upload carefully.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: family
+          in: path
+          required: true
+          schema: { type: string, enum: [evm, tron, solana] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [privateKey, address]
+              properties:
+                privateKey:
+                  type: string
+                  description: Hex-encoded private key (with or without 0x prefix). Length per family.
+                address:
+                  type: string
+                  description: Canonical form for the family; must match the key's derived address.
+      responses:
+        "200":
+          description: Registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallet:
+                    type: object
+                    properties:
+                      family: { type: string }
+                      mode: { type: string, enum: [imported] }
+                      address: { type: string }
+        "400":
+          description: BAD_FAMILY, BAD_JSON, NO_ADAPTER, or INVALID_ADDRESS
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/{family}:
+    delete:
+      tags: [admin, fee-wallets]
+      summary: Remove the fee wallet registration for a family
+      description: |
+        Idempotent. The planner immediately falls back to the self-pay /
+        sponsor-topup flow on the next plan; in-flight payouts are
+        unaffected because fee-wallet selection is a per-plan decision.
+
+        Removing does NOT unfreeze staked TRX or unsend any previously-
+        submitted delegation transactions — for Tron specifically, call
+        `/admin/fee-wallets/tron/undelegate` on each delegated address and
+        `/admin/fee-wallets/tron/unfreeze` on any frozen stake before
+        removing, or the funds stay locked on-chain.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: family
+          in: path
+          required: true
+          schema: { type: string, enum: [evm, tron, solana] }
+      responses:
+        "200":
+          description: Removal result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  removed:
+                    type: boolean
+                    description: True when a row was deleted; false when no row existed.
+        "400":
+          description: BAD_FAMILY
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/resources:
+    get:
+      tags: [admin, fee-wallets, tron]
+      summary: Query the Tron fee wallet's staking/delegation resource budget
+      description: |
+        Reads `/wallet/getaccountresource` against the registered Tron fee
+        wallet and returns its energy + bandwidth budgets. Operators poll
+        this to decide when to stake more TRX, re-delegate, or audit a
+        suspected delegation shortfall.
+
+        `energyAvailable` and `bandwidthAvailable` fields include both the
+        account's own stake AND resources delegated IN to it; they're what
+        the chain actually lets the account consume today before burning.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Resource snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeWallet: { type: string, description: Fee wallet address (base58). }
+                  resources:
+                    type: object
+                    properties:
+                      energyAvailable: { type: integer, description: Energy units still consumable today. }
+                      energyLimit: { type: integer, description: Daily energy budget from own stake + delegations in. }
+                      bandwidthAvailable: { type: integer, description: Bytes still consumable today (incl. ~600/day free). }
+                      bandwidthLimit: { type: integer, description: Daily bandwidth budget. }
+        "409":
+          description: NO_FEE_WALLET — Tron fee wallet is not registered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: NO_TRON_ADAPTER — Tron adapter is not wired.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/freeze:
+    post:
+      tags: [admin, fee-wallets, tron]
+      summary: Stake TRX on the Tron fee wallet for energy or bandwidth
+      description: |
+        Wraps `/wallet/freezebalancev2`. Converts spendable TRX on the fee
+        wallet into staked TRX, which generates a daily resource allowance
+        (ENERGY for TRC-20 execution, BANDWIDTH for tx bytes). Stake is
+        reclaimable via `/unfreeze` (14-day unlock), not burned.
+
+        Signed with the fee wallet's key (resolved via signerStore), broadcast
+        via the same `signAndBroadcast` path production payouts use.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [balance, resource]
+              properties:
+                balance:
+                  type: integer
+                  description: TRX to stake, in sun (1 TRX = 1,000,000 sun).
+                  minimum: 1000000
+                resource:
+                  type: string
+                  enum: [ENERGY, BANDWIDTH]
+      responses:
+        "200":
+          description: Broadcast; resources become active on confirmation (~3s)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  txHash: { type: string }
+                  balance: { type: integer }
+                  resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+        "400":
+          description: BAD_JSON
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: NO_FEE_WALLET
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/unfreeze:
+    post:
+      tags: [admin, fee-wallets, tron]
+      summary: Begin the 14-day unstaking cooldown on the Tron fee wallet
+      description: |
+        Wraps `/wallet/unfreezebalancev2`. TRX becomes withdrawable 14 days
+        after broadcast. Useful when rebalancing or decommissioning a fee
+        wallet. Call `/undelegate` FIRST on any active delegations or the
+        call will fail (can't unstake what's currently lent out).
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [balance, resource]
+              properties:
+                balance:
+                  type: integer
+                  description: Sun to unfreeze.
+                  minimum: 1000000
+                resource:
+                  type: string
+                  enum: [ENERGY, BANDWIDTH]
+      responses:
+        "200":
+          description: Broadcast; withdrawable after 14-day cooldown
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  txHash: { type: string }
+                  balance: { type: integer }
+                  resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+        "400": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: BAD_JSON }
+        "409": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: NO_FEE_WALLET }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/delegate:
+    post:
+      tags: [admin, fee-wallets, tron]
+      summary: Delegate staked resources from the Tron fee wallet to a pool address
+      description: |
+        Wraps `/wallet/delegateresource`. The fee wallet lends a slice of
+        its staked resource to `receiver` — the receiver can then consume
+        that energy/bandwidth for its own transactions without burning TRX.
+        Delegation persists until undelegated (or until `lock_period`
+        expires when `lock=true`).
+
+        The handler verifies whether `receiver` is a pool address (reports
+        `receiverIsInPool`) but permits delegation to non-pool addresses
+        too — intended for one-off delegations to sweep-master / sponsor
+        addresses.
+
+        Typical setup: loop this call across every active pool address so
+        USDT/USDC payouts from any of them consume delegated energy
+        instead of burning TRX.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [receiver, balance, resource]
+              properties:
+                receiver:
+                  type: string
+                  description: Base58 address to receive delegated resources.
+                balance:
+                  type: integer
+                  description: STAKE amount in sun to delegate (not the energy amount — the delegated stake produces a network-variable energy-per-day rate).
+                  minimum: 1000000
+                resource:
+                  type: string
+                  enum: [ENERGY, BANDWIDTH]
+                lock:
+                  type: boolean
+                  description: When true, delegation cannot be reclaimed for 3 days. Defaults false.
+      responses:
+        "200":
+          description: Delegation broadcast
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  txHash: { type: string }
+                  receiver: { type: string }
+                  balance: { type: integer }
+                  resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+                  lock: { type: boolean }
+                  receiverIsInPool: { type: boolean }
+        "400": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: BAD_JSON }
+        "409": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: NO_FEE_WALLET }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/fee-wallets/tron/undelegate:
+    post:
+      tags: [admin, fee-wallets, tron]
+      summary: Reclaim delegated resources from a pool address
+      description: |
+        Wraps `/wallet/undelegateresource`. Returns delegated stake to the
+        fee wallet's free pool. Must be called BEFORE `/unfreeze` on any
+        delegated stake — Tron rejects an unfreeze that would leave active
+        delegations unfunded.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [receiver, balance, resource]
+              properties:
+                receiver: { type: string }
+                balance: { type: integer, minimum: 1000000 }
+                resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+      responses:
+        "200":
+          description: Undelegate broadcast
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  txHash: { type: string }
+                  receiver: { type: string }
+                  balance: { type: integer }
+                  resource: { type: string, enum: [ENERGY, BANDWIDTH] }
+        "400": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: BAD_JSON }
+        "409": { content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }, description: NO_FEE_WALLET }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /admin/migrate:
