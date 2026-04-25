@@ -17,8 +17,12 @@ function spyChainAdapter(spy: (args: Parameters<ChainAdapter["scanIncoming"]>[0]
     },
     validateAddress: () => true,
     canonicalizeAddress: (a: string) => a as Address,
+    addressFromPrivateKey: () => {
+      throw new Error("unused");
+    },
     scanIncoming: spy,
     getConfirmationStatus: async () => ({ blockNumber: null, confirmations: 0, reverted: false }),
+    getConsumedNativeFee: async () => null,
     buildTransfer: async () => {
       throw new Error("unused");
     },

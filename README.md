@@ -713,6 +713,49 @@ Native payouts can't be topped up (gas IS the asset). When the only candidate ha
 - Every successful row gets the same `batchId` (UUID, returned top-level). Filter later with `GET /api/v1/payouts?batchId=<id>`.
 - **Rate limit is proportional**: a 100-row batch costs 100 tokens from the merchant's per-minute quota, not 1.
 
+### Gas-burn ledger debits on failed payouts
+
+When a payout transitions to `failed` with a `txHash` set — meaning the tx actually reached chain before reverting — the chain still charged for gas/energy. EVM takes the full `gasUsed × effectiveGasPrice`, Tron burns `net_fee + energy_fee`, Solana charges the signature fee. Without accounting for this, the DB-tracked spendable stays the same but the on-chain balance drops, and the planner happily picks the same underfunded source again.
+
+`failPayout` handles this by querying the adapter's `getConsumedNativeFee(chainId, txHash)` and inserting a synthetic `payouts` row with:
+
+- `kind='gas_burn'`
+- `sourceAddress` = address actually debited on chain
+- `token` = native symbol for the chain
+- `amountRaw` = consumed fee in native units
+- `status='confirmed'` (so `computeSpendable`'s standard debit query picks it up)
+- `parentPayoutId` = the failed payout
+- `txHash` = the failed payout's txHash
+
+`gas_burn` rows are hidden from merchant-facing `/payouts` lists (same filter as `gas_top_up`). They're visible to admin via the list-all query if you pass `includeKinds`, and via `SELECT * FROM payouts WHERE kind='gas_burn'` for debugging.
+
+Gracefully degraded: if the RPC can't locate the tx receipt yet (just-broadcast, still in mempool), the debit is deferred and logged as `payout.gas_burn.deferred`. The current implementation doesn't auto-retry — a follow-up sweeper for these is worth considering if you see them accumulate in logs.
+
+### Pool derivation audit
+
+`GET /admin/pool/audit` walks every `address_pool` row and re-derives the expected address from `MASTER_SEED` + the row's `address_index` using the same adapter that populated the pool. Mismatches mean the gateway can't sign for the row's stored address — either the seed has rotated since the pool was populated, or the row was inserted by some external tool.
+
+```bash
+curl $GATEWAY/admin/pool/audit -H "Authorization: Bearer $ADMIN_KEY" | jq .
+```
+
+Response:
+```json
+{
+  "status": "healthy",
+  "scanLimit": 500,
+  "reports": [
+    { "family": "evm", "scanned": 14, "matches": 14, "mismatches": [], "unscannedBeyondLimit": 0 },
+    { "family": "tron", "scanned": 4, "matches": 4, "mismatches": [], "unscannedBeyondLimit": 0 },
+    { "family": "solana", "scanned": 5, "matches": 5, "mismatches": [], "unscannedBeyondLimit": 0 }
+  ]
+}
+```
+
+When mismatches exist, the per-family report lists every broken row with its `storedAddress` vs `expectedAddress`. **This is the tool to run before funding a new pool**, after any deploy where `MASTER_SEED` might have changed, or after a "signer-mismatch" error from a failed payout. Read-only; no state mutation.
+
+In a Cloudflare Workers deployment there's no boot sequence to hook a "startup audit" into — this endpoint is the operator-triggered equivalent. Couple with a periodic cron (e.g. once-a-day call from an external scheduler) for a light background safety net.
+
 ### Stuck-reservation watchdog
 
 `sweepStuckPayoutReservations` (cron-driven) does two things: releases any active reservation whose owning payout is already in a terminal state (defense-in-depth — atomic batches in `confirmPayouts`/`failPayout` make this normally a no-op), and logs WARN for reservations older than 30 minutes whose payout is still in flight (operator triage signal).

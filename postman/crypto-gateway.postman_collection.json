@@ -309,6 +309,19 @@
           }
         },
         {
+          "name": "3c. Pool derivation audit (GET /admin/pool/audit)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/pool/audit",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "pool", "audit"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Walks the address_pool and for each row derives the EXPECTED address from the current MASTER_SEED at that row's address_index. Compares to the stored address. Any mismatch means the gateway can't sign for that address — the row was either populated with a different seed or by some external tool.\n\nRun this:\n- Before funding a fresh pool with real money.\n- After deploying where MASTER_SEED might have changed.\n- When a payout reports 'Signer-address mismatch' — identify all broken rows in one call.\n\nResponse `status` is 'healthy' or 'mismatches-detected'. Scans up to 500 rows per family per call; large pools can paginate by fixing and re-running."
+          }
+        },
+        {
           "name": "3. Inspect HD payout sources (admin balance snapshot)",
           "request": {
             "method": "GET",
@@ -375,7 +388,7 @@
               "mode": "raw",
               "raw": "{\n  \"privateKey\": \"<hex, with or without 0x prefix>\",\n  \"address\": \"<canonical form for this family>\"\n}"
             },
-            "description": "Use when you have an external wallet (common for Tron operators who don't want to re-stake 14 days' cooldown on a fresh address).\n\nPrivate key is encrypted at the boundary via secretsCipher (AES-256-GCM — same primitive used for webhook HMAC secrets). Plaintext is only in-memory for the encrypt call, never logged or stored.\n\nSecurity note: the gateway does NOT yet cross-verify that the supplied address actually matches the private key. Mismatch surfaces on the first payout / admin op as a signer-mismatch error."
+            "description": "Use when you have an external wallet (common for Tron operators who don't want to re-stake 14 days' cooldown on a fresh address).\n\nPrivate key is encrypted at the boundary via secretsCipher (AES-256-GCM — same primitive used for webhook HMAC secrets). Plaintext is only in-memory for the encrypt call, never logged or stored.\n\nCross-checked at import: the declared `address` must equal the private key's derived address (via ChainAdapter.addressFromPrivateKey). Mismatch → 400 ADDRESS_KEY_MISMATCH, no row persisted. Key parse failure → 400 INVALID_PRIVATE_KEY. Both caught before storage, so you can't silently persist a mismatched key."
           }
         },
         {

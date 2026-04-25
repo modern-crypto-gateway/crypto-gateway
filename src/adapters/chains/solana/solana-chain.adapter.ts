@@ -161,6 +161,24 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       return address as Address;
     },
 
+    addressFromPrivateKey(privateKey: string): Address {
+      // Solana addresses are the base58-encoded 32-byte ed25519 public key.
+      // Accept hex input with or without `0x` prefix — deriveAddress stores
+      // with the prefix but import paths can come in bare.
+      const normalized = privateKey.startsWith("0x") ? privateKey.slice(2) : privateKey;
+      if (!/^[0-9a-f]{64}$/i.test(normalized)) {
+        throw new Error(
+          `Solana addressFromPrivateKey: expected 32-byte ed25519 seed in hex (64 chars), got ${normalized.length}`
+        );
+      }
+      const bytes = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) {
+        bytes[i] = parseInt(normalized.substring(i * 2, i * 2 + 2), 16);
+      }
+      const pub = publicKeyFromPrivateKey(bytes);
+      return publicKeyBytesToAddress(pub) as Address;
+    },
+
     // ---- Detection ----
 
     async scanIncoming({ chainId, addresses, tokens, sinceMs }) {
@@ -337,6 +355,17 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
         confirmations,
         reverted: status.err !== null
       };
+    },
+
+    async getConsumedNativeFee(chainId: ChainId, txHash: TxHash): Promise<AmountRaw | null> {
+      // Solana charges the signature fee on every tx that lands on chain,
+      // even when execution reverts. `meta.fee` on getTransaction returns
+      // the exact lamports debited from the fee payer. Null meta means
+      // the tx isn't confirmed yet or was purged — caller retries later.
+      const client = getClient(chainId);
+      const tx = await client.getTransaction(txHash).catch(() => null);
+      if (!tx || !tx.meta) return null;
+      return String(tx.meta.fee) as AmountRaw;
     },
 
     // ---- Payouts ----

@@ -46,6 +46,18 @@ export interface ChainAdapter {
   // Used as the DB storage key so lookups are case-consistent.
   canonicalizeAddress(address: string): Address;
 
+  // Derive the on-chain address for a raw private key. Used by any code
+  // path that imports an externally-generated key (fee-wallet /import,
+  // future multisig-co-signer registration, etc.) to cross-check the
+  // operator-supplied `address` matches the key before persisting the
+  // ciphertext — a typo'd address would otherwise surface as a silent
+  // signer-mismatch on the first payout attempt.
+  //
+  // Input format per family: hex string (with or without `0x` prefix) of
+  // the raw private key bytes — 32 bytes for EVM secp256k1, Tron
+  // secp256k1, and Solana ed25519.
+  addressFromPrivateKey(privateKey: string): Address;
+
   // ---- Detection ----
 
   // Pull path. Returns transfers to any of `addresses` in `tokens` since `sinceMs`.
@@ -66,6 +78,21 @@ export interface ChainAdapter {
     confirmations: number;
     reverted: boolean;
   }>;
+
+  // Query the actual native-fee consumed by a previously-broadcast tx.
+  // Called on the fail path so the gateway can debit what the chain
+  // actually spent even when the tx reverted — EVM charges the full
+  // `gasUsed × effectiveGasPrice` on revert, Tron burns energy-fee +
+  // net-fee regardless of execution outcome, Solana charges the signature
+  // fee on any submitted tx. Without this, the DB-tracked spendable
+  // drifts higher than on-chain reality with every failed payout, and
+  // the planner keeps picking the same underfunded source.
+  //
+  // Returns the fee in native units (wei / sun / lamports), or `null`
+  // when the tx can't be located yet (not-yet-mined, purged from mempool,
+  // RPC flap). Callers treat null as "try again later" — debit is
+  // deferred, not zeroed.
+  getConsumedNativeFee(chainId: ChainId, txHash: TxHash): Promise<AmountRaw | null>;
 
   // ---- Payouts ----
 

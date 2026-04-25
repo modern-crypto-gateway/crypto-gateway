@@ -28,8 +28,12 @@ export type PayoutStatus = z.infer<typeof PayoutStatusSchema>;
 // `standard` rows are merchant-facing payouts. `gas_top_up` rows are
 // internal sibling rows the executor inserts when a source address lacks
 // native for gas; they reference the parent via `parentPayoutId` and are
-// hidden from the merchant `/payouts` list.
-export const PayoutKindSchema = z.enum(["standard", "gas_top_up"]);
+// hidden from the merchant `/payouts` list. `gas_burn` rows are synthetic
+// debits created when a standard or gas_top_up payout fails AFTER its tx
+// reached chain and consumed gas — recording these keeps `computeSpendable`
+// in sync with on-chain reality (EVM/Tron/Solana all charge even for
+// reverted txs). gas_burn rows are also filtered out of the merchant list.
+export const PayoutKindSchema = z.enum(["standard", "gas_top_up", "gas_burn"]);
 export type PayoutKind = z.infer<typeof PayoutKindSchema>;
 
 export const PayoutIdSchema = z.string().uuid();

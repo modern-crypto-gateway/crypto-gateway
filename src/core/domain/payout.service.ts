@@ -2,7 +2,7 @@ import { z } from "zod";
 import { and, asc, desc, eq, gte, inArray, isNull, lt, lte, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
-import { ChainIdSchema, type Address, type ChainId } from "../types/chain.js";
+import { ChainIdSchema, type Address, type ChainId, type TxHash } from "../types/chain.js";
 import { MerchantIdSchema } from "../types/merchant.js";
 import { AmountRawSchema, type AmountRaw } from "../types/money.js";
 import type { Payout, PayoutId } from "../types/payout.js";
@@ -1588,6 +1588,96 @@ async function broadcastMain(
 // may carry RPC URLs, internal HD-pool addresses, libsql wrapper
 // strings, etc.). The full message is logged at WARN for operator
 // triage, so nothing is lost — it just doesn't leak to the merchant.
+// Synthesizes a `gas_burn` debit row that records the native fee an on-chain
+// tx actually consumed before failing. Called during `failPayout` when the
+// payout has a txHash — meaning the tx reached chain (EVM: any submit,
+// Tron: any simulated-or-real submit, Solana: any signed-and-landed tx)
+// and the chain charged for the gas/energy even though the merchant-facing
+// payout never settled. Without this entry, `computeSpendable` would keep
+// thinking the source has the same native balance it had before the fail
+// — and the planner keeps picking the same underfunded address until it
+// runs out of gas for real.
+//
+// Errors during the lookup or insert are swallowed (logged but not
+// propagated) — the payout is already failing; losing the debit is a
+// less-bad outcome than re-throwing and leaving the status update stuck.
+// The next fail-path sweep or admin-triggered reconcile will re-query.
+async function recordGasBurnDebit(
+  deps: AppDeps,
+  parent: typeof payouts.$inferSelect,
+  chainAdapter: ChainAdapter
+): Promise<void> {
+  if (parent.txHash === null) return;
+  if (parent.sourceAddress === null) return;
+  try {
+    const fee = await chainAdapter.getConsumedNativeFee(
+      parent.chainId as ChainId,
+      parent.txHash as TxHash
+    );
+    if (fee === null) {
+      // Tx not yet visible to RPC — common right after a fail. The
+      // confirmation sweeper will retry this once the receipt is available
+      // via a separate reconciliation pass (follow-up work). For now we
+      // log so operators can audit.
+      deps.logger.info("payout.gas_burn.deferred", {
+        payoutId: parent.id,
+        chainId: parent.chainId,
+        txHash: parent.txHash
+      });
+      return;
+    }
+    const feeBig = BigInt(fee);
+    if (feeBig <= 0n) return;
+    const nativeSymbol = chainAdapter.nativeSymbol(parent.chainId as ChainId);
+    const now = deps.clock.now().getTime();
+    const syntheticId = globalThis.crypto.randomUUID();
+    await deps.db.insert(payouts).values({
+      id: syntheticId,
+      merchantId: parent.merchantId,
+      kind: "gas_burn",
+      parentPayoutId: parent.id,
+      status: "confirmed", // already-consumed on-chain
+      chainId: parent.chainId,
+      token: nativeSymbol,
+      amountRaw: feeBig.toString(),
+      quotedAmountUsd: null,
+      quotedRate: null,
+      feeTier: null,
+      feeQuotedNative: null,
+      batchId: null,
+      destinationAddress: "0x0", // burned — no recipient. Kept non-null for NOT NULL.
+      sourceAddress: parent.sourceAddress,
+      txHash: parent.txHash,
+      feeEstimateNative: null,
+      topUpTxHash: null,
+      topUpSponsorAddress: null,
+      topUpAmountRaw: null,
+      lastError: null,
+      createdAt: now,
+      submittedAt: now,
+      confirmedAt: now,
+      updatedAt: now,
+      broadcastAttemptedAt: null,
+      webhookUrl: null,
+      webhookSecretCiphertext: null
+    });
+    deps.logger.info("payout.gas_burn.recorded", {
+      parentPayoutId: parent.id,
+      gasBurnPayoutId: syntheticId,
+      chainId: parent.chainId,
+      sourceAddress: parent.sourceAddress,
+      token: nativeSymbol,
+      feeRaw: feeBig.toString()
+    });
+  } catch (err) {
+    deps.logger.warn("payout.gas_burn.failed_to_record", {
+      payoutId: parent.id,
+      chainId: parent.chainId,
+      error: err instanceof Error ? err.message : String(err)
+    });
+  }
+}
+
 async function failPayout(
   deps: AppDeps,
   row: typeof payouts.$inferSelect,
@@ -1651,7 +1741,32 @@ async function failPayout(
       at: new Date(now)
     });
   }
+
+  // Debit the gas actually consumed when the tx reached chain. Scheduled
+  // AFTER the status update + event publish so the order is: the merchant
+  // sees payout.failed first; the internal ledger repair happens next (and
+  // is idempotent via the unique-constraint-less shape — duplicate synths
+  // are visible but rare since failPayout is serialized per-row via the
+  // status CAS). If the sibling (gas_top_up) also has a txHash, debit it
+  // too — a failed top-up tx still burned its sponsor's gas.
+  const chainAdapter = findChainAdapter(deps, row.chainId);
+  await recordGasBurnDebit(deps, row, chainAdapter);
+  if (alsoFailSiblingId !== undefined) {
+    const sibling = await fetchPayoutRow(deps, alsoFailSiblingId);
+    if (sibling !== null) {
+      await recordGasBurnDebit(deps, sibling, chainAdapter);
+    }
+  }
+
   return "failed";
+}
+
+async function fetchPayoutRow(
+  deps: AppDeps,
+  id: string
+): Promise<typeof payouts.$inferSelect | null> {
+  const [row] = await deps.db.select().from(payouts).where(eq(payouts.id, id)).limit(1);
+  return row ?? null;
 }
 
 // ---- Confirmer ----

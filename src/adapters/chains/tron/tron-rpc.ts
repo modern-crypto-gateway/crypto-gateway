@@ -48,7 +48,22 @@ export interface TrongridTrxTransfer {
 
 export interface TrongridTxInfo {
   blockNumber?: number;
-  receipt?: { result?: string };
+  receipt?: {
+    result?: string;
+    // Actual resource consumption, in sun. Present on any tx that touched
+    // the VM (TRC-20 transfers, contract calls). Sum these with top-level
+    // `fee` to get the total native cost — Tron charges for energy + net
+    // even when the tx reverted, so fail-path debiting needs all three.
+    net_fee?: number;
+    energy_fee?: number;
+    net_usage?: number;
+    energy_usage?: number;
+    energy_usage_total?: number;
+  };
+  // Fee paid for account activation / smart contract deployment / TX
+  // underpricing. Zero on a typical TRC-20 transfer where the cost is
+  // fully captured in `receipt.{net_fee, energy_fee}`.
+  fee?: number;
 }
 
 export interface TrongridBlock {

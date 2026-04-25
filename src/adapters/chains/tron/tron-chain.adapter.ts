@@ -195,6 +195,15 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
       return isValidTronAddress(addr);
     },
 
+    addressFromPrivateKey(privateKey: string): Address {
+      // Reuse the exact primitive `deriveAddress` already uses. Unlike EVM,
+      // Tron's privateKey-to-address path doesn't need any further
+      // normalization — privateKeyToTronAddress handles the `0x` prefix
+      // transparently.
+      const normalized = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
+      return privateKeyToTronAddress(normalized) as Address;
+    },
+
     canonicalizeAddress(addr: string): Address {
       // Base58 is already case-sensitive and canonical — decoding validates
       // the checksum, and re-encoding is the identity for valid inputs.
@@ -354,6 +363,24 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
         confirmations: Math.max(0, latest - info.blockNumber + 1),
         reverted
       };
+    },
+
+    async getConsumedNativeFee(chainId: ChainId, txHash: TxHash): Promise<AmountRaw | null> {
+      // Tron separates the total fee across three fields:
+      //   - `fee`                    (account activation, contract deploy)
+      //   - `receipt.net_fee`        (bandwidth burned past the free allowance)
+      //   - `receipt.energy_fee`     (energy burned past the delegation pool)
+      // Any of them can be zero on a given tx; sum them to get the total
+      // sun actually debited from the owner. Unlike EVM, Tron returns the
+      // energy/net fees even when the tx reverted due to out-of-energy —
+      // which is exactly the case this path handles.
+      const client = getClient(chainId);
+      const info = await client.getTransactionInfo(txHash).catch(() => null);
+      if (!info || info.blockNumber === undefined) return null;
+      const fee = info.fee ?? 0;
+      const netFee = info.receipt?.net_fee ?? 0;
+      const energyFee = info.receipt?.energy_fee ?? 0;
+      return String(fee + netFee + energyFee) as AmountRaw;
     },
 
     // ---- Payouts ----

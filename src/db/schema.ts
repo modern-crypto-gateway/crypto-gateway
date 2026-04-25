@@ -266,7 +266,25 @@ export const payouts = sqliteTable(
     // filtered out of merchant-facing lists but still debit the sponsor's
     // native balance through the normal `payouts.amountRaw` path, which
     // keeps `computeSpendable` single-sourced.
-    kind: text("kind", { enum: ["standard", "gas_top_up"] }).notNull().default("standard"),
+    //
+    // `gas_burn` rows are synthetic debits created when a standard or
+    // gas_top_up payout transitions to `failed` with a non-null txHash —
+    // i.e. the tx reached chain and consumed gas/energy before reverting.
+    // The chain charges even reverted txs (EVM: gasUsed × effectiveGasPrice,
+    // Tron: net_fee + energy_fee, Solana: signature fee), and without this
+    // synthetic debit the DB's computed spendable drifts higher than the
+    // on-chain balance every time a payout fails. These rows carry:
+    //   - kind='gas_burn'
+    //   - token=<native>, amountRaw=<fee in native units>
+    //   - sourceAddress=<address actually debited>
+    //   - parentPayoutId=<failed payout id>
+    //   - status='confirmed' (so the existing computeSpendable debit query
+    //     picks them up without changes)
+    //   - txHash=<failed payout's txHash>
+    //   - feeTier=null, feeQuotedNative=null, topUp*=null
+    // Merchant-facing list endpoints filter them out the same way they
+    // filter gas_top_up.
+    kind: text("kind", { enum: ["standard", "gas_top_up", "gas_burn"] }).notNull().default("standard"),
     // Set on `gas_top_up` rows, pointing at the standard payout that
     // triggered the top-up. NULL on standard rows.
     parentPayoutId: text("parent_payout_id"),
@@ -357,7 +375,7 @@ export const payouts = sqliteTable(
     ),
     check(
       "payouts_kind_check",
-      sql`${t.kind} IN ('standard','gas_top_up')`
+      sql`${t.kind} IN ('standard','gas_top_up','gas_burn')`
     ),
     check(
       "payouts_fee_tier_check",

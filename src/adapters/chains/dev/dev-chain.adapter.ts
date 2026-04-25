@@ -62,6 +62,17 @@ export function devChainAdapter(config: DevChainConfig = {}): ChainAdapter {
       return addr.toLowerCase() as Address;
     },
 
+    addressFromPrivateKey(privateKey: string): Address {
+      // Dev adapter's HMAC "keypair" is not real secp256k1 — see deriveAddress.
+      // The address isn't cryptographically derivable from the "private key"
+      // bytes alone (the address is the first 20 bytes of the same HMAC
+      // output, not a pubkey-hash). There's no inverse to compute here,
+      // so we make this a loud no-op: any production code that tries to
+      // cross-check an imported key against the dev adapter fails early.
+      void privateKey;
+      throw new Error("dev-chain adapter has no privateKey→address mapping; this is a test-only fixture");
+    },
+
     async scanIncoming() {
       return incoming;
     },
@@ -70,6 +81,12 @@ export function devChainAdapter(config: DevChainConfig = {}): ChainAdapter {
       const override = config.confirmationStatuses?.get(txHash);
       if (override) return override;
       return config.defaultConfirmationStatus ?? { blockNumber: null, confirmations: 0, reverted: false };
+    },
+
+    async getConsumedNativeFee(_chainId: ChainId, _txHash: TxHash): Promise<AmountRaw | null> {
+      // Dev adapter has no chain; no fees to report. Returning null makes
+      // the fail-path debit logic skip this family cleanly in tests.
+      return null;
     },
 
     async buildTransfer(args: BuildTransferArgs): Promise<UnsignedTx> {

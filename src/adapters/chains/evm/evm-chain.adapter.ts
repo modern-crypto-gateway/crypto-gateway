@@ -208,6 +208,13 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       return getAddress(addr).toLowerCase() as Address;
     },
 
+    addressFromPrivateKey(privateKey: string): Address {
+      // Same lowercase canonical form pool addresses use.
+      const normalized = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
+      const account = privateKeyToAccount(normalized as Hex);
+      return account.address.toLowerCase() as Address;
+    },
+
     // ---- Detection ----
 
     async scanIncoming({ chainId, addresses, tokens, sinceMs }) {
@@ -300,6 +307,22 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         confirmations: Math.max(0, confirmations),
         reverted: receipt.status === "reverted"
       };
+    },
+
+    async getConsumedNativeFee(chainId: ChainId, txHash: TxHash): Promise<AmountRaw | null> {
+      // On EVM the chain charges `gasUsed × effectiveGasPrice` regardless
+      // of whether the tx reverted. The receipt carries both fields
+      // directly; multiplying them gives the exact wei debited from the
+      // sender. When the tx isn't mined yet (or the RPC can't find it),
+      // return null — the caller retries on a later tick.
+      const client = getClient(chainId);
+      const receipt = await client
+        .getTransactionReceipt({ hash: txHash as Hex })
+        .catch(() => null);
+      if (!receipt) return null;
+      const gasUsed = receipt.gasUsed as bigint;
+      const effective = receipt.effectiveGasPrice as bigint;
+      return (gasUsed * effective).toString() as AmountRaw;
     },
 
     // ---- Payouts ----

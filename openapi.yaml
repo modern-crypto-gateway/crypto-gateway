@@ -1698,6 +1698,64 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /admin/pool/audit:
+    get:
+      tags: [admin]
+      summary: Audit every address_pool row against current MASTER_SEED derivation
+      description: |
+        Walks the pool, derives the expected address for each row's
+        `address_index` using the current `MASTER_SEED` + the family's
+        adapter, and compares to the stored address. Mismatches mean the
+        gateway can NOT sign for those rows — either `MASTER_SEED` rotated
+        since the pool was populated, or the rows were inserted by some
+        external tool that doesn't match our HD path.
+
+        Run this before funding a new pool with real money, after any
+        deployment where the seed might have changed, or when a payout
+        fails with a signer-mismatch error. The endpoint is read-only and
+        doesn't modify state.
+
+        Response `status` is `healthy` when no mismatches exist across any
+        family; `mismatches-detected` otherwise. Each family's report
+        lists up to the first 500 mismatched rows; operators with larger
+        pools get a warning via `unscannedBeyondLimit > 0` and should
+        paginate by dropping the rows they've already fixed and re-running.
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          description: Audit outcome
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy, mismatches-detected]
+                  scanLimit:
+                    type: integer
+                    description: Max rows inspected per family in one call.
+                  reports:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        family: { type: string, enum: [evm, tron, solana] }
+                        scanned: { type: integer }
+                        matches: { type: integer }
+                        unscannedBeyondLimit: { type: integer }
+                        mismatches:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              family: { type: string, enum: [evm, tron, solana] }
+                              addressIndex: { type: integer }
+                              storedAddress: { type: string }
+                              expectedAddress: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /admin/fee-wallets:
     get:
       tags: [admin, fee-wallets]
@@ -1828,11 +1886,12 @@ paths:
         of the encrypt call. At sign time, the ciphertext is decrypted for
         one `signAndBroadcast` call and the buffer is immediately zeroed.
 
-        **Operational note:** the gateway does not yet cross-check the
-        declared `address` against the `privateKey` at import time (port
-        doesn't expose a `privateKeyToAddress` method yet); a mismatch
-        manifests later as a signer-mismatch error on the first payout or
-        admin op. Upload carefully.
+        **Cross-checked at import time:** the declared `address` is
+        verified against the private key's derived address via the adapter's
+        `addressFromPrivateKey`. A mismatch returns 400
+        `ADDRESS_KEY_MISMATCH` with both values in the error message — no
+        row is persisted. This prevents a silent signer-mismatch failure on
+        the first payout.
       security:
         - AdminKey: []
       parameters:
@@ -1869,7 +1928,10 @@ paths:
                       mode: { type: string, enum: [imported] }
                       address: { type: string }
         "400":
-          description: BAD_FAMILY, BAD_JSON, NO_ADAPTER, or INVALID_ADDRESS
+          description: |
+            BAD_FAMILY, BAD_JSON, NO_ADAPTER, INVALID_ADDRESS,
+            INVALID_PRIVATE_KEY (key could not be parsed for this family), or
+            ADDRESS_KEY_MISMATCH (declared address doesn't match key).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

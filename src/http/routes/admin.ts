@@ -1068,6 +1068,110 @@ const hasFeeWallet = poolFamilies.has(
     return c.json({ stats }, 200);
   });
 
+  // HD-derivation audit: for every address_pool row, derive the expected
+  // address from MASTER_SEED at that row's address_index and compare.
+  // Mismatches mean the row's key is NOT derivable from the current seed
+  // — typically a sign MASTER_SEED has rotated since the pool was
+  // populated, or the rows were written by some external tool that
+  // doesn't use the gateway's HD path. Either way, the gateway can't
+  // sign for those addresses, so funding them is money lost.
+  //
+  // Run this:
+  //   - Before funding a new pool with real money.
+  //   - After any deploy where MASTER_SEED might have changed.
+  //   - When a payout fails with "Signer-address mismatch" — identify
+  //     which rows are broken in one call.
+  //
+  // The endpoint is read-only and doesn't mutate state. Capped at the
+  // first 500 rows per family so an operator with a massive pool gets a
+  // fast response; mismatches of concern will almost certainly be
+  // contiguous (a seed-rotation corrupts the entire pool at once) and
+  // surface in the sample.
+  app.get("/pool/audit", async (c) => {
+    try {
+      const scanLimit = 500;
+      type Mismatch = {
+        family: ChainFamily;
+        addressIndex: number;
+        storedAddress: string;
+        expectedAddress: string;
+      };
+      type FamilyReport = {
+        family: ChainFamily;
+        scanned: number;
+        matches: number;
+        mismatches: Mismatch[];
+        unscannedBeyondLimit: number;
+      };
+
+      const families: readonly ChainFamily[] = ["evm", "tron", "solana"];
+      const reports: FamilyReport[] = [];
+
+      for (const family of families) {
+        // Find any adapter for this family (HD derivation is chainId-
+        // independent within a family for every adapter we ship today).
+        const adapter = deps.chains.find((a) => a.family === family);
+        if (!adapter) continue; // Family not wired — nothing to audit.
+
+        const seed = deps.secrets.getRequired("MASTER_SEED");
+        const rows = await deps.db
+          .select({ address: addressPool.address, addressIndex: addressPool.addressIndex })
+          .from(addressPool)
+          .where(eq(addressPool.family, family))
+          .orderBy(asc(addressPool.addressIndex))
+          .limit(scanLimit + 1);
+
+        const scanned = Math.min(rows.length, scanLimit);
+        const unscannedBeyondLimit = Math.max(0, rows.length - scanLimit);
+        const mismatches: Mismatch[] = [];
+        let matches = 0;
+
+        for (let i = 0; i < scanned; i++) {
+          const row = rows[i]!;
+          try {
+            const derived = adapter.deriveAddress(seed, row.addressIndex);
+            const expected = adapter.canonicalizeAddress(derived.address);
+            const stored = adapter.canonicalizeAddress(row.address);
+            if (expected === stored) {
+              matches += 1;
+            } else {
+              mismatches.push({
+                family,
+                addressIndex: row.addressIndex,
+                storedAddress: stored,
+                expectedAddress: expected
+              });
+            }
+          } catch (err) {
+            // A single row that throws (e.g. unparseable stored address)
+            // is reported as a mismatch with a diagnostic string — better
+            // than masking the issue by skipping it.
+            mismatches.push({
+              family,
+              addressIndex: row.addressIndex,
+              storedAddress: row.address,
+              expectedAddress: `DERIVATION_ERROR: ${err instanceof Error ? err.message : String(err)}`
+            });
+          }
+        }
+
+        reports.push({ family, scanned, matches, mismatches, unscannedBeyondLimit });
+      }
+
+      const totalMismatches = reports.reduce((n, r) => n + r.mismatches.length, 0);
+      return c.json(
+        {
+          status: totalMismatches === 0 ? "healthy" : "mismatches-detected",
+          scanLimit,
+          reports
+        },
+        200
+      );
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
   // Webhook delivery dead-letter surface. Operators list rows by status
   // (usually 'dead') and replay individual ones once they've coordinated a
   // fix with the merchant (TLS cert renewed, URL path changed, etc.).
@@ -1667,21 +1771,6 @@ const hasFeeWallet = poolFamilies.has(
           400
         );
       }
-      // Derive the address from the private key so we never trust the caller's
-      // claim of what address their key belongs to. We reuse deriveAddress
-      // indirectly via a temporary index lookup isn't clean — instead each
-      // adapter's address derivation is a different function shape (EVM from
-      // privateKey via viem, Solana/Tron from raw bytes), and we don't have a
-      // uniform "privateKeyToAddress" port method yet. Document this limitation
-      // and defer strict address-derivation to a follow-up — for now, the
-      // operator supplies the address and we trust it, same as Fireblocks
-      // wallet-import flows do at the admin layer. Mismatch surfaces at first
-      // payout attempt via the signer-mismatch guard we added to the EVM
-      // adapter (and parallel guards in other adapters).
-      //
-      // TODO(fee-wallet/import): add `ChainAdapter.addressFromPrivateKey` so
-      // import can verify the declared address before persisting, not after
-      // the first failed payout.
       const declaredAddress = (body as { address?: unknown }).address;
       if (typeof declaredAddress !== "string" || declaredAddress.length === 0) {
         return c.json(
@@ -1700,6 +1789,36 @@ const hasFeeWallet = poolFamilies.has(
       } catch {
         return c.json(
           { error: { code: "INVALID_ADDRESS", message: `Address ${declaredAddress} is not valid for family='${family.data}'` } },
+          400
+        );
+      }
+      // Cross-check that the declared address actually derives from the
+      // supplied private key. Without this, a typo in the address field
+      // would silently persist and surface later as a signer-mismatch on
+      // the first payout attempt — hard to debug, and the encrypted key
+      // would be the wrong one. Fail now, clearly.
+      let derived: string;
+      try {
+        derived = adapter.canonicalizeAddress(adapter.addressFromPrivateKey(body.privateKey));
+      } catch (err) {
+        return c.json(
+          {
+            error: {
+              code: "INVALID_PRIVATE_KEY",
+              message: `privateKey could not be parsed for family='${family.data}': ${err instanceof Error ? err.message : String(err)}`
+            }
+          },
+          400
+        );
+      }
+      if (derived !== canonical) {
+        return c.json(
+          {
+            error: {
+              code: "ADDRESS_KEY_MISMATCH",
+              message: `The declared address does not match the private key. Declared: ${canonical}. Derived from key: ${derived}.`
+            }
+          },
           400
         );
       }
