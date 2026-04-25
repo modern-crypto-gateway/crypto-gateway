@@ -104,6 +104,126 @@ describe("evmChainAdapter.scanIncoming", () => {
     expect(result).toEqual([]);
   });
 
+  it("drops dust ERC-20 stablecoin spam (amount < $0.01) but keeps the real payment", async () => {
+    // Address-poisoning attack pattern: attacker watches mempool, blasts
+    // sub-cent USDC transfers from a vanity-prefix lookalike address so the
+    // recipient may later copy the spoofed sender from history. 0.000099 USDC
+    // = 99 base units (6-dec). The dust threshold for stablecoins is $0.01
+    // = 10000 base units, so 99 must be dropped. A real 1.000000 USDC
+    // (1_000_000 base units) must pass.
+    const realFrom = "0x1111111111111111111111111111111111111111";
+    const dustFrom = "0x9999999999999999999999999999999999999999";
+    const toAddr = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+    const latestBlock = 1_000;
+
+    const transport = mockTransport({
+      eth_blockNumber: () => hex(latestBlock),
+      eth_getLogs: () => [
+        // Real 1 USDC payment.
+        {
+          address: USDC_MAINNET.toLowerCase(),
+          topics: [ERC20_TRANSFER_EVENT_TOPIC0, padAddress(realFrom), padAddress(toAddr)],
+          data: padUint256(1_000_000n),
+          blockNumber: hex(995),
+          blockHash: `0x${"b".repeat(64)}`,
+          transactionHash: `0x${"a".repeat(64)}`,
+          transactionIndex: "0x0",
+          logIndex: "0x1",
+          removed: false
+        },
+        // Dust 0.000099 USDC spam (99 base units).
+        {
+          address: USDC_MAINNET.toLowerCase(),
+          topics: [ERC20_TRANSFER_EVENT_TOPIC0, padAddress(dustFrom), padAddress(toAddr)],
+          data: padUint256(99n),
+          blockNumber: hex(996),
+          blockHash: `0x${"c".repeat(64)}`,
+          transactionHash: `0x${"d".repeat(64)}`,
+          transactionIndex: "0x0",
+          logIndex: "0x2",
+          removed: false
+        }
+      ]
+    });
+
+    const adapter = evmChainAdapter({ chainIds: [1], transports: { 1: transport } });
+    const transfers = await adapter.scanIncoming({
+      chainId: 1,
+      addresses: [toAddr],
+      tokens: ["USDC"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]?.amountRaw).toBe("1000000");
+    expect(transfers[0]?.fromAddress.toLowerCase()).toBe(realFrom.toLowerCase());
+  });
+
+  it("keeps a stablecoin payment exactly at the dust threshold ($0.01 = 10000 base units)", async () => {
+    // Boundary check: tokenDustThreshold uses `<` not `<=`, so a payment at
+    // exactly the floor must pass. Anything below it is dust. This guards
+    // against drift if someone re-tunes the threshold later.
+    const fromAddr = "0x1111111111111111111111111111111111111111";
+    const toAddr = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+
+    const transport = mockTransport({
+      eth_blockNumber: () => hex(1_000),
+      eth_getLogs: () => [
+        {
+          address: USDC_MAINNET.toLowerCase(),
+          topics: [ERC20_TRANSFER_EVENT_TOPIC0, padAddress(fromAddr), padAddress(toAddr)],
+          data: padUint256(10_000n), // exactly $0.01
+          blockNumber: hex(995),
+          blockHash: `0x${"b".repeat(64)}`,
+          transactionHash: `0x${"a".repeat(64)}`,
+          transactionIndex: "0x0",
+          logIndex: "0x1",
+          removed: false
+        }
+      ]
+    });
+
+    const adapter = evmChainAdapter({ chainIds: [1], transports: { 1: transport } });
+    const transfers = await adapter.scanIncoming({
+      chainId: 1,
+      addresses: [toAddr],
+      tokens: ["USDC"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]?.amountRaw).toBe("10000");
+  });
+
+  it("does NOT dust-filter native gas-token receives — small invoices on cheap L2s are legitimate", async () => {
+    // Native dust filtering would block legit small ETH/POL/BNB/AVAX invoices
+    // on L2s where checkout amounts can be sub-dollar. tokenDustThreshold
+    // returns 0n for non-stables, so this test is the contract enforcing
+    // that decision against accidental over-filtering.
+    // Note: the EVM RPC poll path doesn't scan native receives (it's covered
+    // by the Alchemy webhook path), so this test exercises the registry
+    // helper rather than scanIncoming.
+    // (Unit test of the helper itself.)
+    const { tokenDustThreshold, findToken } = await import("../../../../core/types/token-registry.js");
+    const eth = findToken(1 as never, "ETH" as never);
+    const pol = findToken(137 as never, "POL" as never);
+    expect(eth).not.toBeNull();
+    expect(pol).not.toBeNull();
+    expect(tokenDustThreshold(eth!)).toBe(0n);
+    expect(tokenDustThreshold(pol!)).toBe(0n);
+  });
+
+  it("scales the dust threshold to 18-decimal stablecoins (Binance-Peg USDC/USDT on BSC)", async () => {
+    // BSC stablecoins are 18-decimal Binance-Peg ERC-20s, not the 6-decimal
+    // canonical USDC/USDT. The threshold must scale accordingly: $0.01 in
+    // an 18-decimal token is 10^16 base units, not 10^4.
+    const { tokenDustThreshold, findToken } = await import("../../../../core/types/token-registry.js");
+    const usdcBsc = findToken(56 as never, "USDC" as never);
+    expect(usdcBsc).not.toBeNull();
+    expect(usdcBsc!.decimals).toBe(18);
+    expect(tokenDustThreshold(usdcBsc!)).toBe(10n ** 16n);
+  });
+
   it("skips tokens that are not in the registry for this chain", async () => {
     let getLogsCalls = 0;
     const transport = mockTransport({

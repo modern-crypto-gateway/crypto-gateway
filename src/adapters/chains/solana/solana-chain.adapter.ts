@@ -5,7 +5,7 @@ import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
-import { findToken, TOKEN_REGISTRY } from "../../../core/types/token-registry.js";
+import { findToken, tokenDustThreshold, TOKEN_REGISTRY } from "../../../core/types/token-registry.js";
 import type { DetectedTransfer } from "../../../core/types/transaction.js";
 import type { BuildTransferArgs, EstimateArgs, UnsignedTx } from "../../../core/types/unsigned-tx.js";
 import { bytesToHex } from "../../crypto/subtle.js";
@@ -293,6 +293,13 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
                 const post = postAmounts.get(mint) ?? 0n;
                 const delta = post - pre;
                 if (delta <= 0n) continue;
+                // Drop sub-cent stablecoin SPL transfers — same address-poisoning
+                // spam pattern as EVM. tokenDustThreshold returns 0n for non-
+                // stables, so non-USD SPL tokens (if any are added later) pass.
+                const symbol = symbolByMint.get(mint)!;
+                const tokenInfo = findToken(chainId as ChainId, symbol);
+                const dustFloor = tokenInfo ? tokenDustThreshold(tokenInfo) : 0n;
+                if (dustFloor > 0n && delta < dustFloor) continue;
                 // Sender-side: any (other-owner, same-mint) whose amount
                 // dropped by -delta. Best-effort; falls back to accountKeys[0].
                 let fromAddress = accountKeys[0] ?? "unknown";

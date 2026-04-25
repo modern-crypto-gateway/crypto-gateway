@@ -3,7 +3,8 @@ import type { DetectionStrategy } from "../../core/ports/detection.port.ts";
 import type { ChainId } from "../../core/types/chain.js";
 import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import type { DetectedTransfer } from "../../core/types/transaction.js";
-import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
+import { TOKEN_REGISTRY, tokenDustThreshold } from "../../core/types/token-registry.js";
+import type { TokenInfo } from "../../core/types/token.js";
 import type { AmountRaw } from "../../core/types/money.js";
 import { CHAIN_ID_BY_ALCHEMY_NETWORK } from "./alchemy-network.js";
 
@@ -114,22 +115,24 @@ export function alchemyNotifyDetection(): DetectionStrategy {
         return parseSolanaEvent(payload.event?.transaction ?? [], chainId, chainAdapter, deps);
       }
 
-      // Build a contract-address -> symbol map from the registry for this chain.
-      // ERC-20 transfers arrive with rawContract.address; we need that to
-      // resolve the token symbol (Alchemy's `asset` field is human-readable but
-      // unreliable — empty for unknown contracts, and shadows our registry when
-      // Alchemy disagrees on the ticker).
-      const symbolByContract = new Map<string, string>();
+      // Build a contract-address -> TokenInfo map from the registry for this
+      // chain. ERC-20 transfers arrive with rawContract.address; we need that
+      // to resolve the token symbol (Alchemy's `asset` field is human-readable
+      // but unreliable — empty for unknown contracts, and shadows our registry
+      // when Alchemy disagrees on the ticker). Carrying the full TokenInfo
+      // (not just the symbol) lets parseActivity also dust-filter using the
+      // token's decimals + isStable.
+      const tokenByContract = new Map<string, TokenInfo>();
       for (const t of TOKEN_REGISTRY) {
         if (t.chainId !== chainIdNumber) continue;
         if (t.contractAddress === null) continue;
-        symbolByContract.set(t.contractAddress.toLowerCase(), t.symbol);
+        tokenByContract.set(t.contractAddress.toLowerCase(), t);
       }
 
       const activities = payload.event?.activity ?? [];
       const transfers: DetectedTransfer[] = [];
       for (const activity of activities) {
-        const parsed = parseActivity(activity, chainId, chainAdapter, symbolByContract);
+        const parsed = parseActivity(activity, chainId, chainAdapter, tokenByContract);
         if (parsed) transfers.push(parsed);
       }
       return transfers;
@@ -156,12 +159,14 @@ function parseSolanaEvent(
   deps: AppDeps
 ): readonly DetectedTransfer[] {
   const now = new Date();
-  // Mint -> symbol map for SPL resolution.
-  const symbolByMint = new Map<string, string>();
+  // Mint -> TokenInfo map for SPL resolution. Carrying full TokenInfo (vs
+  // just the symbol) lets the SPL credit loop dust-filter using the token's
+  // decimals + isStable, mirroring the EVM webhook path.
+  const tokenByMint = new Map<string, TokenInfo>();
   for (const t of TOKEN_REGISTRY) {
     if (t.chainId !== chainId) continue;
     if (t.contractAddress === null) continue;
-    symbolByMint.set(t.contractAddress, t.symbol);
+    tokenByMint.set(t.contractAddress, t);
   }
   const nativeSymbol = chainAdapter.nativeSymbol(chainId);
 
@@ -246,6 +251,7 @@ function parseSolanaEvent(
       let droppedMissingOwner = 0;
       let droppedUnknownMint = 0;
       let droppedNonPositive = 0;
+      let droppedDust = 0;
       // Reasons a token-balance entry was silently filtered by
       // indexTokenBalances (missing owner/mint or unparseable amount).
       // A payload that arrives without `owner` on balance rows would
@@ -259,10 +265,16 @@ function parseSolanaEvent(
         const owner = post.owner || pre.owner;
         const mint = post.mint || pre.mint;
         if (!owner || !mint) { droppedMissingOwner += 1; continue; }
-        const symbol = symbolByMint.get(mint);
-        if (symbol === undefined) { droppedUnknownMint += 1; continue; }
+        const tokenInfo = tokenByMint.get(mint);
+        if (tokenInfo === undefined) { droppedUnknownMint += 1; continue; }
+        const symbol = tokenInfo.symbol;
         const delta = post.amount - pre.amount;
         if (delta <= 0n) { droppedNonPositive += 1; continue; }
+        // Drop sub-cent stablecoin SPL transfers — same address-poisoning
+        // spam pattern as EVM: vanity-prefix lookalike sends 0.000099 USDC
+        // hoping the user later copies the spoofed sender from history.
+        const dustFloor = tokenDustThreshold(tokenInfo);
+        if (dustFloor > 0n && delta < dustFloor) { droppedDust += 1; continue; }
         // Try to find the sender: the (other-owner, same-mint) pair whose
         // amount dropped by -delta. Best-effort; falls back to account[0].
         const fromAddress = guessSplSender(preMap, postMap, owner, mint, delta) ?? accountKeys[0] ?? "unknown";
@@ -291,7 +303,8 @@ function parseSolanaEvent(
           indexedEntries,
           droppedMissingOwner,
           droppedUnknownMint,
-          droppedNonPositive
+          droppedNonPositive,
+          droppedDust
         });
       }
     }
@@ -371,7 +384,7 @@ function parseActivity(
   activity: AlchemyActivityEvent,
   chainId: ChainId,
   chainAdapter: ReturnType<typeof findChainAdapter>,
-  symbolByContract: Map<string, string>
+  tokenByContract: Map<string, TokenInfo>
 ): DetectedTransfer | null {
   const { fromAddress, toAddress, hash, blockNum, category } = activity;
   if (!fromAddress || !toAddress || !hash) return null;
@@ -385,12 +398,14 @@ function parseActivity(
   //                  multicalls, etc.). Same native-symbol resolution.
   // Anything else (e.g. "erc721", "erc1155") is ignored — we don't index NFTs.
   let symbol: string;
+  let dustFloor = 0n;
   if (category === "token") {
     const contractAddress = activity.rawContract?.address;
     if (!contractAddress) return null;
-    const matched = symbolByContract.get(contractAddress.toLowerCase());
+    const matched = tokenByContract.get(contractAddress.toLowerCase());
     if (!matched) return null;
-    symbol = matched;
+    symbol = matched.symbol;
+    dustFloor = tokenDustThreshold(matched);
   } else if (category === "external" || category === "internal") {
     symbol = chainAdapter.nativeSymbol(chainId);
   } else {
@@ -399,12 +414,17 @@ function parseActivity(
 
   const rawValueHex = activity.rawContract?.rawValue;
   if (!rawValueHex) return null;
-  let amountRaw: string;
+  let amountRawBig: bigint;
   try {
-    amountRaw = BigInt(rawValueHex).toString();
+    amountRawBig = BigInt(rawValueHex);
   } catch {
     return null;
   }
+  // Drop sub-cent stablecoin transfers — address-poisoning spam from vanity
+  // lookalike senders. Native transfers always pass (dustFloor stays 0n)
+  // because cheap L2 invoices legitimately use small native amounts.
+  if (dustFloor > 0n && amountRawBig < dustFloor) return null;
+  const amountRaw = amountRawBig.toString();
 
   let blockNumber: number | null = null;
   if (blockNum) {

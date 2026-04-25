@@ -15,7 +15,7 @@ import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
-import { findToken, TOKEN_REGISTRY } from "../../../core/types/token-registry.js";
+import { findToken, tokenDustThreshold, TOKEN_REGISTRY } from "../../../core/types/token-registry.js";
 import type { DetectedTransfer } from "../../../core/types/transaction.js";
 import type { BuildTransferArgs, EstimateArgs, UnsignedTx } from "../../../core/types/unsigned-tx.js";
 import { ERC20_ABI } from "./erc20.js";
@@ -268,9 +268,16 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
             fromBlock,
             toBlock: latest
           });
+          // Drop sub-cent stablecoin transfers — address-poisoning spam
+          // sends 0.000099 USDC or similar from a vanity lookalike address
+          // hoping the user later copies the spoofed sender from history.
+          // See tokenDustThreshold for the scaling rationale (returns 0n for
+          // non-stables, so native flow-throughs aren't affected).
+          const threshold = tokenDustThreshold(token);
           for (const log of logs) {
             // viem-decoded args: { from, to, value }
             const args = log.args as { from: Hex; to: Hex; value: bigint };
+            if (threshold > 0n && args.value < threshold) continue;
             results.push({
               chainId: chainId as ChainId,
               txHash: log.transactionHash,

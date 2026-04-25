@@ -324,3 +324,18 @@ export function findToken(chainId: ChainId, symbol: TokenSymbol): TokenInfo | nu
   const match = TOKEN_REGISTRY.find((t) => t.chainId === chainId && t.symbol === symbol);
   return match ?? null;
 }
+
+// Per-token dust threshold for incoming-transfer spam filtering. Stablecoin
+// "dust" attacks flood watched addresses with sub-cent transfers from vanity
+// lookalike addresses, hoping the user later copies the spoofed sender from
+// their tx history. Threshold is $0.01-equivalent expressed in base units,
+// scaled by the token's declared decimals — covers both 6-decimal stables
+// (USDC/USDT on most EVMs and Tron) and 18-decimal stables (Binance-Peg
+// USDC/USDT on BSC) without per-token configuration. Native gas tokens get
+// no dust filter: cheap L2 invoices legitimately use small native amounts,
+// and there's no cross-chain peg to anchor a USD floor against.
+export function tokenDustThreshold(token: TokenInfo): bigint {
+  if (!token.isStable) return 0n;
+  if (token.decimals < 2) return 0n;
+  return 10n ** BigInt(token.decimals - 2);
+}
