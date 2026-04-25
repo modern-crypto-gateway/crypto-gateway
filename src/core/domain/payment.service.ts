@@ -15,7 +15,7 @@ import {
 import { confirmationThreshold } from "./payment-config.js";
 import { reacquireForInvoice } from "./pool.service.js";
 import { addUsd, applyBps, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
-import { addressPool, invoices, invoiceReceiveAddresses, transactions } from "../../db/schema.js";
+import { addressPool, invoices, invoiceReceiveAddresses, payouts, transactions } from "../../db/schema.js";
 
 type InvoiceRow = typeof invoices.$inferSelect;
 
@@ -96,6 +96,43 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   // attribution or dismissal. Matched transfers follow the normal
   // detected → confirmed lifecycle.
   const isOrphanRow = invoiceRow === null;
+
+  // Outbound-payout dedupe. Alchemy ADDRESS_ACTIVITY webhooks (and our
+  // RPC poller) fire on EVERY transfer touching a watched address — so
+  // when the gateway broadcasts a payout FROM a pool address, the same
+  // tx surfaces here as a "detected transfer" whose `to_address` is the
+  // merchant's destination. There's no invoice that wants to receive at
+  // the merchant's destination address, so without this guard the row
+  // lands as an orphan. The orphan row contributes 0 to spendable
+  // (computeSpendable only sums `confirmed`) — but it's noise in the
+  // admin orphan queue and dilutes the signal of real unattributed
+  // inbound payments.
+  //
+  // Authoritative source for this tx already exists in the `payouts`
+  // table (kind='standard' or 'gas_top_up' with txHash set). When the
+  // detected tx_hash matches a known payout, skip the insert entirely:
+  // the payout's existing row is the canonical record, and `failPayout`'s
+  // gas_burn debit + `confirmPayouts`' value debit handle the ledger.
+  if (isOrphanRow) {
+    const [matchingPayout] = await deps.db
+      .select({ id: payouts.id })
+      .from(payouts)
+      .where(
+        and(
+          eq(payouts.txHash, transfer.txHash),
+          eq(payouts.chainId, transfer.chainId)
+        )
+      )
+      .limit(1);
+    if (matchingPayout) {
+      deps.logger.debug("ingest.skip.payout_self_detect", {
+        chainId: transfer.chainId,
+        txHash: transfer.txHash,
+        payoutId: matchingPayout.id
+      });
+      return { inserted: false };
+    }
+  }
 
   // Decide initial tx status using the reported confirmation count. Orphaned
   // transfers (no invoice match under cooldown rules) bypass the detected →
