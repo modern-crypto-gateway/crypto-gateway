@@ -5,16 +5,17 @@ import { evmChainAdapter } from "../../../../adapters/chains/evm/evm-chain.adapt
 // These tests exercise the EVM adapter's fee-quoting path end-to-end via a
 // mock JSON-RPC transport. We feed synthetic `eth_feeHistory` /
 // `eth_maxPriorityFeePerGas` / `eth_gasPrice` responses to assert that
-// per-chain floors kick in when the RPC reports values below them, and that
-// `getFeeHistory` medians are used on the happy path.
+// per-chain floors and the dynamic provider floor combine correctly, and
+// that `getFeeHistory` medians are used on the happy path.
 //
-// The key regression this guards against: the BSC native-payout failure that
-// motivated this module — quote returned 0.05 gwei × 21000 = 1.05e12 wei of
-// fee, reservation was 1.5× that, broadcast failed at the chain with
-// "insufficient funds for gas * price + value" because actual inclusion cost
-// was several-fold higher. With the floor (1 gwei min priority, 3 gwei min
-// maxFeePerGas on BSC) the quote now lands at 3e9 × 21000 = 6.3e13 wei — 60×
-// the old quote, still well under a cent, and the picker reserves enough.
+// The key regressions guarded against:
+//   1. BSC native-payout failure (original): RPC reported 0.05 gwei priority,
+//      reservation undersized real inclusion cost. Now: hardcoded panic min
+//      (0.1 gwei) plus dynamic floor (eth_gasPrice × 1.1) prevent both
+//      starvation and provider-side simulation rejection.
+//   2. BSC overpay (recent): static 3 gwei BSC floor caused quotes 6× higher
+//      than Trust Wallet for the same transfer. Now driven by eth_gasPrice
+//      with 10% headroom — tracks the real network instead of a static value.
 
 // Convert a gwei number literal to wei as bigint without any floating-point
 // wobble.
@@ -84,12 +85,14 @@ function feeTransport(responses: MockResponses) {
 }
 
 describe("evmChainAdapter fee quoting — per-chain floors", () => {
-  it("floors BSC native-transfer quote at 3 gwei maxFeePerGas when feeHistory returns ~0.05 gwei", async () => {
-    // The exact failure scenario: every block in the window returned 0.05 gwei
-    // priority, baseFee 0 (BSC BEP-226 always-zero baseFee). Pre-floor the
-    // quote would be 21000 × 0.05 gwei = 1.05e12 wei. With the 3 gwei floor
-    // (matches Alchemy BSC's internal `eth_gasPrice`-based submission check),
-    // the quote is 21000 × 3 gwei = 6.3e13 wei.
+  it("floors BSC native-transfer quote at eth_gasPrice × 1.1 (dynamic provider floor) when feeHistory returns ~0.05 gwei", async () => {
+    // The exact failure scenario: every block returned 0.05 gwei priority,
+    // baseFee 0 (BSC BEP-226 always-zero baseFee). The dynamic floor reads
+    // eth_gasPrice (here 0.5 gwei — typical BSC quiet-period value) and
+    // bands +10% headroom for inter-block drift, so all three tiers land at
+    // 0.55 gwei × 21000 = 1.155e13 wei (~$0.008 at BNB $700). Replaces the
+    // previous static 3 gwei floor that was 6× more aggressive than the
+    // network's real-time gas price.
     const adapter = evmChainAdapter({
       chainIds: [56],
       transports: {
@@ -97,7 +100,8 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
           feeHistory: {
             baseFeePerGas: Array(21).fill(0n),
             reward: Array(20).fill([gwei(0.04), gwei(0.05), gwei(0.06)])
-          }
+          },
+          gasPrice: gwei(0.5)
         })
       }
     });
@@ -110,11 +114,47 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
       amountRaw: "1000"
     });
 
-    const expected = (21_000n * gwei(3)).toString();
+    // 0.5 gwei × 1.1 = 0.55 gwei (= 5.5e8 wei) — comfortably above raw
+    // 1559 calc (0 baseFee + 0.05 gwei priority floored to 0.1 gwei) AND
+    // above the hardcoded panic min (0.1 gwei).
+    const expectedMaxFee = (gwei(0.5) * 110n) / 100n;
+    const expected = (21_000n * expectedMaxFee).toString();
     expect(quote.low.nativeAmountRaw).toBe(expected);
     expect(quote.medium.nativeAmountRaw).toBe(expected);
     expect(quote.high.nativeAmountRaw).toBe(expected);
     expect(quote.nativeSymbol).toBe("BNB");
+  });
+
+  it("falls back to hardcoded panic floor on BSC when eth_gasPrice is unavailable", async () => {
+    // Defensive case: RPC doesn't implement eth_gasPrice. The dynamic floor
+    // degrades to 0n, leaving only the hardcoded 0.1 gwei BSC panic min.
+    // Quote stays low ($0.001-0.002) but tx still has a non-zero tip so
+    // strict-tip validators don't reject it.
+    const adapter = evmChainAdapter({
+      chainIds: [56],
+      transports: {
+        56: feeTransport({
+          feeHistory: {
+            baseFeePerGas: Array(21).fill(0n),
+            reward: Array(20).fill([gwei(0.04), gwei(0.05), gwei(0.06)])
+          },
+          gasPrice: "throw"
+        })
+      }
+    });
+
+    const quote = await adapter.quoteFeeTiers({
+      chainId: 56,
+      fromAddress: "0x0873fcac83d802f03f1db70714a72efdcf7ce254",
+      toAddress: "0xd3115b156bcdcf16ee5c5c08c5ef6d9afd7715d1",
+      token: "BNB",
+      amountRaw: "1000"
+    });
+
+    const expected = (21_000n * gwei(0.1)).toString();
+    expect(quote.low.nativeAmountRaw).toBe(expected);
+    expect(quote.medium.nativeAmountRaw).toBe(expected);
+    expect(quote.high.nativeAmountRaw).toBe(expected);
   });
 
   it("uses feeHistory medians when they exceed the floor (tiers produce distinct numbers)", async () => {
@@ -150,15 +190,17 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
     expect(quote.tieringSupported).toBe(true);
   });
 
-  it("falls back to spot eth_maxPriorityFeePerGas + floor when feeHistory is unsupported", async () => {
+  it("falls back to spot eth_maxPriorityFeePerGas + dynamic floor when feeHistory is unsupported", async () => {
     // Some self-hosted / private RPCs don't implement eth_feeHistory. The
-    // fallback should still produce a quote, still floored.
+    // fallback should still produce a quote, still floored — and now the
+    // dynamic floor still applies in this branch too.
     const adapter = evmChainAdapter({
       chainIds: [56],
       transports: {
         56: feeTransport({
           feeHistory: "throw",
-          maxPriority: gwei(0.05) // classic BSC quiet-mempool value
+          maxPriority: gwei(0.05), // classic BSC quiet-mempool value
+          gasPrice: gwei(1) // network spot 1 gwei
         })
       }
     });
@@ -171,8 +213,11 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
       amountRaw: "1000"
     });
 
-    // Floor takes over: 3 gwei × 21000 per tier.
-    const expected = (21_000n * gwei(3)).toString();
+    // viem's estimateFeesPerGas returns maxFeePerGas = baseFee + priority.
+    // Our test mock returns 0 baseFee + 0.05 gwei priority = 0.05 gwei spot
+    // maxFee, but the dynamic floor (1 gwei × 1.1 = 1.1 gwei) dominates.
+    const expectedMaxFee = (gwei(1) * 110n) / 100n;
+    const expected = (21_000n * expectedMaxFee).toString();
     expect(quote.medium.nativeAmountRaw).toBe(expected);
   });
 
@@ -212,11 +257,11 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
 });
 
 describe("evmChainAdapter.buildTransfer — fee binding uses the same floor as the quote", () => {
-  it("binds BSC native tx maxFeePerGas at the 3 gwei floor when spot RPC reports 0.05 gwei", async () => {
-    // Regression test: before the floor, buildTransfer would set
-    // maxFeePerGas to ~0.05 gwei, leaving the reservation (1.5× the tiny
-    // quote) under the real inclusion cost. With the floor the tx carries a
-    // maxFeePerGas matching what was reserved at plan time.
+  it("binds BSC native tx maxFeePerGas to the dynamic eth_gasPrice floor (matches the quote)", async () => {
+    // Regression: before flooring, buildTransfer set maxFeePerGas to
+    // ~0.05 gwei, leaving reservation under real inclusion cost. The fix
+    // now uses the dynamic eth_gasPrice × 1.1 floor — same as quoteFeeTiers
+    // — so what we quote is what we broadcast.
     const adapter = evmChainAdapter({
       chainIds: [56],
       transports: {
@@ -224,7 +269,8 @@ describe("evmChainAdapter.buildTransfer — fee binding uses the same floor as t
           feeHistory: {
             baseFeePerGas: Array(21).fill(0n),
             reward: Array(20).fill([gwei(0.04), gwei(0.05), gwei(0.06)])
-          }
+          },
+          gasPrice: gwei(0.5)
         })
       }
     });
@@ -241,19 +287,19 @@ describe("evmChainAdapter.buildTransfer — fee binding uses the same floor as t
       maxFeePerGas?: bigint;
       maxPriorityFeePerGas?: bigint;
     };
-    expect(raw.maxFeePerGas).toBe(gwei(3));
-    expect(raw.maxPriorityFeePerGas).toBe(gwei(3));
+    // Dynamic floor: 0.5 gwei × 1.1 = 0.55 gwei.
+    expect(raw.maxFeePerGas).toBe((gwei(0.5) * 110n) / 100n);
+    // Priority is the medium-tier feeHistory value (0.05 gwei), then
+    // hardcoded panic min (0.1 gwei) wins.
+    expect(raw.maxPriorityFeePerGas).toBe(gwei(0.1));
   });
 
-  it("binds the floor at broadcast even when the merchant didn't specify a feeTier", async () => {
-    // The bug this guards against: a payout planned without an explicit
-    // feeTier (common case — merchants don't always pass one) previously
-    // left `raw.maxFeePerGas` unset, letting viem's sendTransaction invoke
-    // its internal fee calc (baseFeeMultiplier=1.2 + spot priority) which on
-    // BSC can return 4+ gwei while the planner's reservation was sized for
-    // the 1 gwei floor. buildTransfer now applies the floor for every
-    // 1559-supporting call, defaulting to the medium tier (which matches
-    // what planPayout uses for the picker budget).
+  it("binds the dynamic floor at broadcast even when the merchant didn't specify a feeTier", async () => {
+    // Bug guarded against: payouts planned without an explicit feeTier
+    // (common case) previously left `raw.maxFeePerGas` unset, letting viem
+    // pick an arbitrary value at broadcast. buildTransfer now applies the
+    // dynamic+hardcoded floor for every 1559 call, defaulting to medium tier
+    // (which matches planPayout's picker-budget target).
     const adapter = evmChainAdapter({
       chainIds: [56],
       transports: {
@@ -261,7 +307,8 @@ describe("evmChainAdapter.buildTransfer — fee binding uses the same floor as t
           feeHistory: {
             baseFeePerGas: Array(21).fill(0n),
             reward: Array(20).fill([gwei(0.04), gwei(0.05), gwei(0.06)])
-          }
+          },
+          gasPrice: gwei(0.5)
         })
       }
     });
@@ -279,8 +326,8 @@ describe("evmChainAdapter.buildTransfer — fee binding uses the same floor as t
       maxFeePerGas?: bigint;
       maxPriorityFeePerGas?: bigint;
     };
-    expect(raw.maxFeePerGas).toBe(gwei(3));
-    expect(raw.maxPriorityFeePerGas).toBe(gwei(3));
+    expect(raw.maxFeePerGas).toBe((gwei(0.5) * 110n) / 100n);
+    expect(raw.maxPriorityFeePerGas).toBe(gwei(0.1));
   });
 
   it("pre-binds `gas` on the raw tx so viem skips its own eth_estimateGas call", async () => {

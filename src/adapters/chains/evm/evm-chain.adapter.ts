@@ -33,53 +33,56 @@ const NATIVE_SYMBOLS: Readonly<Record<number, string>> = {
   43114: "AVAX"
 };
 
-// Per-chain gas floors. Guards against RPCs that report implausibly low
-// `eth_maxPriorityFeePerGas` during quiet periods: BSC spot reads of 0.05 gwei
-// (the consensus minimum set by the Oct-2025 validator vote) are routinely
-// returned even though real-world inclusion reliability wants ~1 gwei. When
-// reservation is sized against a quote of 0.05 gwei and a tx broadcasts a few
-// blocks later at 0.1 gwei, viem's sendTransaction fails the balance check
-// with "total cost (gas * gas fee + value) exceeds balance" — which is the
-// failure mode these floors exist to prevent.
+// Per-chain gas floors. These encode network-level consensus rules (e.g.
+// Polygon's Heimdall v2 mandatory 25 gwei priority) and a small "panic
+// minimum" so a misbehaving RPC reporting 0 gwei doesn't produce a starved
+// reservation. They are NOT the primary mechanism for matching provider-side
+// pre-send simulation — that role is now played by the dynamic eth_gasPrice
+// floor in `buildFeeBinding`, which queries the same value Alchemy/QuickNode/
+// Infura use in their submission checks and bands above it with 10% headroom.
 //
-// Values are deliberately conservative (1-3 gwei on chains whose consensus
-// floor is far lower) because payout flows are low-frequency / high-reliability
-// rather than high-frequency / cost-sensitive. The operator funds these
-// wallets and the merchant sees the quoted fee up-front via POST /payouts/
-// estimate, so there's no hidden cost drift — just a small predictable cushion
-// that makes every broadcast succeed.
+// Why the dynamic floor matters: RPC providers run their own balance
+// simulation using `eth_gasPrice` rather than the tx's bound maxFeePerGas,
+// rejecting tight-balance txs at the submission layer even when our own
+// math is a clear pass. Pinning each chain to a static "comfortable" gwei
+// number (the previous design) overpays during quiet periods — observed: BSC
+// quoting $0.06 vs Trust Wallet's $0.01 for the same transfer because the
+// hardcoded 3 gwei floor was 6× the network's real-time spot gas price.
+//
+// What stays in this map: only consensus-enforced floors and a sub-gwei
+// safety net. Real-world inclusion price is now driven by the dynamic floor,
+// which moves with the network instead of waiting for an operator to retune.
 interface GasFloor {
   readonly minPriorityFeePerGas: bigint;
   readonly minMaxFeePerGas: bigint;
 }
 const CHAIN_GAS_FLOORS: Readonly<Record<number, GasFloor>> = {
-  // Ethereum mainnet: typical priority ~1 gwei; maxFeePerGas floor covers
-  // a single-block baseFee bump.
-  1:     { minPriorityFeePerGas:  1_000_000_000n, minMaxFeePerGas:  2_000_000_000n },
+  // Ethereum mainnet: ~1 gwei priority is the conventional minimum tip; the
+  // dynamic floor handles the rest. maxFee floor stays small — the 1559-
+  // derived 2×baseFee + priority always dominates in real usage.
+  1:     { minPriorityFeePerGas:  1_000_000_000n, minMaxFeePerGas:    100_000_000n },
   // Optimism: L2 priority essentially free, sub-gwei base.
-  10:    { minPriorityFeePerGas:      1_000_000n, minMaxFeePerGas:      1_000_000n },
-  // BSC: consensus floor is 0.05 gwei (Oct-2025 validator vote) and BEP-226
-  // pins baseFee to 0 — but RPC providers (Alchemy BSC in particular) run
-  // their own pre-send balance simulation using `eth_gasPrice` (~1-3 gwei
-  // during normal network activity) rather than the tx's bound maxFeePerGas,
-  // rejecting tight-balance txs at the submission layer even when the math
-  // against our own fee binding is a clear pass. 3 gwei priority / 3 gwei
-  // maxFee matches that provider-side minimum; costs ~$0.04 per native
-  // transfer at BNB $700 (vs ~$0.01 wallet-layer quotes) but is the price
-  // of reliable inclusion via Alchemy/QuickNode/Infura on BSC today. Drop
-  // this to 1 gwei when (and only when) the operator configures a BSC RPC
-  // that honors maxFeePerGas at the submission layer.
-  56:    { minPriorityFeePerGas:  3_000_000_000n, minMaxFeePerGas:  3_000_000_000n },
+  10:    { minPriorityFeePerGas:      1_000_000n, minMaxFeePerGas:        100_000n },
+  // BSC: consensus floor is 0.05 gwei (Oct-2025 validator vote), BEP-226 pins
+  // baseFee to 0. We hold a 0.1 gwei priority floor as a "non-zero tip" safety
+  // (some validator implementations occasionally reject zero-tip txs) and let
+  // the dynamic eth_gasPrice floor in buildFeeBinding drive the real
+  // inclusion price. This produces ~$0.01 quotes during quiet periods (vs
+  // the previous static 3 gwei → $0.06) and naturally rises during congestion.
+  56:    { minPriorityFeePerGas:    100_000_000n, minMaxFeePerGas:    100_000_000n },
   // Polygon PoS: Heimdall v2 enforces a hard 25 gwei mandatory priority fee
-  // at the network layer. Below this, txs are rejected outright.
+  // at the network layer. Below this, txs are rejected outright. Keep this
+  // hardcoded — the dynamic floor would also typically read ~25 gwei here,
+  // but the consensus rule must hold even on a misbehaving RPC.
   137:   { minPriorityFeePerGas: 25_000_000_000n, minMaxFeePerGas: 30_000_000_000n },
   // Base: L2 priority essentially free.
-  8453:  { minPriorityFeePerGas:      1_000_000n, minMaxFeePerGas:      1_000_000n },
-  // Arbitrum One: priority tiny (sequencer ordering); keep a small maxFee floor.
-  42161: { minPriorityFeePerGas:     10_000_000n, minMaxFeePerGas:    100_000_000n },
-  // Avalanche C-Chain: post-ACP-125 baseFee floor is 1 nAVAX (gwei); real-
-  // world inclusion often wants more when utilization is non-zero.
-  43114: { minPriorityFeePerGas:  1_000_000_000n, minMaxFeePerGas:  1_000_000_000n }
+  8453:  { minPriorityFeePerGas:      1_000_000n, minMaxFeePerGas:        100_000n },
+  // Arbitrum One: priority tiny (sequencer ordering); keep a small panic min.
+  42161: { minPriorityFeePerGas:     10_000_000n, minMaxFeePerGas:     10_000_000n },
+  // Avalanche C-Chain: post-ACP-125 baseFee floor is 1 nAVAX (gwei). The
+  // dynamic floor handles real-world inclusion; the hardcoded priority floor
+  // keeps a baseline tip in case eth_maxPriorityFeePerGas reads 0.
+  43114: { minPriorityFeePerGas:  1_000_000_000n, minMaxFeePerGas:    100_000_000n }
 };
 
 // The zero-floor lookup lets unknown / dev chains pass through without a
@@ -398,7 +401,7 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       const sample = await sampleFees(getClient(args.chainId), args.chainId);
       if (sample !== null) {
         const priority = pickPriorityForTier(sample, broadcastTier);
-        const binding = buildFeeBinding(args.chainId, sample.baseFee, priority);
+        const binding = buildFeeBinding(args.chainId, sample.baseFee, priority, sample.spotGasPrice);
         raw.maxFeePerGas = binding.maxFeePerGas;
         raw.maxPriorityFeePerGas = binding.maxPriorityFeePerGas;
       }
@@ -609,7 +612,7 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       }
 
       const nativeAt = (priority: bigint): AmountRaw => {
-        const { maxFeePerGas } = buildFeeBinding(args.chainId, sample.baseFee, priority);
+        const { maxFeePerGas } = buildFeeBinding(args.chainId, sample.baseFee, priority, sample.spotGasPrice);
         return (gasUnits * maxFeePerGas).toString() as AmountRaw;
       };
       const lowFee = nativeAt(sample.priorityLow);
@@ -765,11 +768,19 @@ interface EvmUnsignedTxRaw {
 // the happy path (stable across single-block noise), falling back to the
 // single spot value from `eth_maxPriorityFeePerGas` scaled 0.8×/1.0×/1.5×
 // only when feeHistory is unavailable.
+//
+// `spotGasPrice` carries the chain's current `eth_gasPrice` reading — the
+// same value RPC providers use in their pre-send balance simulation. We
+// floor maxFeePerGas against `spotGasPrice × 1.1` so our broadcast can never
+// be cheaper than what the provider thinks it should be, which was the root
+// cause of the original BSC tight-balance rejection. 0n when the RPC doesn't
+// support `eth_gasPrice` (rare; degrades to the hardcoded floor).
 interface FeeSample {
   readonly baseFee: bigint;
   readonly priorityLow: bigint;
   readonly priorityMid: bigint;
   readonly priorityHigh: bigint;
+  readonly spotGasPrice: bigint;
 }
 
 // Read per-tier fees from the chain. Returns `null` ONLY when neither
@@ -778,6 +789,11 @@ interface FeeSample {
 // best-effort sample (floors are applied in `buildFeeBinding`, not here).
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 async function sampleFees(client: PublicClient, chainId: number): Promise<FeeSample | null> {
+  // Run the gas-price probe in parallel with feeHistory so the dynamic floor
+  // doesn't add latency. Best-effort: if the RPC doesn't implement
+  // eth_gasPrice (very rare on EVM-compatible chains), fall back to 0n and
+  // the hardcoded floor still applies.
+  const spotGasPricePromise = client.getGasPrice().catch(() => 0n);
   // Happy path: eth_feeHistory gives us per-percentile priority fees + a
   // "next block" baseFee, both smoothed over a 20-block window.
   try {
@@ -811,7 +827,8 @@ async function sampleFees(client: PublicClient, chainId: number): Promise<FeeSam
         baseFee,
         priorityLow: median(0),
         priorityMid: median(1),
-        priorityHigh: median(2)
+        priorityHigh: median(2),
+        spotGasPrice: await spotGasPricePromise
       };
     }
     // feeHistory responded but with empty `reward` rows (a fully quiet
@@ -837,7 +854,8 @@ async function sampleFees(client: PublicClient, chainId: number): Promise<FeeSam
       baseFee,
       priorityLow: (priority * 4n) / 5n,
       priorityMid: priority,
-      priorityHigh: (priority * 3n) / 2n
+      priorityHigh: (priority * 3n) / 2n,
+      spotGasPrice: await spotGasPricePromise
     };
   } catch {
     return null;
@@ -848,16 +866,32 @@ async function sampleFees(client: PublicClient, chainId: number): Promise<FeeSam
 // maxPriorityFeePerGas / maxFeePerGas values to bind on the tx. The 2×
 // baseFee multiplier covers ~6 blocks of EIP-1559 baseFee growth (baseFee
 // rises at most 12.5% per block, so `2 × baseFee` > `baseFee × 1.125^6`).
+//
+// Three flooring layers stacked on maxFeePerGas (winner is the largest):
+//   1. raw = 2×baseFee + flooredPriority (the 1559-derived target)
+//   2. hardcoded `minMaxFeePerGas` (panic minimum / consensus rule)
+//   3. dynamic `spotGasPrice × 1.1` (provider-compatibility floor)
+//
+// Layer 3 is what makes our maxFeePerGas track real-time provider behavior:
+// Alchemy/QuickNode/Infura all run pre-send balance simulation using
+// `eth_gasPrice`, and a tx with maxFeePerGas below that simulation's price
+// is rejected at the submission layer. 10% headroom covers single-block
+// drift between when we sample and when the tx actually broadcasts.
 function buildFeeBinding(
   chainId: number,
   baseFee: bigint,
-  priority: bigint
+  priority: bigint,
+  spotGasPrice: bigint
 ): { maxPriorityFeePerGas: bigint; maxFeePerGas: bigint } {
   const floor = gasFloorFor(chainId);
   const flooredPriority =
     priority > floor.minPriorityFeePerGas ? priority : floor.minPriorityFeePerGas;
   const raw = 2n * baseFee + flooredPriority;
-  const maxFeePerGas = raw > floor.minMaxFeePerGas ? raw : floor.minMaxFeePerGas;
+  let maxFeePerGas = raw > floor.minMaxFeePerGas ? raw : floor.minMaxFeePerGas;
+  if (spotGasPrice > 0n) {
+    const providerFloor = (spotGasPrice * 110n) / 100n;
+    if (providerFloor > maxFeePerGas) maxFeePerGas = providerFloor;
+  }
   return { maxPriorityFeePerGas: flooredPriority, maxFeePerGas };
 }
 
