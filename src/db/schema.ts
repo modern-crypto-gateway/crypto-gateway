@@ -635,9 +635,13 @@ export const invoiceReceiveAddresses = sqliteTable(
       .references(() => invoices.id),
     family: text("family", { enum: ["evm", "tron", "solana", "utxo"] }).notNull(),
     address: text("address").notNull(),
-    poolAddressId: text("pool_address_id")
-      .notNull()
-      .references(() => addressPool.id),
+    // Pool-allocated address: NOT NULL on EVM / Tron / Solana invoices (every
+    // receive address comes from `address_pool`). NULL on UTXO invoices —
+    // those use fresh-per-invoice derivation via `address_index_counters` and
+    // never participate in the pool's cooldown/reuse semantics. Privacy
+    // heuristics on UTXO chains require non-reuse, so a pool row would be
+    // structurally wrong here.
+    poolAddressId: text("pool_address_id").references(() => addressPool.id),
     createdAt: integer("created_at").notNull()
   },
   (t) => [

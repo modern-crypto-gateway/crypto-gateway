@@ -14,6 +14,7 @@ import { isUniqueViolation } from "./db-errors.js";
 import { drizzleRowToInvoice, drizzleRowToTransaction, fetchInvoiceReceiveAddresses, loadInvoice } from "./mappers.js";
 import { DomainError } from "../errors.js";
 import { allocateForInvoice, releaseFromInvoice } from "./pool.service.js";
+import { allocateUtxoAddress } from "./utxo-address-allocator.js";
 import { addUsd, snapshotRates, subUsd, tokenDecimalsFor, tokensForFamilies } from "./rate-window.js";
 import { invoices, invoiceReceiveAddresses, merchants, transactions } from "../../db/schema.js";
 
@@ -208,16 +209,33 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
           `No chain adapter wired for family '${family}'. Invoice creation requires all accepted families to be configured on the gateway.`
         );
       }
-      const allocated = await allocateForInvoice(deps, invoiceId, family);
-      const canonical = familyAdapter.canonicalizeAddress(allocated.address);
+      // UTXO family bypasses the address pool entirely — privacy heuristics on
+      // Bitcoin/Litecoin require non-reuse, and BIP84 derivation is cheap, so
+      // each invoice mints a fresh address from the per-chain monotonic
+      // counter. EVM/Tron/Solana keep using the existing pool path.
+      let canonical: string;
+      let addressIndex: number;
+      let poolAddressId: string | null;
+      if (family === "utxo") {
+        const seed = deps.secrets.getRequired("MASTER_SEED");
+        const allocated = await allocateUtxoAddress(deps, familyAdapter, parsed.chainId, seed);
+        canonical = familyAdapter.canonicalizeAddress(allocated.address);
+        addressIndex = allocated.addressIndex;
+        poolAddressId = null;
+      } else {
+        const allocated = await allocateForInvoice(deps, invoiceId, family);
+        canonical = familyAdapter.canonicalizeAddress(allocated.address);
+        addressIndex = allocated.addressIndex;
+        poolAddressId = allocated.id;
+      }
       receiveRows.push({
         family,
         address: canonical as InvoiceReceiveAddress["address"],
-        poolAddressId: allocated.id
+        poolAddressId
       });
       if (family === primaryFamily) {
         primaryAddress = canonical;
-        primaryAddressIndex = allocated.addressIndex;
+        primaryAddressIndex = addressIndex;
       }
     }
     if (primaryAddress === null) {

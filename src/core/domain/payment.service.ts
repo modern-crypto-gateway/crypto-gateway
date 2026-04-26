@@ -15,7 +15,7 @@ import {
 import { confirmationThreshold } from "./payment-config.js";
 import { reacquireForInvoice } from "./pool.service.js";
 import { addUsd, applyBps, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
-import { addressPool, invoices, invoiceReceiveAddresses, payouts, transactions } from "../../db/schema.js";
+import { addressPool, invoices, invoiceReceiveAddresses, payouts, transactions, utxos } from "../../db/schema.js";
 
 type InvoiceRow = typeof invoices.$inferSelect;
 
@@ -73,8 +73,10 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     .where(and(eq(invoiceReceiveAddresses.address, canonicalTo), eq(invoiceReceiveAddresses.family, family)))
     .orderBy(
       // Non-terminal invoices first. SQLite has no boolean sort so we materialize
-      // a CASE expression and ASC-sort it.
-      sql`CASE WHEN ${invoices.status} IN ('created','partial','detected','confirmed','overpaid') THEN 0 ELSE 1 END`,
+      // a CASE expression and ASC-sort it. Status taxonomy: pending/processing
+      // are pre-terminal active states; completed is positive terminal;
+      // expired/canceled are negative terminal. Active states win the sort.
+      sql`CASE WHEN ${invoices.status} IN ('pending','processing','completed') THEN 0 ELSE 1 END`,
       desc(invoices.createdAt)
     )
     .limit(1);
@@ -227,6 +229,41 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     return { inserted: false };
   }
 
+  // UTXO-family-only: also record the spendability overlay. The transactions
+  // row is the source of truth for confirmation state; this `utxos` row is
+  // the capital-management view (script_pubkey + address_index for sign time,
+  // spent_in_payout_id for spend tracking). Skipped for orphans where we
+  // don't know the address_index — admin-attribute path repairs that later.
+  // Late-payment-to-completed-invoice scenarios DO get a utxo row (we own
+  // the address; the funds are spendable) — only the no-invoice orphan case
+  // skips. Re-derives scriptPubkey from address (P2WPKH = OP_0 + hash160),
+  // so detection layer doesn't need to carry that field through.
+  if (family === "utxo" && invoiceRow !== null) {
+    try {
+      await insertUtxoRow(deps, {
+        chainId: transfer.chainId,
+        transactionId: txId,
+        txHash: transfer.txHash,
+        address: canonicalTo,
+        addressIndex: invoiceRow.addressIndex,
+        vout: transfer.logIndex ?? 0,
+        valueSats: transfer.amountRaw,
+        now
+      });
+    } catch (err) {
+      // UTXO ledger failure must not block the parent ingest path — the
+      // transactions row is the user-visible audit record. Log and continue;
+      // a follow-up reconcile cron can backfill missing utxo rows by
+      // joining transactions on (chain_id, family='utxo', invoice_id NOT NULL)
+      // and inserting any that are missing from `utxos`.
+      deps.logger.error("utxo ingest extension failed", {
+        chainId: transfer.chainId,
+        txHash: transfer.txHash,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
+
   const tx = drizzleRowToTransaction(txInsert as typeof transactions.$inferSelect);
 
   // Orphans are admin-private: no tx.detected / tx.confirmed fan-out, no
@@ -331,6 +368,68 @@ async function isAddressInCooldown(
   if (!row) return false;
   if (row.cooldownUntil === null) return false;
   return row.cooldownUntil > now;
+}
+
+// Insert a UTXO ledger row mirroring a just-detected output that paid one of
+// our invoice addresses. Re-derives the P2WPKH scriptPubkey from the address
+// (deterministic: OP_0 <20-byte hash160>) so the detection layer doesn't
+// need to carry that field through DetectedTransfer.
+//
+// Idempotent on UNIQUE(chain_id, transaction_id): a duplicate ingest that
+// somehow gets here (e.g. ingestDetectedTransfer's own transactions UNIQUE
+// would normally short-circuit first, but a future change might let two
+// codepaths reach this) silently no-ops.
+async function insertUtxoRow(
+  deps: AppDeps,
+  args: {
+    chainId: number;
+    transactionId: string;
+    txHash: string;
+    address: string;
+    addressIndex: number;
+    vout: number;
+    valueSats: string;
+    now: number;
+  }
+): Promise<void> {
+  // Re-derive P2WPKH scriptPubkey from the bech32 address. Uses dynamic
+  // import to avoid pulling the UTXO crypto into core's hot path for non-UTXO
+  // chains. (The bundler tree-shakes this on EVM-only deployments.)
+  const { decodeP2wpkhAddress } = await import("../../adapters/chains/utxo/bech32-address.js");
+  const decoded = decodeP2wpkhAddress(args.address);
+  if (decoded === null) {
+    throw new Error(`insertUtxoRow: address ${args.address} is not a P2WPKH bech32 address`);
+  }
+  // P2WPKH scriptPubkey = 0x00 (OP_0) + 0x14 (push 20 bytes) + 20-byte program.
+  const scriptPubkey = `0014${bytesToHex(decoded.program)}`;
+  try {
+    await deps.db.insert(utxos).values({
+      // Outpoint id — globally unique per (txhash, vout). Same shape every
+      // BTC node uses for "where this coin lives" identification.
+      id: `${args.txHash}:${args.vout}`,
+      transactionId: args.transactionId,
+      chainId: args.chainId,
+      address: args.address,
+      addressIndex: args.addressIndex,
+      vout: args.vout,
+      valueSats: args.valueSats,
+      scriptPubkey,
+      spentInPayoutId: null,
+      spentAt: null,
+      createdAt: args.now
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) return; // duplicate is fine; row already there
+    throw err;
+  }
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    s += bytes[i]!.toString(16).padStart(2, "0");
+  }
+  return s;
 }
 
 // Parse the `accepted_families` JSON column. Null (legacy single-family

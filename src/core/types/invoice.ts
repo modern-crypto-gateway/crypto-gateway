@@ -49,7 +49,9 @@ export type InvoiceId = Brand<z.infer<typeof InvoiceIdSchema>, "InvoiceId">;
 export const InvoiceReceiveAddressSchema = z.object({
   family: ChainFamilySchema,
   address: AddressSchema,
-  poolAddressId: z.string().uuid()
+  // NULL for UTXO-family receive addresses (no pool — fresh-per-invoice
+  // derivation via address_index_counters). Non-null on EVM/Tron/Solana.
+  poolAddressId: z.string().uuid().nullable()
 });
 export type InvoiceReceiveAddress = z.infer<typeof InvoiceReceiveAddressSchema>;
 

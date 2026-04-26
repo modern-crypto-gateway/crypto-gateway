@@ -16,6 +16,13 @@ import {
   isValidP2wpkhAddress
 } from "./bech32-address.js";
 import {
+  esploraClient,
+  EsploraNotFoundError,
+  type EsploraBackend,
+  type EsploraClient,
+  type EsploraTx
+} from "./esplora-rpc.js";
+import {
   BITCOIN_CONFIG,
   LITECOIN_CONFIG,
   utxoConfigForChainId,
@@ -40,11 +47,25 @@ export interface UtxoChainAdapterConfig {
   readonly chain: UtxoChainConfig;
   // Optional override for HD derivation account index. Defaults to 0.
   readonly accountIndex?: number;
+  // Override the Esplora client (tests inject a fake; production passes
+  // nothing and falls back to the chain's `defaultEsploraUrls`).
+  readonly esplora?: EsploraClient;
+  // Override the Esplora backend list (production knob — point at a
+  // self-hosted Electrs/Esplora deployment). Ignored when `esplora` is set.
+  readonly esploraBackends?: readonly EsploraBackend[];
+  // Inject fetch (Workers + tests). Forwarded to esploraClient.
+  readonly fetch?: typeof globalThis.fetch;
 }
 
 export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
   const { chain } = cfg;
   const accountIndex = cfg.accountIndex ?? DEFAULT_ACCOUNT_INDEX;
+  const esplora =
+    cfg.esplora ??
+    esploraClient({
+      backends: (cfg.esploraBackends ?? chain.defaultEsploraUrls.map((url) => ({ baseUrl: url }))),
+      ...(cfg.fetch !== undefined ? { fetch: cfg.fetch } : {})
+    });
 
   return {
     family: "utxo",
@@ -135,21 +156,87 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
       return "none";
     },
 
-    // ---- Detection (Phase 2) ----
+    // ---- Detection ----
 
-    async scanIncoming(_args): Promise<readonly DetectedTransfer[]> {
-      throw new UtxoNotImplementedError("scanIncoming");
+    async scanIncoming({ chainId, addresses, tokens, sinceMs }): Promise<readonly DetectedTransfer[]> {
+      // UTXO chains have one native token per chain. If the caller didn't ask
+      // for our native, there's nothing to scan. (Token detection on UTXO is
+      // out of scope for v1 — no Runes/BRC-20/Omni.)
+      const wantsNative = tokens.some((t) => t === chain.nativeSymbol);
+      if (!wantsNative || addresses.length === 0) return [];
+
+      const tip = await esplora.getTipHeight().catch(() => 0);
+      const now = new Date();
+      const ourAddresses = new Set<string>(addresses.map((a) => a.toLowerCase()));
+
+      // Each address gets two queries: confirmed history + mempool. Both feed
+      // the same DetectedTransfer projection. Order across addresses doesn't
+      // matter — the ingest path dedupes on (chainId, txHash, vout).
+      const results: DetectedTransfer[] = [];
+      for (const address of addresses) {
+        const lc = address.toLowerCase();
+        // sinceMs filter: confirmed txs carry block_time (seconds); mempool
+        // txs have no time so we always include them. The poll cadence is
+        // ~30s so a single sinceMs window misses nothing.
+        const sinceSec = Math.floor(sinceMs / 1000);
+        const [confirmed, mempool] = await Promise.all([
+          esplora.getAddressTxs(lc).catch(() => [] as readonly EsploraTx[]),
+          esplora.getAddressMempoolTxs(lc).catch(() => [] as readonly EsploraTx[])
+        ]);
+        for (const tx of confirmed) {
+          if (
+            tx.status.confirmed &&
+            tx.status.block_time !== undefined &&
+            tx.status.block_time < sinceSec
+          ) {
+            continue;
+          }
+          results.push(...projectTxOutputs(tx, lc, ourAddresses, chainId, chain, tip, now));
+        }
+        for (const tx of mempool) {
+          results.push(...projectTxOutputs(tx, lc, ourAddresses, chainId, chain, tip, now));
+        }
+      }
+      return results;
     },
 
     async getConfirmationStatus(
       _chainId: ChainId,
-      _txHash: TxHash
+      txHash: TxHash
     ): Promise<{ blockNumber: number | null; confirmations: number; reverted: boolean }> {
-      throw new UtxoNotImplementedError("getConfirmationStatus");
+      let tx: EsploraTx;
+      try {
+        tx = await esplora.getTx(txHash);
+      } catch (err) {
+        if (err instanceof EsploraNotFoundError) {
+          // Mempool eviction or pre-broadcast; report zero confirmations,
+          // not reverted. Caller retries on a later tick.
+          return { blockNumber: null, confirmations: 0, reverted: false };
+        }
+        throw err;
+      }
+      if (!tx.status.confirmed) {
+        return { blockNumber: null, confirmations: 0, reverted: false };
+      }
+      const tip = await esplora.getTipHeight().catch(() => tx.status.block_height!);
+      const blockHeight = tx.status.block_height!;
+      const confirmations = Math.max(0, tip - blockHeight + 1);
+      // UTXO chains have no execution / revert concept. A tx either confirmed
+      // (at most once, modulo reorg) or it didn't. The reorg-recheck cron
+      // path handles orphaning via getConfirmationStatus → tx not found.
+      return { blockNumber: blockHeight, confirmations, reverted: false };
     },
 
-    async getConsumedNativeFee(_chainId: ChainId, _txHash: TxHash): Promise<AmountRaw | null> {
-      throw new UtxoNotImplementedError("getConsumedNativeFee");
+    async getConsumedNativeFee(_chainId: ChainId, txHash: TxHash): Promise<AmountRaw | null> {
+      try {
+        const tx = await esplora.getTx(txHash);
+        // tx.fee is in satoshis (uint53-safe up to 9 PB ~ way past Bitcoin's
+        // 21 M cap). Stringify for AmountRaw.
+        return tx.fee.toString() as AmountRaw;
+      } catch (err) {
+        if (err instanceof EsploraNotFoundError) return null;
+        throw err;
+      }
     },
 
     // ---- Payouts (Phase 3) ----
@@ -207,6 +294,61 @@ function hexToBytes(hex: string): Uint8Array {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i += 1) {
     out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+// Walk a tx's outputs and emit a DetectedTransfer for each output paying one
+// of OUR addresses. The same tx can carry multiple credits (rare in practice
+// but happens when a sender batches). `vout` (output index in the tx) is
+// carried in `logIndex` per the existing UTXO convention used by detection
+// dedup (`transactions.UNIQUE(chain_id, tx_hash, log_index)`).
+//
+// `fromAddress` is best-effort — UTXO inputs can come from many addresses,
+// none of them necessarily owned by the sender's "main wallet." We pick the
+// first input with a known prevout address. Falls back to the empty string
+// when no input prevout addresses are available (rare).
+function projectTxOutputs(
+  tx: EsploraTx,
+  watchedAddress: string,
+  ourAddresses: ReadonlySet<string>,
+  chainId: number,
+  chain: UtxoChainConfig,
+  tipHeight: number,
+  seenAt: Date
+): DetectedTransfer[] {
+  const out: DetectedTransfer[] = [];
+  // Best-effort sender attribution — first input with a known address.
+  const fromAddress =
+    tx.vin.find((vin) => vin.prevout?.scriptpubkey_address)?.prevout?.scriptpubkey_address ?? "";
+  const blockNumber = tx.status.confirmed ? (tx.status.block_height ?? null) : null;
+  const confirmations =
+    tx.status.confirmed && tx.status.block_height !== undefined
+      ? Math.max(0, tipHeight - tx.status.block_height + 1)
+      : 0;
+
+  for (let vout = 0; vout < tx.vout.length; vout += 1) {
+    const o = tx.vout[vout]!;
+    const recipient = o.scriptpubkey_address?.toLowerCase();
+    if (recipient === undefined) continue;
+    if (recipient !== watchedAddress) continue;
+    // Defensive: only emit for addresses we actually watch (the API call
+    // already scoped to `watchedAddress`, but a malicious server could echo
+    // unrelated outputs — the cross-check guards against trust misplacement).
+    if (!ourAddresses.has(recipient)) continue;
+
+    out.push({
+      chainId: chainId as DetectedTransfer["chainId"],
+      txHash: tx.txid as DetectedTransfer["txHash"],
+      logIndex: vout,
+      fromAddress: fromAddress as DetectedTransfer["fromAddress"],
+      toAddress: recipient as DetectedTransfer["toAddress"],
+      token: chain.nativeSymbol as DetectedTransfer["token"],
+      amountRaw: o.value.toString() as DetectedTransfer["amountRaw"],
+      blockNumber,
+      confirmations,
+      seenAt
+    });
   }
   return out;
 }
