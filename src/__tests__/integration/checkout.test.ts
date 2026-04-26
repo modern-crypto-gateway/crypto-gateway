@@ -32,7 +32,8 @@ describe("GET /checkout/:id", () => {
     const body = (await res.json()) as { invoice: Record<string, unknown> };
     expect(body.invoice).toMatchObject({
       id: invoice.id,
-      status: "created",
+      status: "pending",
+      extraStatus: null,
       chainId: 999,
       token: "DEV",
       requiredAmountRaw: "1500000",

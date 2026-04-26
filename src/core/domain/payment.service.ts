@@ -3,7 +3,7 @@ import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
 import type { ChainFamily } from "../types/chain.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
-import type { Invoice, InvoiceId, InvoiceStatus } from "../types/invoice.js";
+import type { Invoice, InvoiceExtraStatus, InvoiceId, InvoiceStatus } from "../types/invoice.js";
 import { DetectedTransferSchema, type TransactionId, type TxStatus } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { isUniqueViolation } from "./db-errors.js";
@@ -249,13 +249,14 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
 
   // Per-transfer webhooks. Two flavors so merchants can drive both
   // "incoming, awaiting confirmations" UX and "money in the bank" UX:
-  //   - invoice.transfer_detected — fires the first time a transfer is
-  //     observed against an invoice, while it's still in `detected`
-  //     (pre-confirmation). Carries `confirmations` so the merchant can
-  //     show progress.
-  //   - invoice.payment_received — fires once per CONFIRMED transfer
-  //     that contributes to an invoice. This is the audit-grade signal:
-  //     the chain has crossed the threshold and the money is durable.
+  //   - invoice.payment_detected (wire: invoice:payment_detected) — fires
+  //     the first time a transfer is observed against an invoice, while
+  //     the tx is still pre-confirmation. Carries `confirmations` so the
+  //     merchant can show progress.
+  //   - invoice.payment_confirmed (wire: invoice:payment_confirmed) —
+  //     fires once per CONFIRMED transfer that contributes to an invoice.
+  //     Audit-grade signal: the chain has crossed the threshold and the
+  //     money is durable.
   // On reorg-revert the tx.orphaned event + subsequent invoice recompute
   // handle the reversal of a previously-confirmed transfer.
   const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceRow.id);
@@ -269,7 +270,7 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   );
   if (initialStatus === "detected") {
     await deps.events.publish({
-      type: "invoice.transfer_detected",
+      type: "invoice.payment_detected",
       invoiceId: invoiceRow.id as InvoiceId,
       invoice: snapshotInvoice,
       payment: {
@@ -286,7 +287,7 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   }
   if (initialStatus === "confirmed") {
     await deps.events.publish({
-      type: "invoice.payment_received",
+      type: "invoice.payment_confirmed",
       invoiceId: invoiceRow.id as InvoiceId,
       invoice: snapshotInvoice,
       payment: {
@@ -489,12 +490,13 @@ export async function confirmTransactions(
     for (const invoiceRow of invoiceRows) {
       const before = invoiceRow.status as InvoiceStatus;
       const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, deps.clock.now().getTime());
-      if (before !== "confirmed" && after === "confirmed") promotedInvoices += 1;
+      if (before !== "completed" && after === "completed") promotedInvoices += 1;
     }
-    // Per-transfer "transfer confirmed" webhook for the polled path. Push-
-    // ingest already fires `invoice.payment_received` from ingestDetectedTransfer
-    // when a transfer arrives confirmed; this is the cron-promoted twin so
-    // merchants on poll-only chains see the same per-payment audit signal.
+    // Per-transfer "payment confirmed" webhook for the polled path. Push-
+    // ingest already fires `invoice.payment_confirmed` from
+    // ingestDetectedTransfer when a transfer arrives confirmed; this is the
+    // cron-promoted twin so merchants on poll-only chains see the same
+    // per-payment audit signal.
     for (const promotedRow of promotedTxRows) {
       if (promotedRow.invoiceId === null) continue;
       const invoiceRow = invoicesById.get(promotedRow.invoiceId);
@@ -502,7 +504,7 @@ export async function confirmTransactions(
       const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceRow.id);
       const snapshotInvoice = drizzleRowToInvoice(invoiceRow, addresses);
       await deps.events.publish({
-        type: "invoice.payment_received",
+        type: "invoice.payment_confirmed",
         invoiceId: invoiceRow.id as InvoiceId,
         invoice: snapshotInvoice,
         payment: {
@@ -732,17 +734,30 @@ export async function recomputeInvoiceFromTransactions(
 
   const required = BigInt(invoiceRow.requiredAmountRaw);
 
+  // Map (total vs required, allConfirmed) → (status, extraStatus). Legacy
+  // single-token path has no overpaid concept (the amount column is the
+  // exact target), so extra_status only ever flips to 'partial'. The
+  // 'detected' nuance (amount reached but unconfirmed) is gone — those land
+  // as `processing` with extra_status=null.
   let after: InvoiceStatus;
+  let afterExtra: InvoiceExtraStatus | null = null;
   if (total >= required && total > 0n) {
-    after = allConfirmed ? "confirmed" : "detected";
+    if (allConfirmed) {
+      after = "completed";
+    } else {
+      // Amount is fully present but at least one contributing tx is still
+      // unconfirmed. Old code called this `detected`; new code surfaces it
+      // as `processing` (no extra_status — the amount is fine, we're just
+      // waiting on confirmations).
+      after = "processing";
+    }
   } else if (total > 0n) {
-    after = "partial";
+    after = "processing";
+    afterExtra = "partial";
   } else {
-    // Total is zero — every contributing tx was reverted/orphaned. Re-open the
-    // invoice so new payments can still credit it (up until `expires_at`).
-    // "created" is the clean structural match: no valid pending inbound
-    // transfers.
-    after = "created";
+    // Total is zero — every contributing tx was reverted/orphaned. Re-open
+    // the invoice so new payments can still credit it (up until expiresAt).
+    after = "pending";
   }
 
   // Admin override against a terminal invoice: only full-amount credits can
@@ -752,23 +767,27 @@ export async function recomputeInvoiceFromTransactions(
   if (
     options.viaAdminOverride &&
     ADMIN_TERMINAL_STATES.has(before) &&
-    after !== "confirmed"
+    after !== "completed"
   ) {
     after = before;
+    afterExtra = (invoiceRow.extraStatus as InvoiceExtraStatus | null) ?? null;
   }
 
+  const beforeExtra = (invoiceRow.extraStatus as InvoiceExtraStatus | null) ?? null;
+  const statusChanged = after !== before || afterExtra !== beforeExtra;
+
   // Persist: always update received_amount_raw; update status only when changed.
-  if (after !== before) {
+  if (statusChanged) {
     // Preserve the first-confirm timestamp across reorg round-trips. When a
-    // confirmed invoice demotes (reorg) and later re-confirms, keeping the
-    // original confirmed_at makes "time-to-confirm" dashboards honest. The
-    // USD path already did this; the legacy path didn't, which is C6 territory.
+    // completed invoice demotes (reorg) and later re-completes, keeping the
+    // original confirmedAt makes "time-to-confirm" dashboards honest.
     const nextConfirmedAt =
-      after === "confirmed" && invoiceRow.confirmedAt === null ? now : invoiceRow.confirmedAt;
+      after === "completed" && invoiceRow.confirmedAt === null ? now : invoiceRow.confirmedAt;
     await deps.db
       .update(invoices)
       .set({
         status: after,
+        extraStatus: afterExtra,
         receivedAmountRaw: total.toString(),
         confirmedAt: nextConfirmedAt,
         updatedAt: now
@@ -780,24 +799,25 @@ export async function recomputeInvoiceFromTransactions(
       {
         ...invoiceRow,
         status: after,
+        extraStatus: afterExtra,
         receivedAmountRaw: total.toString(),
         confirmedAt: nextConfirmedAt,
         updatedAt: now
       },
       addresses
     );
-    // Reorg demotion (confirmed -> anything lower) is an operator-visible
-    // event: the merchant has already been told the payment confirmed, and
+    // Reorg demotion (completed -> anything lower) is an operator-visible
+    // event: the merchant has already been told the payment completed, and
     // downstream systems (payout, fulfillment) may have acted on it.
     //
     // Two things happen, in order:
     //   1. Try to re-claim the pool addresses this invoice used. They were
-    //      released on `invoice.confirmed`; a newer invoice may have taken
+    //      released on `invoice.completed`; a newer invoice may have taken
     //      the slot. `reacquireForInvoice` reports the outcome so we log
     //      (and publish) whether any collision happened.
-    //   2. Publish `invoice.demoted` BEFORE the normal status-transition
+    //   2. Publish `invoice.demoted` BEFORE any other status-transition
     //      event so subscribers see the reorg flag first.
-    if (before === "confirmed" && after !== "confirmed") {
+    if (before === "completed" && after !== "completed") {
       let poolReacquired = 0;
       let poolCollided = 0;
       try {
@@ -814,7 +834,7 @@ export async function recomputeInvoiceFromTransactions(
           error: err instanceof Error ? err.message : String(err)
         });
       }
-      deps.logger.error("invoice demoted after confirmation (reorg)", {
+      deps.logger.error("invoice demoted after completion (reorg)", {
         invoiceId: invoiceRow.id,
         merchantId: invoiceRow.merchantId,
         before,
@@ -835,7 +855,8 @@ export async function recomputeInvoiceFromTransactions(
         at: new Date(now)
       });
     }
-    await deps.events.publish(invoiceEventFor(after, updated, now));
+    const evt = invoiceEventFor(after, updated, now);
+    if (evt !== null) await deps.events.publish(evt);
   } else if (total.toString() !== invoiceRow.receivedAmountRaw) {
     await deps.db
       .update(invoices)
@@ -889,46 +910,52 @@ async function recomputeUsdInvoice(
   const confirmThreshold = applyBps(amountUsd, invoiceRow.paymentToleranceUnderBps, "down");
   const overpaidThreshold = applyBps(amountUsd, invoiceRow.paymentToleranceOverBps, "up");
 
+  // Map (paidUsd vs thresholds) → (status, extraStatus). Paying ≥ confirm
+  // threshold completes the invoice; going past the over threshold flips
+  // extra_status to 'overpaid' (lifecycle status stays `completed` — overpaid
+  // is a fidelity signal, not a separate stage). overpaidUsd is the *raw*
+  // delta (paid − amount) so merchant accounting still sees the true
+  // overshoot regardless of where the threshold sits.
   let after: InvoiceStatus;
+  let afterExtra: InvoiceExtraStatus | null = null;
   let overpaidUsd = "0";
   if (compareUsd(paidUsd, overpaidThreshold) > 0) {
-    after = "overpaid";
+    after = "completed";
+    afterExtra = "overpaid";
     overpaidUsd = subUsd(paidUsd, amountUsd);
   } else if (compareUsd(paidUsd, confirmThreshold) >= 0 && compareUsd(paidUsd, "0") > 0) {
-    after = "confirmed";
+    after = "completed";
   } else if (compareUsd(paidUsd, "0") > 0) {
-    after = "partial";
+    after = "processing";
+    afterExtra = "partial";
   } else {
-    // Nothing confirmed yet. `detected` (still under threshold) payments exist
-    // as transactions but don't move the invoice off `created` / whatever
-    // prior.
-    after = "created";
+    // Nothing confirmed yet. `detected` (unconfirmed) payments exist as
+    // transactions but don't move the invoice off `pending`.
+    after = "pending";
   }
 
   // Admin override against a terminal invoice: only credits that clear the
-  // confirm bar (confirmed or overpaid) flip the invoice out of expired /
-  // canceled. `partial` / `created` leave the merchant's prior decision in
-  // place.
+  // confirm bar flip the invoice out of expired / canceled. Partial credits
+  // leave the merchant's prior decision in place.
   if (
     options.viaAdminOverride &&
     ADMIN_TERMINAL_STATES.has(before) &&
-    after !== "confirmed" &&
-    after !== "overpaid"
+    after !== "completed"
   ) {
     after = before;
+    afterExtra = (invoiceRow.extraStatus as InvoiceExtraStatus | null) ?? null;
   }
 
   // Always update paid_usd / overpaid_usd (even on same-status) so merchant
   // UIs see live progress on partial invoices. Status-change also flips
-  // confirmed_at + fires the status event.
+  // confirmedAt + fires the status event.
   const nextConfirmedAt =
-    (after === "confirmed" || after === "overpaid") && invoiceRow.confirmedAt === null
-      ? now
-      : invoiceRow.confirmedAt;
+    after === "completed" && invoiceRow.confirmedAt === null ? now : invoiceRow.confirmedAt;
   await deps.db
     .update(invoices)
     .set({
       status: after,
+      extraStatus: afterExtra,
       paidUsd,
       overpaidUsd,
       confirmedAt: nextConfirmedAt,
@@ -936,12 +963,15 @@ async function recomputeUsdInvoice(
     })
     .where(eq(invoices.id, invoiceRow.id));
 
-  if (after !== before) {
+  const beforeExtra = (invoiceRow.extraStatus as InvoiceExtraStatus | null) ?? null;
+  const statusChanged = after !== before || afterExtra !== beforeExtra;
+  if (statusChanged) {
     const addresses = await fetchInvoiceReceiveAddresses(deps, invoiceRow.id);
     const updated = drizzleRowToInvoice(
       {
         ...invoiceRow,
         status: after,
+        extraStatus: afterExtra,
         paidUsd,
         overpaidUsd,
         confirmedAt: nextConfirmedAt,
@@ -949,16 +979,11 @@ async function recomputeUsdInvoice(
       },
       addresses
     );
-    // Reorg demotion on USD-path invoices: confirmed / overpaid are positive
-    // terminal-ish outcomes the merchant has been notified about. A
-    // transition to a lower status (partial / detected / created) means the
-    // chain walked back our happy-path event. Same re-acquire + demoted-
-    // event flow as the non-USD path.
-    if (
-      (before === "confirmed" || before === "overpaid") &&
-      after !== "confirmed" &&
-      after !== "overpaid"
-    ) {
+    // Reorg demotion on USD-path invoices: completed is the positive terminal
+    // state the merchant has been notified about. A transition off completed
+    // means the chain walked back our happy-path event. Same re-acquire +
+    // demoted-event flow as the legacy path.
+    if (before === "completed" && after !== "completed") {
       let poolReacquired = 0;
       let poolCollided = 0;
       try {
@@ -975,7 +1000,7 @@ async function recomputeUsdInvoice(
           error: err instanceof Error ? err.message : String(err)
         });
       }
-      deps.logger.error("USD invoice demoted after confirmation (reorg)", {
+      deps.logger.error("USD invoice demoted after completion (reorg)", {
         invoiceId: invoiceRow.id,
         merchantId: invoiceRow.merchantId,
         before,
@@ -996,29 +1021,30 @@ async function recomputeUsdInvoice(
         at: new Date(now)
       });
     }
-    await deps.events.publish(invoiceEventFor(after, updated, now));
+    const evt = invoiceEventFor(after, updated, now);
+    if (evt !== null) await deps.events.publish(evt);
   }
 
   return after;
 }
 
-function invoiceEventFor(status: InvoiceStatus, invoice: Invoice, now: number): DomainEvent {
+// Whole-invoice lifecycle events. Returns null for `pending` / `processing`
+// because per-tx events (`invoice.payment_detected` / `payment_confirmed`)
+// already carry merchant-visibility for those phases — there's no separate
+// invoice-level signal until the invoice itself completes (or terminates).
+// `invoice.created` fires from the invoice creation path, not from recompute.
+function invoiceEventFor(status: InvoiceStatus, invoice: Invoice, now: number): DomainEvent | null {
   const at = new Date(now);
   switch (status) {
-    case "partial":
-      return { type: "invoice.partial", invoiceId: invoice.id, invoice, at };
-    case "detected":
-      return { type: "invoice.detected", invoiceId: invoice.id, invoice, at };
-    case "confirmed":
-      return { type: "invoice.confirmed", invoiceId: invoice.id, invoice, at };
+    case "completed":
+      return { type: "invoice.completed", invoiceId: invoice.id, invoice, at };
     case "expired":
       return { type: "invoice.expired", invoiceId: invoice.id, invoice, at };
     case "canceled":
       return { type: "invoice.canceled", invoiceId: invoice.id, invoice, at };
-    case "created":
-      return { type: "invoice.created", invoiceId: invoice.id, invoice, at };
-    case "overpaid":
-      return { type: "invoice.overpaid", invoiceId: invoice.id, invoice, at };
+    case "pending":
+    case "processing":
+      return null;
   }
 }
 
@@ -1128,12 +1154,12 @@ export async function relinkOrphanTransactions(
         .where(eq(transactions.id, row.id));
 
       // Per-payment webhook for confirmed orphans, mirroring the live ingest
-      // path (only confirmed transfers fire `invoice.payment_received`).
+      // path (only confirmed transfers fire `invoice.payment_confirmed`).
       if (row.status === "confirmed") {
         const addresses = await fetchInvoiceReceiveAddresses(deps, matched.invoice.id);
         const snapshotInvoice = drizzleRowToInvoice(matched.invoice, addresses);
         await deps.events.publish({
-          type: "invoice.payment_received",
+          type: "invoice.payment_confirmed",
           invoiceId: matched.invoice.id as InvoiceId,
           invoice: snapshotInvoice,
           payment: {
@@ -1164,8 +1190,9 @@ export async function relinkOrphanTransactions(
   }
 
   // Recompute every touched invoice. The recompute itself fires the
-  // status-transition events (invoice.confirmed / .partial / etc.) so
-  // merchants see both the per-payment ping and the invoice lifecycle event.
+  // lifecycle event (invoice.completed) when the threshold is crossed, and
+  // per-payment events fire above for each contributing tx — so merchants
+  // see both the per-payment ping and the invoice lifecycle event.
   let invoicesPromoted = 0;
   if (apply && touchedInvoiceIds.size > 0) {
     const ids = [...touchedInvoiceIds];
@@ -1173,7 +1200,7 @@ export async function relinkOrphanTransactions(
     for (const invoiceRow of invoiceRows) {
       const before = invoiceRow.status as InvoiceStatus;
       const after = await recomputeInvoiceFromTransactions(deps, invoiceRow, now);
-      if (before !== "confirmed" && after === "confirmed") invoicesPromoted += 1;
+      if (before !== "completed" && after === "completed") invoicesPromoted += 1;
     }
   }
 

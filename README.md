@@ -486,7 +486,7 @@ Event-driven enqueue (via the in-process event bus):
 | Domain event         | Enqueued op                            |
 | -------------------- | -------------------------------------- |
 | `invoice.created`    | `add` row for `(chainId, receiveAddress)` |
-| `invoice.confirmed`  | `remove` row (frees a slot toward Alchemy's 50k-per-webhook cap) |
+| `invoice:completed`  | `remove` row (frees a slot toward Alchemy's 50k-per-webhook cap) |
 | `invoice.expired`    | `remove` row                           |
 | `invoice.canceled`   | `remove` row                           |
 
@@ -515,7 +515,7 @@ Improvements over v1's equivalent flow (studied before this was built):
   malformed address doesn't look identical to an Alchemy outage.
 - **Automatic deregistration on terminal invoice states** — v1 let addresses
   accumulate toward the 50k-per-webhook cap and required manual cleanup;
-  we enqueue `remove` on `invoice.confirmed | expired | canceled`.
+  we enqueue `remove` on `invoice:completed | expired | canceled`.
 - **Per-chain signing keys in the DB** — v1 shared one env var across every
   chain; that approach could never serve multi-chain correctly. We persist
   per-(chainId, webhookId) rows in `alchemy_webhook_registry`, encrypted via
@@ -561,37 +561,92 @@ URL/secret resolution per event: **per-resource override → merchant default
 → silently skipped** (a `warn` log fires when no destination is configured
 so operators can grep `"webhook event skipped — no target resolved"`).
 
-### Invoice lifecycle (one row per status transition)
+### Status model
 
-| Event                | Fires when                                                                                  | Idempotency key shape                              |
-| -------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| `invoice.partial`    | First confirmed payment lands but USD total is still under `amountUsd × (1 − underBps)`     | `invoice.partial:{invoiceId}:partial`              |
-| `invoice.detected`   | A pending transfer covers the required amount (legacy single-token path)                    | `invoice.detected:{invoiceId}:detected`            |
-| `invoice.confirmed`  | USD total clears the under-tolerance threshold                                              | `invoice.confirmed:{invoiceId}:confirmed`          |
-| `invoice.overpaid`   | USD total exceeds `amountUsd × (1 + overBps)`                                               | `invoice.overpaid:{invoiceId}:overpaid`            |
-| `invoice.expired`    | `expiresAt` elapses (cron sweeper) or `POST /invoices/{id}/expire` is called                | `invoice.expired:{invoiceId}:expired`              |
-| `invoice.canceled`   | Merchant cancels via API                                                                    | `invoice.canceled:{invoiceId}:canceled`            |
-| `invoice.demoted`    | Reorg un-confirms a previously-confirmed invoice; carries `previousStatus` + pool-recapture counts | `invoice.demoted:{invoiceId}:{prev}:{new}`  |
+Two orthogonal axes:
+
+- **`status`** — lifecycle stage:
+  `pending` → `processing` → `completed` (or terminal: `expired` / `canceled`)
+- **`extraStatus`** — payment-fidelity signal: `null` | `"partial"` | `"overpaid"`
+
+| `(status, extraStatus)`        | Meaning                                                  |
+| ------------------------------ | -------------------------------------------------------- |
+| `(pending, null)`              | No on-chain activity yet                                 |
+| `(processing, null)`           | Required amount seen but unconfirmed (waiting on N confs)|
+| `(processing, "partial")`      | Some payment in, less than threshold                     |
+| `(completed, null)`            | Paid in full within tolerance                            |
+| `(completed, "overpaid")`      | Paid past the over-tolerance threshold                   |
+| `(expired, null)`              | Past `expiresAt` without completion                      |
+| `(canceled, null)`             | Merchant aborted via admin route                         |
 
 ### Per-transfer audit (one row per on-chain tx, per stage)
 
-These give merchants deep visibility into partial-payment scenarios — every
-incoming transfer surfaces twice (once when first observed, once when
-confirmed), with `confirmations` and a `payment` block alongside the invoice
-snapshot.
+Every incoming transfer surfaces twice — once when first observed, once when
+confirmed. The payload's `transactions[]` array carries every contributing
+on-chain tx with hash, chainId/chainName, token (with `isNative` flag),
+human-decimal `amount` + `amountRaw`, `amountUsd`, confirmation count, and
+per-tx status. `triggerTxHash` points at the tx that caused this specific
+event.
 
 | Event                         | Fires when                                                          | Idempotency key shape                                        |
 | ----------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------ |
-| `invoice.transfer_detected`   | First sighting of a pending transfer (push or poll). `data.payment.confirmations` will be `0` for push-detected, `n` for poll-detected | `invoice.transfer_detected:{invoiceId}:{txHash}` |
-| `invoice.payment_received`    | Same transfer reaches the configured confirmation threshold          | `invoice.payment_received:{invoiceId}:{txHash}`              |
+| `invoice:payment_detected`    | First sighting of a pending contributing tx (push or poll). The tx's `confirmations` will be `0` for push-detected, `n` for poll-detected | `invoice:payment_detected:{invoiceId}:{txHash}` |
+| `invoice:payment_confirmed`   | Same tx reaches the configured confirmation threshold. Fires once per contributing tx, even on partial-payment invoices that haven't completed yet | `invoice:payment_confirmed:{invoiceId}:{txHash}` |
 
 The event type is part of the idempotency key — a transfer that's first
 detected and later confirmed produces TWO distinct webhook rows (not a
-collision), so merchants can show "transfer pending" and "transfer
-confirmed" UI states separately. For a partial payment scenario, expect
-N pairs of `transfer_detected` + `payment_received` plus one or more
-`invoice.partial` and finally `invoice.confirmed` once the USD total
-crosses the threshold.
+collision).
+
+### Whole-invoice lifecycle (one row per transition)
+
+| Event                | Fires when                                                                                  | Idempotency key shape                              |
+| -------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| `invoice:completed`  | Invoice transitions to `status='completed'`. Overpaid invoices fire this same event with `data.invoice.extraStatus='overpaid'` on the snapshot | `invoice:completed:{invoiceId}:completed`          |
+| `invoice:expired`    | `expiresAt` elapses (cron sweeper) or `POST /invoices/{id}/expire`                          | `invoice:expired:{invoiceId}:expired`              |
+| `invoice:canceled`   | Merchant cancels via API                                                                    | `invoice:canceled:{invoiceId}:canceled`            |
+| `invoice:demoted`    | Reorg un-confirms a previously-completed invoice; carries `previousStatus` + pool-recapture counts | `invoice:demoted:{invoiceId}:{prev}:{new}`  |
+
+There's no separate event for `pending → processing` — the per-tx
+`payment_detected` event already carries that visibility. A typical partial-
+payment scenario emits N pairs of `payment_detected` + `payment_confirmed`
+(per contributing tx, with `data.invoice.extraStatus='partial'`) and finally
+one `invoice:completed` once the threshold is crossed.
+
+### Payload shape
+
+Every invoice event uses the same envelope:
+
+```jsonc
+{
+  "event": "invoice:payment_confirmed",
+  "timestamp": "2026-04-26T14:32:15.123Z",
+  "data": {
+    "invoice": {
+      "id": "...",
+      "status": "processing",
+      "extraStatus": "partial",
+      "amountUsd": "10.00",
+      "paidUsd": "5.00",
+      // ... full invoice snapshot
+    },
+    "transactions": [
+      {
+        "hash": "0xbc73...",
+        "chainId": 56,
+        "chainName": "bsc",
+        "token": "USDT",
+        "isNative": false,
+        "amount": "5.00",
+        "amountRaw": "5000000000000000000",
+        "amountUsd": "5.00",
+        "confirmations": 12,
+        "status": "confirmed"
+      }
+    ],
+    "triggerTxHash": "0xbc73..."  // null for status-only events
+  }
+}
+```
 
 ### Payout lifecycle
 
@@ -937,8 +992,10 @@ Tradeoffs to flag in your merchant settings UI:
 
 - A nonzero **under-tolerance** creates an accounting gap (invoice closes for
   the full amount; cashflow is short by the slippage).
-- A nonzero **over-tolerance** suppresses the `invoice.overpaid` webhook for
-  payments inside the band — they fire `invoice.confirmed` instead.
+- A nonzero **over-tolerance** keeps payments inside the band as
+  `(completed, null)` — only payments past the threshold flip
+  `extraStatus='overpaid'` on the snapshot. The lifecycle event is the
+  same `invoice:completed` either way.
 
 ## API reference
 

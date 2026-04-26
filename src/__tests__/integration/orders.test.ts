@@ -35,7 +35,8 @@ describe("POST /api/v1/invoices", () => {
       merchantId: MERCHANT_ID,
       chainId: 999,
       token: "DEV",
-      status: "created",
+      status: "pending",
+      extraStatus: null,
       requiredAmountRaw: "1000000",
       receivedAmountRaw: "0",
       addressIndex: 0

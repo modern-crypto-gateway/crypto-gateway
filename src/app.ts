@@ -33,7 +33,7 @@ export interface App {
 // silently dropped on the floor.
 export function registerEventSubscribers(deps: AppDeps): void {
   registerWebhookSubscriber(deps);
-  // Pool release: every invoice.confirmed/expired/canceled returns its pool
+  // Pool release: every invoice.completed/expired/canceled returns its pool
   // row(s) to 'available' so the address can serve the next invoice. This is
   // the whole point of the reuse model — one pool row, N invoices, 1 sweep.
   registerPoolReleaseHandler(deps);

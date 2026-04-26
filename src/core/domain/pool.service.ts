@@ -269,7 +269,10 @@ export async function reconcileOrphanedAllocations(
   const activeRows = await deps.db
     .select({ id: invoices.id })
     .from(invoices)
-    .where(inArray(invoices.status, ["created", "partial", "detected"]))
+    // Non-terminal lifecycle stages — pool addresses tied to these stay
+    // pinned to their invoice. `completed` releases on transition (sweeper
+    // doesn't need to release them); `expired`/`canceled` are terminal.
+    .where(inArray(invoices.status, ["pending", "processing"]))
     .limit(RECONCILE_ACTIVE_INVOICE_FETCH_LIMIT);
   const activeIds = activeRows.map((r) => r.id);
 
@@ -465,7 +468,7 @@ export function registerPoolReleaseHandler(deps: AppDeps): () => void {
   };
 
   const unsubscribers = [
-    deps.events.subscribe("invoice.confirmed", handler),
+    deps.events.subscribe("invoice.completed", handler),
     deps.events.subscribe("invoice.expired", handler),
     deps.events.subscribe("invoice.canceled", handler)
   ];

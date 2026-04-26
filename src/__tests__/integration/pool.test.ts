@@ -216,7 +216,7 @@ describe("pool.service — reconcileOrphanedAllocations", () => {
   // through createInvoice (which would itself touch the pool). All required
   // columns are filled with placeholder values that satisfy NOT NULL/CHECK
   // constraints — only `id` and `status` matter for the reconciler.
-  async function insertInvoiceRow(id: string, status: "created" | "expired"): Promise<void> {
+  async function insertInvoiceRow(id: string, status: "pending" | "expired"): Promise<void> {
     const t = Date.now();
     await booted.deps.db.insert(invoices).values({
       id,
@@ -283,7 +283,7 @@ describe("pool.service — reconcileOrphanedAllocations", () => {
 
   it("does NOT release rows tied to an active (non-terminal) invoice", async () => {
     const a = await allocateForInvoice(booted.deps, "active-invoice", "evm");
-    await insertInvoiceRow("active-invoice", "created");
+    await insertInvoiceRow("active-invoice", "pending");
     await ageAllocation(a.id);
 
     const result = await reconcileOrphanedAllocations(booted.deps);

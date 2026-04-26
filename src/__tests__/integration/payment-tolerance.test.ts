@@ -100,7 +100,7 @@ describe("payment tolerance — under-payment closes as confirmed within band", 
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(result.invoiceStatusAfter).toBe("confirmed");
+    expect(result.invoiceStatusAfter).toBe("completed");
 
     const [row] = await booted.deps.db
       .select({
@@ -111,7 +111,7 @@ describe("payment tolerance — under-payment closes as confirmed within band", 
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(row?.status).toBe("confirmed");
+    expect(row?.status).toBe("completed");
     expect(row?.paid_usd).toBe("99.00");
     expect(row?.overpaid_usd).toBe("0");
   });
@@ -132,7 +132,7 @@ describe("payment tolerance — under-payment closes as confirmed within band", 
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(result.invoiceStatusAfter).toBe("partial");
+    expect(result.invoiceStatusAfter).toBe("processing");
   });
 });
 
@@ -165,7 +165,7 @@ describe("payment tolerance — over-payment within band stays 'confirmed' (not 
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(result.invoiceStatusAfter).toBe("confirmed");
+    expect(result.invoiceStatusAfter).toBe("completed");
 
     const [row] = await booted.deps.db
       .select({
@@ -176,7 +176,7 @@ describe("payment tolerance — over-payment within band stays 'confirmed' (not 
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(row?.status).toBe("confirmed");
+    expect(row?.status).toBe("completed");
     expect(row?.paid_usd).toBe("101.00");
     // Even when status is `confirmed`, overpaid_usd stays at 0 because the
     // payment never crossed the over threshold.
@@ -200,14 +200,15 @@ describe("payment tolerance — over-payment within band stays 'confirmed' (not 
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(result.invoiceStatusAfter).toBe("overpaid");
+    expect(result.invoiceStatusAfter).toBe("completed");
 
     const [row] = await booted.deps.db
-      .select({ status: invoices.status, overpaid_usd: invoices.overpaidUsd })
+      .select({ status: invoices.status, extra_status: invoices.extraStatus, overpaid_usd: invoices.overpaidUsd })
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(row?.status).toBe("overpaid");
+    expect(row?.status).toBe("completed");
+    expect(row?.extra_status).toBe("overpaid");
     expect(row?.overpaid_usd).toBe("5.00");
   });
 });
@@ -247,7 +248,7 @@ describe("payment tolerance — per-invoice override beats merchant default", ()
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(result.invoiceStatusAfter).toBe("confirmed");
+    expect(result.invoiceStatusAfter).toBe("completed");
   });
 
   it("rejects out-of-range tolerance values at the API boundary", async () => {

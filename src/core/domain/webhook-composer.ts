@@ -1,20 +1,33 @@
+import { asc, eq } from "drizzle-orm";
+import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
 import type { Invoice } from "../types/invoice.js";
 import type { Payout } from "../types/payout.js";
+import { transactions as transactionsTable } from "../../db/schema.js";
+import { chainSlug } from "../types/chain-registry.js";
+import { findToken } from "../types/token-registry.js";
 
-// Pure function: DomainEvent -> (merchant-bound webhook payload, idempotency key).
-// Returns `null` for events that are internal and not exposed to merchants
-// (e.g. tx.detected fires during polling and isn't merchant-visible; we only
-// surface invoice- and payout-level state changes).
+// DomainEvent → (merchant-bound webhook payload, idempotency key).
+// Returns `null` for events that are internal and not exposed to merchants.
 //
-// Rules:
-//   - payload.event:   kebab-case event name merchants see on the wire
-//   - payload.data:    minimal, JSON-safe entity snapshot
-//   - idempotencyKey:  stable per (event type, entity id, target status) so a
-//                      dispatcher retry never delivers twice to a well-behaved merchant
+// Event-name conventions:
+//   - Internal DomainEvent.type uses dots:  invoice.completed
+//   - Merchant-facing payload.event uses colons:  invoice:completed
 //
-// The composer does NOT look up the merchant or dispatch. It is a leaf function
-// for easy unit testing and to keep the event bus subscriber thin.
+// This mapping makes the wire surface visually distinct from the internal
+// type names ("which side am I looking at?"), and the colon namespacing
+// reads as a hierarchical label rather than a sub-namespace traversal.
+//
+// Two scopes of events:
+//   - invoice:payment_*  — per-transaction (one fires per contributing tx)
+//   - invoice:*          — whole-invoice lifecycle (fires once per transition)
+//
+// Payload is uniformly:
+//   { event, timestamp, data: { invoice, transactions, triggerTxHash? } }
+// `transactions` always lists every tx ever associated with the invoice
+// (status: detected | confirmed | reverted | orphaned) so merchants get a
+// complete picture on every event without an extra GET. `triggerTxHash` is
+// the tx that caused the event for per-tx events; null for status-only ones.
 
 export interface ComposedWebhook {
   merchantId: string;
@@ -33,82 +46,104 @@ export interface WebhookPayload {
   data: Record<string, unknown>;
 }
 
+// Merchant-facing event names. Colon-separated; the leading prefix is the
+// resource ("invoice" | "payout") and the suffix is the lifecycle action.
+// `payment_*` is a sub-prefix on invoice events that distinguishes per-tx
+// signals from whole-invoice lifecycle signals.
 export type WebhookEventName =
-  | "invoice.partial"
-  | "invoice.detected"
-  | "invoice.confirmed"
-  | "invoice.overpaid"
-  | "invoice.expired"
-  | "invoice.canceled"
-  | "invoice.demoted"
-  | "invoice.transfer_detected"
-  | "invoice.payment_received"
+  | "invoice:payment_detected"
+  | "invoice:payment_confirmed"
+  | "invoice:completed"
+  | "invoice:expired"
+  | "invoice:canceled"
+  | "invoice:demoted"
   | "payout.submitted"
   | "payout.confirmed"
   | "payout.failed";
 
-export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
+// Pure: takes the event plus pre-loaded transactions and returns the wire
+// payload. The DB read for transactions happens in the subscriber so this
+// function stays free of side effects and trivially unit-testable.
+//
+// `transactions` should be the full set of txs ever associated with the
+// invoice (status: detected | confirmed | reverted | orphaned). Callers that
+// don't have an invoice context (payout events) pass [].
+export function composeWebhook(
+  event: DomainEvent,
+  transactions: readonly TransactionPayload[] = []
+): ComposedWebhook | null {
   switch (event.type) {
-    case "invoice.partial":
-    case "invoice.detected":
-    case "invoice.confirmed":
-    case "invoice.overpaid":
+    case "invoice.completed":
+      return {
+        merchantId: event.invoice.merchantId,
+        resource: { type: "invoice", id: event.invoice.id },
+        payload: {
+          event: "invoice:completed",
+          timestamp: event.at.toISOString(),
+          data: invoiceEnvelope(event.invoice, transactions, null)
+        },
+        // Status is part of the key so a same-invoice transition that lands
+        // again at `completed` after a reorg-then-reconfirm produces a fresh
+        // delivery row instead of being deduped against the prior one.
+        idempotencyKey: `invoice:completed:${event.invoice.id}:${event.invoice.status}`
+      };
+
     case "invoice.expired":
-    case "invoice.canceled":
+    case "invoice.canceled": {
+      const wireEvent: WebhookEventName =
+        event.type === "invoice.expired" ? "invoice:expired" : "invoice:canceled";
       return {
         merchantId: event.invoice.merchantId,
         resource: { type: "invoice", id: event.invoice.id },
         payload: {
-          event: event.type,
+          event: wireEvent,
           timestamp: event.at.toISOString(),
-          data: serializeInvoice(event.invoice)
+          data: invoiceEnvelope(event.invoice, transactions, null)
         },
-        idempotencyKey: `${event.type}:${event.invoice.id}:${event.invoice.status}`
+        idempotencyKey: `${wireEvent}:${event.invoice.id}:${event.invoice.status}`
       };
+    }
 
-    case "invoice.demoted":
+    case "invoice.demoted": {
       // Reorg un-confirmation. Keyed by (invoiceId, previousStatus, newStatus)
-      // so distinct reorg events from the same invoice are not deduped. Pool
-      // re-acquire counts travel alongside the invoice body so merchants
-      // can surface "address potentially reused by invoice X" alerts if
-      // `poolCollided > 0`.
+      // so distinct reorg events from the same invoice aren't deduped.
+      const envelope = invoiceEnvelope(event.invoice, transactions, null);
+      // demoted carries reorg-specific extras alongside the standard envelope.
+      envelope.previousStatus = event.previousStatus;
+      envelope.poolReacquired = event.poolReacquired;
+      envelope.poolCollided = event.poolCollided;
       return {
         merchantId: event.invoice.merchantId,
         resource: { type: "invoice", id: event.invoice.id },
         payload: {
-          event: event.type,
+          event: "invoice:demoted",
           timestamp: event.at.toISOString(),
-          data: {
-            invoice: serializeInvoice(event.invoice),
-            previousStatus: event.previousStatus,
-            poolReacquired: event.poolReacquired,
-            poolCollided: event.poolCollided
-          }
+          data: envelope
         },
-        idempotencyKey: `${event.type}:${event.invoice.id}:${event.previousStatus}:${event.invoice.status}`
+        idempotencyKey: `invoice:demoted:${event.invoice.id}:${event.previousStatus}:${event.invoice.status}`
       };
+    }
 
-    case "invoice.payment_received":
-    case "invoice.transfer_detected":
-      // Per-transfer audit events. transfer_detected fires once per first-seen
-      // unconfirmed transfer; payment_received fires once per confirmed
-      // transfer. Both key idempotency on txHash so merchants de-dup retries
-      // — the event TYPE is part of the key, so a transfer that's first
-      // detected and later confirmed produces TWO distinct webhook rows
-      // (one per type) instead of colliding.
+    case "invoice.payment_detected":
+    case "invoice.payment_confirmed": {
+      // Per-transfer audit events. Keyed on (invoice id + tx hash + event
+      // name) — same hash detected then later confirmed produces TWO distinct
+      // webhook rows (one per event name) instead of colliding.
+      const wireEvent: WebhookEventName =
+        event.type === "invoice.payment_detected"
+          ? "invoice:payment_detected"
+          : "invoice:payment_confirmed";
       return {
         merchantId: event.invoice.merchantId,
         resource: { type: "invoice", id: event.invoice.id },
         payload: {
-          event: event.type,
+          event: wireEvent,
           timestamp: event.at.toISOString(),
-          data: {
-            invoice: serializeInvoice(event.invoice),
-            payment: event.payment
-          }
+          data: invoiceEnvelope(event.invoice, transactions, event.payment.txHash)
         },
-        idempotencyKey: `${event.type}:${event.invoice.id}:${event.payment.txHash}`
+        idempotencyKey: `${wireEvent}:${event.invoice.id}:${event.payment.txHash}`
       };
+    }
 
     case "payout.submitted":
     case "payout.confirmed":
@@ -136,10 +171,101 @@ export function composeWebhook(event: DomainEvent): ComposedWebhook | null {
   }
 }
 
+// Single shared shape for every invoice-event payload's `data` block. The
+// caller can tack on event-specific extras (e.g. `previousStatus` for
+// demoted) as additional properties on the returned object.
+function invoiceEnvelope(
+  invoice: Invoice,
+  txs: readonly TransactionPayload[],
+  triggerTxHash: string | null
+): Record<string, unknown> {
+  return {
+    invoice: serializeInvoice(invoice),
+    transactions: txs,
+    triggerTxHash
+  };
+}
+
+export interface TransactionPayload {
+  hash: string;
+  chainId: number;
+  chainName: string | null;
+  token: string;
+  isNative: boolean;
+  // Human-decimal form (amountRaw / 10^decimals), formatted as a string to
+  // preserve precision. `null` when we can't resolve the token's decimals
+  // (e.g. a transfer recorded against a token that was later removed from
+  // the registry).
+  amount: string | null;
+  amountRaw: string;
+  amountUsd: string | null;
+  confirmations: number;
+  status: "detected" | "confirmed" | "reverted" | "orphaned";
+}
+
+// Loads every transaction associated with an invoice, ordered by detection
+// time. Returns an empty array for invoices with no contributing txs (e.g.
+// `pending` or `expired` with no payment activity). Called by the subscriber
+// for invoice events; payout events skip the call.
+export async function loadInvoiceTransactions(
+  deps: AppDeps,
+  invoiceId: string
+): Promise<readonly TransactionPayload[]> {
+  const rows = await deps.db
+    .select({
+      txHash: transactionsTable.txHash,
+      chainId: transactionsTable.chainId,
+      token: transactionsTable.token,
+      amountRaw: transactionsTable.amountRaw,
+      amountUsd: transactionsTable.amountUsd,
+      confirmations: transactionsTable.confirmations,
+      status: transactionsTable.status,
+      detectedAt: transactionsTable.detectedAt
+    })
+    .from(transactionsTable)
+    .where(eq(transactionsTable.invoiceId, invoiceId))
+    .orderBy(asc(transactionsTable.detectedAt));
+
+  return rows.map((row) => {
+    const tokenInfo = findToken(row.chainId as never, row.token as never);
+    const isNative = tokenInfo !== null && tokenInfo.contractAddress === null;
+    const amount = tokenInfo === null ? null : formatAmount(row.amountRaw, tokenInfo.decimals);
+    return {
+      hash: row.txHash,
+      chainId: row.chainId,
+      chainName: chainSlug(row.chainId as never),
+      token: row.token,
+      isNative,
+      amount,
+      amountRaw: row.amountRaw,
+      amountUsd: row.amountUsd,
+      confirmations: row.confirmations,
+      status: row.status as TransactionPayload["status"]
+    };
+  });
+}
+
+// `amountRaw` (base units) → human decimal string. Pure integer math —
+// avoids floating-point precision loss for 18-decimal tokens at large
+// amounts. e.g. ("1500000", 6) → "1.5", ("12345678901234567890", 18) →
+// "12.34567890123456789".
+function formatAmount(amountRaw: string, decimals: number): string {
+  if (decimals === 0) return amountRaw;
+  const negative = amountRaw.startsWith("-");
+  const digits = negative ? amountRaw.slice(1) : amountRaw;
+  if (digits === "0") return "0";
+  const padded = digits.padStart(decimals + 1, "0");
+  const whole = padded.slice(0, padded.length - decimals);
+  const fraction = padded.slice(padded.length - decimals).replace(/0+$/, "");
+  const formatted = fraction.length === 0 ? whole : `${whole}.${fraction}`;
+  return negative ? `-${formatted}` : formatted;
+}
+
 function serializeInvoice(invoice: Invoice): Record<string, unknown> {
   return {
     id: invoice.id,
     status: invoice.status,
+    extraStatus: invoice.extraStatus,
     chainId: invoice.chainId,
     token: invoice.token,
     receiveAddress: invoice.receiveAddress,
@@ -202,3 +328,6 @@ function serializePayout(payout: Payout): Record<string, unknown> {
     confirmedAt: payout.confirmedAt === null ? null : payout.confirmedAt.toISOString()
   };
 }
+
+// Exported for unit-test access — the formatter is pure and worth pinning.
+export { formatAmount as __formatAmountForTest };

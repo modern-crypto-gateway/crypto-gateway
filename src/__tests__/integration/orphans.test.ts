@@ -69,7 +69,7 @@ describe("PaymentService ingest — orphan write path", () => {
 
     expect(events).not.toContain("tx.detected");
     expect(events).not.toContain("tx.confirmed");
-    expect(events).not.toContain("invoice.payment_received");
+    expect(events).not.toContain("invoice.payment_confirmed");
   });
 
   it("credits the expired invoice when the pool address is still in cooldown (no orphan)", async () => {
@@ -237,7 +237,7 @@ describe("confirmTransactions — orphan enrichment", () => {
       // Orphans are admin-private — no merchant-facing events fired by the
       // enrichment pass.
       expect(events).not.toContain("tx.confirmed");
-      expect(events).not.toContain("invoice.payment_received");
+      expect(events).not.toContain("invoice.payment_confirmed");
       expect(events).not.toContain("tx.detected");
     } finally {
       await booted.close();
@@ -394,10 +394,10 @@ describe("POST /admin/orphan-transactions/:id/attribute", () => {
     const body = (await res.json()) as {
       attribution: { invoiceStatusBefore: string; invoiceStatusAfter: string };
     };
-    expect(body.attribution.invoiceStatusBefore).toBe("created");
-    expect(body.attribution.invoiceStatusAfter).toBe("confirmed");
+    expect(body.attribution.invoiceStatusBefore).toBe("pending");
+    expect(body.attribution.invoiceStatusAfter).toBe("completed");
 
-    // Tx is now linked; invoice is confirmed.
+    // Tx is now linked; invoice is completed.
     const [txRow] = await booted.deps.db
       .select({ invoiceId: transactions.invoiceId, status: transactions.status })
       .from(transactions)
@@ -407,7 +407,7 @@ describe("POST /admin/orphan-transactions/:id/attribute", () => {
     expect(txRow?.status).toBe("confirmed");
   });
 
-  it("flips an expired invoice to confirmed when the attributed orphan clears the confirm bar", async () => {
+  it("flips an expired invoice to completed when the attributed orphan clears the confirm bar", async () => {
     const invoice = await createInvoiceViaApi(booted, { amountRaw: "1000" });
     await expireInvoice(booted, invoice.id);
     const txId = await createOrphan("0xattr2", "1000");
@@ -424,14 +424,14 @@ describe("POST /admin/orphan-transactions/:id/attribute", () => {
       attribution: { invoiceStatusBefore: string; invoiceStatusAfter: string };
     };
     expect(body.attribution.invoiceStatusBefore).toBe("expired");
-    expect(body.attribution.invoiceStatusAfter).toBe("confirmed");
+    expect(body.attribution.invoiceStatusAfter).toBe("completed");
 
     const [inv] = await booted.deps.db
       .select({ status: invoices.status })
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(inv?.status).toBe("confirmed");
+    expect(inv?.status).toBe("completed");
   });
 
   it("leaves an expired invoice expired when the attributed orphan is below the confirm bar (no partial flip)", async () => {
@@ -690,13 +690,13 @@ describe("POST /admin/audit-address", () => {
       const body = (await res.json()) as { audit: { inserted: number } };
       expect(body.audit.inserted).toBe(1);
 
-      // Invoice confirmed via the normal ingest code path.
+      // Invoice completed via the normal ingest code path.
       const [inv] = await booted.deps.db
         .select({ status: invoices.status })
         .from(invoices)
         .where(eq(invoices.id, newInvoice.id))
         .limit(1);
-      expect(inv?.status).toBe("confirmed");
+      expect(inv?.status).toBe("completed");
     } finally {
       await booted.close();
     }

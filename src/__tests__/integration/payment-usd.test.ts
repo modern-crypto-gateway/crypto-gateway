@@ -86,7 +86,7 @@ describe("USD-path ingest — single payment", () => {
     await booted.close();
   });
 
-  it("confirmed transfer covering the USD target flips status to 'confirmed' and records paid_usd", async () => {
+  it("confirmed transfer covering the USD target flips status to 'completed' and records paid_usd", async () => {
     const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "100.00",
       acceptedFamilies: ["evm"]
@@ -105,11 +105,12 @@ describe("USD-path ingest — single payment", () => {
       seenAt: new Date()
     });
     expect(result.inserted).toBe(true);
-    expect(result.invoiceStatusAfter).toBe("confirmed");
+    expect(result.invoiceStatusAfter).toBe("completed");
 
     const [row] = await booted.deps.db
       .select({
         status: invoices.status,
+        extra_status: invoices.extraStatus,
         paid_usd: invoices.paidUsd,
         overpaid_usd: invoices.overpaidUsd,
         confirmed_at: invoices.confirmedAt
@@ -117,7 +118,8 @@ describe("USD-path ingest — single payment", () => {
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(row?.status).toBe("confirmed");
+    expect(row?.status).toBe("completed");
+    expect(row?.extra_status).toBeNull();
     expect(row?.paid_usd).toBe("100.00");
     expect(row?.overpaid_usd).toBe("0");
     expect(row?.confirmed_at).not.toBeNull();
@@ -132,7 +134,7 @@ describe("USD-path ingest — single payment", () => {
     expect(txRow?.usd_rate).toBe("1");
   });
 
-  it("underpayment transitions to 'partial'; a second transfer completes and confirms", async () => {
+  it("underpayment transitions to processing(extra='partial'); a second transfer completes and confirms", async () => {
     const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "50.00",
       acceptedFamilies: ["evm"]
@@ -150,7 +152,7 @@ describe("USD-path ingest — single payment", () => {
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(r1.invoiceStatusAfter).toBe("partial");
+    expect(r1.invoiceStatusAfter).toBe("processing");
 
     const r2 = await ingestDetectedTransfer(booted.deps, {
       chainId: 1,
@@ -164,7 +166,7 @@ describe("USD-path ingest — single payment", () => {
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(r2.invoiceStatusAfter).toBe("confirmed");
+    expect(r2.invoiceStatusAfter).toBe("completed");
 
     const [row] = await booted.deps.db
       .select({ paid_usd: invoices.paidUsd })
@@ -174,7 +176,7 @@ describe("USD-path ingest — single payment", () => {
     expect(row?.paid_usd).toBe("50.00");
   });
 
-  it("overpayment in a single transfer flips to 'overpaid' with correct delta", async () => {
+  it("overpayment in a single transfer flips to completed(extra='overpaid') with correct delta", async () => {
     const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "25.00",
       acceptedFamilies: ["evm"]
@@ -192,11 +194,12 @@ describe("USD-path ingest — single payment", () => {
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(result.invoiceStatusAfter).toBe("overpaid");
+    expect(result.invoiceStatusAfter).toBe("completed");
 
     const [row] = await booted.deps.db
       .select({
         status: invoices.status,
+        extra_status: invoices.extraStatus,
         paid_usd: invoices.paidUsd,
         overpaid_usd: invoices.overpaidUsd,
         confirmed_at: invoices.confirmedAt
@@ -204,7 +207,8 @@ describe("USD-path ingest — single payment", () => {
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(row?.status).toBe("overpaid");
+    expect(row?.status).toBe("completed");
+    expect(row?.extra_status).toBe("overpaid");
     expect(row?.paid_usd).toBe("40.00");
     expect(row?.overpaid_usd).toBe("15.00");
     expect(row?.confirmed_at).not.toBeNull();
@@ -229,15 +233,16 @@ describe("USD-path ingest — single payment", () => {
       confirmations: 0,
       seenAt: new Date()
     });
-    // Invoice stays on 'created' since nothing is confirmed yet.
-    expect(result.invoiceStatusAfter).toBe("created");
+    // Invoice stays on 'pending' since nothing is confirmed yet (USD path
+    // only counts confirmed txs toward paid_usd; unconfirmed contributes 0).
+    expect(result.invoiceStatusAfter).toBe("pending");
 
     const [row] = await booted.deps.db
       .select({ status: invoices.status, paid_usd: invoices.paidUsd })
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(row?.status).toBe("created");
+    expect(row?.status).toBe("pending");
     expect(row?.paid_usd).toBe("0");
   });
 });
@@ -303,14 +308,14 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
       confirmations: 25,
       seenAt: new Date()
     });
-    expect(last.invoiceStatusAfter).toBe("confirmed");
+    expect(last.invoiceStatusAfter).toBe("completed");
 
     const [row] = await booted.deps.db
       .select({ status: invoices.status, paid_usd: invoices.paidUsd })
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(row?.status).toBe("confirmed");
+    expect(row?.status).toBe("completed");
     expect(row?.paid_usd).toBe("90.00");
   });
 
@@ -334,7 +339,7 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(result.invoiceStatusAfter).toBe("confirmed");
+    expect(result.invoiceStatusAfter).toBe("completed");
 
     const [txRow] = await booted.deps.db
       .select({ amount_usd: transactions.amountUsd, usd_rate: transactions.usdRate })
@@ -380,11 +385,11 @@ describe("USD-path ingest — mix-and-match across chains and families", () => {
       .where(eq(invoices.id, invoice.id))
       .limit(1);
     expect(invoiceRow?.paid_usd).toBe("0");
-    expect(invoiceRow?.status).toBe("created");
+    expect(invoiceRow?.status).toBe("pending");
   });
 });
 
-describe("USD-path ingest — invoice.payment_received webhook event", () => {
+describe("USD-path ingest — invoice.payment_confirmed webhook event", () => {
   let booted: BootedTestApp;
   let apiKey: string;
 
@@ -397,7 +402,7 @@ describe("USD-path ingest — invoice.payment_received webhook event", () => {
     await booted.close();
   });
 
-  it("fires invoice.payment_received on every confirmed contributing transfer", async () => {
+  it("fires invoice.payment_confirmed on every confirmed contributing transfer", async () => {
     const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "60.00",
       acceptedFamilies: ["evm"]
@@ -409,7 +414,7 @@ describe("USD-path ingest — invoice.payment_received webhook event", () => {
       amountUsd: string | null;
       status: string;
     }> = [];
-    booted.deps.events.subscribe("invoice.payment_received", (e) => {
+    booted.deps.events.subscribe("invoice.payment_confirmed", (e) => {
       received.push({
         txHash: e.payment.txHash,
         token: e.payment.token,
@@ -449,24 +454,26 @@ describe("USD-path ingest — invoice.payment_received webhook event", () => {
       txHash: "0xpay1",
       token: "USDC",
       amountUsd: "20.00",
-      status: "partial"
+      // First payment is below threshold — invoice is still processing
+      // (with extra_status='partial' on the snapshot, not asserted here).
+      status: "processing"
     });
     expect(received[1]).toMatchObject({
       txHash: "0xpay2",
       token: "USDC",
       amountUsd: "40.00",
-      status: "confirmed"
+      status: "completed"
     });
   });
 
-  it("does NOT fire invoice.payment_received for still-detected (below-threshold) transfers", async () => {
+  it("does NOT fire invoice.payment_confirmed for still-detected (below-threshold) transfers", async () => {
     const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "25.00",
       acceptedFamilies: ["evm"]
     });
 
     const received: string[] = [];
-    booted.deps.events.subscribe("invoice.payment_received", (e) => { received.push(e.payment.txHash); });
+    booted.deps.events.subscribe("invoice.payment_confirmed", (e) => { received.push(e.payment.txHash); });
 
     await ingestDetectedTransfer(booted.deps, {
       chainId: 1,

@@ -127,7 +127,7 @@ describe("GET /api/v1/invoices/:id details", () => {
       confirmations: 20,
       seenAt: new Date()
     });
-    expect(confirmedTx.invoiceStatusAfter).toBe("partial");
+    expect(confirmedTx.invoiceStatusAfter).toBe("processing");
 
     // 3. Ingest a still-detected payment ($25 USDC on chain 137, 0 confirmations).
     const detectedTx = await ingestDetectedTransfer(booted.deps, {
@@ -258,7 +258,7 @@ describe("GET /api/v1/invoices/:id details", () => {
       })
     );
     const body = (await getRes.json()) as DetailsResponse;
-    expect(body.invoice.status).toBe("confirmed");
+    expect(body.invoice.status).toBe("completed");
     expect(body.amounts.confirmedUsd).toBe("10.00");
     expect(body.transactions).toHaveLength(1);
     // Stored on the row as lowercase regardless of incoming case.

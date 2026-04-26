@@ -109,8 +109,14 @@ paths:
           in: query
           description: |
             Comma-separated list of statuses. Any of:
-            `created,partial,detected,confirmed,overpaid,expired,canceled`.
+            `pending,processing,completed,expired,canceled`.
             Unknown values yield 400.
+
+            Lifecycle vs. fidelity: `status` answers "where is this invoice
+            in its journey?", and the orthogonal `extraStatus` field on each
+            invoice answers "did the customer pay the right amount?".
+            Filter on `status` for lifecycle queries; filter responses
+            client-side on `extraStatus` for "show me partial / overpaid".
           schema: { type: string }
         - name: chainId
           in: query
@@ -1292,23 +1298,55 @@ paths:
 
         ### Outbound event types (`eventType` field)
 
-        Invoice lifecycle (one row per status transition, idempotency key
-        `{event}:{invoiceId}:{status}`):
-          - `invoice.partial`, `invoice.detected`, `invoice.confirmed`,
-            `invoice.overpaid`, `invoice.expired`, `invoice.canceled`
-          - `invoice.demoted` — reorg un-confirmation; key includes
-            `{previousStatus}:{newStatus}` instead of one status
+        Two scopes, distinct prefixes:
+          - `invoice:payment_*` — per-transaction events (one fires per
+            contributing on-chain tx)
+          - `invoice:*` (no `payment_`) — whole-invoice lifecycle events
+            (one fires when the invoice itself transitions)
 
-        Per-transfer audit (one row per on-chain tx per stage; key
-        `{event}:{invoiceId}:{txHash}` so detect→confirm produces TWO
-        distinct rows for the same tx):
-          - `invoice.transfer_detected` — first sighting of a pending
-            transfer (push or poll). `data.payment.confirmations` is `0`
-            for push-detected, `n` for poll-detected.
-          - `invoice.payment_received` — same transfer reached the
-            confirmation threshold.
+        Per-transfer audit (key `{event}:{invoiceId}:{txHash}` — detect→confirm
+        produces TWO distinct rows for the same tx):
+          - `invoice:payment_detected` — first sighting of a pending
+            transfer. `data.transactions[]` includes the tx with status
+            `detected`.
+          - `invoice:payment_confirmed` — same transfer reached the
+            confirmation threshold. Fires for every contributing tx, even
+            on partial-payment invoices that haven't completed yet — gives
+            merchants per-payment running-total visibility.
 
-        Payout lifecycle:
+        Whole-invoice lifecycle (key `{event}:{invoiceId}:{status}`):
+          - `invoice:completed` — invoice transitioned to
+            `status='completed'`. Overpaid invoices fire this same event
+            with `data.invoice.extraStatus='overpaid'` on the snapshot —
+            overpayment is a fidelity signal, not a separate stage.
+          - `invoice:expired` — past `expiresAt` with no completion.
+          - `invoice:canceled` — merchant aborted via admin route.
+          - `invoice:demoted` — reorg un-confirmation; key includes
+            `{previousStatus}:{newStatus}` instead of one status. Carries
+            `previousStatus` and `poolReacquired` / `poolCollided` extras.
+
+        Payload shape (every invoice event):
+          ```jsonc
+          {
+            "event": "invoice:payment_confirmed",
+            "timestamp": "2026-04-26T14:32:15.123Z",
+            "data": {
+              "invoice": { "status": "processing", "extraStatus": "partial", ... },
+              "transactions": [
+                {
+                  "hash": "0x...", "chainId": 56, "chainName": "bsc",
+                  "token": "USDT", "isNative": false,
+                  "amount": "5.00", "amountRaw": "5000000000000000000",
+                  "amountUsd": "5.00", "confirmations": 12,
+                  "status": "confirmed"
+                }
+              ],
+              "triggerTxHash": "0x..."  // null for status-only events
+            }
+          }
+          ```
+
+        Payout lifecycle (unchanged dot format for now):
           - `payout.submitted`, `payout.confirmed`, `payout.failed`
 
         URL/secret resolution: per-resource override → merchant default
@@ -2482,7 +2520,29 @@ components:
         merchantId: { type: string, format: uuid }
         status:
           type: string
-          enum: [created, partial, detected, confirmed, overpaid, expired, canceled]
+          enum: [pending, processing, completed, expired, canceled]
+          description: |
+            Lifecycle stage:
+              - `pending`     — no on-chain activity yet
+              - `processing`  — at least one tx seen (may be `partial` per
+                                 `extraStatus`); threshold not yet met OR
+                                 met but unconfirmed
+              - `completed`   — confirmed payment ≥ threshold (within
+                                 tolerance). Overpaid invoices read as
+                                 `completed` with `extraStatus='overpaid'`.
+              - `expired`     — past `expiresAt` with no completion
+              - `canceled`    — merchant aborted via admin route
+        extraStatus:
+          type: string
+          nullable: true
+          enum: [partial, overpaid]
+          description: |
+            Payment-fidelity signal, orthogonal to `status`:
+              - `null`        — normal flow, nothing special
+              - `"partial"`   — `0 < paid < threshold` (paired with
+                                 `status='processing'`)
+              - `"overpaid"`  — `paid > threshold × (1 + over_bps/10000)`
+                                 (paired with `status='completed'`)
         chainId: { type: integer }
         token: { type: string }
         receiveAddress: { type: string }

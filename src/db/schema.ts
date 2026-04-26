@@ -74,8 +74,14 @@ export const invoices = sqliteTable(
       .notNull()
       .references(() => merchants.id),
     status: text("status", {
-      enum: ["created", "partial", "detected", "confirmed", "overpaid", "expired", "canceled"]
+      enum: ["pending", "processing", "completed", "expired", "canceled"]
     }).notNull(),
+    // Payment-fidelity signal orthogonal to `status`. See
+    // src/core/types/invoice.ts for the (status, extra_status) state grid.
+    //   NULL       — normal flow, nothing special
+    //   'partial'  — 0 < paid < threshold (paired with status='processing')
+    //   'overpaid' — paid > threshold + tolerance (paired with status='completed')
+    extraStatus: text("extra_status", { enum: ["partial", "overpaid"] }),
 
     chainId: integer("chain_id").notNull(),
     token: text("token").notNull(),
@@ -134,7 +140,11 @@ export const invoices = sqliteTable(
       .where(sql`${t.externalId} IS NOT NULL`),
     check(
       "invoices_status_check",
-      sql`${t.status} IN ('created','partial','detected','confirmed','overpaid','expired','canceled')`
+      sql`${t.status} IN ('pending','processing','completed','expired','canceled')`
+    ),
+    check(
+      "invoices_extra_status_check",
+      sql`${t.extraStatus} IS NULL OR ${t.extraStatus} IN ('partial','overpaid')`
     )
   ]
 );

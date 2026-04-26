@@ -256,7 +256,8 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
     const invoiceInsert = {
       id: invoiceId,
       merchantId: parsed.merchantId,
-      status: "created" as const,
+      status: "pending" as const,
+      extraStatus: null,
       chainId: parsed.chainId,
       token: parsed.token,
       receiveAddress: primaryAddress,
@@ -363,7 +364,7 @@ export const ListInvoicesInputSchema = z
     merchantId: MerchantIdSchema,
     // Comma-separated in the HTTP layer; the schema accepts either an array or
     // a single status. Empty array = no filter.
-    status: z.array(z.enum(["created", "partial", "detected", "confirmed", "overpaid", "expired", "canceled"])).optional(),
+    status: z.array(z.enum(["pending", "processing", "completed", "expired", "canceled"])).optional(),
     chainId: ChainIdSchema.optional(),
     token: TokenSymbolSchema.optional(),
     // Merchant-supplied dedup / order key. Exact match — usually cart / order id.
@@ -636,10 +637,15 @@ function computeAmountsBreakdown(
 
 export async function expireInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<Invoice> {
   const now = deps.clock.now().getTime();
+  // Expirable iff still in a non-terminal lifecycle stage. `pending` covers
+  // invoices with no payment activity; `processing` covers invoices that
+  // received some payment but never crossed the threshold (`extra_status`
+  // is 'partial' on those, but the WHERE clause doesn't need to filter on
+  // it — both pending and processing are eligible).
   const [row] = await deps.db
     .update(invoices)
     .set({ status: "expired", updatedAt: now })
-    .where(and(eq(invoices.id, invoiceId), inArray(invoices.status, ["created", "partial"])))
+    .where(and(eq(invoices.id, invoiceId), inArray(invoices.status, ["pending", "processing"])))
     .returning();
   if (!row) {
     throw new InvoiceError(
@@ -657,18 +663,19 @@ export interface SweepExpiredInvoicesResult {
   expired: number;
 }
 
-// Cron-driven expiration sweeper. Transitions every `created`/`partial` row
+// Cron-driven expiration sweeper. Transitions every pending/processing row
 // past its expiresAt to `expired`, then publishes invoice.expired per row so
 // downstream subscribers (pool release, webhook dispatch) fire. Without this,
-// expired invoices sit in `partial` forever — payment polling skips them
-// (poll-payments.ts gates on expiresAt > now), but their pool addresses never
-// return to rotation and the merchant never receives the lifecycle webhook.
+// expired invoices sit in their pre-expiry state forever — payment polling
+// skips them (poll-payments.ts gates on expiresAt > now), but their pool
+// addresses never return to rotation and the merchant never receives the
+// lifecycle webhook.
 export async function sweepExpiredInvoices(deps: AppDeps): Promise<SweepExpiredInvoicesResult> {
   const now = deps.clock.now().getTime();
   const updated = await deps.db
     .update(invoices)
     .set({ status: "expired", updatedAt: now })
-    .where(and(inArray(invoices.status, ["created", "partial"]), lte(invoices.expiresAt, now)))
+    .where(and(inArray(invoices.status, ["pending", "processing"]), lte(invoices.expiresAt, now)))
     .returning();
   if (updated.length === 0) return { expired: 0 };
 

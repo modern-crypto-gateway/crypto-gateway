@@ -5,27 +5,39 @@ import { AmountRawSchema, FiatAmountSchema, FiatCurrencySchema } from "./money.j
 import { MerchantIdSchema } from "./merchant.js";
 import { TokenSymbolSchema } from "./token.js";
 
-// Invoice lifecycle:
-//   created   -> awaiting first detection (or re-opened after all contributing txs reverted)
-//   partial   -> transfers seen sum to < required amount; timer still running
-//   detected  -> exact-or-over amount seen, awaiting N confirmations
-//   confirmed -> finalized; merchant webhook fired
-//   overpaid  -> reached the USD target AND the aggregate went OVER — customer
-//                sent more than we asked for. Distinct from `confirmed` so
-//                merchants can surface a refund / credit prompt without parsing
-//                amounts.
-//   expired   -> expiry window elapsed without sufficient funds
-//   canceled  -> merchant canceled before confirmation
+// Invoice lifecycle. Two orthogonal axes:
+//
+// `status` — where the invoice sits in its journey:
+//   pending    -> awaiting first detection (or re-opened after all contributing
+//                 txs reverted)
+//   processing -> at least one tx seen (confirmed or not), threshold not yet met
+//   completed  -> confirmed payment ≥ threshold (within tolerance)
+//   expired    -> expiry window elapsed without enough confirmed funds
+//   canceled   -> merchant canceled before completion
+//
+// `extraStatus` — payment fidelity, orthogonal to lifecycle:
+//   null       -> normal flow, no special signal
+//   partial    -> 0 < paid < threshold (meaningful while status='processing')
+//   overpaid   -> paid > threshold × (1 + over_bps/10000) (meaningful while
+//                 status='completed')
+//
+// The two fields combine to express the full state surface a single 7-value
+// enum used to encode:
+//   (processing, partial)  — "some money in, not enough yet"
+//   (completed, null)      — "exact match within tolerance"
+//   (completed, overpaid)  — "fully paid plus extra"
+//   (pending, null)        — "no activity at all"
 export const InvoiceStatusSchema = z.enum([
-  "created",
-  "partial",
-  "detected",
-  "confirmed",
-  "overpaid",
+  "pending",
+  "processing",
+  "completed",
   "expired",
   "canceled"
 ]);
 export type InvoiceStatus = z.infer<typeof InvoiceStatusSchema>;
+
+export const InvoiceExtraStatusSchema = z.enum(["partial", "overpaid"]);
+export type InvoiceExtraStatus = z.infer<typeof InvoiceExtraStatusSchema>;
 
 export const InvoiceIdSchema = z.string().uuid();
 export type InvoiceId = Brand<z.infer<typeof InvoiceIdSchema>, "InvoiceId">;
@@ -45,6 +57,9 @@ export const InvoiceSchema = z.object({
   id: InvoiceIdSchema,
   merchantId: MerchantIdSchema,
   status: InvoiceStatusSchema,
+  // Payment-fidelity signal, orthogonal to `status`. See InvoiceStatusSchema
+  // doc-block for the (status, extraStatus) pairs.
+  extraStatus: InvoiceExtraStatusSchema.nullable(),
 
   // Primary chain + receive address. For multi-family invoices, this is the
   // first family's values (for back-compat display). The authoritative

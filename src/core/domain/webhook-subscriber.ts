@@ -5,7 +5,7 @@ import type {
   WebhookDeliveryRecord,
   WebhookResourceType
 } from "../ports/webhook-delivery-store.port.js";
-import { composeWebhook } from "./webhook-composer.js";
+import { composeWebhook, loadInvoiceTransactions } from "./webhook-composer.js";
 import { invoices, merchants, payouts } from "../../db/schema.js";
 
 // Subscribes to domain events and dispatches composed webhooks. Called once
@@ -28,16 +28,15 @@ import { invoices, merchants, payouts } from "../../db/schema.js";
 // (state machine transition) is not blocked on the merchant's server.
 
 // Events that reach merchants — matches the union returned by composeWebhook.
+// Internal type names use dots (`invoice.completed`); the wire payload uses
+// colons (`invoice:completed`). The composer maps between them.
 const OUTBOUND_EVENT_TYPES = [
-  "invoice.partial",
-  "invoice.detected",
-  "invoice.confirmed",
-  "invoice.overpaid",
+  "invoice.completed",
   "invoice.expired",
   "invoice.canceled",
   "invoice.demoted",
-  "invoice.transfer_detected",
-  "invoice.payment_received",
+  "invoice.payment_detected",
+  "invoice.payment_confirmed",
   "payout.submitted",
   "payout.confirmed",
   "payout.failed"
@@ -88,7 +87,12 @@ export function registerWebhookSubscriber(deps: AppDeps): () => void {
 }
 
 async function dispatchEvent(deps: AppDeps, event: DomainEvent): Promise<void> {
-  const composed = composeWebhook(event);
+  // Invoice events carry a transactions[] in their payload — load before
+  // composing so the composer stays pure. Payout events get [].
+  const txs = isInvoiceEvent(event)
+    ? await loadInvoiceTransactions(deps, event.invoice.id)
+    : [];
+  const composed = composeWebhook(event, txs);
   if (!composed) return;
 
   const target = await resolveWebhookTarget(deps, composed.merchantId, composed.resource);
@@ -318,6 +322,14 @@ async function loadResourceWebhook(
     .limit(1);
   if (!row?.webhookUrl || !row.webhookSecretCiphertext) return undefined;
   return { webhookUrl: row.webhookUrl, secretCiphertext: row.webhookSecretCiphertext };
+}
+
+// Narrows a DomainEvent to one whose payload carries an `invoice` reference.
+// All invoice-* events do; payout-* and tx-* / pool-* events don't.
+function isInvoiceEvent(
+  event: DomainEvent
+): event is Extract<DomainEvent, { invoice: unknown }> {
+  return "invoice" in event;
 }
 
 // Exported for tests that need to assert against a single record.

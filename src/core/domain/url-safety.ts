@@ -1,7 +1,7 @@
 // Merchant-supplied URLs (outbound webhook targets) are a classic SSRF vector.
 // A malicious merchant who registers, say, `http://169.254.169.254/latest/
 // meta-data/iam/security-credentials/` will get the gateway to POST event
-// payloads at cloud metadata services on every invoice.confirmed. Even when
+// payloads at cloud metadata services on every invoice:completed. Even when
 // we don't surface the response body, the mere act of issuing requests from
 // the gateway's network vantage point is what matters — reaching otherwise
 // private services, probing port reachability, or coaxing state changes out

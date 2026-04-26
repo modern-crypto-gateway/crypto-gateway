@@ -391,9 +391,9 @@ export default {
     }
     // Subscribers are registered by buildApp on the fetch path; the scheduled
     // path skips buildApp entirely (no Hono needed) but MUST still wire them,
-    // otherwise webhook events published by the cron sweepers (invoice.partial,
-    // invoice.confirmed, invoice.payment_received, payout.*) reach an empty
-    // bus and never insert into webhook_deliveries.
+    // otherwise webhook events published by the cron sweepers
+    // (invoice.completed, invoice.payment_confirmed, payout.*) reach an
+    // empty bus and never insert into webhook_deliveries.
     registerEventSubscribers(deps);
     const result = await runScheduledJobs(deps);
     for (const [name, outcome] of Object.entries(result)) {

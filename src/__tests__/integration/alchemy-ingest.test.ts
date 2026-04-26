@@ -190,14 +190,15 @@ describe("POST /webhooks/alchemy", () => {
     expect(tx?.invoice_id).toBe(invoice.id);
     expect(tx?.amount_raw).toBe("1000000");
 
-    // Invoice should have progressed to 'detected' (amount met, 1 confirmation
-    // below mainnet's 12-block threshold).
+    // Invoice should have progressed to 'processing' (amount met, 1 confirmation
+    // below mainnet's 12-block threshold; full amount seen but unconfirmed
+    // → processing with extra_status=null).
     const [invoiceRow] = await booted.deps.db
       .select({ status: invoices.status })
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(invoiceRow?.status).toBe("detected");
+    expect(invoiceRow?.status).toBe("processing");
   });
 
   it("silently drops activities for networks not mapped (unknown Alchemy network)", async () => {

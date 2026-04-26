@@ -92,6 +92,7 @@ export function checkoutRouter(deps: AppDeps): Hono {
       invoice: {
         id: invoice.id,
         status: invoice.status,
+        extraStatus: invoice.extraStatus,
         chainId: invoice.chainId,
         token: invoice.token,
         receiveAddress: invoice.receiveAddress,

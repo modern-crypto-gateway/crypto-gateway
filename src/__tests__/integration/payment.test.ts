@@ -47,10 +47,16 @@ describe("PaymentService.ingestDetectedTransfer", () => {
     });
 
     expect(result.inserted).toBe(true);
-    expect(result.invoiceStatusBefore).toBe("created");
-    expect(result.invoiceStatusAfter).toBe("detected");
+    expect(result.invoiceStatusBefore).toBe("pending");
+    // Full required amount seen but unconfirmed → status moves to processing
+    // (the new model collapses the old `detected` and `partial` into the
+    // single `processing` lifecycle stage; the unconfirmed-but-full case has
+    // extra_status=null since the amount is fine, just awaiting confirmations).
+    expect(result.invoiceStatusAfter).toBe("processing");
     expect(events).toContain("tx.detected");
-    expect(events).toContain("invoice.detected");
+    // No invoice-lifecycle event for pending→processing — per-tx
+    // invoice.payment_detected carries the visibility instead.
+    expect(events).toContain("invoice.payment_detected");
 
     // Verify persisted row
     const [row] = await booted.deps.db
@@ -58,11 +64,11 @@ describe("PaymentService.ingestDetectedTransfer", () => {
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(row?.status).toBe("detected");
+    expect(row?.status).toBe("processing");
     expect(row?.received_amount_raw).toBe("1000000");
   });
 
-  it("moves invoice to 'partial' on underpayment, then to 'detected' on a second transfer that covers the balance", async () => {
+  it("moves invoice to 'processing' (extra='partial') on underpayment, then to 'processing' (extra=null) when a second transfer covers the balance", async () => {
     const invoice = await createInvoice(booted, { amountRaw: "1000" });
 
     const r1 = await ingestDetectedTransfer(booted.deps, {
@@ -77,7 +83,8 @@ describe("PaymentService.ingestDetectedTransfer", () => {
       confirmations: 0,
       seenAt: new Date()
     });
-    expect(r1.invoiceStatusAfter).toBe("partial");
+    // Underpayment → processing (with extra_status='partial' on the row).
+    expect(r1.invoiceStatusAfter).toBe("processing");
 
     const r2 = await ingestDetectedTransfer(booted.deps, {
       chainId: 999,
@@ -91,7 +98,9 @@ describe("PaymentService.ingestDetectedTransfer", () => {
       confirmations: 0,
       seenAt: new Date()
     });
-    expect(r2.invoiceStatusAfter).toBe("detected");
+    // Second transfer covers the balance — full amount seen but unconfirmed,
+    // so still `processing` with extra=null (the old `detected` status).
+    expect(r2.invoiceStatusAfter).toBe("processing");
 
     const [row] = await booted.deps.db
       .select({ received_amount_raw: invoices.receivedAmountRaw })
@@ -102,7 +111,7 @@ describe("PaymentService.ingestDetectedTransfer", () => {
     expect(row?.received_amount_raw).toBe("1100");
   });
 
-  it("goes straight to 'detected' with a single immediately-confirmed transfer (above threshold)", async () => {
+  it("goes straight to 'completed' with a single immediately-confirmed transfer (above threshold)", async () => {
     // dev chain threshold is 1; confirmations=5 => tx status='confirmed' on insert.
     const invoice = await createInvoice(booted, { amountRaw: "1000" });
 
@@ -119,8 +128,8 @@ describe("PaymentService.ingestDetectedTransfer", () => {
       seenAt: new Date()
     });
 
-    // One tx, immediately confirmed, covers the full amount -> invoice goes to confirmed.
-    expect(result.invoiceStatusAfter).toBe("confirmed");
+    // One tx, immediately confirmed, covers the full amount -> invoice goes to completed.
+    expect(result.invoiceStatusAfter).toBe("completed");
 
     const [row] = await booted.deps.db
       .select({ confirmed_at: invoices.confirmedAt })
@@ -215,18 +224,18 @@ describe("PaymentService.ingestDetectedTransfer", () => {
       seenAt: new Date()
     });
     // The tx still gets recorded and linked to the invoice for audit, but the
-    // invoice MUST stay in `created` (no credit toward the DEV-denominated
+    // invoice MUST stay in `pending` (no credit toward the DEV-denominated
     // total) and `received_amount_raw` MUST stay 0.
     expect(wrongTokenResult.inserted).toBe(true);
-    expect(wrongTokenResult.invoiceStatusBefore).toBe("created");
-    expect(wrongTokenResult.invoiceStatusAfter).toBe("created");
+    expect(wrongTokenResult.invoiceStatusBefore).toBe("pending");
+    expect(wrongTokenResult.invoiceStatusAfter).toBe("pending");
 
     const [invoiceRow] = await booted.deps.db
       .select({ status: invoices.status, received: invoices.receivedAmountRaw })
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(invoiceRow?.status).toBe("created");
+    expect(invoiceRow?.status).toBe("pending");
     expect(invoiceRow?.received).toBe("0");
 
     // Audit row exists with the invoice link — operator can still see what landed.
@@ -253,20 +262,20 @@ describe("PaymentService.ingestDetectedTransfer", () => {
       confirmations: 0,
       seenAt: new Date()
     });
-    expect(correctResult.invoiceStatusAfter).toBe("detected");
+    expect(correctResult.invoiceStatusAfter).toBe("processing");
 
     const [afterRow] = await booted.deps.db
       .select({ status: invoices.status, received: invoices.receivedAmountRaw })
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(afterRow?.status).toBe("detected");
+    expect(afterRow?.status).toBe("processing");
     expect(afterRow?.received).toBe("1000000");
   });
 });
 
 describe("PaymentService.confirmTransactions", () => {
-  it("promotes detected txs to confirmed and bumps invoices from detected to confirmed", async () => {
+  it("promotes detected txs to confirmed and bumps invoices from processing to completed", async () => {
     // Boot with a shared Map so we can mutate the chain adapter's responses
     // between the initial ingest and the sweep.
     const confirmations = new Map<string, { blockNumber: number | null; confirmations: number; reverted: boolean }>();
@@ -277,7 +286,7 @@ describe("PaymentService.confirmTransactions", () => {
     try {
       const invoice = await createInvoice(booted, { amountRaw: "1000" });
 
-      // Ingest with 0 confirmations -> tx status='detected', invoice status='detected'
+      // Ingest with 0 confirmations -> tx status='detected', invoice status='processing'
       await ingestDetectedTransfer(booted.deps, {
         chainId: 999,
         txHash: "0xsweep1",
@@ -296,7 +305,7 @@ describe("PaymentService.confirmTransactions", () => {
         .from(invoices)
         .where(eq(invoices.id, invoice.id))
         .limit(1);
-      expect(beforeSweep?.status).toBe("detected");
+      expect(beforeSweep?.status).toBe("processing");
 
       // Now tell the chain adapter this tx has enough confirmations.
       confirmations.set("0xsweep1", { blockNumber: 110, confirmations: 5, reverted: false });
@@ -314,11 +323,11 @@ describe("PaymentService.confirmTransactions", () => {
         .from(invoices)
         .where(eq(invoices.id, invoice.id))
         .limit(1);
-      expect(afterSweep?.status).toBe("confirmed");
+      expect(afterSweep?.status).toBe("completed");
       expect(afterSweep?.confirmed_at).not.toBeNull();
 
       expect(events).toContain("tx.confirmed");
-      expect(events).toContain("invoice.confirmed");
+      expect(events).toContain("invoice.completed");
     } finally {
       await booted.close();
     }
@@ -360,7 +369,7 @@ describe("PaymentService.confirmTransactions", () => {
       expect(txRow?.status).toBe("reverted");
 
       // Reverted tx no longer contributes -> total drops to 0. The invoice re-opens
-      // (moves back to 'created') so new payments can still satisfy it before
+      // (moves back to 'pending') so new payments can still satisfy it before
       // the expiry window elapses.
       const [invoiceRow] = await booted.deps.db
         .select({ status: invoices.status, received_amount_raw: invoices.receivedAmountRaw })
@@ -368,7 +377,7 @@ describe("PaymentService.confirmTransactions", () => {
         .where(eq(invoices.id, invoice.id))
         .limit(1);
       expect(invoiceRow?.received_amount_raw).toBe("0");
-      expect(invoiceRow?.status).toBe("created");
+      expect(invoiceRow?.status).toBe("pending");
     } finally {
       await booted.close();
     }

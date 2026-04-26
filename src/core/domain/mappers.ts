@@ -1,7 +1,7 @@
 import { asc, eq } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainFamily } from "../types/chain.js";
-import type { Invoice, InvoiceId, InvoiceReceiveAddress, InvoiceStatus } from "../types/invoice.js";
+import type { Invoice, InvoiceExtraStatus, InvoiceId, InvoiceReceiveAddress, InvoiceStatus } from "../types/invoice.js";
 import type { Payout, PayoutId, PayoutStatus } from "../types/payout.js";
 import type { Transaction, TransactionId, TxStatus } from "../types/transaction.js";
 import { invoices, invoiceReceiveAddresses, payouts, transactions } from "../../db/schema.js";
@@ -18,6 +18,7 @@ export function drizzleRowToInvoice(
     id: row.id as InvoiceId,
     merchantId: row.merchantId as Invoice["merchantId"],
     status: row.status as InvoiceStatus,
+    extraStatus: (row.extraStatus as InvoiceExtraStatus | null) ?? null,
     chainId: row.chainId,
     token: row.token,
     receiveAddress: row.receiveAddress,

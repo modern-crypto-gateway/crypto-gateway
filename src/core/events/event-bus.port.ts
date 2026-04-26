@@ -12,22 +12,24 @@ import type { Transaction, TransactionId } from "../types/transaction.js";
 // future queue-backed EventBus (CF Queues / Redis Streams) can serialize them.
 
 export type DomainEvent =
+  // Internal — never reaches merchants (POST /invoices returns synchronously,
+  // so a separate webhook for creation would be redundant noise).
   | { type: "invoice.created"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
-  | { type: "invoice.partial"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
-  | { type: "invoice.detected"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
-  | { type: "invoice.confirmed"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
-  | { type: "invoice.overpaid"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  // Whole-invoice lifecycle. Fires once when the invoice transitions to
+  // status='completed'. Overpaid invoices fire this same event with
+  // extra_status='overpaid' on the snapshot — overpayment is a fidelity
+  // signal, not a separate lifecycle stage.
+  | { type: "invoice.completed"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
   | { type: "invoice.expired"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
   | { type: "invoice.canceled"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
   // Reorg un-confirmation. Fired BEFORE the normal status-transition event
-  // when a previously confirmed (or overpaid) invoice is demoted back to
-  // a lower status because the chain rolled back the underlying
-  // transaction(s). `previousStatus` is the pre-demotion status
-  // ('confirmed' or 'overpaid'); `invoice.status` carries the new one.
-  // `poolReacquired` / `poolCollided` report whether the receive addresses
-  // were successfully re-claimed from the pool — `collided > 0` means a
-  // new invoice had already grabbed the slot and manual reconciliation
-  // is needed.
+  // when a previously completed invoice is demoted back to processing/pending
+  // because the chain rolled back the underlying transaction(s).
+  // `previousStatus` is the pre-demotion main status ('completed');
+  // `invoice.status` carries the new one. `poolReacquired` / `poolCollided`
+  // report whether the receive addresses were successfully re-claimed from
+  // the pool — `collided > 0` means a new invoice had already grabbed the
+  // slot and manual reconciliation is needed.
   | {
       type: "invoice.demoted";
       invoiceId: InvoiceId;
@@ -37,34 +39,12 @@ export type DomainEvent =
       poolCollided: number;
       at: Date;
     }
-  // Fires on EVERY confirmed inbound transfer that contributes to an invoice,
-  // separate from the invoice-status transition events above. Gives merchants
-  // audit-grade per-payment visibility — they can render "USDC 30.00 on
-  // Polygon | ETH 0.02 on mainnet | USDT 45.00 on BSC" running totals on
-  // their own side. The `payment` block carries the on-chain specifics;
-  // the `invoice` block is the post-payment invoice snapshot.
+  // Per-transfer event fired the FIRST time a transfer contributing to an
+  // invoice is observed, BEFORE it crosses the confirmation threshold. Pairs
+  // with `invoice.payment_confirmed` (same tx, post-confirmation). Idempotency
+  // keys on (invoice id, tx hash) so redelivery never duplicates.
   | {
-      type: "invoice.payment_received";
-      invoiceId: InvoiceId;
-      invoice: Invoice;
-      payment: {
-        txHash: string;
-        chainId: number;
-        token: string;
-        amountRaw: string;
-        amountUsd: string | null;
-        usdRate: string | null;
-      };
-      at: Date;
-    }
-  // Per-transfer event fired the FIRST time a transfer is observed against
-  // an invoice but BEFORE it crosses the chain's confirmation threshold.
-  // Pairs with `invoice.payment_received` (which fires once the same transfer
-  // confirms) so a merchant can render "incoming — N/M confirmations" UX.
-  // Idempotency is on (invoice id + tx hash) so a redelivery never produces
-  // a second 'detected' webhook for the same transfer.
-  | {
-      type: "invoice.transfer_detected";
+      type: "invoice.payment_detected";
       invoiceId: InvoiceId;
       invoice: Invoice;
       payment: {
@@ -75,6 +55,25 @@ export type DomainEvent =
         amountUsd: string | null;
         usdRate: string | null;
         confirmations: number;
+      };
+      at: Date;
+    }
+  // Per-transfer event fired when a contributing transfer reaches the chain's
+  // confirmation threshold. Audit-grade signal: the money is durable. Fires
+  // even when the invoice itself hasn't reached `completed` yet (partial
+  // payments produce one of these per confirmed contributing tx). Gives
+  // merchants per-payment running-total visibility on multi-tx invoices.
+  | {
+      type: "invoice.payment_confirmed";
+      invoiceId: InvoiceId;
+      invoice: Invoice;
+      payment: {
+        txHash: string;
+        chainId: number;
+        token: string;
+        amountRaw: string;
+        amountUsd: string | null;
+        usdRate: string | null;
       };
       at: Date;
     }
@@ -100,8 +99,8 @@ export type EventHandler<E extends DomainEvent = DomainEvent> = (event: E) => Pr
 export interface EventBus {
   publish(event: DomainEvent): Promise<void>;
 
-  // Type-narrowed subscription: subscribe("invoice.confirmed", ...) gets an
-  // Extract<DomainEvent, { type: "invoice.confirmed" }> typed argument.
+  // Type-narrowed subscription: subscribe("invoice.completed", ...) gets an
+  // Extract<DomainEvent, { type: "invoice.completed" }> typed argument.
   subscribe<T extends DomainEventType>(
     type: T,
     handler: EventHandler<Extract<DomainEvent, { type: T }>>

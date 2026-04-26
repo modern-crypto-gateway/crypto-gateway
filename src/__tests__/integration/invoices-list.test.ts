@@ -127,12 +127,12 @@ describe("GET /api/v1/invoices", () => {
     );
     expect(expireRes.status).toBe(200);
 
-    const justCreated = await listInvoices(booted, apiKey, "?status=created");
+    const justCreated = await listInvoices(booted, apiKey, "?status=pending");
     const ids = (justCreated.body.invoices ?? []).map((i) => i["id"]);
     expect(ids).toContain(live.id);
     expect(ids).not.toContain(toExpire.id);
 
-    const multi = await listInvoices(booted, apiKey, "?status=created,expired");
+    const multi = await listInvoices(booted, apiKey, "?status=pending,expired");
     const multiIds = (multi.body.invoices ?? []).map((i) => i["id"]);
     expect(multiIds).toEqual(expect.arrayContaining([live.id, toExpire.id]));
   });

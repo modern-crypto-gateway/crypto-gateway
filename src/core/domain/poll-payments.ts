@@ -41,7 +41,10 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
     .innerJoin(invoiceReceiveAddresses, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
     .where(
       and(
-        inArray(invoices.status, ["created", "partial", "detected", "confirmed"]),
+        // Active invoices for the poll loop. Includes `completed` because
+        // a reorg-recheck can demote a completed invoice and we still want
+        // to poll its addresses for any incoming top-ups during the window.
+        inArray(invoices.status, ["pending", "processing", "completed"]),
         gt(invoices.expiresAt, deps.clock.now().getTime())
       )
     );

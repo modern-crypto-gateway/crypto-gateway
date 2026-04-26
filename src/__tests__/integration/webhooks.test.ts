@@ -17,8 +17,8 @@ async function createInvoice(
   return createInvoiceViaApi(booted, { amountRaw });
 }
 
-describe("end-to-end: invoice.detected -> webhook dispatched", () => {
-  it("delivers a webhook to the merchant URL when an invoice is promoted to detected", async () => {
+describe("end-to-end: invoice:payment_detected -> webhook dispatched", () => {
+  it("delivers a webhook to the merchant URL when an unconfirmed transfer arrives", async () => {
     const booted = await bootTestApp({
       merchants: [
         {
@@ -48,26 +48,23 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       // Dispatch is deferred via deps.jobs.defer; drain to flush.
       await booted.deps.jobs.drain(1_000);
 
-      // Two webhooks per ingest: the per-status event (invoice.detected) and
-      // the per-transfer event (invoice.transfer_detected). Assert both go to
-      // the merchant URL with the merchant secret, then drill into each.
+      // One webhook per unconfirmed ingest: invoice:payment_detected (per-tx).
+      // The lifecycle transition pending→processing has no separate event —
+      // per-tx events carry merchant visibility for that phase.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(2);
-      for (const call of calls) {
-        expect(call.url).toBe("https://merchant.example.com/hook");
-        expect(call.secret).toBe("b".repeat(64));
-      }
-      const statusCall = calls.find(
-        (c) => (c.payload as { event: string }).event === "invoice.detected"
-      )!;
-      expect(statusCall.idempotencyKey).toBe(`invoice.detected:${invoice.id}:detected`);
-      const statusPayload = statusCall.payload as { event: string; data: { id: string; status: string } };
-      expect(statusPayload.data.id).toBe(invoice.id);
-      expect(statusPayload.data.status).toBe("detected");
-      const transferCall = calls.find(
-        (c) => (c.payload as { event: string }).event === "invoice.transfer_detected"
-      )!;
-      expect(transferCall.idempotencyKey).toBe(`invoice.transfer_detected:${invoice.id}:0xhook1`);
+      expect(calls).toHaveLength(1);
+      const transferCall = calls[0]!;
+      expect(transferCall.url).toBe("https://merchant.example.com/hook");
+      expect(transferCall.secret).toBe("b".repeat(64));
+      const payload = transferCall.payload as {
+        event: string;
+        data: { invoice: { id: string; status: string; extraStatus: string | null }; triggerTxHash: string | null };
+      };
+      expect(payload.event).toBe("invoice:payment_detected");
+      expect(payload.data.invoice.id).toBe(invoice.id);
+      expect(payload.data.invoice.status).toBe("processing");
+      expect(payload.data.triggerTxHash).toBe("0xhook1");
+      expect(transferCall.idempotencyKey).toBe(`invoice:payment_detected:${invoice.id}:0xhook1`);
     } finally {
       await booted.close();
     }
@@ -131,11 +128,11 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
-      // Two webhooks per ingest (status + transfer); both routed to the
-      // per-invoice URL with the per-invoice secret — merchant default
-      // was ignored because the override took precedence.
+      // One webhook per unconfirmed ingest (invoice:payment_detected); routed
+      // to the per-invoice URL with the per-invoice secret — merchant default
+      // ignored because the override took precedence.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(2);
+      expect(calls).toHaveLength(1);
       for (const c of calls) {
         expect(c.url).toBe("https://merchant.example.com/per-invoice");
         expect(c.secret).toBe("i".repeat(64));
@@ -174,10 +171,10 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
-      // Two webhooks per ingest (status + transfer); both fall back to the
-      // merchant default URL/secret since the invoice has no override.
+      // One webhook per unconfirmed ingest; falls back to the merchant default
+      // URL/secret since the invoice has no override.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(2);
+      expect(calls).toHaveLength(1);
       for (const c of calls) {
         expect(c.url).toBe("https://merchant.example.com/default");
         expect(c.secret).toBe("m".repeat(64));
@@ -211,10 +208,10 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
-      // Two webhooks per ingest (status + transfer); both go to the per-
-      // invoice URL since no merchant default exists.
+      // One webhook per unconfirmed ingest; goes to the per-invoice URL since
+      // no merchant default exists.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(2);
+      expect(calls).toHaveLength(1);
       for (const c of calls) {
         expect(c.url).toBe("https://merchant.example.com/only-invoice");
         expect(c.secret).toBe("i".repeat(64));
@@ -267,10 +264,9 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       await booted.deps.jobs.drain(200);
       expect(booted.webhookDispatcher!.calls).toHaveLength(0);
 
-      // A partial-payment transfer (< requiredAmount) emits invoice.partial,
-      // tx.detected, and invoice.transfer_detected. Of those, only the two
-      // merchant-visible ones (invoice.partial + invoice.transfer_detected)
-      // produce webhooks; tx.detected is internal-only.
+      // A partial-payment transfer (< requiredAmount) emits tx.detected and
+      // invoice.payment_detected internally. Only the latter is merchant-
+      // facing → exactly one webhook; tx.detected is internal-only.
       await ingestDetectedTransfer(booted.deps, {
         chainId: 999,
         txHash: "0xhook3",
@@ -286,9 +282,9 @@ describe("end-to-end: invoice.detected -> webhook dispatched", () => {
       await booted.deps.jobs.drain(1_000);
 
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(2);
-      const events = calls.map((c) => (c.payload as { event: string }).event).sort();
-      expect(events).toEqual(["invoice.partial", "invoice.transfer_detected"]);
+      expect(calls).toHaveLength(1);
+      const events = calls.map((c) => (c.payload as { event: string }).event);
+      expect(events).toEqual(["invoice:payment_detected"]);
     } finally {
       await booted.close();
     }
@@ -395,13 +391,13 @@ describe("pollPayments orchestrator", () => {
   // Regression: prior to wiring registerEventSubscribers into the Workers
   // `scheduled` handler, events published from inside `confirmTransactions`
   // (and any other cron sweeper) reached an empty bus and never inserted
-  // into webhook_deliveries — operators saw `invoice.transfer_detected`
+  // into webhook_deliveries — operators saw `invoice:payment_detected`
   // (fired from the HTTP-ingest path, which goes through buildApp) but no
-  // `invoice.confirmed` or `invoice.payment_received`. This test exercises
+  // `invoice:completed` or `invoice:payment_confirmed`. This test exercises
   // the same shape: ingest at conf=0, then promote via the cron sweeper,
-  // and assert BOTH the per-status webhook AND the per-transfer-confirmed
+  // and assert BOTH the lifecycle webhook AND the per-transfer-confirmed
   // webhook fire.
-  it("dispatches invoice.confirmed AND invoice.payment_received when the cron sweeper promotes a tx", async () => {
+  it("dispatches invoice:completed AND invoice:payment_confirmed when the cron sweeper promotes a tx", async () => {
     const { confirmTransactions } = await import("../../core/domain/payment.service.js");
     const confirmations = new Map<
       string,
@@ -434,12 +430,12 @@ describe("pollPayments orchestrator", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
-      // After ingest: invoice.detected (per-status) + invoice.transfer_detected
-      // (per-transfer) — the existing happy path.
+      // After ingest: only invoice:payment_detected (per-tx). The lifecycle
+      // pending→processing has no separate event in the new model.
       const initialEvents = booted.webhookDispatcher!.calls.map(
         (c) => (c.payload as { event: string }).event
       );
-      expect(initialEvents.sort()).toEqual(["invoice.detected", "invoice.transfer_detected"]);
+      expect(initialEvents).toEqual(["invoice:payment_detected"]);
 
       // Now mark the tx confirmed on-chain and run the cron sweeper. THIS is
       // the path that was silently dropping events on Workers `scheduled`.
@@ -450,18 +446,18 @@ describe("pollPayments orchestrator", () => {
       const allEvents = booted.webhookDispatcher!.calls.map(
         (c) => (c.payload as { event: string }).event
       );
-      // Promotion should add invoice.confirmed + invoice.payment_received.
-      expect(allEvents).toContain("invoice.confirmed");
-      expect(allEvents).toContain("invoice.payment_received");
+      // Promotion adds invoice:completed (lifecycle) + invoice:payment_confirmed (per-tx).
+      expect(allEvents).toContain("invoice:completed");
+      expect(allEvents).toContain("invoice:payment_confirmed");
 
+      const completedCall = booted.webhookDispatcher!.calls.find(
+        (c) => (c.payload as { event: string }).event === "invoice:completed"
+      )!;
+      expect(completedCall.idempotencyKey).toBe(`invoice:completed:${invoice.id}:completed`);
       const confirmedCall = booted.webhookDispatcher!.calls.find(
-        (c) => (c.payload as { event: string }).event === "invoice.confirmed"
+        (c) => (c.payload as { event: string }).event === "invoice:payment_confirmed"
       )!;
-      expect(confirmedCall.idempotencyKey).toBe(`invoice.confirmed:${invoice.id}:confirmed`);
-      const receivedCall = booted.webhookDispatcher!.calls.find(
-        (c) => (c.payload as { event: string }).event === "invoice.payment_received"
-      )!;
-      expect(receivedCall.idempotencyKey).toBe(`invoice.payment_received:${invoice.id}:0xpromote`);
+      expect(confirmedCall.idempotencyKey).toBe(`invoice:payment_confirmed:${invoice.id}:0xpromote`);
     } finally {
       await booted.close();
     }
