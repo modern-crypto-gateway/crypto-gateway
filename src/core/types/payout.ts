@@ -89,6 +89,19 @@ export const PayoutSchema = z.object({
 
   webhookUrl: z.string().url().nullable(),
 
+  // Confirmation count required for this payout's tx to flip from
+  // `submitted` to `confirmed`. Snapshotted at plan time using the
+  // merchant's per-chain override (or env / gateway default). Frozen for
+  // the row's lifetime — merchant policy edits don't reshape in-flight
+  // payouts. Nullable for back-compat with pre-migration rows.
+  confirmationThreshold: z.number().int().positive().nullable(),
+
+  // Snapshot of merchant.confirmation_tiers_json at plan time. The payout-
+  // confirmation sweep evaluates the rule list for `${chainId}:${token}`
+  // against the payout's amount; on no match, falls back to the flat
+  // `confirmationThreshold`. NULL = no tiers.
+  confirmationTiersJson: z.string().nullable(),
+
   createdAt: z.date(),
   submittedAt: z.date().nullable(),
   confirmedAt: z.date().nullable(),

@@ -58,6 +58,40 @@ export const merchants = sqliteTable(
     // (orphan + admin-attribute path); after cooldown expires, late payments
     // become orphans available for reconciliation. 0 = no cooldown (legacy).
     addressCooldownSeconds: integer("address_cooldown_seconds").notNull().default(0),
+    // Per-merchant confirmation threshold overrides as a JSON map keyed by
+    // chainId-as-string → positive integer block-count. Example:
+    //   {"1": 24, "800": 12, "137": 8}
+    // NULL = no override (gateway defaults apply, see
+    // payment-config.ts DEFAULT_CONFIRMATION_THRESHOLDS).
+    //
+    // Resolved at invoice/payout CREATE time and snapshotted onto the
+    // resource row's `confirmation_threshold` column — runtime confirmation
+    // sweeps read from there, never from this column. So a merchant
+    // changing this value AFTER an invoice is created does NOT retroactively
+    // change that invoice's settlement threshold (matches the
+    // payment-tolerance pattern).
+    confirmationThresholdsJson: text("confirmation_thresholds_json"),
+    // Per-(chain, token) amount-tiered confirmation rules. Layered ON TOP
+    // of `confirmation_thresholds_json`: when a transfer arrives, the tier
+    // table for `${chainId}:${token}` is checked first; first matching rule
+    // wins; if no rule matches (and there's no catch-all), the flat
+    // `confirmation_threshold` snapshotted on the invoice/payout applies.
+    //
+    // Shape (validated by ConfirmationTiersSchema in payment-config.ts):
+    //   {
+    //     "801:LTC": [
+    //       {"amount":"0.5","op":"<","confirmations":1},
+    //       {"amount":"5",  "op":"<","confirmations":6},
+    //       {"confirmations":12}                          // catch-all
+    //     ],
+    //     "1:USDT":  [{"amount":"100","op":">","confirmations":24},
+    //                 {"confirmations":6}]
+    //   }
+    //
+    // Same snapshot-at-create discipline as confirmation_thresholds_json:
+    // the merchant's value is copied to invoice/payout rows when those are
+    // created and frozen for the resource's lifetime.
+    confirmationTiersJson: text("confirmation_tiers_json"),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull()
   },
@@ -123,6 +157,31 @@ export const invoices = sqliteTable(
     // status-transition semantics.
     paymentToleranceUnderBps: integer("payment_tolerance_under_bps").notNull().default(0),
     paymentToleranceOverBps: integer("payment_tolerance_over_bps").notNull().default(0),
+
+    // Confirmation count required for transfers paying THIS invoice to flip
+    // from `detected` to `confirmed`. Snapshotted at create time by resolving
+    // the merchant's per-chain override (merchants.confirmation_thresholds_json)
+    // for the invoice's primary chainId, falling back to the env override
+    // (FINALITY_OVERRIDES) and then to the per-chain default. Once
+    // snapshotted the value is frozen for the invoice's lifetime — merchant
+    // policy changes don't retroactively reshape in-flight invoices.
+    //
+    // For multi-family invoices (acceptedFamilies includes more than one
+    // family), this single value applies regardless of which chain the
+    // customer pays on — merchant risk policy is per-invoice, not per-leg.
+    //
+    // Backfilled on existing rows by migration 0004 from the gateway's
+    // per-chain default for the row's primary chainId, so behavior is
+    // identical post-migration for already-issued invoices.
+    confirmationThreshold: integer("confirmation_threshold"),
+
+    // Snapshot of merchant.confirmation_tiers_json at create time. Per-
+    // transfer amount-tiered finality (see merchants schema for shape).
+    // NULL = no tiers configured at create time → confirmation sweep uses
+    // `confirmation_threshold` flat. When present, sweep evaluates the
+    // matching tier list per-transfer (each detected transfer can land in
+    // a different tier based on its raw amount).
+    confirmationTiersJson: text("confirmation_tiers_json"),
 
     createdAt: integer("created_at").notNull(),
     expiresAt: integer("expires_at").notNull(),
@@ -436,6 +495,20 @@ export const payouts = sqliteTable(
     // a crash after broadcast (but before the `submitted` write) can't retry
     // into a second on-chain tx.
     broadcastAttemptedAt: integer("broadcast_attempted_at"),
+
+    // Confirmation count required for this payout's tx to flip from
+    // `submitted` to `confirmed`. Snapshotted at PLAN time by resolving
+    // the merchant's per-chain override for the payout's chainId — frozen
+    // for the row's lifetime. Same pattern as invoices.confirmation_threshold.
+    // Backfilled on existing rows by migration 0004 from the gateway's
+    // per-chain default for the row's chainId.
+    confirmationThreshold: integer("confirmation_threshold"),
+
+    // Snapshot of merchant.confirmation_tiers_json at plan time. Used by the
+    // payout-confirmation sweep to evaluate the payout's amount against the
+    // merchant's tier rules for `${chainId}:${token}`. NULL or no matching
+    // entry → fall back to confirmation_threshold flat.
+    confirmationTiersJson: text("confirmation_tiers_json"),
 
     // ---- RBF (Replace-By-Fee) audit trail ----
     //

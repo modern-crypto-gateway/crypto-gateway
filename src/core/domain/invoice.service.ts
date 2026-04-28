@@ -17,6 +17,7 @@ import { DomainError } from "../errors.js";
 import { allocateForInvoice, releaseFromInvoice } from "./pool.service.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
 import { addUsd, snapshotRates, subUsd, tokenDecimalsFor, tokensForFamilies } from "./rate-window.js";
+import { resolveMerchantConfirmationThreshold } from "./payment-config.js";
 import { invoices, invoiceReceiveAddresses, merchants, transactions } from "../../db/schema.js";
 
 // ---- Input validation ----
@@ -98,7 +99,9 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
       id: merchants.id,
       active: merchants.active,
       paymentToleranceUnderBps: merchants.paymentToleranceUnderBps,
-      paymentToleranceOverBps: merchants.paymentToleranceOverBps
+      paymentToleranceOverBps: merchants.paymentToleranceOverBps,
+      confirmationThresholdsJson: merchants.confirmationThresholdsJson,
+      confirmationTiersJson: merchants.confirmationTiersJson
     })
     .from(merchants)
     .where(eq(merchants.id, parsed.merchantId))
@@ -328,6 +331,17 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
     //    can't leave the invoice unreachable for detection.
     const expiresAt = now + parsed.expiresInMinutes * 60_000;
     const metadataJson = parsed.metadata !== undefined ? JSON.stringify(parsed.metadata) : null;
+    // Snapshot the confirmation threshold for THIS invoice. Resolution:
+    // merchant per-chain JSON > env override > chain default. Frozen for
+    // the invoice's lifetime — merchant policy edits don't reshape in-flight
+    // invoices. For multi-family invoices, the same value applies regardless
+    // of which family ultimately receives the payment (merchant policy is
+    // per-invoice, not per-leg).
+    const confirmationThresholdSnapshot = resolveMerchantConfirmationThreshold(
+      parsed.chainId,
+      merchant.confirmationThresholdsJson,
+      deps.confirmationThresholds
+    );
     const invoiceInsert = {
       id: invoiceId,
       merchantId: parsed.merchantId,
@@ -356,6 +370,13 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
         parsed.paymentToleranceUnderBps ?? merchant.paymentToleranceUnderBps,
       paymentToleranceOverBps:
         parsed.paymentToleranceOverBps ?? merchant.paymentToleranceOverBps,
+      confirmationThreshold: confirmationThresholdSnapshot,
+      // Snapshot the WHOLE merchant tier map verbatim. Each transfer paying
+      // this invoice can land in a different (chainId, token) tier; storing
+      // the full map lets the confirm-sweep look up per-transfer without
+      // re-reading the merchant row. Frozen at create time — merchant edits
+      // don't reshape in-flight invoices.
+      confirmationTiersJson: merchant.confirmationTiersJson,
       createdAt: now,
       expiresAt: expiresAt,
       confirmedAt: null,

@@ -12,12 +12,48 @@ import {
   drizzleRowToTransaction,
   fetchInvoiceReceiveAddresses
 } from "./mappers.js";
-import { confirmationThreshold } from "./payment-config.js";
+import {
+  confirmationThreshold,
+  evaluateConfirmationTier,
+  lookupTierRules
+} from "./payment-config.js";
+import { findToken } from "../types/token-registry.js";
 import { reacquireForInvoice } from "./pool.service.js";
 import { addUsd, applyBps, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
 import { addressPool, invoices, invoiceReceiveAddresses, payouts, transactions, utxos } from "../../db/schema.js";
 
 type InvoiceRow = typeof invoices.$inferSelect;
+
+// Resolve the confirmation threshold to apply to a single transfer paying
+// `invoiceRow`. Precedence at evaluation time:
+//   1. Tier rule match on invoice.confirmationTiersJson for `${chainId}:${token}`
+//   2. Invoice's flat confirmationThreshold (snapshotted at create)
+//   3. Gateway per-chain default
+// Returns null only when invoiceRow is null (caller should not reach here
+// for orphans). The decimals lookup uses TOKEN_REGISTRY; tokens not in the
+// registry skip the tier evaluation and fall through to the flat threshold.
+function resolveThresholdForTransfer(
+  invoiceRow: InvoiceRow | null,
+  chainId: number,
+  token: string,
+  amountRaw: string,
+  envOverrides: Readonly<Record<number, number>> | undefined
+): number {
+  if (invoiceRow !== null && invoiceRow.confirmationTiersJson !== null) {
+    const tierRules = lookupTierRules(invoiceRow.confirmationTiersJson, chainId, token);
+    if (tierRules !== null) {
+      const tokenEntry = findToken(chainId, token);
+      if (tokenEntry !== null) {
+        const tierResult = evaluateConfirmationTier(amountRaw, tokenEntry.decimals, tierRules);
+        if (tierResult !== null) return tierResult;
+      }
+    }
+  }
+  if (invoiceRow !== null && invoiceRow.confirmationThreshold !== null) {
+    return invoiceRow.confirmationThreshold;
+  }
+  return confirmationThreshold(chainId, envOverrides);
+}
 
 // PaymentService: rules for how detected transfers become transactions, how
 // transactions accumulate into invoices, and how confirmation counts promote
@@ -136,10 +172,27 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     }
   }
 
-  // Decide initial tx status using the reported confirmation count. Orphaned
-  // transfers (no invoice match under cooldown rules) bypass the detected →
-  // confirmed track entirely and land as 'orphaned' for admin attribution.
-  const threshold = confirmationThreshold(transfer.chainId, deps.confirmationThresholds);
+  // Decide initial tx status using the reported confirmation count.
+  //
+  // Resolution order at this site (highest precedence first):
+  //   1. Invoice's snapshotted tier rules — per-(chain, token) amount
+  //      tiering. Look up `${chainId}:${token}` in invoice.confirmationTiersJson
+  //      and evaluate against the transfer's raw amount. First-match-wins.
+  //   2. Invoice's snapshotted flat threshold (confirmationThreshold).
+  //   3. Gateway per-chain default (FINALITY_OVERRIDES env / defaults).
+  //
+  // Orphans (no invoice match under cooldown rules) bypass the detected →
+  // confirmed track entirely and land as 'orphaned' for admin attribution;
+  // we don't tier them because there's no merchant context yet.
+  const threshold = isOrphanRow
+    ? confirmationThreshold(transfer.chainId, deps.confirmationThresholds)
+    : resolveThresholdForTransfer(
+        invoiceRow,
+        transfer.chainId,
+        transfer.token,
+        transfer.amountRaw,
+        deps.confirmationThresholds
+      );
   const initialStatus: TxStatus = isOrphanRow
     ? "orphaned"
     : (transfer.confirmations >= threshold ? "confirmed" : "detected");
@@ -479,9 +532,17 @@ export async function confirmTransactions(
   //     detector emitted. This branch runs getConfirmationStatus on each
   //     and fills those fields in so the admin queue + forensic lookups
   //     have a full picture of the tx. Status stays 'orphaned'; no events.
-  const pending = await deps.db
-    .select()
+  // LEFT JOIN invoices so we can read each row's invoice-snapshotted
+  // threshold + tier rules in the same query (orphans have no invoice row
+  // → joined columns are null → fall back to gateway default per-chainId).
+  const pendingJoined = await deps.db
+    .select({
+      tx: transactions,
+      invoiceConfirmationThreshold: invoices.confirmationThreshold,
+      invoiceConfirmationTiersJson: invoices.confirmationTiersJson
+    })
     .from(transactions)
+    .leftJoin(invoices, eq(invoices.id, transactions.invoiceId))
     .where(
       or(
         eq(transactions.status, "detected"),
@@ -490,6 +551,15 @@ export async function confirmTransactions(
     )
     .orderBy(asc(transactions.detectedAt))
     .limit(limit);
+  // Flatten back to the original shape so the rest of the loop is unchanged,
+  // and stash the per-row threshold + tiers alongside.
+  const pending = pendingJoined.map((j) => j.tx);
+  const thresholdByTxId = new Map<string, number | null>(
+    pendingJoined.map((j) => [j.tx.id, j.invoiceConfirmationThreshold ?? null])
+  );
+  const tiersJsonByTxId = new Map<string, string | null>(
+    pendingJoined.map((j) => [j.tx.id, j.invoiceConfirmationTiersJson ?? null])
+  );
 
   let confirmed = 0;
   let reverted = 0;
@@ -504,7 +574,29 @@ export async function confirmTransactions(
     const chainAdapter = findChainAdapter(deps, row.chainId);
     const live = await chainAdapter.getConfirmationStatus(row.chainId, row.txHash);
     const now = deps.clock.now().getTime();
-    const threshold = confirmationThreshold(row.chainId, deps.confirmationThresholds);
+    // Threshold resolution per row: (1) tier match on this transfer's
+    // amount + (chainId, token), (2) invoice's flat snapshot, (3) gateway
+    // default. The per-row tier eval re-reads the invoice's tier JSON
+    // because each transfer can land in a different tier (a $5 transfer
+    // and a $5000 transfer to the same invoice settle independently).
+    const tiersJson = tiersJsonByTxId.get(row.id) ?? null;
+    let tieredThreshold: number | null = null;
+    if (tiersJson !== null) {
+      const tierRules = lookupTierRules(tiersJson, row.chainId, row.token);
+      if (tierRules !== null) {
+        const tokenEntry = findToken(row.chainId, row.token);
+        if (tokenEntry !== null) {
+          tieredThreshold = evaluateConfirmationTier(
+            row.amountRaw,
+            tokenEntry.decimals,
+            tierRules
+          );
+        }
+      }
+    }
+    const threshold = tieredThreshold ??
+      thresholdByTxId.get(row.id) ??
+      confirmationThreshold(row.chainId, deps.confirmationThresholds);
     // Orphan rows are admin-private: they get the same block/confs
     // enrichment pass but skip merchant-facing events and invoice
     // recomputes. The query above already restricts orphan rows to those

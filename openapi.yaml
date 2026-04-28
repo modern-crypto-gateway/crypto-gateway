@@ -661,6 +661,60 @@ paths:
                     arriving during the cooldown still credit the original invoice
                     via the orphan + admin-attribute path. `0` (default) preserves
                     legacy immediate-reuse behavior. Capped at 7 days (604800s).
+                confirmationThresholds:
+                  type: object
+                  additionalProperties:
+                    type: integer
+                    minimum: 1
+                    maximum: 10000
+                  description: |
+                    Per-chain confirmation override map (chainId-as-string keys →
+                    positive integer block-counts). Resolution order at invoice/
+                    payout create time: this map > FINALITY_OVERRIDES env >
+                    per-chain gateway default (BTC=6, ETH=12, Polygon=256, etc.).
+                    The resolved value is snapshotted onto each invoice/payout
+                    at create time and frozen — merchant edits don't reshape
+                    in-flight resources. Setting a value below the chain's
+                    gateway default is allowed (merchant accepts the reorg risk)
+                    and surfaces a `merchant_confirmation_below_default` WARN log.
+                    Omit to use gateway defaults for every chain.
+                  example:
+                    "1": 24
+                    "137": 8
+                    "800": 12
+                confirmationTiers:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    minItems: 1
+                    maxItems: 20
+                    items:
+                      type: object
+                      properties:
+                        amount: { type: string, pattern: "^\\d+(\\.\\d+)?$" }
+                        op: { type: string, enum: ["<", "<=", ">", ">=", "=", "<>"] }
+                        confirmations: { type: integer, minimum: 1, maximum: 10000 }
+                      required: [confirmations]
+                  description: |
+                    Per-(chain, token) amount-tiered confirmation rules. Keys are
+                    `"{chainId}:{TOKEN}"` (e.g., `"1:USDC"`, `"800:BTC"`,
+                    `"801:LTC"`). Each value is a list of rules evaluated in
+                    order against the invoice/payout's amount (token-decimal
+                    precise BigInt comparison). The first rule whose `amount`
+                    + `op` predicate matches supplies the confirmation count;
+                    a rule with `amount`/`op` omitted acts as a catch-all.
+                    Operators: `<`, `<=`, `>`, `>=`, `=`, `<>`. Returns null
+                    if no rule matches → falls back to flat
+                    `confirmationThresholds` then gateway default. Snapshotted
+                    verbatim onto invoice/payout at create time and frozen.
+                  example:
+                    "801:LTC":
+                      - { amount: "3", op: "<", confirmations: 1 }
+                      - { confirmations: 12 }
+                    "1:USDC":
+                      - { amount: "100", op: "<", confirmations: 6 }
+                      - { amount: "1000", op: "<", confirmations: 12 }
+                      - { confirmations: 24 }
       responses:
         "201":
           description: Merchant created
@@ -679,6 +733,15 @@ paths:
                       paymentToleranceUnderBps: { type: integer, minimum: 0, maximum: 2000 }
                       paymentToleranceOverBps: { type: integer, minimum: 0, maximum: 2000 }
                       addressCooldownSeconds: { type: integer, minimum: 0, maximum: 604800 }
+                      confirmationThresholds:
+                        type: [object, "null"]
+                        additionalProperties:
+                          type: integer
+                      confirmationTiers:
+                        type: [object, "null"]
+                        additionalProperties:
+                          type: array
+                          items: { type: object }
                       createdAt: { type: string, format: date-time }
                   apiKey:
                     type: string
@@ -762,6 +825,44 @@ paths:
                   type: integer
                   minimum: 0
                   maximum: 604800
+                confirmationThresholds:
+                  type: [object, "null"]
+                  additionalProperties:
+                    type: integer
+                    minimum: 1
+                    maximum: 10000
+                  description: |
+                    Per-chain confirmation override map. Pass an object to
+                    replace the merchant's current map whole-sale (partial-key
+                    updates aren't supported); pass `null` to clear the
+                    override and revert to gateway defaults for new invoices.
+                    Already-issued invoices keep their snapshotted thresholds.
+                  example:
+                    "1": 24
+                    "137": 8
+                confirmationTiers:
+                  type: [object, "null"]
+                  additionalProperties:
+                    type: array
+                    minItems: 1
+                    maxItems: 20
+                    items:
+                      type: object
+                      properties:
+                        amount: { type: string, pattern: "^\\d+(\\.\\d+)?$" }
+                        op: { type: string, enum: ["<", "<=", ">", ">=", "=", "<>"] }
+                        confirmations: { type: integer, minimum: 1, maximum: 10000 }
+                      required: [confirmations]
+                  description: |
+                    Per-(chain, token) amount-tiered confirmation rules.
+                    Whole-sale replace (pass an object) or clear (`null`).
+                    Keys: `"{chainId}:{TOKEN}"`. See POST `/admin/merchants`
+                    for full semantics. New invoices/payouts snapshot the
+                    tier map at create time; in-flight resources are unchanged.
+                  example:
+                    "801:LTC":
+                      - { amount: "3", op: "<", confirmations: 1 }
+                      - { confirmations: 12 }
       responses:
         "200":
           description: Merchant updated
@@ -780,6 +881,14 @@ paths:
                       paymentToleranceUnderBps: { type: integer }
                       paymentToleranceOverBps: { type: integer }
                       addressCooldownSeconds: { type: integer }
+                      confirmationThresholds:
+                        type: [object, "null"]
+                        additionalProperties: { type: integer }
+                      confirmationTiers:
+                        type: [object, "null"]
+                        additionalProperties:
+                          type: array
+                          items: { type: object }
                       updatedAt: { type: string, format: date-time }
                   webhookSecret:
                     type: string
@@ -2511,6 +2620,19 @@ components:
         paymentToleranceUnderBps: { type: integer, minimum: 0, maximum: 2000 }
         paymentToleranceOverBps: { type: integer, minimum: 0, maximum: 2000 }
         addressCooldownSeconds: { type: integer, minimum: 0, maximum: 604800 }
+        confirmationThresholds:
+          type: [object, "null"]
+          additionalProperties:
+            type: integer
+            minimum: 1
+            maximum: 10000
+          description: Per-chain confirmation override map (or `null`).
+        confirmationTiers:
+          type: [object, "null"]
+          additionalProperties:
+            type: array
+            items: { type: object }
+          description: Per-(chain, token) amount-tiered confirmation rules (or `null`).
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
 

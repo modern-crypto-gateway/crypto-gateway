@@ -15,7 +15,12 @@ import {
   ingestDetectedTransfer,
   recomputeInvoiceFromTransactions
 } from "../../core/domain/payment.service.js";
-import { confirmationThreshold } from "../../core/domain/payment-config.js";
+import {
+  confirmationThreshold,
+  ConfirmationThresholdsSchema,
+  ConfirmationTiersSchema,
+  DEFAULT_CONFIRMATION_THRESHOLDS
+} from "../../core/domain/payment-config.js";
 import { ChainFamilySchema, type ChainFamily, type ChainId } from "../../core/types/chain.js";
 import { CHAIN_REGISTRY, chainEntry, chainSlug } from "../../core/types/chain-registry.js";
 import { TOKEN_REGISTRY } from "../../core/types/token-registry.js";
@@ -63,7 +68,20 @@ const CreateMerchantSchema = z.object({
   // invoice for this many seconds. Late payments arriving during the
   // cooldown still credit the original invoice via the orphan + admin-
   // attribute path. 0 (default) preserves legacy immediate-reuse behavior.
-  addressCooldownSeconds: z.number().int().min(0).max(MAX_ADDRESS_COOLDOWN_SECONDS).optional()
+  addressCooldownSeconds: z.number().int().min(0).max(MAX_ADDRESS_COOLDOWN_SECONDS).optional(),
+  // Per-chain confirmation-threshold override map (chainId-as-string keys →
+  // positive integer block-counts). Snapshotted onto each new invoice and
+  // payout at create time; merchant edits don't reshape in-flight resources.
+  // Omit to use gateway defaults. Setting a value below the chain's gateway
+  // default is allowed (merchant accepts the reorg risk) and surfaces a
+  // WARN log entry for operator audit.
+  confirmationThresholds: ConfirmationThresholdsSchema.optional(),
+  // Per-(chain, token) amount-tiered confirmation rules. Layered ON TOP of
+  // confirmationThresholds: the tier list for `${chainId}:${TOKEN}` is
+  // checked first per-transfer (first matching rule wins); on no match,
+  // falls back to the flat threshold. Same snapshot-at-create discipline.
+  // See payment-config.ts ConfirmationTiersSchema for the rule shape.
+  confirmationTiers: ConfirmationTiersSchema.optional()
 });
 
 const UpdateMerchantSchema = z
@@ -72,7 +90,14 @@ const UpdateMerchantSchema = z
     webhookUrl: z.string().url().optional(),
     paymentToleranceUnderBps: z.number().int().min(0).max(2000).optional(),
     paymentToleranceOverBps: z.number().int().min(0).max(2000).optional(),
-    addressCooldownSeconds: z.number().int().min(0).max(MAX_ADDRESS_COOLDOWN_SECONDS).optional()
+    addressCooldownSeconds: z.number().int().min(0).max(MAX_ADDRESS_COOLDOWN_SECONDS).optional(),
+    // Pass `null` to clear an existing override (revert to gateway defaults).
+    // Pass an object to replace the whole map. Partial-key updates aren't
+    // supported — full-replace keeps the model simple and matches REST
+    // PATCH-on-resource semantics for whole-attribute writes.
+    confirmationThresholds: ConfirmationThresholdsSchema.nullable().optional(),
+    // Same nullable/whole-replace semantics as confirmationThresholds.
+    confirmationTiers: ConfirmationTiersSchema.nullable().optional()
   })
   .refine((v) => Object.values(v).some((x) => x !== undefined), {
     message: "PATCH body must contain at least one updatable field"
@@ -205,6 +230,32 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       const paymentToleranceUnderBps = parsed.paymentToleranceUnderBps ?? 0;
       const paymentToleranceOverBps = parsed.paymentToleranceOverBps ?? 0;
       const addressCooldownSeconds = parsed.addressCooldownSeconds ?? 0;
+      // Per-chain confirmation override map. Stored as JSON. Log a WARN
+      // for any entry below the gateway default so operators can audit
+      // merchants opting into shorter finality windows than the chain
+      // default recommends.
+      const confirmationThresholdsJson =
+        parsed.confirmationThresholds === undefined
+          ? null
+          : JSON.stringify(parsed.confirmationThresholds);
+      if (parsed.confirmationThresholds !== undefined) {
+        for (const [chainIdStr, value] of Object.entries(parsed.confirmationThresholds)) {
+          const chainId = Number(chainIdStr);
+          const def = DEFAULT_CONFIRMATION_THRESHOLDS[chainId];
+          if (def !== undefined && value < def) {
+            deps.logger.warn("merchant_confirmation_below_default", {
+              merchantId: id,
+              chainId,
+              configured: value,
+              gatewayDefault: def
+            });
+          }
+        }
+      }
+      const confirmationTiersJson =
+        parsed.confirmationTiers === undefined
+          ? null
+          : JSON.stringify(parsed.confirmationTiers);
       await deps.db.insert(merchants).values({
         id,
         name: parsed.name,
@@ -215,6 +266,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         paymentToleranceUnderBps,
         paymentToleranceOverBps,
         addressCooldownSeconds,
+        confirmationThresholdsJson,
+        confirmationTiersJson,
         createdAt: now,
         updatedAt: now
       });
@@ -229,6 +282,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
             paymentToleranceUnderBps,
             paymentToleranceOverBps,
             addressCooldownSeconds,
+            confirmationThresholds: parsed.confirmationThresholds ?? null,
+            confirmationTiers: parsed.confirmationTiers ?? null,
             createdAt: new Date(now).toISOString()
           },
           // Plaintext API key returned once — never recoverable after this response.
@@ -307,6 +362,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         paymentToleranceUnderBps: number;
         paymentToleranceOverBps: number;
         addressCooldownSeconds: number;
+        confirmationThresholdsJson: string | null;
+        confirmationTiersJson: string | null;
         updatedAt: number;
       }> = { updatedAt: now };
       if (parsed.name !== undefined) patch.name = parsed.name;
@@ -318,6 +375,34 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
       }
       if (parsed.addressCooldownSeconds !== undefined) {
         patch.addressCooldownSeconds = parsed.addressCooldownSeconds;
+      }
+      // confirmationThresholds: explicit-null clears the override, undefined
+      // leaves the existing value untouched, an object replaces it whole-sale.
+      if (parsed.confirmationThresholds !== undefined) {
+        if (parsed.confirmationThresholds === null) {
+          patch.confirmationThresholdsJson = null;
+        } else {
+          patch.confirmationThresholdsJson = JSON.stringify(parsed.confirmationThresholds);
+          for (const [chainIdStr, value] of Object.entries(parsed.confirmationThresholds)) {
+            const chainId = Number(chainIdStr);
+            const def = DEFAULT_CONFIRMATION_THRESHOLDS[chainId];
+            if (def !== undefined && value < def) {
+              deps.logger.warn("merchant_confirmation_below_default", {
+                merchantId: id,
+                chainId,
+                configured: value,
+                gatewayDefault: def
+              });
+            }
+          }
+        }
+      }
+      // Same nullable/whole-replace semantics for confirmationTiers.
+      if (parsed.confirmationTiers !== undefined) {
+        patch.confirmationTiersJson =
+          parsed.confirmationTiers === null
+            ? null
+            : JSON.stringify(parsed.confirmationTiers);
       }
 
       let mintedWebhookSecret: string | null = null;
@@ -350,6 +435,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
             paymentToleranceUnderBps: row.paymentToleranceUnderBps,
             paymentToleranceOverBps: row.paymentToleranceOverBps,
             addressCooldownSeconds: row.addressCooldownSeconds,
+            confirmationThresholds: parseConfirmationThresholdsJson(row.confirmationThresholdsJson),
+            confirmationTiers: parseConfirmationTiersJson(row.confirmationTiersJson),
             updatedAt: new Date(row.updatedAt).toISOString()
           },
           ...(mintedWebhookSecret !== null ? { webhookSecret: mintedWebhookSecret } : {})
@@ -388,6 +475,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         paymentToleranceUnderBps: merchants.paymentToleranceUnderBps,
         paymentToleranceOverBps: merchants.paymentToleranceOverBps,
         addressCooldownSeconds: merchants.addressCooldownSeconds,
+        confirmationThresholdsJson: merchants.confirmationThresholdsJson,
+        confirmationTiersJson: merchants.confirmationTiersJson,
         createdAt: merchants.createdAt,
         updatedAt: merchants.updatedAt
       })
@@ -406,6 +495,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
           paymentToleranceUnderBps: r.paymentToleranceUnderBps,
           paymentToleranceOverBps: r.paymentToleranceOverBps,
           addressCooldownSeconds: r.addressCooldownSeconds,
+          confirmationThresholds: parseConfirmationThresholdsJson(r.confirmationThresholdsJson),
+          confirmationTiers: parseConfirmationTiersJson(r.confirmationTiersJson),
           createdAt: new Date(r.createdAt).toISOString(),
           updatedAt: new Date(r.updatedAt).toISOString()
         })),
@@ -427,6 +518,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
         paymentToleranceUnderBps: merchants.paymentToleranceUnderBps,
         paymentToleranceOverBps: merchants.paymentToleranceOverBps,
         addressCooldownSeconds: merchants.addressCooldownSeconds,
+        confirmationThresholdsJson: merchants.confirmationThresholdsJson,
+        confirmationTiersJson: merchants.confirmationTiersJson,
         createdAt: merchants.createdAt,
         updatedAt: merchants.updatedAt
       })
@@ -449,6 +542,8 @@ export function adminRouter(deps: AppDeps, opts: AdminRouterOptions = {}): Hono 
           paymentToleranceUnderBps: row.paymentToleranceUnderBps,
           paymentToleranceOverBps: row.paymentToleranceOverBps,
           addressCooldownSeconds: row.addressCooldownSeconds,
+          confirmationThresholds: parseConfirmationThresholdsJson(row.confirmationThresholdsJson),
+          confirmationTiers: parseConfirmationTiersJson(row.confirmationTiersJson),
           createdAt: new Date(row.createdAt).toISOString(),
           updatedAt: new Date(row.updatedAt).toISOString()
         }
@@ -1335,10 +1430,14 @@ const hasFeeWallet = poolFamilies.has(
       }
 
       // Promote orphan → detected/confirmed based on its existing confirmation
-      // count vs the chain's threshold. Skips the per-tx event publish: the
-      // recompute below fires the invoice-level lifecycle event, which is the
-      // only signal merchants need for an admin-driven credit.
-      const threshold = confirmationThreshold(orphan.chainId, deps.confirmationThresholds);
+      // count vs the threshold the destination invoice was issued under
+      // (snapshotted at invoice create time). Falls back to gateway default
+      // for legacy invoices without a snapshotted value. Skips the per-tx
+      // event publish: the recompute below fires the invoice-level
+      // lifecycle event, which is the only signal merchants need for an
+      // admin-driven credit.
+      const threshold = invoiceRow.confirmationThreshold ??
+        confirmationThreshold(orphan.chainId, deps.confirmationThresholds);
       const newStatus = orphan.confirmations >= threshold ? "confirmed" : "detected";
       const confirmedAt = newStatus === "confirmed" ? (orphan.confirmedAt ?? now) : orphan.confirmedAt;
 
@@ -2227,5 +2326,38 @@ function bytesToRandomHex(numBytes: number): string {
   const bytes = new Uint8Array(numBytes);
   getRandomValues(bytes);
   return bytesToHex(bytes);
+}
+
+// Parse merchants.confirmation_thresholds_json for API response use. Returns
+// the parsed object, or null when the column is null / malformed. Tolerant
+// of bad JSON because the same value is read on hot paths (resolver) without
+// throwing — keep API behavior consistent.
+function parseConfirmationThresholdsJson(raw: string | null): Record<string, number> | null {
+  if (raw === null || raw.length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, number>;
+    }
+  } catch {
+    /* fall through */
+  }
+  return null;
+}
+
+// Same shape as parseConfirmationThresholdsJson, returns the per-(chain,token)
+// tier map verbatim for API echo. Hot-path tier eval lives in payment-config.ts
+// `lookupTierRules`; this helper is API-presentation-only.
+function parseConfirmationTiersJson(raw: string | null): Record<string, unknown> | null {
+  if (raw === null || raw.length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* fall through */
+  }
+  return null;
 }
 

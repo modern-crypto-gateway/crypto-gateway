@@ -1152,6 +1152,115 @@ Tradeoffs to flag in your merchant settings UI:
   `extraStatus='overpaid'` on the snapshot. The lifecycle event is the
   same `invoice:completed` either way.
 
+## Per-merchant confirmation thresholds
+
+Different merchants tolerate different reorg risk:
+
+- A coffee shop wants 1-conf finality so customers don't sit waiting.
+- A high-value B2B settlement wants deeper-than-default confirmations on
+  EVM (and may not care that BTC takes longer).
+- Some merchants trust BTC's economic security highly but want extra
+  caution on Polygon (or vice versa).
+
+Each merchant sets a per-chain JSON map of confirmation overrides:
+
+```bash
+curl -X PATCH "$GATEWAY_URL/admin/merchants/$MERCHANT_ID" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -d '{
+    "confirmationThresholds": {
+      "1":   24,    "// ETH mainnet": "deeper than default 12",
+      "137": 8,     "// Polygon":     "shallower than default 256",
+      "800": 12     "// BTC":         "deeper than default 6"
+    }
+  }'
+```
+
+Resolution order at invoice/payout create time (highest precedence first):
+
+1. `merchant.confirmationThresholds[chainId]` — per-chain override
+2. `FINALITY_OVERRIDES` env (per-deployment ops escape hatch)
+3. Per-chain default in [`payment-config.ts`](src/core/domain/payment-config.ts)
+4. `12` fallback (for unknown chainIds)
+
+The resolved value is **snapshotted onto each new invoice and payout**
+(`invoices.confirmation_threshold`, `payouts.confirmation_threshold`) at
+create time. Runtime confirmation sweeps read from the resource row, so
+merchant policy edits never reshape in-flight invoices — same discipline
+as `paymentToleranceUnderBps`. The fields are returned in API responses
+so the frontend can render "settles in N confs" alongside each invoice.
+
+For multi-family invoices (`acceptedFamilies` includes more than one
+family), the merchant override for the **primary** chainId is applied to
+every accepted family — a single risk policy per invoice, not per leg.
+
+Operational notes:
+
+- No floor is enforced. Setting `{"800": 1}` (1-conf BTC) is allowed; the
+  merchant accepts the reorg risk. The gateway logs a `merchant_confirmation_below_default`
+  WARN at config time so operators can audit shorter-than-default windows.
+- `confirmationThresholds: null` (PATCH only) clears the override and
+  reverts to gateway defaults for new invoices.
+- Per-invoice / per-payout request-body override is **not** supported yet.
+  Merchant-level only. Add it later by mirroring the `paymentToleranceUnderBps`
+  shape if real demand surfaces.
+
+### Per-(chain, token) amount-tiered confirmations
+
+Beyond the flat per-chain override above, merchants can set
+**amount-tiered** rules per `(chainId, token)` pair. Use case: charge
+1 confirmation for tiny LTC top-ups (instant UX), 12 confs for
+mid-tier transfers, and 50 confs for whales — without splitting
+products across separate merchants.
+
+```bash
+curl -X PATCH "$GATEWAY_URL/admin/merchants/$MERCHANT_ID" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -d '{
+    "confirmationTiers": {
+      "801:LTC": [
+        { "amount": "3",    "op": "<",  "confirmations": 1  },
+        { "amount": "100",  "op": "<",  "confirmations": 12 },
+        { "confirmations": 50 }
+      ],
+      "1:USDC": [
+        { "amount": "100",  "op": "<",  "confirmations": 6  },
+        { "amount": "1000", "op": "<",  "confirmations": 12 },
+        { "confirmations": 24 }
+      ]
+    }
+  }'
+```
+
+Each value is a list of rules evaluated **in order** against the
+invoice/payout's amount. The first rule whose predicate matches supplies
+the confirmation count. A rule with `amount`/`op` omitted is a catch-all
+(typically the last entry).
+
+Operators: `<`, `<=`, `>`, `>=`, `=`, `<>`. Amount comparison is decimal-
+precise (BigInt at the token's native scale — LTC 8 decimals, USDC 6,
+ETH 18, etc.), so `0.1` always means 0.1 LTC.
+
+Resolution order at confirmation time (highest precedence first):
+
+1. `merchant.confirmationTiers["{chainId}:{token}"]` — first matching rule wins
+2. `merchant.confirmationThresholds[chainId]` — flat per-chain override
+3. `FINALITY_OVERRIDES` env
+4. Per-chain default in [`payment-config.ts`](src/core/domain/payment-config.ts)
+5. `12` fallback
+
+If no tier rule matches (no catch-all configured), the resolver falls
+through to the flat per-chain map. This means you can layer a tiered
+ladder on top of an existing flat override without breaking it.
+
+The whole tier map is **snapshotted onto each new invoice and payout**
+(`invoices.confirmation_tiers_json`, `payouts.confirmation_tiers_json`)
+at create time and frozen — exactly like the flat threshold and the
+payment-tolerance fields. Confirmation sweeps re-evaluate the snapshot
+each tick; the amount being matched is the resource's `amountRaw`.
+
+`confirmationTiers: null` (PATCH only) clears the tier map.
+
 ## API reference
 
 Full spec: [`openapi.yaml`](openapi.yaml). Import into Postman, Bruno, or Insomnia

@@ -35,3 +35,20 @@ export function formatRawAmount(amountRaw: string, decimals: number): string {
   const fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "");
   return fracStr === "" ? whole.toString() : `${whole}.${fracStr}`;
 }
+
+// Inverse of formatRawAmount. Decimal-string ("0.5") → BigInt at the token's
+// raw smallest-unit scale (`5n * 10n^(decimals-1)`). Used by the
+// confirmation-tier evaluator to compare a rule's `amount: "0.5"` against
+// a transfer's `amount_raw` without any float drift. Truncates excess
+// fraction digits past `decimals` (no rounding).
+//
+// Throws on malformed input so a bad tier-rule amount surfaces at config
+// time, not silently at confirmation time.
+export function scaleDecimalToRaw(value: string, decimals: number): bigint {
+  if (!/^\d+(\.\d+)?$/.test(value)) {
+    throw new Error(`scaleDecimalToRaw: malformed decimal string '${value}'`);
+  }
+  const [whole, frac = ""] = value.split(".");
+  const fracPadded = (frac + "0".repeat(decimals)).slice(0, decimals);
+  return BigInt(whole ?? "0") * BigInt(10) ** BigInt(decimals) + BigInt(fracPadded || "0");
+}

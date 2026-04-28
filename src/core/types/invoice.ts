@@ -139,6 +139,22 @@ export const InvoiceSchema = z.object({
   paymentToleranceUnderBps: z.number().int().min(0).max(2000),
   paymentToleranceOverBps: z.number().int().min(0).max(2000),
 
+  // Confirmation count required for a transfer paying this invoice to flip
+  // from `detected` to `confirmed`. Snapshotted at invoice create time —
+  // resolves merchant.confirmation_thresholds_json[primary chainId] →
+  // env-FINALITY_OVERRIDES → gateway per-chain default. Frozen for the
+  // invoice's lifetime: merchant policy changes don't reshape in-flight
+  // invoices. Applies to every accepted family (one threshold per invoice,
+  // not per chain leg). Nullable for back-compat with pre-migration rows.
+  confirmationThreshold: z.number().int().positive().nullable(),
+
+  // Snapshot of merchant.confirmation_tiers_json at invoice create time
+  // (raw JSON string from the column). Each transfer paying this invoice
+  // is evaluated against the tier list for `${chainId}:${token}` — first
+  // matching rule's confirmations win; on no match, falls back to the
+  // flat `confirmationThreshold` above. NULL = no tiers configured.
+  confirmationTiersJson: z.string().nullable(),
+
   createdAt: z.date(),
   expiresAt: z.date(),
   confirmedAt: z.date().nullable(),

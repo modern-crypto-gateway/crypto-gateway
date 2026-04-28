@@ -11,7 +11,12 @@ import { findToken } from "../types/token-registry.js";
 import type { SignerScope } from "../types/signer.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { drizzleRowToPayout } from "./mappers.js";
-import { confirmationThreshold } from "./payment-config.js";
+import {
+  confirmationThreshold,
+  evaluateConfirmationTier,
+  lookupTierRules,
+  resolveMerchantConfirmationThreshold
+} from "./payment-config.js";
 import { DomainError } from "../errors.js";
 import { assertWebhookUrlSafe } from "./url-safety.js";
 import { addressPool, merchants, payoutReservations, payouts, utxos } from "../../db/schema.js";
@@ -257,12 +262,30 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   const parsed = PlanPayoutInputSchema.parse(input);
 
   const [merchant] = await deps.db
-    .select({ id: merchants.id, active: merchants.active })
+    .select({
+      id: merchants.id,
+      active: merchants.active,
+      confirmationThresholdsJson: merchants.confirmationThresholdsJson,
+      confirmationTiersJson: merchants.confirmationTiersJson
+    })
     .from(merchants)
     .where(eq(merchants.id, parsed.merchantId))
     .limit(1);
   if (!merchant) throw new PayoutError("MERCHANT_NOT_FOUND", "Merchant not found");
   if (merchant.active !== 1) throw new PayoutError("MERCHANT_INACTIVE", "Merchant is inactive");
+  // Snapshot the confirmation threshold for THIS payout once at plan time.
+  // Frozen for the row's lifetime; merchant policy edits don't reshape
+  // already-planned payouts. Same pattern as invoices.
+  const confirmationThresholdSnapshot = resolveMerchantConfirmationThreshold(
+    parsed.chainId,
+    merchant.confirmationThresholdsJson,
+    deps.confirmationThresholds
+  );
+  // Snapshot the merchant's tier map verbatim. The confirm sweep evaluates
+  // the relevant `${chainId}:${token}` entry against the payout's amount
+  // at confirmation time; falls back to the flat threshold above when the
+  // map has no matching entry or no rule matches.
+  const confirmationTiersSnapshot = merchant.confirmationTiersJson;
 
   const token = findToken(parsed.chainId, parsed.token);
   if (!token) {
@@ -431,6 +454,8 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
       submittedAt: null,
       confirmedAt: null,
       updatedAt: now,
+      confirmationThreshold: confirmationThresholdSnapshot,
+      confirmationTiersJson: confirmationTiersSnapshot,
       webhookUrl: parsed.webhookUrl ?? null,
       webhookSecretCiphertext
     });
@@ -491,6 +516,8 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         submittedAt: null,
         confirmedAt: null,
         updatedAt: now,
+        confirmationThreshold: confirmationThresholdSnapshot,
+        confirmationTiersJson: confirmationTiersSnapshot,
         webhookUrl: parsed.webhookUrl ?? null,
         webhookSecretCiphertext: webhookSecretCiphertext
       });
@@ -1394,6 +1421,11 @@ async function startTopUpFromReservation(
     submittedAt: null,
     confirmedAt: null,
     updatedAt: now,
+    // gas_top_up sibling inherits the parent payout's confirmation threshold
+    // — the parent's settlement waits on the parent tx, but for ledger
+    // consistency we record the same finality bar on the sibling.
+    confirmationThreshold: parent.confirmationThreshold,
+    confirmationTiersJson: parent.confirmationTiersJson,
     webhookUrl: null,
     webhookSecretCiphertext: null
   });
@@ -1524,7 +1556,10 @@ async function executeTopUp(
       sibling?.id
     );
   }
-  const threshold = confirmationThreshold(row.chainId, deps.confirmationThresholds);
+  // Top-up tx finality uses the parent payout's snapshotted threshold —
+  // same merchant policy applies to the gas-funding leg as the main tx.
+  const threshold = row.confirmationThreshold ??
+    confirmationThreshold(row.chainId, deps.confirmationThresholds);
   if (status.confirmations < threshold) {
     // Not confirmed yet — leave payout in topping-up; next tick re-checks.
     return "deferred";
@@ -1979,6 +2014,11 @@ async function recordGasBurnDebit(
       confirmedAt: now,
       updatedAt: now,
       broadcastAttemptedAt: null,
+      // gas_burn synthetic row inherits the parent's threshold for audit
+      // consistency. Already 'confirmed' so the threshold isn't gating
+      // anything; recorded for ledger completeness.
+      confirmationThreshold: parent.confirmationThreshold,
+      confirmationTiersJson: parent.confirmationTiersJson,
       webhookUrl: null,
       webhookSecretCiphertext: null
     });
@@ -2123,7 +2163,27 @@ export async function confirmPayouts(
     if (!row.txHash) return;
     const chainAdapter = findChainAdapter(deps, row.chainId);
     const now = deps.clock.now().getTime();
-    const threshold = confirmationThreshold(row.chainId, deps.confirmationThresholds);
+    // Threshold resolution: (1) tier match on the payout's amount +
+    // (chainId, token), (2) the row's flat snapshot, (3) gateway default.
+    // The tier eval reads the row's snapshotted tier JSON — frozen at plan
+    // time, encodes merchant policy.
+    let tieredThreshold: number | null = null;
+    if (row.confirmationTiersJson !== null) {
+      const tierRules = lookupTierRules(row.confirmationTiersJson, row.chainId, row.token);
+      if (tierRules !== null) {
+        const tokenEntry = findToken(row.chainId as ChainId, row.token as TokenSymbol);
+        if (tokenEntry !== null) {
+          tieredThreshold = evaluateConfirmationTier(
+            row.amountRaw,
+            tokenEntry.decimals,
+            tierRules
+          );
+        }
+      }
+    }
+    const threshold = tieredThreshold ??
+      row.confirmationThreshold ??
+      confirmationThreshold(row.chainId, deps.confirmationThresholds);
 
     const status = await chainAdapter.getConfirmationStatus(row.chainId, row.txHash);
 
