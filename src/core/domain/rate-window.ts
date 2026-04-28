@@ -68,20 +68,109 @@ export function tokensForFamilies(families: readonly ChainFamily[]): readonly To
   return Array.from(set) as TokenSymbol[];
 }
 
-// Snapshot the current rates for `tokens`. Used at invoice creation and at
-// rate-window refresh. Missing rates (oracle doesn't recognize the token)
-// are omitted — detection of a payment in an unpriced token will fall
-// back gracefully to "ignore" rather than crash the ingest path.
+// Single shared cache key holding the latest USD rate map across every
+// token any wired family might price. The cron's `warmRateCache` writes
+// this entry; `snapshotRates` reads it. TTL is intentionally long — the
+// cron rewrites it every minute, so the only time it can age out is a
+// genuine multi-hour cron outage, in which case the static-peg
+// in-memory fallback kicks in to keep invoice-create flowing.
+const WARMED_RATES_CACHE_KEY = "rates:usd:warmed";
+const WARMED_RATES_TTL_SECONDS = 3600;
+
+interface WarmedRatesEntry {
+  rates: Record<string, string>;
+  updatedAt: number;
+}
+
+// Thrown by snapshotRates when the cron-warmed rates cache is empty —
+// either the gateway just booted and the cron hasn't run yet, or the
+// cron has been failing long enough for the previous good entry to age
+// out. Surface as a clear 503-style error so merchants retry rather
+// than getting silent mis-priced invoices from hardcoded fallbacks.
+export class RateUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RateUnavailableError";
+  }
+}
+
+// Snapshot the current rates for `tokens`. Reads ONLY the cron-warmed
+// shared cache — no upstream call, no fallback chain traversal, no
+// static-peg substitution. The invoice-create hot path stays sub-
+// millisecond regardless of which oracle is currently up: the cron is
+// the only thing that ever touches the network, and the merchant's
+// request just consults the prebuilt rate map.
+//
+// Cold-start path: if the cache is empty, throw RateUnavailableError.
+// Mis-priced USD-pegged invoices (off by 30–50 % when a hardcoded
+// peg is stale) cause real financial loss; failing the request and
+// asking the merchant to retry once the cron warms the cache is the
+// safe answer. Raw-amount invoices don't need rates and are unaffected.
 export async function snapshotRates(
   deps: AppDeps,
   tokens: readonly TokenSymbol[]
 ): Promise<RateSnapshot> {
   const now = deps.clock.now().getTime();
-  const rates = await deps.priceOracle.getUsdRates(tokens);
-  return {
-    rates,
-    expiresAt: now + RATE_WINDOW_DURATION_MS
-  };
+  const cached = await deps.cache.getJSON<WarmedRatesEntry>(WARMED_RATES_CACHE_KEY);
+  if (cached === null) {
+    throw new RateUnavailableError(
+      "Rate cache is empty — the oracle cron has not warmed yet, or has been failing for longer than the cache TTL. Retry shortly."
+    );
+  }
+  const out: Record<string, string> = {};
+  for (const t of tokens) {
+    const rate = cached.rates[t];
+    if (rate !== undefined) out[t] = rate;
+  }
+  return { rates: out, expiresAt: now + RATE_WINDOW_DURATION_MS };
+}
+
+// Cron-driven cache warmer. The ONLY place that touches upstream
+// oracles in steady state — runs once per cron tick, calls the full
+// fallback chain (CoinGecko → Alchemy → CoinCap → Binance per
+// `select-oracle.ts`), and writes whatever the chain returned to the
+// shared `WARMED_RATES_CACHE_KEY` slot.
+//
+// No static-peg layering: hardcoded fallback values can drift far
+// from market and quietly mis-price invoices. If every live oracle is
+// down, we leave the existing (last good) cache entry in place and
+// log; merchants requesting a USD-pegged invoice while the cache is
+// stale-but-present still get those last good rates, and once the
+// cache TTL elapses without a successful warm, snapshotRates will
+// throw RateUnavailableError instead of pricing against stale junk.
+//
+// Family enumeration: read straight off `deps.chains` so a deployment
+// with only EVM wired doesn't waste calls warming BTC/LTC, and a
+// deployment that later adds UTXO automatically picks up the new
+// symbols on the next tick.
+export async function warmRateCache(deps: AppDeps): Promise<void> {
+  const families = new Set<ChainFamily>();
+  for (const adapter of deps.chains) families.add(adapter.family);
+  if (families.size === 0) return;
+  const tokens = tokensForFamilies([...families]);
+  if (tokens.length === 0) return;
+
+  let live: Record<string, string> = {};
+  try {
+    live = { ...(await deps.priceOracle.getUsdRates(tokens)) };
+  } catch (err) {
+    deps.logger.warn("warmRateCache: oracle chain failed; preserving last good cache", {
+      error: err instanceof Error ? err.message : String(err)
+    });
+    return;
+  }
+  // If the chain returned nothing usable (every provider is down or every
+  // token is unmapped), don't overwrite the previous good entry with an
+  // empty map. Log and let the next tick try again.
+  if (Object.keys(live).length === 0) {
+    deps.logger.warn("warmRateCache: oracle chain returned no rates; preserving last good cache");
+    return;
+  }
+  await deps.cache.putJSON(
+    WARMED_RATES_CACHE_KEY,
+    { rates: live, updatedAt: deps.clock.now().getTime() },
+    { ttlSeconds: WARMED_RATES_TTL_SECONDS }
+  );
 }
 
 // If the invoice's rate window has expired, re-query the oracle and persist a

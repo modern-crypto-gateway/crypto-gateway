@@ -8,6 +8,7 @@ import {
 } from "./payout.service.js";
 import { pollPayments } from "./poll-payments.js";
 import { reconcileOrphanedAllocations } from "./pool.service.js";
+import { warmRateCache } from "./rate-window.js";
 import { sweepWebhookDeliveries } from "./webhook-subscriber.js";
 
 // Runs every scheduled job in sequence. Shared between the Workers `scheduled`
@@ -27,6 +28,7 @@ import { sweepWebhookDeliveries } from "./webhook-subscriber.js";
 // cost differs from the defaults (200 payouts / 200 txs / 100 webhooks).
 
 export interface ScheduledJobsResult {
+  warmRateCache: JobOutcome;
   pollPayments: JobOutcome;
   confirmTransactions: JobOutcome;
   recheckConfirmedForReorg: JobOutcome;
@@ -49,6 +51,12 @@ export type JobOutcome = { ok: true; value: unknown } | { ok: false; error: stri
 
 export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResult> {
   const result: ScheduledJobsResult = {
+    // Pre-warm the price-oracle cache so USD-pegged invoice creation in the
+    // next minute reads warm cache instead of paying upstream latency on
+    // its critical path. Single batched call covers every token symbol any
+    // wired family might need to price; oracle outage is non-fatal (the
+    // SWR layer keeps serving stale rates until the next tick recovers).
+    warmRateCache: await run(() => warmRateCache(deps)),
     pollPayments: await run(() => pollPayments(deps)),
     confirmTransactions: await run(() => confirmTransactions(deps)),
     // Reorg safety net — runs after confirmTransactions so a tx confirmed

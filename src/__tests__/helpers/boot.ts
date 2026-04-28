@@ -10,6 +10,7 @@ import { createDb, createLibsqlClient } from "../../db/client.js";
 import { merchants as merchantsTable } from "../../db/schema.js";
 import { devCipher } from "../../adapters/crypto/secrets-cipher.js";
 import { initializePool } from "../../core/domain/pool.service.js";
+import { warmRateCache } from "../../core/domain/rate-window.js";
 import { promiseSetJobs } from "../../adapters/jobs/promise-set.adapter.js";
 import { staticPegPriceOracle } from "../../adapters/price-oracle/static-peg.adapter.js";
 import { hdSignerStore } from "../../adapters/signer-store/hd.adapter.js";
@@ -293,6 +294,13 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
       initialSize: options.poolInitialSize ?? 10
     });
   }
+
+  // Pre-warm the rate cache. In production this runs every cron tick;
+  // tests boot in a fresh state so without this initial warm, USD-pegged
+  // invoice creation would throw RATES_UNAVAILABLE on the first request.
+  // The default test oracle is `staticPegPriceOracle` which returns
+  // hardcoded mid-range rates instantly, so this is a no-network call.
+  await warmRateCache(deps);
 
   const booted: BootedTestApp = {
     app,

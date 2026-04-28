@@ -5,6 +5,7 @@ import { alchemyPriceOracle } from "./alchemy.adapter.js";
 import { binancePriceOracle } from "./binance.adapter.js";
 import { coincapPriceOracle } from "./coincap.adapter.js";
 import { coingeckoPriceOracle } from "./coingecko.adapter.js";
+import { noopPriceOracle } from "./noop.adapter.js";
 import { staticPegPriceOracle } from "./static-peg.adapter.js";
 
 // Shared oracle-selection policy used by every entrypoint. Builds a fallback
@@ -12,27 +13,34 @@ import { staticPegPriceOracle } from "./static-peg.adapter.js";
 //
 // Full chain when every live source is configured (CoinGecko-first default):
 //
-//     CoinGecko → Alchemy → CoinCap → Binance → static-peg
+//     CoinGecko → Alchemy → CoinCap → Binance → noop
 //
 // When PRICE_ADAPTER=alchemy is set (and an ALCHEMY_API_KEY is available),
 // Alchemy swaps to the front of the chain:
 //
-//     Alchemy → CoinGecko → CoinCap → Binance → static-peg
+//     Alchemy → CoinGecko → CoinCap → Binance → noop
 //
 // Each link tries itself first; on HTTP error, timeout, unmapped symbol, or
-// malformed response it delegates to the next link. Only `static-peg` — the
-// terminal fallback — is allowed to answer with hardcoded numbers, and only
-// for the stablecoin set and the override map.
+// malformed response it delegates to the next link. The terminal `noop`
+// throws OracleUnavailableError for tokenToFiat / fiatToTokenAmount and
+// returns `{}` for getUsdRates — production never silently substitutes
+// hardcoded numbers for a live rate. Mis-priced invoices (off by tens of
+// percent against a stale hardcoded peg) cause real financial loss, so
+// the gateway prefers an explicit failure. The cron's warmRateCache
+// preserves the last-good cache entry across short outages so this
+// failure is rare in practice.
 //
 // Selection rules:
-//   - PRICE_ADAPTER="static-peg": skip every live source, return static-peg.
+//   - PRICE_ADAPTER="static-peg": explicit opt-in — return static-peg as
+//     the only oracle. Intended for tests and dev. NOT recommended for
+//     production: rates are hardcoded mid-range values that can be off
+//     by 30–50 % against the live market.
 //   - PRICE_ADAPTER="alchemy": Alchemy becomes the outermost link if a key
 //     is set; if no key is available we log and fall through to the default
-//     CoinGecko-first ordering rather than silently degrading to static-peg.
+//     CoinGecko-first ordering.
 //   - PRICE_ADAPTER="coingecko" (or unset): CoinGecko-first default chain.
 //   - No API keys set at all is still a valid production config because the
-//     CoinGecko/CoinCap/Binance free tiers are keyless. Set PRICE_ADAPTER=
-//     static-peg explicitly to force keyless-static-only behavior.
+//     CoinGecko/CoinCap/Binance free tiers are keyless.
 //
 // Individual fallbacks can be disabled via `DISABLE_<PROVIDER>=1` flags for
 // operators who want to exclude a specific provider (e.g. a deployment
@@ -55,8 +63,13 @@ export interface SelectOracleInput {
 }
 
 export function selectPriceOracle(input: SelectOracleInput): PriceOracle {
-  const staticPeg = staticPegPriceOracle();
-  if (input.priceAdapter === "static-peg") return staticPeg;
+  // Explicit opt-in for the static-peg oracle. Tests and dev use this
+  // directly via `staticPegPriceOracle()` without going through select-
+  // oracle; this branch is here for operators who want to force keyless
+  // hardcoded behavior in production-like environments. Otherwise the
+  // production chain ends with `noop`, which fails explicitly rather
+  // than silently substituting hardcoded numbers.
+  if (input.priceAdapter === "static-peg") return staticPegPriceOracle();
 
   const alchemyEnabled = input.disableAlchemy !== true && input.alchemyApiKey !== undefined;
   const alchemyFirst = input.priceAdapter === "alchemy";
@@ -66,10 +79,11 @@ export function selectPriceOracle(input: SelectOracleInput): PriceOracle {
     );
   }
 
-  // Build inside-out: start from static-peg (always the last link), then wrap
-  // with each enabled provider in reverse priority order so the final outer
-  // layer is the highest-priority source.
-  let chain: PriceOracle = staticPeg;
+  // Build inside-out: start from `noop` (terminal — empty rates +
+  // explicit error), then wrap with each enabled provider in reverse
+  // priority order so the final outer layer is the highest-priority
+  // source. No static-peg in production — see file header for rationale.
+  let chain: PriceOracle = noopPriceOracle();
 
   if (input.disableBinance !== true) {
     chain = binancePriceOracle({

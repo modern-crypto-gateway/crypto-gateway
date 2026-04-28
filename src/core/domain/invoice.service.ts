@@ -16,7 +16,7 @@ import { drizzleRowToInvoice, drizzleRowToTransaction, fetchInvoiceReceiveAddres
 import { DomainError } from "../errors.js";
 import { allocateForInvoice, releaseFromInvoice } from "./pool.service.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
-import { addUsd, snapshotRates, subUsd, tokenDecimalsFor, tokensForFamilies } from "./rate-window.js";
+import { addUsd, RateUnavailableError, snapshotRates, subUsd, tokenDecimalsFor, tokensForFamilies } from "./rate-window.js";
 import { resolveMerchantConfirmationThreshold } from "./payment-config.js";
 import { invoices, invoiceReceiveAddresses, merchants, transactions } from "../../db/schema.js";
 
@@ -454,6 +454,14 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
     ) {
       const winner = await loadInvoiceByExternalId(deps, parsed.merchantId, parsed.externalId);
       if (winner !== null) return winner;
+    }
+    // Translate the rate-window's empty-cache error into a typed
+    // InvoiceError so the HTTP layer renders it as a clean 503 with a
+    // stable error code merchants can match on. Static-peg is intentionally
+    // not in the production chain — see select-oracle.ts — so this fires
+    // only when every live oracle is down longer than the cache TTL.
+    if (err instanceof RateUnavailableError) {
+      throw new InvoiceError("RATES_UNAVAILABLE", err.message);
     }
     throw err;
   }
@@ -920,7 +928,8 @@ export type InvoiceErrorCode =
   | "MERCHANT_NOT_FOUND"
   | "MERCHANT_INACTIVE"
   | "TOKEN_NOT_SUPPORTED"
-  | "EXPIRE_NOT_ALLOWED";
+  | "EXPIRE_NOT_ALLOWED"
+  | "RATES_UNAVAILABLE";
 
 // HTTP status per code lives here (next to the codes themselves) rather than
 // in the route's handleError — routes shouldn't reverse-engineer semantics
@@ -931,7 +940,12 @@ const INVOICE_ERROR_HTTP_STATUS: Readonly<Record<InvoiceErrorCode, number>> = {
   MERCHANT_NOT_FOUND: 404,
   MERCHANT_INACTIVE: 403,
   TOKEN_NOT_SUPPORTED: 400,
-  EXPIRE_NOT_ALLOWED: 409
+  EXPIRE_NOT_ALLOWED: 409,
+  // 503 — transient, retryable. Surfaces when the cron-warmed rate cache
+  // is empty (gateway just booted, or oracle outage outlasted the cache
+  // TTL). Merchant retries; once the cron repopulates, the request
+  // succeeds.
+  RATES_UNAVAILABLE: 503
 };
 
 export class InvoiceError extends DomainError {

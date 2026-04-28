@@ -21,7 +21,11 @@ export interface StaticPegConfig {
 // Placeholder mid-range rates for volatile natives. Only used by dev/test;
 // production mainnet requires a real oracle (Alchemy Prices or equivalent).
 // Kept in a single map so operators see the assumptions at a glance.
-const DEFAULT_NATIVE_RATES: Readonly<Record<string, string>> = {
+//
+// Exported so the rate-window's cold-start path (cron hasn't populated the
+// shared cache yet) can fall back to these without instantiating a full
+// PriceOracle. Pure-data export, never mutated.
+export const DEFAULT_NATIVE_RATES: Readonly<Record<string, string>> = {
   ETH: "2500",
   BNB: "600",
   MATIC: "0.60",
@@ -32,6 +36,34 @@ const DEFAULT_NATIVE_RATES: Readonly<Record<string, string>> = {
   BTC: "65000",
   LTC: "85"
 };
+
+// Default pegged-stable set used by static-peg + as the rate-window's
+// terminal cold-start fallback. Stables are 1:1 USD by definition for the
+// gateway's invoicing purposes; if a deployment needs a non-1:1 stable,
+// override via `staticPegPriceOracle({ peggedSymbols })`.
+export const DEFAULT_PEGGED_SYMBOLS: readonly TokenSymbol[] = [
+  "USDC", "USDT", "DAI", "DEV"
+] as TokenSymbol[];
+
+// Pure helper: project the static-peg rate map (pegged stables → "1",
+// known natives → DEFAULT_NATIVE_RATES) to a Record matching the requested
+// tokens. Used by the rate-window cold-start path so invoice creation
+// always has rates without any network call. Never throws — unknown tokens
+// are silently omitted (caller treats them as "not priced").
+export function staticPegRates(
+  tokens: readonly TokenSymbol[]
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const token of tokens) {
+    if (DEFAULT_PEGGED_SYMBOLS.includes(token)) {
+      out[token] = "1";
+      continue;
+    }
+    const native = DEFAULT_NATIVE_RATES[token];
+    if (native !== undefined) out[token] = native;
+  }
+  return out;
+}
 
 export function staticPegPriceOracle(config: StaticPegConfig = {}): PriceOracle {
   const pegged = new Set<string>(config.peggedSymbols ?? (["USDC", "USDT", "DAI", "DEV"] as TokenSymbol[]));

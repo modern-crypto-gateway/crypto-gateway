@@ -102,49 +102,43 @@ export async function allocateForInvoice(
   const now = deps.clock.now().getTime();
 
   for (let attempt = 0; attempt < ALLOCATE_RETRY_LIMIT; attempt += 1) {
-    const [candidate] = await deps.db
-      .select({
-        id: addressPool.id,
-        address: addressPool.address,
-        addressIndex: addressPool.addressIndex
-      })
+    // Single-statement allocate: pick the cheapest available row via
+    // subquery and CAS-update it in one round-trip. SQLite's UPDATE…WHERE
+    // id IN (SELECT … LIMIT 1) is atomic — the subquery runs against the
+    // pre-update snapshot and the WHERE re-checks status='available'
+    // against the same snapshot, so two concurrent allocators can't both
+    // land on the same row. The retry loop covers the legitimate CAS-miss
+    // case (two parallel allocators both saw the same candidate before
+    // either ran the UPDATE).
+    //
+    // Ordering rationale:
+    //   1. totalAllocations ASC — never-used rows (count=0) win first.
+    //   2. lastReleasedAt ASC NULLS FIRST — among rows with equal use count,
+    //      longest-dormant wins; just-released rows go to the back. Gives a
+    //      late payment to a recently expired invoice the longest possible
+    //      window to land on the address that was tied to it. SQLite's
+    //      default ASC already places NULLs first.
+    //   3. addressIndex ASC — deterministic final tiebreak, oldest derivation
+    //      first.
+    //
+    // Pre-fix this was SELECT then UPDATE — two RTTs per allocation; on a
+    // Turso edge replica that doubled the per-family cost in invoice-create.
+    const candidateSubquery = deps.db
+      .select({ id: addressPool.id })
       .from(addressPool)
       .where(
         and(
           eq(addressPool.family, family),
           eq(addressPool.status, "available"),
-          // Cooldown filter: skip rows whose previous owner asked us to park
-          // them. NULL or past deadlines are immediately eligible.
           or(isNull(addressPool.cooldownUntil), lte(addressPool.cooldownUntil, now))
         )
       )
-      // Ordering rationale:
-      //   1. totalAllocations ASC — never-used rows (count=0) win first.
-      //   2. lastReleasedAt ASC NULLS FIRST — among rows with equal use count,
-      //      longest-dormant wins; just-released rows go to the back. This
-      //      gives a late payment to a recently expired invoice the longest
-      //      possible window to land on the address that was tied to it
-      //      rather than on a freshly-reused one. SQLite's default ASC
-      //      ordering already places NULLs first, so the never-used (NULL
-      //      lastReleasedAt) rows naturally win the tie inside the count=0
-      //      bucket too.
-      //   3. addressIndex ASC — deterministic final tiebreak, oldest derivation
-      //      first.
       .orderBy(
         asc(addressPool.totalAllocations),
         asc(addressPool.lastReleasedAt),
         asc(addressPool.addressIndex)
       )
       .limit(1);
-
-    if (!candidate) {
-      // Empty pool — kick off a background refill so the next invoice
-      // creation has something to allocate, then surface the 503 so this
-      // invoice-create call fails fast (merchant retries and succeeds once
-      // the refill lands).
-      scheduleRefill(deps, family);
-      throw new PoolExhaustedError(family);
-    }
 
     const [claim] = await deps.db
       .update(addressPool)
@@ -157,7 +151,12 @@ export async function allocateForInvoice(
         cooldownUntil: null,
         lastReleasedByMerchantId: null
       })
-      .where(and(eq(addressPool.id, candidate.id), eq(addressPool.status, "available")))
+      .where(
+        and(
+          inArray(addressPool.id, candidateSubquery),
+          eq(addressPool.status, "available")
+        )
+      )
       .returning();
 
     if (claim) {
@@ -186,10 +185,17 @@ export async function allocateForInvoice(
       })();
       return drizzleRowToPoolAddress(claim);
     }
-    // CAS miss — another allocator got this row first. Retry with the next
-    // cheapest candidate. This loop terminates because the pool is finite
-    // and we cap at ALLOCATE_RETRY_LIMIT attempts.
+    // claim === undefined: either the subquery found no candidate (pool
+    // empty / all rows in cooldown) or another allocator beat us to it
+    // (CAS-miss). Both manifest the same way after collapsing SELECT+
+    // UPDATE — distinguishing them would require an extra read, which is
+    // exactly the cost we just removed. Loop and let the retry budget
+    // surface PoolExhaustedError if it really is empty.
   }
+  // Pool exhausted (or N concurrent allocators all lost the race against
+  // each other). Schedule a background refill before throwing so the
+  // next request has something to allocate.
+  scheduleRefill(deps, family);
   throw new PoolExhaustedError(family);
 }
 
