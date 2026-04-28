@@ -53,6 +53,7 @@ export interface WebhookPayload {
 export type WebhookEventName =
   | "invoice:payment_detected"
   | "invoice:payment_confirmed"
+  | "invoice:processing"
   | "invoice:completed"
   | "invoice:expired"
   | "invoice:canceled"
@@ -101,6 +102,32 @@ export function composeWebhook(
           data: invoiceEnvelope(event.invoice, transactions, null)
         },
         idempotencyKey: `${wireEvent}:${event.invoice.id}:${event.invoice.status}`
+      };
+    }
+
+    case "invoice.processing": {
+      // Idempotency key encodes status + extra_status so each distinct
+      // processing flavor delivers exactly once. Examples:
+      //   - pending → processing (full amount detected, awaiting conf):
+      //     key = invoice:processing:<id>:processing:none
+      //   - pending → processing(partial):
+      //     key = invoice:processing:<id>:processing:partial
+      //   - processing(partial) → processing (extra cleared after a top-up):
+      //     key = invoice:processing:<id>:processing:none — distinct from
+      //     the partial delivery above, so the merchant sees the upgrade.
+      // A reorg cycle (processing → completed → processing) reuses the
+      // earlier key — that's the dedup contract; reorg specifically uses
+      // `invoice:demoted` for the merchant signal.
+      const extraSlug = event.invoice.extraStatus ?? "none";
+      return {
+        merchantId: event.invoice.merchantId,
+        resource: { type: "invoice", id: event.invoice.id },
+        payload: {
+          event: "invoice:processing",
+          timestamp: event.at.toISOString(),
+          data: invoiceEnvelope(event.invoice, transactions, null)
+        },
+        idempotencyKey: `invoice:processing:${event.invoice.id}:${event.invoice.status}:${extraSlug}`
       };
     }
 

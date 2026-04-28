@@ -148,12 +148,24 @@ export const InvoiceSchema = z.object({
   // not per chain leg). Nullable for back-compat with pre-migration rows.
   confirmationThreshold: z.number().int().positive().nullable(),
 
-  // Snapshot of merchant.confirmation_tiers_json at invoice create time
-  // (raw JSON string from the column). Each transfer paying this invoice
-  // is evaluated against the tier list for `${chainId}:${token}` — first
-  // matching rule's confirmations win; on no match, falls back to the
-  // flat `confirmationThreshold` above. NULL = no tiers configured.
-  confirmationTiersJson: z.string().nullable(),
+  // Snapshot of merchant.confirmation_tiers_json at invoice create time,
+  // parsed back into its object form for API responses. Each transfer
+  // paying this invoice is evaluated against the tier list for
+  // `${chainId}:${token}` — first matching rule's confirmations win;
+  // on no match, falls back to the flat `confirmationThreshold` above.
+  // NULL = no tiers configured.
+  confirmationTiers: z
+    .record(
+      z.string(),
+      z.array(
+        z.object({
+          amount: z.string().optional(),
+          op: z.enum(["<", "<=", ">", ">=", "=", "<>"]).optional(),
+          confirmations: z.number().int().positive()
+        })
+      )
+    )
+    .nullable(),
 
   createdAt: z.date(),
   expiresAt: z.date(),

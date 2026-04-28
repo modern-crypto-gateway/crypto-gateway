@@ -22,6 +22,14 @@ export type DomainEvent =
   | { type: "invoice.completed"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
   | { type: "invoice.expired"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
   | { type: "invoice.canceled"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
+  // Mid-lifecycle signal. Fires when an invoice transitions INTO `processing`
+  // — either pending → processing (first contributing transfer detected) or
+  // a same-status extra-status flip (e.g. processing(partial) →
+  // processing(no extra) once enough has been received). Lets merchants
+  // drive a "payment in flight" UI without subscribing to every per-tx
+  // event. Idempotency key encodes status + extra_status so each distinct
+  // processing flavor delivers exactly once (partial vs full-but-unconfirmed).
+  | { type: "invoice.processing"; invoiceId: InvoiceId; invoice: Invoice; at: Date }
   // Reorg un-confirmation. Fired BEFORE the normal status-transition event
   // when a previously completed invoice is demoted back to processing/pending
   // because the chain rolled back the underlying transaction(s).

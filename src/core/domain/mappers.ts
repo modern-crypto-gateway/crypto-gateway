@@ -7,6 +7,22 @@ import type { Transaction, TransactionId, TxStatus } from "../types/transaction.
 import { invoices, invoiceReceiveAddresses } from "../../db/schema.js";
 import type { payouts, transactions } from "../../db/schema.js";
 
+// Parse the raw `confirmation_tiers_json` column into the shape Invoice /
+// Payout API responses expose. The column stores JSON text; consumers
+// should see the object. Returns null on null-or-malformed input —
+// downstream code already treats "no rules" as fall-through to the flat
+// confirmation_threshold, so swallowing parse errors here is safe.
+function parseConfirmationTiers(json: string | null): Invoice["confirmationTiers"] {
+  if (json === null || json.length === 0) return null;
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as Invoice["confirmationTiers"];
+  } catch {
+    return null;
+  }
+}
+
 // DB row <-> domain object conversions. Kept in one place so invoice.service.ts
 // and payment.service.ts don't drift on shape.
 
@@ -45,7 +61,7 @@ export function drizzleRowToInvoice(
     paymentToleranceUnderBps: row.paymentToleranceUnderBps,
     paymentToleranceOverBps: row.paymentToleranceOverBps,
     confirmationThreshold: row.confirmationThreshold,
-    confirmationTiersJson: row.confirmationTiersJson,
+    confirmationTiers: parseConfirmationTiers(row.confirmationTiersJson),
     createdAt: new Date(row.createdAt),
     expiresAt: new Date(row.expiresAt),
     confirmedAt: row.confirmedAt === null ? null : new Date(row.confirmedAt),
@@ -137,7 +153,7 @@ export function drizzleRowToPayout(row: typeof payouts.$inferSelect): Payout {
     lastError: row.lastError,
     webhookUrl: row.webhookUrl,
     confirmationThreshold: row.confirmationThreshold,
-    confirmationTiersJson: row.confirmationTiersJson,
+    confirmationTiers: parseConfirmationTiers(row.confirmationTiersJson),
     createdAt: new Date(row.createdAt),
     submittedAt: row.submittedAt === null ? null : new Date(row.submittedAt),
     confirmedAt: row.confirmedAt === null ? null : new Date(row.confirmedAt),

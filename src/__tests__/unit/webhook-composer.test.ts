@@ -47,7 +47,7 @@ function fixtureInvoice(overrides: Partial<Invoice> = {}): Invoice {
     paymentToleranceUnderBps: 0,
     paymentToleranceOverBps: 0,
     confirmationThreshold: 12,
-    confirmationTiersJson: null,
+    confirmationTiers: null,
     createdAt: new Date("2026-04-16T10:00:00Z"),
     expiresAt: new Date("2026-04-16T10:30:00Z"),
     confirmedAt: null,
@@ -82,7 +82,7 @@ function fixturePayout(overrides: Partial<Payout> = {}): Payout {
     lastError: null,
     webhookUrl: null,
     confirmationThreshold: 12,
-    confirmationTiersJson: null,
+    confirmationTiers: null,
     createdAt: new Date("2026-04-16T10:00:00Z"),
     submittedAt: new Date("2026-04-16T10:05:00Z"),
     confirmedAt: null,
@@ -129,6 +129,31 @@ describe("composeWebhook", () => {
     expect(data.transactions).toEqual(txs);
     expect(data.triggerTxHash).toBeNull();
     expect(composed!.idempotencyKey).toBe(`invoice:completed:${invoice.id}:completed`);
+  });
+
+  it("maps invoice.processing → invoice:processing with idempotency key encoding (status, extra_status)", () => {
+    // pending → processing (full amount in flight, no extra). Distinct
+    // delivery from a processing(partial) event so the merchant UI can
+    // distinguish "payment seen but partial" from "payment fully landed,
+    // awaiting confirmations".
+    const fullInFlight = fixtureInvoice({ status: "processing", extraStatus: null });
+    const composedFull = composeWebhook(
+      { type: "invoice.processing", invoiceId: fullInFlight.id, invoice: fullInFlight, at: new Date("2026-04-16T10:00:30Z") }
+    );
+    expect(composedFull).not.toBeNull();
+    expect(composedFull!.payload.event).toBe("invoice:processing");
+    expect(composedFull!.idempotencyKey).toBe(`invoice:processing:${fullInFlight.id}:processing:none`);
+
+    // processing(partial) — distinct key from the full-in-flight delivery
+    // above. A partial-then-full sequence delivers TWO webhooks.
+    const partial = fixtureInvoice({ status: "processing", extraStatus: "partial" });
+    const composedPartial = composeWebhook(
+      { type: "invoice.processing", invoiceId: partial.id, invoice: partial, at: new Date("2026-04-16T10:00:31Z") }
+    );
+    expect(composedPartial!.idempotencyKey).toBe(`invoice:processing:${partial.id}:processing:partial`);
+    const data = composedPartial!.payload.data as { invoice: { status: string; extraStatus: string | null } };
+    expect(data.invoice.status).toBe("processing");
+    expect(data.invoice.extraStatus).toBe("partial");
   });
 
   it("returns null for internal events (invoice.created, tx.*, payout.planned)", () => {

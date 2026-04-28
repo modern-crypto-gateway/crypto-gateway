@@ -1250,11 +1250,15 @@ async function recomputeUsdInvoice(
   return after;
 }
 
-// Whole-invoice lifecycle events. Returns null for `pending` / `processing`
-// because per-tx events (`invoice.payment_detected` / `payment_confirmed`)
-// already carry merchant-visibility for those phases — there's no separate
-// invoice-level signal until the invoice itself completes (or terminates).
-// `invoice.created` fires from the invoice creation path, not from recompute.
+// Whole-invoice lifecycle events. Returns null for `pending` only — per-tx
+// events (`invoice.payment_detected` / `payment_confirmed`) already cover
+// the "transfer just landed" case, but they don't tell the merchant that
+// the invoice as a whole has flipped into the in-flight state. The
+// `invoice.processing` event closes that gap: one signal per distinct
+// (status, extra_status) transition, so a merchant UI can swap from
+// "waiting for payment" to "payment in flight" without subscribing to
+// every per-transfer event. `invoice.created` fires from the invoice
+// creation path, not from recompute.
 function invoiceEventFor(status: InvoiceStatus, invoice: Invoice, now: number): DomainEvent | null {
   const at = new Date(now);
   switch (status) {
@@ -1264,8 +1268,9 @@ function invoiceEventFor(status: InvoiceStatus, invoice: Invoice, now: number): 
       return { type: "invoice.expired", invoiceId: invoice.id, invoice, at };
     case "canceled":
       return { type: "invoice.canceled", invoiceId: invoice.id, invoice, at };
-    case "pending":
     case "processing":
+      return { type: "invoice.processing", invoiceId: invoice.id, invoice, at };
+    case "pending":
       return null;
   }
 }

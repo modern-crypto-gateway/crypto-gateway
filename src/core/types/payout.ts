@@ -96,11 +96,23 @@ export const PayoutSchema = z.object({
   // payouts. Nullable for back-compat with pre-migration rows.
   confirmationThreshold: z.number().int().positive().nullable(),
 
-  // Snapshot of merchant.confirmation_tiers_json at plan time. The payout-
-  // confirmation sweep evaluates the rule list for `${chainId}:${token}`
-  // against the payout's amount; on no match, falls back to the flat
-  // `confirmationThreshold`. NULL = no tiers.
-  confirmationTiersJson: z.string().nullable(),
+  // Snapshot of merchant.confirmation_tiers_json at plan time, parsed back
+  // into its object form for API responses. The payout-confirmation sweep
+  // evaluates the rule list for `${chainId}:${token}` against the payout's
+  // amount; on no match, falls back to the flat `confirmationThreshold`.
+  // NULL = no tiers.
+  confirmationTiers: z
+    .record(
+      z.string(),
+      z.array(
+        z.object({
+          amount: z.string().optional(),
+          op: z.enum(["<", "<=", ">", ">=", "=", "<>"]).optional(),
+          confirmations: z.number().int().positive()
+        })
+      )
+    )
+    .nullable(),
 
   createdAt: z.date(),
   submittedAt: z.date().nullable(),
