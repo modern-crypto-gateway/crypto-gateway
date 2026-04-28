@@ -406,23 +406,98 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   // UTXO chains don't pick a single source — coin selection happens at
   // broadcast time across every owned UTXO. There are no per-source
   // reservations (the `utxos.spent_in_payout_id` column does that job
-  // atomically with the broadcast attempt). All `planPayout` does for UTXO is:
-  //   1. Verify that confirmed-and-unspent UTXOs total >= amount + fee.
-  //   2. Insert a payouts row in `reserved` state. The executor's
-  //      `broadcastUtxoMain` picks it up, runs coinselect, signs, and
-  //      broadcasts.
+  // atomically with the broadcast attempt). What `planPayout` does for UTXO:
+  //   1. Run coinselect at the requested amount with the chosen tier's
+  //      sat/vB rate. The fee it returns reflects the actual input/output
+  //      count we'll broadcast — far more accurate than the
+  //      typical-1-input-141-vbytes shortcut quoteFeeTiers uses.
+  //   2. If coinselect can't assemble inputs (amount + fee > balance),
+  //      compute a max-sendable suggestion (`MAX_AMOUNT_EXCEEDS_NET_SPENDABLE`)
+  //      so the merchant sees "Try X or less" instead of an opaque
+  //      INSUFFICIENT — same UX as the EVM/Tron/Solana planner.
+  //   3. Insert a payouts row in `reserved` state. The executor's
+  //      `broadcastUtxoMain` re-runs coinselect against the live spendable
+  //      set (UTXOs may have moved between plan and broadcast).
   if (chainAdapter.family === "utxo") {
     const spendable = await loadSpendableUtxos(deps, parsed.chainId as ChainId);
     const totalSpendable = spendable.reduce((sum, u) => sum + BigInt(u.value), 0n);
-    const required = BigInt(amountRaw) + gasNeeded;
-    if (totalSpendable < required) {
+
+    // Recover the sat/vB rate from the chosen tier — same inversion the
+    // executor uses in `broadcastUtxoMain`, so plan-time and broadcast-time
+    // agree on the rate. Floor 1 sat/vB to stay above the relay floor.
+    const TYPICAL_VBYTES_FOR_TIER = 141;
+    const feeRate = Math.max(
+      1,
+      Math.ceil(Number(tierQuotes[targetTier].nativeAmountRaw) / TYPICAL_VBYTES_FOR_TIER)
+    );
+
+    // Run coinselect at the requested amount. If it fits, the returned `fee`
+    // is the realistic plan-time quote — that becomes feeQuotedNative.
+    const planSelection = selectCoins(
+      spendable,
+      [{ address: destination, value: Number(amountRaw) }],
+      feeRate
+    );
+
+    let feeQuotedNativeUtxo: string;
+    if (planSelection !== null) {
+      feeQuotedNativeUtxo = planSelection.fee.toString();
+    } else {
+      // Coinselect failed at the requested amount. Find the highest amount
+      // it WILL accept by simulation — starting near the theoretical
+      // ceiling (no-change vbytes formula) and stepping down until
+      // coinselect returns a valid assembly. Pure-formula approaches
+      // (subtract worst-case fee, subtract fee + dust) consistently land
+      // either above or below the actual coinselect-acceptable boundary
+      // because the library's dust check uses `inputBytes × feeRate` —
+      // a function of feeRate that no fixed constant matches across
+      // every (rate, input-count) combination.
+      const noChangeVbytes = 11 + 68 * spendable.length + 31;
+      const initialEstimate =
+        totalSpendable - BigInt(Math.ceil(noChangeVbytes * feeRate));
+      let suggestedRaw: bigint | null = null;
+      let candidate = initialEstimate;
+      // 20 iterations × ~1 %/iter ≈ 18 % max reduction. Caps the loop at a
+      // bounded cost (each iteration is one in-memory branch-and-bound
+      // call against a small UTXO set).
+      for (let i = 0; i < 20 && candidate > 0n; i++) {
+        const sel = selectCoins(
+          spendable,
+          [{ address: destination, value: Number(candidate) }],
+          feeRate
+        );
+        if (sel !== null) {
+          suggestedRaw = candidate;
+          break;
+        }
+        // Reduce by 1 % or 100 sats, whichever is larger. The 100-sat floor
+        // matters at very small balances where 1 % rounds to 0.
+        const step = candidate / 100n > 100n ? candidate / 100n : 100n;
+        candidate -= step;
+      }
+
+      if (suggestedRaw !== null && suggestedRaw < BigInt(amountRaw)) {
+        const details = await buildMaxSendDetails(deps, {
+          token: parsed.token,
+          decimals: token.decimals,
+          suggestedRaw
+        });
+        throw new PayoutError(
+          "MAX_AMOUNT_EXCEEDS_NET_SPENDABLE",
+          `Requested ${amountRaw} ${parsed.token} exceeds spendable UTXO balance after fees ` +
+            `(${feeRate} sat/vB across ${spendable.length} input${spendable.length === 1 ? "" : "s"}). ` +
+            `Try ${details.suggestedAmount} ${parsed.token} or less.`,
+          details
+        );
+      }
       throw new PayoutError(
         "INSUFFICIENT_BALANCE_ANY_SOURCE",
         `Confirmed UTXO balance ${totalSpendable.toString()} sats is below ` +
-          `requested ${amountRaw} + estimated fee ${gasNeeded.toString()} sats. ` +
+          `requested ${amountRaw} + fee at ${feeRate} sat/vB. ` +
           `Wait for pending payments to confirm or top up the gateway's UTXO addresses.`
       );
     }
+
     await deps.db.insert(payouts).values({
       id: payoutId,
       merchantId: parsed.merchantId,
@@ -436,8 +511,10 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
       amountRaw,
       quotedAmountUsd,
       quotedRate,
-      feeTier: parsed.feeTier ?? null,
-      feeQuotedNative,
+      feeTier: parsed.feeTier ?? targetTier,
+      // feeQuotedNative now reflects coinselect's realistic plan-time fee
+      // for the actual UTXO set, not the typical-1-input shortcut.
+      feeQuotedNative: feeQuotedNativeUtxo,
       batchId: parsed.batchId ?? null,
       destinationAddress: destination,
       // sourceAddress stays NULL on UTXO — there's no single source. The
@@ -841,6 +918,13 @@ export async function estimatePayoutFees(
       medium: { tier: "medium", nativeAmountRaw: raw.medium.nativeAmountRaw, usdAmount: usdFor(raw.medium.nativeAmountRaw) },
       high: { tier: "high", nativeAmountRaw: raw.high.nativeAmountRaw, usdAmount: usdFor(raw.high.nativeAmountRaw) }
     };
+    // Adapter served conservative hardcoded rates because its fee oracle
+    // was unreachable. Plan/broadcast still works; the warning lets the
+    // dashboard surface "rates aren't market-fresh" so operators can
+    // decide whether to override the tier or wait for the oracle to recover.
+    if (raw.degraded === true) {
+      warnings.push("fee_quote_degraded");
+    }
   } catch (err) {
     warnings.push("fee_quote_unavailable");
     deps.logger.warn("payout.estimate.fee_quote_failed", {
@@ -854,6 +938,22 @@ export async function estimatePayoutFees(
       medium: { tier: "medium", nativeAmountRaw: "0", usdAmount: null },
       high: { tier: "high", nativeAmountRaw: "0", usdAmount: null }
     };
+  }
+
+  // Surface "fee market is uniform" so the frontend can render a hint
+  // instead of three identical numbers that look like a bug. Triggers when
+  // low === medium === high — typical causes: empty mempool (real flat
+  // market), or upstream provider returned sparse/stale data that all
+  // three pickers happened to resolve to the same bucket. We don't try
+  // to differentiate those causes here; the warning is for "the tiers
+  // you see aren't differentiated, take one priced action instead of
+  // three". Fee-quote-failed is its own warning, pushed in the catch above.
+  if (
+    tiers.tieringSupported &&
+    tiers.low.nativeAmountRaw === tiers.medium.nativeAmountRaw &&
+    tiers.medium.nativeAmountRaw === tiers.high.nativeAmountRaw
+  ) {
+    warnings.push("fee_market_uniform");
   }
 
   // Tier we'll plan against. Defaults to medium when unspecified.
@@ -871,16 +971,111 @@ export async function estimatePayoutFees(
   //
   // UTXO chains coin-select across every owned UTXO at broadcast time;
   // there's no single "source" to surface. The merchant gets a synthetic
-  // candidate representing the total spendable UTXO balance + the same
-  // tiers/warnings shape as account-model chains.
+  // candidate representing the total spendable UTXO balance.
+  //
+  // Feasibility uses real coinselect (same call planPayout makes) so the
+  // estimate matches what plan/broadcast will actually do. When coinselect
+  // can't fit the amount + fee, throw MAX_AMOUNT_EXCEEDS_NET_SPENDABLE with
+  // a suggested max — same UX contract as the account-model chains.
   if (chainAdapter.family === "utxo") {
     const spendable = await loadSpendableUtxos(deps, parsed.chainId as ChainId);
     const totalSpendable = spendable.reduce((s, u) => s + BigInt(u.value), 0n);
-    const requiredAmount = BigInt(amountRaw);
-    const requiredNative = requiredAmount + gasNeeded;
-    if (totalSpendable < requiredNative) {
-      warnings.push("insufficient_utxo_balance");
+
+    // If fee quoting failed upstream (esplora unreachable / rate-limited),
+    // we have no actionable rate to feed coinselect. Returning a synthetic
+    // source candidate would be misleading — the merchant would see "$X
+    // ready to plan" with $0 fees, then planPayout would re-call
+    // quoteFeeTiers, hit the same upstream failure, and reject. Bail out
+    // here with `source: null` so the only signal is the warning that
+    // already explains the situation.
+    if (!tiers.tieringSupported) {
+      return {
+        amountRaw,
+        quotedAmountUsd,
+        quotedRate,
+        tiers,
+        source: null,
+        alternatives: [],
+        warnings
+      };
     }
+
+    // Recover the sat/vB rate for the chosen tier — same inversion the
+    // executor uses, so estimate / plan / broadcast all agree on the rate.
+    const TYPICAL_VBYTES_FOR_TIER = 141;
+    const feeRate = Math.max(
+      1,
+      Math.ceil(Number(tiers[targetTier].nativeAmountRaw) / TYPICAL_VBYTES_FOR_TIER)
+    );
+
+    // Run coinselect against the live UTXO set. If it succeeds, the merchant
+    // is good to plan; the tiers object already shows per-tier fee estimates
+    // built from typical-vbytes — close enough for display, and broadcast
+    // will use the same coinselect result.
+    let coinSelectFits = true;
+    if (spendable.length > 0) {
+      const planSelection = selectCoins(
+        spendable,
+        [{ address: destination, value: Number(amountRaw) }],
+        feeRate
+      );
+      coinSelectFits = planSelection !== null;
+    } else {
+      coinSelectFits = false;
+    }
+
+    if (!coinSelectFits) {
+      // Find the highest amount coinselect will actually accept by
+      // simulation. See planPayout's UTXO branch for why a pure-formula
+      // approach is unreliable: coinselect's dust check is feeRate-
+      // dependent, and any fixed constant lands either above or below
+      // the boundary depending on (rate, input-count).
+      const noChangeVbytes = 11 + 68 * spendable.length + 31;
+      const initialEstimate =
+        totalSpendable - BigInt(Math.ceil(noChangeVbytes * feeRate));
+      let suggestedRaw: bigint | null = null;
+      let candidate = initialEstimate;
+      for (let i = 0; i < 20 && candidate > 0n; i++) {
+        const sel = selectCoins(
+          spendable,
+          [{ address: destination, value: Number(candidate) }],
+          feeRate
+        );
+        if (sel !== null) {
+          suggestedRaw = candidate;
+          break;
+        }
+        const step = candidate / 100n > 100n ? candidate / 100n : 100n;
+        candidate -= step;
+      }
+
+      if (suggestedRaw !== null && suggestedRaw < BigInt(amountRaw)) {
+        const details = await buildMaxSendDetails(deps, {
+          token: parsed.token,
+          decimals: token.decimals,
+          suggestedRaw
+        });
+        warnings.push("max_amount_exceeds_net_spendable");
+        throw new PayoutError(
+          "MAX_AMOUNT_EXCEEDS_NET_SPENDABLE",
+          `Requested ${amountRaw} ${parsed.token} exceeds spendable UTXO balance after fees ` +
+            `(${feeRate} sat/vB across ${spendable.length} input${spendable.length === 1 ? "" : "s"}). ` +
+            `Try ${details.suggestedAmount} ${parsed.token} or less.`,
+          details
+        );
+      }
+      warnings.push("insufficient_utxo_balance");
+      return {
+        amountRaw,
+        quotedAmountUsd,
+        quotedRate,
+        tiers,
+        source: null,
+        alternatives: [],
+        warnings
+      };
+    }
+
     return {
       amountRaw,
       quotedAmountUsd,

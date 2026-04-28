@@ -336,21 +336,47 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
 
     async estimateGasForTransfer(_args: EstimateArgs): Promise<AmountRaw> {
       // Typical 1-input 2-output P2WPKH tx is ~141 vbytes. Fee = vsize ×
-      // medium feeRate (sat/vB). Used by the source-picker for sanity
-      // checks; the actual fee at broadcast comes from coinselect's
-      // feeRate × actual vsize.
+      // medium feeRate (sat/vB).
+      //
+      // On esplora failure, fall back to a conservative 2 sat/vB so the
+      // gateway can still plan / broadcast payouts. See `quoteFeeTiers`
+      // for the full fallback rationale.
       const TYPICAL_VBYTES = 141;
-      const fees = await esplora.getFeeEstimates().catch(() => ({}));
-      const mediumFeeRate = pickFeeTier(fees, "medium");
+      let mediumFeeRate: number;
+      try {
+        const fees = await esplora.getFeeEstimates();
+        mediumFeeRate = pickFeeTier(fees, "medium");
+      } catch {
+        mediumFeeRate = 2;
+      }
       return (BigInt(Math.ceil(TYPICAL_VBYTES * mediumFeeRate))).toString() as AmountRaw;
     },
 
     async quoteFeeTiers(_args: EstimateArgs): Promise<FeeTierQuote> {
       const TYPICAL_VBYTES = 141;
-      const fees = await esplora.getFeeEstimates().catch(() => ({}));
-      const lowRate = pickFeeTier(fees, "low");
-      const medRate = pickFeeTier(fees, "medium");
-      const highRate = pickFeeTier(fees, "high");
+      let lowRate: number;
+      let medRate: number;
+      let highRate: number;
+      let degraded = false;
+      try {
+        const fees = await esplora.getFeeEstimates();
+        lowRate = pickFeeTier(fees, "low");
+        medRate = pickFeeTier(fees, "medium");
+        highRate = pickFeeTier(fees, "high");
+      } catch {
+        // Esplora unavailable. Fall back to conservative hardcoded rates so
+        // payouts can still be planned and broadcast. 1/2/3 sat/vB is well
+        // above the relay-floor and low enough that we never overpay during
+        // real outages — operators can RBF-bump if mempool conditions push
+        // the market above 3 sat/vB while the fee oracle is down. The
+        // `degraded` flag propagates up so the estimate response can carry
+        // a `fee_quote_degraded` warning — quote is plannable but not
+        // market-fresh.
+        lowRate = 1;
+        medRate = 2;
+        highRate = 3;
+        degraded = true;
+      }
       const feeAt = (rate: number): AmountRaw =>
         BigInt(Math.ceil(TYPICAL_VBYTES * rate)).toString() as AmountRaw;
       return {
@@ -360,7 +386,8 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
         // UTXO has real tier differentiation via mempool fee-market depth,
         // unlike Tron's flat-energy model.
         tieringSupported: true,
-        nativeSymbol: chain.nativeSymbol as TokenSymbol
+        nativeSymbol: chain.nativeSymbol as TokenSymbol,
+        degraded
       };
     },
 

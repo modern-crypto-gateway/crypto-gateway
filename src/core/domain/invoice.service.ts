@@ -216,7 +216,10 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
     primaryFamily,
     ...acceptedFamilies.filter((f) => f !== primaryFamily)
   ];
-  const receiveRows: InvoiceReceiveAddress[] = [];
+  // Carries an extra `addressIndex` over InvoiceReceiveAddress — used at
+  // insert time only so the row can be re-derived back to its private key
+  // at payout sign time. Not exposed in the public Invoice shape.
+  const receiveRows: (InvoiceReceiveAddress & { addressIndex: number })[] = [];
   let primaryAddress: string | null = null;
   let primaryAddressIndex = 0;
   // Single try wraps allocation, rate snapshot, secret encryption, and batch
@@ -287,7 +290,8 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
           family,
           chainId,
           address: canonical as InvoiceReceiveAddress["address"],
-          poolAddressId
+          poolAddressId,
+          addressIndex
         });
         // Only the PRIMARY family's primary chain populates the legacy
         // denormalized columns. For UTXO-primary that's the chosen UTXO
@@ -389,6 +393,12 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
         family: rx.family,
         chainId: rx.chainId,
         address: rx.address,
+        // Per-row derivation index. Critical for multi-family invoices
+        // where the legacy `invoices.address_index` only carries the
+        // primary family's index — non-primary UTXO receive addresses
+        // would otherwise have the wrong index propagated into `utxos`
+        // at ingest time, breaking signing.
+        addressIndex: rx.addressIndex,
         poolAddressId: rx.poolAddressId,
         createdAt: now
       })

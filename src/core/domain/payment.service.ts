@@ -103,7 +103,17 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   // merchant may no longer own the address.
   const family = chainAdapter.family;
   const candidates = await deps.db
-    .select({ invoice: invoices })
+    .select({
+      invoice: invoices,
+      // Per-(family, chainId, address) addressIndex from the matched receive
+      // address row. Critical for multi-family invoices where the primary
+      // family's index on `invoices.address_index` doesn't match a UTXO
+      // non-primary receive address — using the per-row value lets the
+      // utxos ledger insert the correct derivation index, which is what
+      // broadcastUtxoMain uses to recover the private key at sign time.
+      // Pre-migration-0006 rows have NULL here; the SELECT coalesces below.
+      rxAddressIndex: invoiceReceiveAddresses.addressIndex
+    })
     .from(invoices)
     .innerJoin(invoiceReceiveAddresses, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
     .where(and(eq(invoiceReceiveAddresses.address, canonicalTo), eq(invoiceReceiveAddresses.family, family)))
@@ -117,6 +127,8 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     )
     .limit(1);
   const topCandidate: InvoiceRow | null = candidates[0] ? candidates[0].invoice : null;
+  const matchedAddressIndex: number | null =
+    candidates[0]?.rxAddressIndex ?? null;
 
   // Cooldown-aware attribution: if the top candidate is a terminal invoice
   // (expired / canceled), we only credit it when the pool row for this
@@ -293,12 +305,19 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   // so detection layer doesn't need to carry that field through.
   if (family === "utxo" && invoiceRow !== null) {
     try {
+      // Prefer the per-row addressIndex from the matched receive-address row
+      // (post-migration-0006). Falls back to the legacy denormalized
+      // `invoices.address_index` for pre-migration rows; that value is only
+      // correct for single-family invoices, which is the only case where
+      // pre-migration rows could have produced a working UTXO payment in
+      // the first place.
+      const addressIndex = matchedAddressIndex ?? invoiceRow.addressIndex;
       await insertUtxoRow(deps, {
         chainId: transfer.chainId,
         transactionId: txId,
         txHash: transfer.txHash,
         address: canonicalTo,
-        addressIndex: invoiceRow.addressIndex,
+        addressIndex,
         vout: transfer.logIndex ?? 0,
         valueSats: transfer.amountRaw,
         now

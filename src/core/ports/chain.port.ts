@@ -26,6 +26,13 @@ export interface FeeTierQuote {
   // chainId) — returned alongside so the frontend doesn't need a second call
   // just to label the tier amounts.
   readonly nativeSymbol: TokenSymbol;
+  // Optional: true when the adapter served conservative hardcoded rates
+  // because its upstream fee oracle was unreachable. Tier numbers are
+  // still safe to plan/broadcast against — operators can RBF-bump later
+  // if real mempool conditions push the market above the fallback. Used
+  // by the payout estimate to surface a `fee_quote_degraded` warning so
+  // the merchant/dashboard can flag "rates aren't market-fresh".
+  readonly degraded?: boolean;
 }
 
 // The one contract every chain family implements. Adding a new family

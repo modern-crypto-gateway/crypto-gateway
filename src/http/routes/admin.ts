@@ -11,6 +11,7 @@ import { isTronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../adapters/chains
 import type { TronResourceKind, TronRpcBackend } from "../../adapters/chains/tron/tron-rpc.js";
 import type { UnsignedTx } from "../../core/types/unsigned-tx.js";
 import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
+import { repairUtxoAddressIndex } from "../../core/domain/utxo-address-index-repair.js";
 import {
   ingestDetectedTransfer,
   recomputeInvoiceFromTransactions
@@ -1161,6 +1162,28 @@ const hasFeeWallet = poolFamilies.has(
   app.get("/pool/stats", async (c) => {
     const stats = await getPoolStats(deps);
     return c.json({ stats }, 200);
+  });
+
+  // One-shot repair for the multi-family UTXO `address_index` bug.
+  //
+  // For each registered UTXO chain, derives every counter slot from
+  // MASTER_SEED, builds an `address → addressIndex` map, then corrects any
+  // `invoice_receive_addresses` and `utxos` rows whose `address_index`
+  // doesn't match. Idempotent — re-running after success is a no-op.
+  //
+  // Run this ONCE after deploying migration 0006 (or the equivalent
+  // collapsed baseline) on a database that had pre-fix multi-family UTXO
+  // payments. The response reports per-chain how many rows were fixed +
+  // any unmatched addresses (typically a sign of a different MASTER_SEED
+  // than at minting time, which is unrecoverable here — the operator
+  // would need the original seed).
+  app.post("/utxo/repair-address-index", async (c) => {
+    try {
+      const result = await repairUtxoAddressIndex(deps);
+      return c.json(result, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
   });
 
   // HD-derivation audit: for every address_pool row, derive the expected

@@ -243,7 +243,50 @@ export function esploraClient(config: EsploraClientConfig): EsploraClient {
     },
 
     async getFeeEstimates(): Promise<Readonly<Record<string, number>>> {
-      return withFailover((b) => getJson<Record<string, number>>(b, "/fee-estimates"));
+      // Two compatible endpoints across mempool.space / litecoinspace /
+      // blockstream.info:
+      //   1. `/v1/fees/recommended` — mempool.space's modern API, named-
+      //      priority shape. Served by mempool.space + litecoinspace.
+      //   2. `/fee-estimates` — the older Esplora-native endpoint, keyed by
+      //      block target. Served by all three (blockstream.info only
+      //      supports this one).
+      // Try the named-priority endpoint first (smaller response, more
+      // reliable on mempool.space's CDN), then fall back to the Esplora-
+      // native endpoint within the same backend before withFailover moves
+      // on to the next backend.
+      return withFailover(async (b) => {
+        try {
+          const recommended = await getJson<{
+            fastestFee: number;
+            halfHourFee: number;
+            hourFee: number;
+            economyFee: number;
+            minimumFee: number;
+          }>(b, "/v1/fees/recommended");
+          // Convert to Esplora-compat shape so pickFeeTier (which keys on
+          // confirmation-target strings) keeps working unchanged.
+          // fastestFee → next-block (1), halfHourFee → 3-block,
+          // hourFee → 6-block, economyFee → 144-block, minimumFee →
+          // 1008-block. Floor at 1 sat/vB so a stale 0 doesn't break
+          // downstream Math.ceil(141 × rate) producing 0 sats.
+          const floor1 = (n: number): number => (typeof n === "number" && n > 0 ? n : 1);
+          return {
+            "1": floor1(recommended.fastestFee),
+            "3": floor1(recommended.halfHourFee),
+            "6": floor1(recommended.hourFee),
+            "144": floor1(recommended.economyFee),
+            "1008": floor1(recommended.minimumFee)
+          };
+        } catch (err) {
+          if (err instanceof EsploraNotFoundError) {
+            return getJson<Record<string, number>>(b, "/fee-estimates");
+          }
+          // For non-404 errors (5xx, network), the modern endpoint is
+          // probably down on this backend — try the Esplora-native one
+          // before letting withFailover move backends.
+          return getJson<Record<string, number>>(b, "/fee-estimates");
+        }
+      });
     },
 
     async getAddressBalanceSats(address: string): Promise<bigint> {

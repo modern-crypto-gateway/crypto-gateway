@@ -861,6 +861,16 @@ export const invoiceReceiveAddresses = sqliteTable(
     // column distinguishing them.
     chainId: integer("chain_id").notNull(),
     address: text("address").notNull(),
+    // BIP44 derivation index THIS specific receive address corresponds to.
+    // For multi-family invoices (universal / USD-pegged with several
+    // accepted families) the legacy `invoices.address_index` denormalized
+    // column carries only the PRIMARY family's index — UTXO non-primary
+    // receive addresses derive from the per-chain UTXO counter and have a
+    // different index. Storing it per-row lets detection ingest write the
+    // correct value into `utxos.address_index`, which payout signing uses
+    // to recover the private key. Nullable for legacy rows written before
+    // migration 0006; new rows always populate it.
+    addressIndex: integer("address_index"),
     // Pool-allocated address: NOT NULL on EVM / Tron / Solana invoices (every
     // receive address comes from `address_pool`). NULL on UTXO invoices —
     // those use fresh-per-invoice derivation via `address_index_counters` and

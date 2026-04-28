@@ -117,6 +117,52 @@ describe("UTXO invoice creation — per-chain adapter routing", () => {
     expect(Number(body.invoice.rates["LTC"])).toBeGreaterThan(0);
   });
 
+  it("invoice_receive_addresses.address_index is populated per-row so multi-family UTXO non-primary signing recovers the right key", async () => {
+    // Pre-fix: detection ingest read `invoices.address_index` (the legacy
+    // denormalized primary-family-only column) and stamped it on the utxos
+    // row. For a universal/USD-pegged invoice with EVM primary + UTXO non-
+    // primary, the BTC receive address has a UTXO-counter index (e.g. 0)
+    // but `invoices.address_index` carries the EVM pool index (e.g. 17 or
+    // similar). Signing then derived at index 17 over BIP44 coin_type=0
+    // and produced an address whose hash160 didn't match the input's
+    // scriptPubkey — the broadcast aborted with "signing-key/scriptPubkey
+    // mismatch".
+    //
+    // Fix: persist addressIndex on `invoice_receive_addresses` and read
+    // from there at ingest. Single-family invoices keep working unchanged
+    // (per-row value matches the legacy column anyway).
+    booted = await bootTestApp({
+      chains: [bitcoinChainAdapter(), litecoinChainAdapter()]
+    });
+    // Mint two single-family UTXO invoices to bump each chain's counter.
+    await createInvoiceViaApi(booted, { chainId: 800, token: "BTC", amountRaw: "1" });
+    await createInvoiceViaApi(booted, { chainId: 800, token: "BTC", amountRaw: "1" });
+    await createInvoiceViaApi(booted, { chainId: 801, token: "LTC", amountRaw: "1" });
+    // Now create one more on each — these should be at indices 2 and 1
+    // respectively, and the per-row `address_index` must match.
+    const btc = await createInvoiceViaApi(booted, { chainId: 800, token: "BTC", amountRaw: "1" });
+    const ltc = await createInvoiceViaApi(booted, { chainId: 801, token: "LTC", amountRaw: "1" });
+    expect(btc["addressIndex"]).toBe(2);
+    expect(ltc["addressIndex"]).toBe(1);
+
+    // Read the rx rows directly and assert per-row addressIndex matches the
+    // invoice's primary-family value (single-family case — same row).
+    const { eq } = await import("drizzle-orm");
+    const { invoiceReceiveAddresses } = await import("../../db/schema.js");
+    const btcRx = await booted.deps.db
+      .select()
+      .from(invoiceReceiveAddresses)
+      .where(eq(invoiceReceiveAddresses.invoiceId, btc.id));
+    const ltcRx = await booted.deps.db
+      .select()
+      .from(invoiceReceiveAddresses)
+      .where(eq(invoiceReceiveAddresses.invoiceId, ltc.id));
+    expect(btcRx).toHaveLength(1);
+    expect(btcRx[0]!.addressIndex).toBe(2);
+    expect(ltcRx).toHaveLength(1);
+    expect(ltcRx[0]!.addressIndex).toBe(1);
+  });
+
   it("address-index counters increment INDEPENDENTLY per chain", async () => {
     // BTC invoice → index N for chain 800; LTC invoice → index 0 for chain
     // 801 (separate counter row). Pre-fix the LTC invoice would have used
