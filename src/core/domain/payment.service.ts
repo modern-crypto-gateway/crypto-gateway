@@ -1090,24 +1090,29 @@ async function recomputeUsdInvoice(
 ): Promise<InvoiceStatus> {
   const before = invoiceRow.status as InvoiceStatus;
 
-  // Only CONFIRMED contributing transactions count toward paid_usd — we
-  // can't promise the merchant money that might reorg away. `detected`
-  // transactions show up in the event stream but don't satisfy the invoice
-  // until they cross the confirmation threshold.
+  // Pull both `detected` and `confirmed` contributing transactions. Only
+  // confirmed amounts roll into `paid_usd` — we can't promise the merchant
+  // money that might reorg away — but a detected payment IS enough to flip
+  // the invoice from `pending` → `processing` so the merchant's UI shows
+  // "payment in flight". Re-org demotes ('orphaned') drop out naturally.
   const contributing = await deps.db
-    .select({ amountUsd: transactions.amountUsd })
+    .select({ amountUsd: transactions.amountUsd, status: transactions.status })
     .from(transactions)
     .where(
       and(
         eq(transactions.invoiceId, invoiceRow.id),
-        eq(transactions.status, "confirmed"),
+        inArray(transactions.status, ["detected", "confirmed"]),
         isNotNull(transactions.amountUsd)
       )
     );
 
-  let paidUsd = "0";
+  let paidUsd = "0";    // confirmed only — durable
+  let inFlightUsd = "0"; // detected + confirmed — including unconfirmed payments
   for (const row of contributing) {
-    paidUsd = addUsd(paidUsd, row.amountUsd!);
+    inFlightUsd = addUsd(inFlightUsd, row.amountUsd!);
+    if (row.status === "confirmed") {
+      paidUsd = addUsd(paidUsd, row.amountUsd!);
+    }
   }
 
   const amountUsd = invoiceRow.amountUsd!;
@@ -1120,12 +1125,14 @@ async function recomputeUsdInvoice(
   const confirmThreshold = applyBps(amountUsd, invoiceRow.paymentToleranceUnderBps, "down");
   const overpaidThreshold = applyBps(amountUsd, invoiceRow.paymentToleranceOverBps, "up");
 
-  // Map (paidUsd vs thresholds) → (status, extraStatus). Paying ≥ confirm
-  // threshold completes the invoice; going past the over threshold flips
-  // extra_status to 'overpaid' (lifecycle status stays `completed` — overpaid
-  // is a fidelity signal, not a separate stage). overpaidUsd is the *raw*
-  // delta (paid − amount) so merchant accounting still sees the true
-  // overshoot regardless of where the threshold sits.
+  // Status priority (highest first): completed/overpaid > completed > processing > pending.
+  // - completed (overpaid): confirmed paid_usd > overpaid threshold.
+  // - completed: confirmed paid_usd ≥ confirm threshold.
+  // - processing(partial): we have SOMETHING in flight (confirmed or
+  //   detected) but it doesn't reach the confirm threshold yet.
+  // - processing (no extra): in-flight total reaches the threshold but
+  //   not all of it is confirmed yet — merchant is awaiting block depth.
+  // - pending: nothing detected at all.
   let after: InvoiceStatus;
   let afterExtra: InvoiceExtraStatus | null = null;
   let overpaidUsd = "0";
@@ -1135,12 +1142,17 @@ async function recomputeUsdInvoice(
     overpaidUsd = subUsd(paidUsd, amountUsd);
   } else if (compareUsd(paidUsd, confirmThreshold) >= 0 && compareUsd(paidUsd, "0") > 0) {
     after = "completed";
-  } else if (compareUsd(paidUsd, "0") > 0) {
+  } else if (compareUsd(inFlightUsd, confirmThreshold) >= 0 && compareUsd(inFlightUsd, "0") > 0) {
+    // Full amount in flight, just waiting on confirmations. Status flips
+    // to processing without `partial` — the amount is fine.
+    after = "processing";
+  } else if (compareUsd(inFlightUsd, "0") > 0) {
+    // Some payment seen (detected or confirmed) but below the confirm
+    // threshold. Surface as `processing(partial)` so the merchant UI shows
+    // progress instead of staying parked on `pending`.
     after = "processing";
     afterExtra = "partial";
   } else {
-    // Nothing confirmed yet. `detected` (unconfirmed) payments exist as
-    // transactions but don't move the invoice off `pending`.
     after = "pending";
   }
 

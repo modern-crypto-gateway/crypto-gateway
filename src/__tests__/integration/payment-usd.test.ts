@@ -214,13 +214,16 @@ describe("USD-path ingest — single payment", () => {
     expect(row?.confirmed_at).not.toBeNull();
   });
 
-  it("still-detected (below threshold) transfers DON'T move paid_usd — only confirmed ones do", async () => {
+  it("detected transfers flip status to processing but keep paid_usd at 0 (only confirmed counts toward paid_usd)", async () => {
     const invoice = await createUsdInvoice(booted, apiKey, {
       amountUsd: "30.00",
       acceptedFamilies: ["evm"]
     });
 
-    // confirmations=0 → tx lands in 'detected' state. paid_usd stays at 0.
+    // confirmations=0 → tx lands in 'detected' state. The invoice flips
+    // to `processing` so the merchant UI shows "payment in flight", but
+    // `paid_usd` stays at 0 because only confirmed contributions count
+    // toward the durable total — a reorg could still wipe the detected tx.
     const result = await ingestDetectedTransfer(booted.deps, {
       chainId: 1,
       txHash: "0x" + "d1".repeat(32),
@@ -233,16 +236,59 @@ describe("USD-path ingest — single payment", () => {
       confirmations: 0,
       seenAt: new Date()
     });
-    // Invoice stays on 'pending' since nothing is confirmed yet (USD path
-    // only counts confirmed txs toward paid_usd; unconfirmed contributes 0).
-    expect(result.invoiceStatusAfter).toBe("pending");
+    // Full amount in flight → status=processing with no extra (no `partial`
+    // since the in-flight total is at-or-above the confirm threshold).
+    expect(result.invoiceStatusAfter).toBe("processing");
 
     const [row] = await booted.deps.db
-      .select({ status: invoices.status, paid_usd: invoices.paidUsd })
+      .select({
+        status: invoices.status,
+        extra: invoices.extraStatus,
+        paid_usd: invoices.paidUsd
+      })
       .from(invoices)
       .where(eq(invoices.id, invoice.id))
       .limit(1);
-    expect(row?.status).toBe("pending");
+    expect(row?.status).toBe("processing");
+    expect(row?.extra).toBeNull();
+    // paid_usd stays at zero — durable total only counts confirmed.
+    expect(row?.paid_usd).toBe("0");
+  });
+
+  it("partial detected transfers (below threshold) flip status to processing(partial)", async () => {
+    const invoice = await createUsdInvoice(booted, apiKey, {
+      amountUsd: "30.00",
+      acceptedFamilies: ["evm"]
+    });
+
+    // 10 USDC detected — well below the 30 USD threshold.
+    const result = await ingestDetectedTransfer(booted.deps, {
+      chainId: 1,
+      txHash: "0x" + "d2".repeat(32),
+      logIndex: 0,
+      fromAddress: "0x1111111111111111111111111111111111111111",
+      toAddress: invoice.receiveAddress,
+      token: "USDC",
+      amountRaw: "10000000" as AmountRaw,
+      blockNumber: 100,
+      confirmations: 0,
+      seenAt: new Date()
+    });
+    expect(result.invoiceStatusAfter).toBe("processing");
+
+    const [row] = await booted.deps.db
+      .select({
+        status: invoices.status,
+        extra: invoices.extraStatus,
+        paid_usd: invoices.paidUsd
+      })
+      .from(invoices)
+      .where(eq(invoices.id, invoice.id))
+      .limit(1);
+    expect(row?.status).toBe("processing");
+    // Below threshold → extra=partial so the merchant UI shows "we see some
+    // payment but not enough yet".
+    expect(row?.extra).toBe("partial");
     expect(row?.paid_usd).toBe("0");
   });
 });
