@@ -583,7 +583,12 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   // happens after the transaction rolls back or commits.
   type PlanResult =
     | { kind: "committed" }
-    | { kind: "no_candidates" | "insufficient" | "no_sponsor" }
+    | { kind: "no_candidates" | "no_sponsor" }
+    | {
+        kind: "insufficient";
+        aggregateTokenBalanceRaw: string;
+        largestSingleHoldingRaw: string;
+      }
     | { kind: "max_send_exceeded"; suggestedAmountRaw: string };
 
   const result = await runWithBusyRetry(deps, () => deps.db.transaction(
@@ -646,9 +651,16 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         // result kind to a PayoutError after the oracle (USD enrichment)
         // returns — keeps the writer lock short.
         const err = new Error("__plan_rejected__") as Error & { planResult?: PlanResult };
-        err.planResult = selection.kind === "max_send_exceeded"
-          ? { kind: "max_send_exceeded", suggestedAmountRaw: selection.suggestedAmountRaw }
-          : { kind: selection.kind };
+        err.planResult =
+          selection.kind === "max_send_exceeded"
+            ? { kind: "max_send_exceeded", suggestedAmountRaw: selection.suggestedAmountRaw }
+            : selection.kind === "insufficient"
+              ? {
+                  kind: "insufficient",
+                  aggregateTokenBalanceRaw: selection.aggregateTokenBalance.toString(),
+                  largestSingleHoldingRaw: selection.largestSingleHolding.toString()
+                }
+              : { kind: selection.kind };
         throw err;
       }
 
@@ -686,9 +698,29 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
     );
   }
   if (result.kind === "insufficient") {
+    // Distinguish the two flavors of insufficient. When the aggregate IS
+    // enough but it's split across pool addresses, callers reading the
+    // error often have the aggregate showing in their dashboard and would
+    // otherwise reasonably believe the payout system is broken. Spelling
+    // out the gap (largest single holding < requested) tells them
+    // exactly what to do: lower the amount or consolidate.
+    const requestedRaw = BigInt(amountRaw);
+    const aggregateRaw = BigInt(result.aggregateTokenBalanceRaw);
+    const largestRaw = BigInt(result.largestSingleHoldingRaw);
+    if (aggregateRaw >= requestedRaw && largestRaw < requestedRaw) {
+      throw new PayoutError(
+        "INSUFFICIENT_BALANCE_ANY_SOURCE",
+        `Aggregate ${parsed.token} balance on chain ${parsed.chainId} is sufficient ` +
+          `(${aggregateRaw} >= ${requestedRaw}) but split across pool addresses; ` +
+          `the largest single holding is ${largestRaw}. Account-model chains pick a ` +
+          `single source per payout — lower the amount to ${largestRaw} or less, or ` +
+          `consolidate token balances into one address first.`
+      );
+    }
     throw new PayoutError(
       "INSUFFICIENT_BALANCE_ANY_SOURCE",
-      `No HD address on chain ${parsed.chainId} has enough ${parsed.token} balance to cover the payout.`
+      `No HD address on chain ${parsed.chainId} has enough ${parsed.token} balance to cover the payout ` +
+        `(requested ${requestedRaw}, aggregate ${aggregateRaw}, largest single holding ${largestRaw}).`
     );
   }
   if (result.kind === "no_sponsor") {
@@ -1326,6 +1358,20 @@ export async function estimatePayoutFees(
   }
 
   warnings.push("no_source_address_has_sufficient_token_balance");
+  // When the aggregate token balance across the pool IS enough to cover the
+  // payout but no single address holds enough, surface that as a distinct
+  // warning. Without this, operators see "insufficient" while their balance
+  // dashboard shows the requested amount and reasonably wonder which is
+  // wrong — the planner picks one sender per payout (account-model chains
+  // don't coin-select like UTXO), so fragmented holdings can't be sent in a
+  // single tx. Tells the operator "you have the funds, you just need to
+  // consolidate them" rather than "you don't have the funds."
+  if (!isNativePayout) {
+    const aggregateTokenBalance = enriched.reduce((sum, e) => sum + e.tokenBalance, 0n);
+    if (aggregateTokenBalance >= requiredAmount) {
+      warnings.push("single_source_insufficient_consolidate_required");
+    }
+  }
   return {
     amountRaw,
     quotedAmountUsd,
@@ -2796,7 +2842,16 @@ type SourceSelection =
   | { kind: "direct"; source: PickedSource }
   | { kind: "with_sponsor"; source: PickedSource; sponsor: PickedSource; topUpAmountRaw: string }
   | { kind: "no_sponsor"; source: PickedSource }
-  | { kind: "insufficient" }
+  // `aggregateTokenBalance` and `largestSingleHolding` are returned alongside
+  // `insufficient` so the wrapping planPayout error can distinguish "you
+  // don't have the funds" from "you have the funds but they're fragmented
+  // across pool addresses". Both are denominated in the token's smallest
+  // unit (decimal-string at the API surface).
+  | {
+      kind: "insufficient";
+      aggregateTokenBalance: bigint;
+      largestSingleHolding: bigint;
+    }
   | { kind: "no_candidates" }
   | { kind: "max_send_exceeded"; suggestedAmountRaw: string };
 
@@ -2949,6 +3004,17 @@ async function selectSource(
     return { kind: "direct", source: { address: cand.address, derivationIndex: cand.derivationIndex } };
   }
 
+  // Aggregate / largest-single facts. Used both by the native-payout
+  // max-send path and the "insufficient" return so wrapping callers can
+  // distinguish "no funds" from "funds fragmented across pool addresses"
+  // without re-querying. Computed once here; cheap (sum/max over the
+  // already-loaded enriched list).
+  const aggregateTokenBalance = enriched.reduce((sum, e) => sum + e.tokenBalance, 0n);
+  const largestSingleHolding = enriched.reduce(
+    (m, e) => (e.tokenBalance > m ? e.tokenBalance : m),
+    0n
+  );
+
   // Native payouts can't be topped up (gas IS the asset). Surface
   // MAX_AMOUNT_EXCEEDS_NET_SPENDABLE when the richest candidate is close
   // — gives the merchant a concrete suggested amount instead of a vague
@@ -2963,12 +3029,12 @@ async function selectSource(
         suggestedAmountRaw: (richest.nativeBalance - gasNeeded - minNativeReserve).toString()
       };
     }
-    return { kind: "insufficient" };
+    return { kind: "insufficient", aggregateTokenBalance, largestSingleHolding };
   }
 
   // Tier B: token holder + sponsor.
   const tokenHolder = enriched.find((e) => e.tokenBalance >= requiredAmount);
-  if (!tokenHolder) return { kind: "insufficient" };
+  if (!tokenHolder) return { kind: "insufficient", aggregateTokenBalance, largestSingleHolding };
 
   // Token-holder needs native to cover gas AND the chain's rent-exempt
   // reserve (Solana: 890 880 lamports; zero on EVM/Tron). Sponsor must cover
@@ -2979,7 +3045,7 @@ async function selectSource(
     // Token holder actually has enough native — tier A's filter must have
     // found it. We're here only on race or non-determinism; give up this
     // tick.
-    return { kind: "insufficient" };
+    return { kind: "insufficient", aggregateTokenBalance, largestSingleHolding };
   }
   const cushion = (gasNeeded * 20n) / 100n;
   const topUpAmount = gap + cushion;
