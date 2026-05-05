@@ -1400,6 +1400,196 @@ paths:
                         available: { type: integer }
                         allocated: { type: integer }
 
+  /admin/pool/consolidate:
+    post:
+      tags: [admin]
+      summary: Defragment a token balance across pool addresses into one target
+      description: |
+        Account-model chains (EVM, Tron, Solana) pick a single sender per
+        payout — they don't coin-select like UTXO. So when a token's balance
+        is split across many pool addresses, no single address may hold
+        enough to fund a large payout even though the AGGREGATE balance
+        does. This endpoint plans one internal sweep tx per source-with-
+        balance, sending each address's full balance to a designated
+        target. After the legs confirm, a regular `POST /payouts` from
+        that target succeeds.
+
+        Each leg is a `consolidation_sweep` payout under the sentinel
+        system merchant; legs share a `batchId` (the returned
+        `consolidationId`) and ride the regular executor cron through
+        top-up → broadcast → confirmation. They're filtered out of
+        merchant-facing list endpoints — operators poll
+        `GET /admin/pool/consolidations/{id}` to track completion.
+
+        Response status is **202 Accepted**: legs are reserved/topping-up
+        but full confirmation happens asynchronously. Each leg may need a
+        gas sponsor (a pool address with native, or the registered fee
+        wallet on Tron). Sources whose leg couldn't be planned (no
+        sponsor available) appear in `skipped[]` with a reason — the
+        operation succeeds for the legs that COULD be planned. Operator
+        can re-run after funding sponsors to pick up the rest.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chainId, token, targetAddress]
+              properties:
+                chainId:
+                  type: integer
+                  description: Chain whose pool addresses hold fragmented `token` balances.
+                token:
+                  type: string
+                  description: |
+                    Token symbol (uppercase, must be registered on `chainId`).
+                    Use the chain's native symbol to consolidate native — note
+                    that native consolidation still requires each source to
+                    retain enough for its own gas + minimum reserve.
+                targetAddress:
+                  type: string
+                  description: |
+                    Pool address that receives every consolidated balance.
+                    MUST exist in `address_pool` for the chain's family;
+                    consolidating to a non-pool address is rejected (the
+                    target must be addressable by the gateway's signer for
+                    later payouts).
+      responses:
+        "202":
+          description: |
+            Consolidation planned. Legs are inserted in `reserved` (or
+            `topping-up` when a sponsor is needed); the executor advances
+            them asynchronously.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [consolidationId, chainId, token, targetAddress, legs, skipped]
+                properties:
+                  consolidationId:
+                    type: string
+                    format: uuid
+                    description: |
+                      Group identifier shared across legs (stored as
+                      `batchId` on each row). Use this to poll group status.
+                  chainId: { type: integer }
+                  token: { type: string }
+                  targetAddress: { type: string }
+                  legs:
+                    type: array
+                    description: Sources that were successfully planned + reserved.
+                    items:
+                      type: object
+                      required: [payoutId, sourceAddress, amountRaw]
+                      properties:
+                        payoutId: { type: string, format: uuid }
+                        sourceAddress: { type: string }
+                        amountRaw:
+                          type: string
+                          description: Full balance being swept from this source (smallest unit).
+                  skipped:
+                    type: array
+                    description: |
+                      Sources with a non-zero token balance whose leg couldn't
+                      be planned — most often `NO_GAS_SPONSOR_AVAILABLE`
+                      because the registered fee wallet ran dry or no pool
+                      address has enough native to top up this source. Fund a
+                      sponsor and re-run to pick up the remainder.
+                    items:
+                      type: object
+                      required: [sourceAddress, amountRaw, reason]
+                      properties:
+                        sourceAddress: { type: string }
+                        amountRaw: { type: string }
+                        reason:
+                          type: string
+                          description: |
+                            Underlying error code + message from the per-leg
+                            planner (e.g. `NO_GAS_SPONSOR_AVAILABLE: ...`).
+        "400":
+          description: |
+            Validation failure or operator-actionable rejection. Codes:
+              - `BAD_JSON` — malformed body
+              - `INVALID_CHAIN` — no chain adapter wired for `chainId`
+              - `INVALID_TOKEN` — `token` not registered on `chainId`
+              - `TARGET_NOT_IN_POOL` — `targetAddress` isn't in the family pool
+              - `NO_SOURCES_WITH_BALANCE` — no pool address (other than the
+                target) holds the requested token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/pool/consolidations/{id}:
+    get:
+      tags: [admin]
+      summary: Status of a previously-planned consolidation
+      description: |
+        Returns per-leg status plus a summary roll-up. Operators poll until
+        `summary.pendingOrInFlight === 0` before kicking off the actual
+        merchant payout from the target address.
+
+        The same data is queryable via `GET /admin/payouts?batchId=<id>`
+        (also filtered to internal kinds by the admin endpoint), but this
+        view is shaped specifically for the consolidation flow.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: The `consolidationId` returned from POST /admin/pool/consolidate.
+      responses:
+        "200":
+          description: Per-leg status + roll-up summary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [consolidationId, legs, summary]
+                properties:
+                  consolidationId: { type: string, format: uuid }
+                  legs:
+                    type: array
+                    items:
+                      type: object
+                      required: [payoutId, sourceAddress, amountRaw, status]
+                      properties:
+                        payoutId: { type: string, format: uuid }
+                        sourceAddress: { type: string }
+                        amountRaw: { type: string }
+                        status:
+                          type: string
+                          enum: [planned, reserved, topping-up, submitted, confirmed, failed, canceled]
+                        txHash:
+                          type: [string, "null"]
+                        topUpTxHash:
+                          type: [string, "null"]
+                        lastError:
+                          type: [string, "null"]
+                  summary:
+                    type: object
+                    required: [total, pendingOrInFlight, confirmed, failed, canceled]
+                    properties:
+                      total: { type: integer }
+                      pendingOrInFlight:
+                        type: integer
+                        description: |
+                          Legs still in any pre-terminal state:
+                          planned/reserved/topping-up/submitted. Poll until
+                          this hits 0 (and `failed === 0`) before the next
+                          merchant payout.
+                      confirmed: { type: integer }
+                      failed: { type: integer }
+                      canceled: { type: integer }
+        "404":
+          description: No consolidation exists with this id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /admin/webhook-deliveries:
     get:
       tags: [admin]
@@ -1952,7 +2142,21 @@ paths:
                           enum: [evm, tron, solana, utxo]
                         capability:
                           type: string
-                          enum: [none, delegate, co-sign]
+                          enum: [none, top-up, delegate, co-sign]
+                          description: |
+                            How the fee wallet covers gas for payouts on this family:
+                              - `none`: fee-wallet not used by the planner
+                                (EVM today, pending account abstraction).
+                              - `top-up`: fee wallet holds native and is offered
+                                as a top-up sponsor candidate alongside pool
+                                addresses (Tron today). The source still burns
+                                native for gas, but funded by a top-up tx from
+                                the fee wallet rather than its own balance.
+                              - `delegate`: fee wallet pre-delegates resources
+                                out-of-band so payouts spend zero native (Tron
+                                future, pending Phase 4 planner integration).
+                              - `co-sign`: fee wallet signs every payout as the
+                                tx fee payer (Solana).
                         configured:
                           oneOf:
                             - type: "null"
@@ -3095,7 +3299,15 @@ components:
           description: |
             Non-fatal operator-facing notices. Known codes:
               - `no_source_address_has_sufficient_token_balance` — `source: null`
-              - `no_gas_sponsor_available` — `topUp.sponsor: null`
+                (no single pool address holds enough of the requested token)
+              - `single_source_insufficient_consolidate_required` — emitted
+                ALONGSIDE the previous warning when the AGGREGATE token balance
+                across the pool IS sufficient but it's split across multiple
+                addresses. Account-model chains pick one sender per payout, so
+                fragmented holdings can't be sent in a single tx. Run
+                `POST /admin/pool/consolidate` to defragment, then retry.
+              - `no_gas_sponsor_available` — `topUp.sponsor: null` (token holder
+                identified but no funded sponsor exists for the top-up)
               - `fee_quote_unavailable` — chain RPC failed during tier quoting
               - `max_amount_exceeds_net_spendable` — companion to the 400 error
           items: { type: string }
@@ -3270,12 +3482,30 @@ components:
         merchantId: { type: string, format: uuid }
         kind:
           type: string
-          enum: [standard, gas_top_up]
+          enum: [standard, gas_top_up, gas_burn, consolidation_sweep]
           description: |
-            `standard` = merchant-facing payout. `gas_top_up` = internal
-            sibling row inserted when the source needed JIT gas top-up;
-            references the parent via `parentPayoutId`. Merchant-facing
-            list endpoints filter to `standard` by default.
+            `standard` = merchant-facing payout.
+
+            `gas_top_up` = internal sibling row inserted when the source
+            needed JIT gas top-up; references the parent via
+            `parentPayoutId`.
+
+            `gas_burn` = synthetic debit row recording the native fee a
+            failed-but-broadcast tx burned on chain (so `computeSpendable`
+            stays in sync with the chain's actual debit). Carries
+            `parentPayoutId` pointing at the failed payout, status =
+            `confirmed`, and amountRaw = the burned native units.
+
+            `consolidation_sweep` = admin-triggered internal token
+            transfer between two HD pool addresses, used to defragment a
+            token balance into one address before a large merchant
+            payout. Created by `POST /admin/pool/consolidate`; legs share
+            a `batchId` (the consolidationId) and reference the sentinel
+            system merchant via `merchantId`.
+
+            All three internal kinds (gas_top_up, gas_burn,
+            consolidation_sweep) are filtered out of merchant-facing list
+            endpoints; `GET /payouts` returns only `standard` rows.
         parentPayoutId:
           type: [string, "null"]
           format: uuid

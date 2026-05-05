@@ -322,6 +322,54 @@
           }
         },
         {
+          "name": "3d. Consolidate token balance into one pool address",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/pool/consolidate",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "pool", "consolidate"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 137,\n  \"token\": \"USDT\",\n  \"targetAddress\": \"0xc965c39c58c06df2241f6cff7852139269dda1f1\"\n}"
+            },
+            "description": "Defragment a token balance scattered across pool addresses into a single target. Each leg becomes a `consolidation_sweep` payout under the sentinel system merchant; legs share a `batchId` (the returned `consolidationId`) and ride the regular executor cron.\n\nUse this when a merchant payout fails with `INSUFFICIENT_BALANCE_ANY_SOURCE` AND the warning `single_source_insufficient_consolidate_required` was emitted in the prior `/payouts/estimate` — i.e. the AGGREGATE token balance is enough but it's split across many addresses. Account-model chains pick one sender per payout, so consolidation has to happen on chain via N internal sweeps.\n\nReturns 202 with `legs[]` (planned successfully) and `skipped[]` (couldn't be planned, usually NO_GAS_SPONSOR_AVAILABLE — fund the sponsor pool and re-run). Each leg needs gas: on EVM that's a pool address with native; on Tron the registered fee wallet acts as TRX top-up sponsor automatically.\n\nAfter all legs reach `confirmed` (poll `/admin/pool/consolidations/{id}`), the target holds the full aggregate and a normal `POST /payouts` succeeds in one tx.\n\nResponse codes:\n- 202 — consolidation planned (check `skipped[]` for any sources that couldn't be funded)\n- 400 INVALID_CHAIN, INVALID_TOKEN, TARGET_NOT_IN_POOL, NO_SOURCES_WITH_BALANCE"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns consolidationId', () => pm.expect(body.consolidationId).to.be.a('string'));",
+                  "pm.test('legs is an array', () => pm.expect(body.legs).to.be.an('array'));",
+                  "if (body.consolidationId) pm.collectionVariables.set('lastConsolidationId', body.consolidationId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3e. Get consolidation status",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/pool/consolidations/{{lastConsolidationId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "pool", "consolidations", "{{lastConsolidationId}}"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Per-leg status + roll-up summary for a previously-planned consolidation. Poll until `summary.pendingOrInFlight === 0` (and `summary.failed === 0`) before kicking off the actual merchant payout from the target.\n\nThe `lastConsolidationId` collection variable is auto-populated by the `3d` request's test script — for ad-hoc lookups, replace it with the id you want to inspect.\n\nResponse codes:\n- 200 — per-leg status array + summary object\n- 404 — no consolidation with this id (typo, or the legs were created before the consolidation_sweep migration)"
+          }
+        },
+        {
           "name": "3. Inspect HD payout sources (admin balance snapshot)",
           "request": {
             "method": "GET",

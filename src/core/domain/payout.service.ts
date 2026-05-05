@@ -62,7 +62,24 @@ export const PlanPayoutInputSchema = z
     batchId: z.string().min(1).max(64).optional(),
     destinationAddress: z.string().min(1).max(128),
     webhookUrl: z.string().url().optional(),
-    webhookSecret: z.string().min(16).max(512).optional()
+    webhookSecret: z.string().min(16).max(512).optional(),
+    // Internal-only: when set, the picker uses this exact pool address as
+    // the source instead of running its richest-first selection. Used by
+    // the consolidation flow where each leg targets a SPECIFIC source's
+    // full balance (the picker's "richest source" heuristic would pick
+    // the same address every time and never drain the others). Merchants
+    // can't reach this field — `.strict()` rejects unknown keys, and the
+    // public POST /payouts route layers an additional Zod schema that
+    // omits these. Only the admin consolidate endpoint sets it.
+    forceSourceAddress: z.string().min(1).max(128).optional(),
+    // Internal-only: tags the row as an admin-triggered consolidation
+    // sweep so the executor processes it (the executor filter includes
+    // this kind) but merchant-facing list endpoints filter it out (same
+    // pattern as gas_top_up). Set ONLY by the consolidate admin endpoint;
+    // any other caller setting this is a bug — the planner does not
+    // validate it as a security boundary because the field never reaches
+    // the public API surface.
+    internalKind: z.literal("consolidation_sweep").optional()
   })
   .strict()
   .refine(
@@ -599,7 +616,7 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
       await tx.insert(payouts).values({
         id: payoutId,
         merchantId: parsed.merchantId,
-        kind: "standard",
+        kind: parsed.internalKind ?? "standard",
         parentPayoutId: null,
         status: "reserved",
         chainId: parsed.chainId,
@@ -637,7 +654,8 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         feeTier: parsed.feeTier ?? null,
         gasNeeded,
         feeWalletAvailable,
-        feeWalletSponsor
+        feeWalletSponsor,
+        forceSourceAddress: parsed.forceSourceAddress ?? null
       });
 
       if (
@@ -1495,7 +1513,13 @@ export async function executeReservedPayouts(
     .where(
       and(
         inArray(payouts.status, ["reserved", "topping-up"]),
-        eq(payouts.kind, "standard")
+        // consolidation_sweep rows reuse the entire payout state machine
+        // — top-up, broadcast, confirmation — so they ride the same
+        // executor cron. Filtering to `standard` only would leave them
+        // stuck in `reserved` forever. gas_top_up siblings are advanced
+        // synchronously from inside the parent's executor pass, so they
+        // stay excluded from this scan.
+        inArray(payouts.kind, ["standard", "consolidation_sweep"])
       )
     )
     .orderBy(asc(payouts.createdAt))
@@ -2457,9 +2481,11 @@ export interface ConfirmPayoutsOptions {
   maxBatch?: number;
 }
 
-// Cron-triggered: move submitted payouts (standard kind only — gas_top_up
-// siblings are confirmed in `executeTopUp` synchronously) to confirmed or
-// failed based on the chain's view of the tx.
+// Cron-triggered: move submitted payouts (standard + consolidation_sweep)
+// to confirmed or failed based on the chain's view of the tx. gas_top_up
+// siblings are confirmed in `executeTopUp` synchronously and stay out of
+// this scan; consolidation_sweep rows have no parent and ride the regular
+// confirmation pass like a standard payout.
 export async function confirmPayouts(
   deps: AppDeps,
   opts: ConfirmPayoutsOptions = {}
@@ -2468,7 +2494,12 @@ export async function confirmPayouts(
   const submitted = await deps.db
     .select()
     .from(payouts)
-    .where(and(eq(payouts.status, "submitted"), eq(payouts.kind, "standard")))
+    .where(
+      and(
+        eq(payouts.status, "submitted"),
+        inArray(payouts.kind, ["standard", "consolidation_sweep"])
+      )
+    )
     .orderBy(asc(payouts.submittedAt))
     .limit(limit);
 
@@ -2889,6 +2920,13 @@ type SelectionArgs = {
   // sponsors in Tier B. `null` when the capability isn't "top-up", no fee
   // wallet is registered, or the live balance fetch failed.
   feeWalletSponsor: { address: string; nativeBalance: bigint } | null;
+  // Internal-only override: when set, the picker bypasses its richest-first
+  // selection and uses this exact pool address as the source. The address
+  // must still pass the same checks (in pool, has token balance >= amount).
+  // Used by the consolidation flow where each leg targets a SPECIFIC
+  // source's full balance; without this, the picker would pick the same
+  // richest address every time and never drain the others.
+  forceSourceAddress: string | null;
 };
 
 // Drizzle's transaction handle and the top-level Db both implement these
@@ -2927,7 +2965,11 @@ async function selectSource(
 
   if (poolRows.length === 0) return { kind: "no_candidates" };
 
-  // Spendable per candidate.
+  // Spendable per candidate. We enrich the FULL pool even when
+  // forceSourceAddress is set — sponsor selection (Tier B) needs every
+  // address's native balance to find a viable top-up sponsor, and
+  // restricting too early would falsely report "no_sponsor" when a
+  // perfectly good sponsor existed in the pool.
   const enriched = await Promise.all(
     poolRows.map(async (p) => {
       const tokenBalance = await computeSpendable(tx, {
@@ -2952,6 +2994,18 @@ async function selectSource(
   );
   // Richest token holder first.
   enriched.sort((a, b) => (a.tokenBalance < b.tokenBalance ? 1 : a.tokenBalance > b.tokenBalance ? -1 : 0));
+
+  // forceSourceAddress: admin-driven override (consolidation flow). The
+  // picker's normal richest-first scan would always pick the same source;
+  // for consolidation we need to drain a specific one. The restriction is
+  // applied only to the source-pick steps below — sponsor scans still see
+  // the full enriched pool. If the forced address isn't in the pool we
+  // fail loud with no_candidates (caller bug, not a balance condition).
+  const sourceCandidates =
+    args.forceSourceAddress !== null
+      ? enriched.filter((e) => e.address === args.forceSourceAddress)
+      : enriched;
+  if (sourceCandidates.length === 0) return { kind: "no_candidates" };
 
   // Chain-specific minimum native reserve. Solana's 0-byte SystemProgram
   // accounts must hold ~890 880 lamports to remain rent-exempt; letting a
@@ -2994,7 +3048,10 @@ async function selectSource(
     : feeWalletCovers
       ? minNativeReserve
       : gasNeeded + minNativeReserve;
-  for (const cand of enriched) {
+  // Tier A scans only sourceCandidates (= forced address, or all candidates
+  // when no override). Sponsor selection in Tier B still scans the full
+  // enriched pool below.
+  for (const cand of sourceCandidates) {
     if (cand.tokenBalance < directNeed) continue;
     if (cand.nativeBalance < directNative) continue;
     await insertReservationsForDirect(
@@ -3032,8 +3089,11 @@ async function selectSource(
     return { kind: "insufficient", aggregateTokenBalance, largestSingleHolding };
   }
 
-  // Tier B: token holder + sponsor.
-  const tokenHolder = enriched.find((e) => e.tokenBalance >= requiredAmount);
+  // Tier B: token holder + sponsor. Token-holder is restricted to
+  // sourceCandidates so a forced source that lacks token balance fails
+  // out with `insufficient` rather than the picker substituting a
+  // richer-but-different address.
+  const tokenHolder = sourceCandidates.find((e) => e.tokenBalance >= requiredAmount);
   if (!tokenHolder) return { kind: "insufficient", aggregateTokenBalance, largestSingleHolding };
 
   // Token-holder needs native to cover gas AND the chain's rent-exempt

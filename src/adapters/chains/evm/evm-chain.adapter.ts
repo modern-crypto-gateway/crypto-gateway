@@ -112,6 +112,138 @@ const DEFAULT_CHANGE_INDEX = 0;
 // Bound on the block range for a single eth_getLogs call. Most providers cap
 // at 1k–10k blocks; 2k is a safe middle that covers ~7 minutes on mainnet.
 const DEFAULT_MAX_SCAN_BLOCKS = 2_000;
+
+// Local nonce cache, keyed by `${chainId}:${addressLower}`. Maintained to
+// avoid the "replacement transaction underpriced" failure mode that hits
+// when the executor broadcasts many txs from one sender in rapid succession
+// (consolidation top-ups, mass payouts) against a load-balanced RPC fleet:
+// the RPC's pending-mempool view propagates between nodes asynchronously,
+// so two `eth_getTransactionCount(addr, "pending")` calls can return the
+// same value even after the prior tx was accepted by the mempool. Both
+// txs then get signed with the same nonce; only the first lands; the rest
+// fail with `replacement transaction underpriced` because their fees
+// aren't ≥ 1.125× the in-mempool tx's fees.
+//
+// We bypass the RPC's stale view by tracking nextNonce locally. Each
+// successful broadcast increments nextNonce. After the TTL the cache
+// expires and the next broadcast re-queries from chain — bounding stale
+// state on crash / external txs from the same wallet to one window.
+//
+// The cache is intentionally PROCESS-LOCAL. This breaks correctness when
+// two gateway instances broadcast from the same HD address concurrently
+// (each instance has its own cache, both think they own the same nonce).
+// Single-writer is the assumption everywhere else in this codebase
+// (executor cron is single-writer per row via reservations + status CAS),
+// so this is consistent with the rest of the design.
+//
+// CRITICAL: the executor broadcasts up to `payoutConcurrencyPerChain` (16
+// by default) txs in parallel via Promise.all. A naive cache with an
+// `await` between read-cache and write-cache would hit a classic TOCTOU
+// race: N concurrent calls each see "cache miss", each launch their own
+// fetchPending(), each return the same on-chain nonce, each write the
+// same value to the cache (last-wins). All N broadcasts get the same
+// nonce; first wins, rest fail with replacement-underpriced. Mitigated
+// by coalescing concurrent first-fetches into a single shared Promise:
+// once that resolves and seeds the cache, the read-and-increment is
+// purely synchronous so each waiter (resumed sequentially as microtasks)
+// claims a unique value.
+const NONCE_CACHE_TTL_MS = 60_000;
+const nonceCache = new Map<string, { nextNonce: number; expiresAt: number }>();
+// Tracks an in-flight fetch+seed Promise per cache key. Entries are
+// removed in `.finally()` so the next cache miss after the seed completes
+// starts a fresh fetch.
+const inFlightSeed = new Map<string, Promise<void>>();
+
+function nonceKey(chainId: number, address: string): string {
+  return `${chainId}:${address.toLowerCase()}`;
+}
+
+// Read-and-increment the cached nonce, or fetch from chain if cache miss /
+// expired. Caller passes a function to fetch from chain rather than a client
+// so the cache module stays decoupled from viem types.
+//
+// Concurrency contract: when called concurrently from N parallel executor
+// workers, returns N distinct nonces. The first-fetch is coalesced via
+// `inFlightSeed`; once the seed Promise resolves, every waiter wakes up as
+// a microtask and runs the synchronous read-and-increment block, each
+// observing the cache state left by the prior microtask. Single-threaded
+// JS guarantees no interleaving inside the synchronous block, so the
+// claims are atomic per-waiter.
+async function reserveNextNonce(
+  chainId: number,
+  address: string,
+  fetchPending: () => Promise<number>
+): Promise<number> {
+  const key = nonceKey(chainId, address);
+
+  // Fast path: cache hit. Synchronous read+increment — atomic in single-
+  // threaded JS, so concurrent callers each take a distinct value.
+  const cached = nonceCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    const nonce = cached.nextNonce;
+    nonceCache.set(key, { nextNonce: nonce + 1, expiresAt: cached.expiresAt });
+    return nonce;
+  }
+
+  // Slow path: cache miss / expired. Coalesce concurrent first-fetches so
+  // only ONE eth_getTransactionCount RPC fires per (chainId, address)
+  // even when 16 workers race in. The seed populates the cache with the
+  // on-chain pending nonce; nothing increments inside the seed itself.
+  let seed = inFlightSeed.get(key);
+  if (seed === undefined) {
+    seed = (async (): Promise<void> => {
+      const onChain = await fetchPending();
+      // Skip seeding if a successful fast-path increment refreshed the
+      // cache while we were awaiting (rare, but possible if a hit-path
+      // caller arrived after the original miss-path triggered the seed
+      // and TTL was bumped by some other code path). Otherwise the on-
+      // chain value goes in.
+      const existing = nonceCache.get(key);
+      if (existing === undefined || existing.expiresAt <= Date.now()) {
+        nonceCache.set(key, { nextNonce: onChain, expiresAt: Date.now() + NONCE_CACHE_TTL_MS });
+      }
+    })();
+    // void: cleanup is fire-and-forget; the awaiter below blocks on `seed`
+    // itself, not on the post-cleanup chain.
+    void seed.finally(() => {
+      // Clean up regardless of fulfillment/rejection so the next miss
+      // re-fetches rather than reusing a stale or rejected Promise.
+      if (inFlightSeed.get(key) === seed) inFlightSeed.delete(key);
+    });
+    inFlightSeed.set(key, seed);
+  }
+  await seed;
+
+  // Cache is now seeded (unless seed rejected — in which case .get below
+  // returns undefined and we'd throw, propagating the original RPC error
+  // up to the broadcast catch). Read-and-increment is synchronous from
+  // here, so every waiter takes a distinct value.
+  const after = nonceCache.get(key);
+  if (after === undefined) {
+    throw new Error(
+      `Nonce seed failed for ${address} on chain ${chainId} — eth_getTransactionCount RPC error`
+    );
+  }
+  const nonce = after.nextNonce;
+  nonceCache.set(key, { nextNonce: nonce + 1, expiresAt: after.expiresAt });
+  return nonce;
+}
+
+// Roll back a reserved nonce after a broadcast failure. Without this, a
+// failed broadcast leaves a "phantom" reservation: the next call would skip
+// over the reserved nonce, creating a permanent gap that no future tx fills
+// (chain mining stops at the first unfilled nonce). Decrementing only when
+// the cached entry's nextNonce is still exactly `nonce + 1` keeps the
+// rollback safe under interleaved concurrent broadcasts (the more recent
+// reservation has already advanced past us — let it own the slot, the gap
+// will be repaired when the cache TTL expires and we re-fetch from chain).
+function releaseNonceOnFailure(chainId: number, address: string, nonce: number): void {
+  const key = nonceKey(chainId, address);
+  const entry = nonceCache.get(key);
+  if (entry && entry.nextNonce === nonce + 1) {
+    nonceCache.set(key, { nextNonce: nonce, expiresAt: entry.expiresAt });
+  }
+}
 // Approximate mainnet block time. Used to translate `sinceMs` into a block window.
 const APPROX_BLOCK_TIME_MS: Readonly<Record<number, number>> = {
   1: 12_000,
@@ -489,18 +621,40 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         }
       }
 
+      // Reserve a nonce locally. Bypassing viem's default
+      // `getTransactionCount(addr, "pending")` flow because load-balanced
+      // RPCs (Alchemy, QuickNode, public Polygon) propagate the mempool
+      // view asynchronously across nodes; rapid back-to-back broadcasts
+      // from the same sender can read the SAME pending nonce twice and
+      // collide. Local cache + TTL + rollback-on-failure gives us
+      // monotonic nonces within a single executor run.
+      const client = getClient(chainId);
+      const reservedNonce = await reserveNextNonce(chainId, account.address, () =>
+        client.getTransactionCount({ address: account.address, blockTag: "pending" })
+      );
+
       const wallet = createWalletClient({ account, transport });
-      const hash = await wallet.sendTransaction({
-        to: raw.to,
-        data: raw.data,
-        value: raw.value,
-        ...(raw.gas !== undefined ? { gas: raw.gas } : {}),
-        ...(raw.maxFeePerGas !== undefined && raw.maxPriorityFeePerGas !== undefined
-          ? { maxFeePerGas: raw.maxFeePerGas, maxPriorityFeePerGas: raw.maxPriorityFeePerGas }
-          : {}),
-        // viem requires a chain; build a minimal stub since we only need the id.
-        chain: { id: chainId, name: `evm-${chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [] } } }
-      });
+      let hash: Hex;
+      try {
+        hash = await wallet.sendTransaction({
+          to: raw.to,
+          data: raw.data,
+          value: raw.value,
+          nonce: reservedNonce,
+          ...(raw.gas !== undefined ? { gas: raw.gas } : {}),
+          ...(raw.maxFeePerGas !== undefined && raw.maxPriorityFeePerGas !== undefined
+            ? { maxFeePerGas: raw.maxFeePerGas, maxPriorityFeePerGas: raw.maxPriorityFeePerGas }
+            : {}),
+          // viem requires a chain; build a minimal stub since we only need the id.
+          chain: { id: chainId, name: `evm-${chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [] } } }
+        });
+      } catch (err) {
+        // Roll back the reservation so the next broadcast doesn't skip
+        // over an unused nonce, which would create a permanent gap that
+        // stalls every future tx from this sender.
+        releaseNonceOnFailure(chainId, account.address, reservedNonce);
+        throw err;
+      }
       return hash as TxHash;
     },
 

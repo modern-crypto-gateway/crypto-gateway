@@ -754,6 +754,74 @@ curl "$GATEWAY_URL/admin/pool/stats" -H "Authorization: Bearer $ADMIN_KEY"
 Alert on `available < 3` per family to catch low-supply before
 `POOL_EXHAUSTED` (503) fires on a live invoice-create.
 
+### Consolidate a fragmented token balance
+
+Account-model chains (EVM, Tron, Solana) pick **one** sender per payout —
+they don't coin-select like UTXO. So if a token's balance is split across
+many pool addresses, no single address may hold enough to fund a large
+payout even though the aggregate does. Symptom: `POST /payouts` rejects
+with `INSUFFICIENT_BALANCE_ANY_SOURCE` AND `/payouts/estimate` emits the
+warning `single_source_insufficient_consolidate_required`.
+
+Defragment via:
+
+```bash
+curl -X POST "$GATEWAY_URL/admin/pool/consolidate" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 137,
+    "token": "USDT",
+    "targetAddress": "0xc965c39c..."
+  }'
+# 202 Accepted
+# {
+#   "consolidationId": "8f3c...",
+#   "legs": [
+#     { "payoutId": "...", "sourceAddress": "0x8817...", "amountRaw": "293988107" },
+#     { "payoutId": "...", "sourceAddress": "0xfdd8...", "amountRaw": "288804227" },
+#     ...
+#   ],
+#   "skipped": [
+#     { "sourceAddress": "0xabcd...", "amountRaw": "5...", "reason": "NO_GAS_SPONSOR_AVAILABLE: ..." }
+#   ]
+# }
+```
+
+Each leg becomes an internal `consolidation_sweep` payout (filtered out
+of merchant-facing list endpoints), legs share a `batchId` (the returned
+`consolidationId`), and they ride the regular executor cron through
+top-up → broadcast → confirmation. Sources whose leg couldn't be planned
+because no gas sponsor was available appear in `skipped[]`; fund the
+sponsor pool and re-run to pick up the rest.
+
+Poll progress:
+
+```bash
+curl "$GATEWAY_URL/admin/pool/consolidations/$CONSOLIDATION_ID" \
+  -H "Authorization: Bearer $ADMIN_KEY"
+# { "consolidationId": "...",
+#   "legs": [{ "payoutId": "...", "status": "confirmed", "txHash": "0x...", ... }, ...],
+#   "summary": { "total": 3, "pendingOrInFlight": 0, "confirmed": 3, "failed": 0, "canceled": 0 }
+# }
+```
+
+When `summary.pendingOrInFlight === 0` (and `failed === 0`), the target
+holds the full aggregate and a regular `POST /payouts` from the merchant
+succeeds in one tx.
+
+Gas considerations:
+- **EVM** (`feeWalletCapability: "none"`): each leg's source needs a
+  pool address with native (POL/ETH/etc.) acting as a Tier-B sponsor. If
+  your pool has only one address with native, it'll be picked once per
+  leg and run dry quickly — fund several, or run consolidation in waves
+  as the sponsor is replenished.
+- **Tron** (`feeWalletCapability: "top-up"`): the registered fee wallet
+  acts as the TRX top-up sponsor for every leg automatically. Fund it
+  with enough TRX to cover ~25-31 TRX per leg (real worst-case observed
+  burn × safety multiplier — see [src/adapters/chains/tron/tron-chain.adapter.ts](src/adapters/chains/tron/tron-chain.adapter.ts)
+  for the floor).
+
 ### Address subscription lifecycle (automatic)
 
 When `ALCHEMY_NOTIFY_TOKEN` is set, the gateway tracks which of your HD-derived
@@ -1029,6 +1097,23 @@ Native payouts can't be topped up (gas IS the asset). When the only candidate ha
 ```
 
 `source: null` + `warnings: ["no_source_address_has_sufficient_token_balance"]` when no HD address can fund the payout. `topUp.sponsor: null` + `warnings: ["no_gas_sponsor_available"]` when a token holder exists but no funded sponsor — the plan would fail with `NO_GAS_SPONSOR_AVAILABLE`.
+
+When the AGGREGATE token balance across the pool IS sufficient but it's
+fragmented across multiple addresses, both `no_source_address_has_sufficient_token_balance`
+AND `single_source_insufficient_consolidate_required` are surfaced
+together. Account-model chains (EVM, Tron, Solana) pick a single sender
+per payout, so fragmented holdings can't be sent in one tx — run
+`POST /admin/pool/consolidate` to defragment, then retry. The
+plan-time error message also enumerates the aggregate and largest single
+holding so the operator sees exactly the gap to bridge:
+
+```
+INSUFFICIENT_BALANCE_ANY_SOURCE: Aggregate USDT balance on chain 137 is
+sufficient (2089026349 >= 2089026349) but split across pool addresses;
+the largest single holding is 680740762. Account-model chains pick a
+single source per payout — lower the amount to 680740762 or less, or
+consolidate token balances into one address first.
+```
 
 ### Mass (batch) payouts
 

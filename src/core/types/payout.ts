@@ -33,7 +33,17 @@ export type PayoutStatus = z.infer<typeof PayoutStatusSchema>;
 // reached chain and consumed gas — recording these keeps `computeSpendable`
 // in sync with on-chain reality (EVM/Tron/Solana all charge even for
 // reverted txs). gas_burn rows are also filtered out of the merchant list.
-export const PayoutKindSchema = z.enum(["standard", "gas_top_up", "gas_burn"]);
+// `consolidation_sweep` rows are admin-triggered internal token transfers
+// between two HD pool addresses, used to defragment a token balance into
+// one address before a large merchant payout. They reuse the entire payout
+// state machine and reference the sentinel system merchant id; like the
+// other internal kinds they're filtered out of merchant-facing lists.
+export const PayoutKindSchema = z.enum([
+  "standard",
+  "gas_top_up",
+  "gas_burn",
+  "consolidation_sweep"
+]);
 export type PayoutKind = z.infer<typeof PayoutKindSchema>;
 
 export const PayoutIdSchema = z.string().uuid();

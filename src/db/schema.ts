@@ -449,9 +449,22 @@ export const payouts = sqliteTable(
     //     picks them up without changes)
     //   - txHash=<failed payout's txHash>
     //   - feeTier=null, feeQuotedNative=null, topUp*=null
-    // Merchant-facing list endpoints filter them out the same way they
-    // filter gas_top_up.
-    kind: text("kind", { enum: ["standard", "gas_top_up", "gas_burn"] }).notNull().default("standard"),
+    //
+    // `consolidation_sweep` rows are admin-triggered internal token
+    // transfers between two HD pool addresses, used to defragment a token
+    // balance across many addresses into one before a large merchant
+    // payout (account-model chains pick a single sender per payout, so a
+    // 25-way-split USDT pool can't fund a single 2k-USDT payout without
+    // consolidation first). They carry merchantId = the sentinel system
+    // merchant 'ffffffff-ffff-ffff-ffff-ffffffffffff' (FK satisfied
+    // without relaxing the NOT NULL), reuse the entire payout state
+    // machine (top-up sponsor, broadcast idempotency, confirmation
+    // tracking), and are filtered from merchant-facing list endpoints
+    // alongside gas_top_up and gas_burn.
+    //
+    // Merchant-facing list endpoints filter ALL three internal kinds out:
+    // gas_top_up, gas_burn, consolidation_sweep.
+    kind: text("kind", { enum: ["standard", "gas_top_up", "gas_burn", "consolidation_sweep"] }).notNull().default("standard"),
     // Set on `gas_top_up` rows, pointing at the standard payout that
     // triggered the top-up. NULL on standard rows.
     parentPayoutId: text("parent_payout_id"),

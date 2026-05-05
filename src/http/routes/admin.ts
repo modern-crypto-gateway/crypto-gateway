@@ -11,6 +11,12 @@ import { isTronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../adapters/chains
 import type { TronResourceKind, TronRpcBackend } from "../../adapters/chains/tron/tron-rpc.js";
 import type { UnsignedTx } from "../../core/types/unsigned-tx.js";
 import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
+import {
+  ConsolidationError,
+  consolidationErrorStatus,
+  getConsolidationStatus,
+  planPoolConsolidation
+} from "../../core/domain/pool-consolidation.service.js";
 import { repairUtxoAddressIndex } from "../../core/domain/utxo-address-index-repair.js";
 import {
   ingestDetectedTransfer,
@@ -1173,6 +1179,56 @@ const hasFeeWallet = adapterFamily !== undefined && adapterFamily !== "monero"
   app.get("/pool/stats", async (c) => {
     const stats = await getPoolStats(deps);
     return c.json({ stats }, 200);
+  });
+
+  // Defragment a token balance scattered across pool addresses into one
+  // designated target. Each leg is planned as a `consolidation_sweep`
+  // payout under the sentinel system merchant and ridden by the regular
+  // executor cron through top-up → broadcast → confirmation. Returns
+  // immediately with the planned legs (status='reserved' or 'topping-up')
+  // and any sources that couldn't be planned (e.g. no gas sponsor).
+  // Operator polls GET /admin/pool/consolidations/:id to track completion.
+  //
+  // Use case: account-model chains (EVM, Tron, Solana) pick a single
+  // sender per payout — they can't coin-select like UTXO. So a 25-way
+  // split USDT pool can't fund a single 2k-USDT payout. Run this first;
+  // once the legs confirm, the token balance is consolidated on the
+  // target and a regular POST /payouts succeeds.
+  app.post("/pool/consolidate", async (c) => {
+    const rawBody = await c.req.text();
+    let parsedBody: unknown;
+    try {
+      parsedBody = rawBody.length > 0 ? JSON.parse(rawBody) : {};
+    } catch {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const result = await planPoolConsolidation(deps, parsedBody);
+      // 202 Accepted: the legs are reserved/topping-up; full confirmation
+      // happens asynchronously via the executor.
+      return c.json(result, 202);
+    } catch (err) {
+      if (err instanceof ConsolidationError) {
+        return c.json(
+          { error: { code: err.code, message: err.message } },
+          consolidationErrorStatus(err.code) as 400
+        );
+      }
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Status of a previously-planned consolidation, keyed by the
+  // consolidationId returned from POST /pool/consolidate. The summary
+  // counts legs by lifecycle bucket so operators can poll until
+  // pendingOrInFlight === 0 before kicking off the actual merchant payout.
+  app.get("/pool/consolidations/:id", async (c) => {
+    const id = c.req.param("id");
+    const status = await getConsolidationStatus(deps, id);
+    if (status === null) {
+      return c.json({ error: { code: "NOT_FOUND", message: `No consolidation ${id}` } }, 404);
+    }
+    return c.json(status, 200);
   });
 
   // One-shot repair for the multi-family UTXO `address_index` bug.
