@@ -648,22 +648,24 @@ describe("tronChainAdapter.estimateGasForTransfer — TRC-20 simulation failure"
     // under-funded sources:
     //   (1) pre-fix we called triggerSmartContract which returned
     //       energy_used=0, making the fee quote ~345 000 sun (bandwidth only);
-    //   (2) the energy burn rate was hardcoded to 420 SUN/unit — Tron's
-    //       pre-2024 value — and silently doubled quotes after the SR vote
-    //       halved the rate to 210.
+    //   (2) the energy burn rate was hardcoded — first 420, then 210 SUN —
+    //       and silently mis-quoted by 2-4× as Tron's SR votes halved the
+    //       rate (most recently to 100 SUN/energy).
     // Both paths now run via triggerConstantContract (real VM sim) and
     // getChainParameters (live rate), so the quote tracks what the chain
-    // actually charges.
+    // actually charges. Use 220 000 reported energy so we exercise the live
+    // rate (above MIN_EXPECTED_TRC20_ENERGY=200 000); the floor is covered
+    // separately below.
     const client = fakeClient({
       async triggerConstantContract() {
         return {
-          energy_used: 32_000,
+          energy_used: 220_000,
           result: { result: true },
           constant_result: []
         };
       },
       async getChainParameters() {
-        return { params: { getEnergyFee: 210 } };
+        return { params: { getEnergyFee: 100 } };
       }
     });
     const adapter = tronChainAdapter({
@@ -677,18 +679,18 @@ describe("tronChainAdapter.estimateGasForTransfer — TRC-20 simulation failure"
       token: "USDT" as unknown as never,
       amountRaw: "1000000" as unknown as never
     });
-    // 32 000 energy × 210 SUN + 345 bytes × 1000 SUN = 6 720 000 + 345 000 = 7 065 000 sun.
-    expect(quote.medium.nativeAmountRaw).toBe("7065000");
+    // 220 000 energy × 100 SUN + 345 bytes × 1000 SUN = 22 000 000 + 345 000 = 22 345 000 sun.
+    expect(quote.medium.nativeAmountRaw).toBe("22345000");
     expect(quote.nativeSymbol).toBe("TRX");
   });
 
-  it("falls back to the 210 SUN/energy default when getChainParameters fails", async () => {
+  it("falls back to the 100 SUN/energy default when getChainParameters fails", async () => {
     // RPC flap on /wallet/getchainparameters must NOT block a fee quote —
-    // degrade to the fallback (also 210 today, so no under-quoting) rather
-    // than erroring out of /payouts/estimate entirely.
+    // degrade to the fallback (matches current mainnet rate) rather than
+    // erroring out of /payouts/estimate entirely.
     const client = fakeClient({
       async triggerConstantContract() {
-        return { energy_used: 32_000, result: { result: true }, constant_result: [] };
+        return { energy_used: 220_000, result: { result: true }, constant_result: [] };
       },
       async getChainParameters() {
         throw new Error("trongrid 503");
@@ -705,6 +707,36 @@ describe("tronChainAdapter.estimateGasForTransfer — TRC-20 simulation failure"
       token: "USDT" as unknown as never,
       amountRaw: "1000000" as unknown as never
     });
-    expect(quote.medium.nativeAmountRaw).toBe("7065000");
+    expect(quote.medium.nativeAmountRaw).toBe("22345000");
+  });
+
+  it("floors the energy estimate at MIN_EXPECTED_TRC20_ENERGY when the simulation underreports", async () => {
+    // Regression for production failures where triggerConstantContract
+    // returned energy_used ~14-30k for a real USDT transfer that actually
+    // burned > 106k on broadcast. With only the simulated value, the planner
+    // sized the top-up at ~10.7 TRX, the source ran out, and the tx reverted
+    // OUT_OF_ENERGY with all funds consumed. Floor at 200 000 energy keeps
+    // the quote covering observed real-world worst-case USDT transfers.
+    const client = fakeClient({
+      async triggerConstantContract() {
+        return { energy_used: 14_000, result: { result: true }, constant_result: [] };
+      },
+      async getChainParameters() {
+        return { params: { getEnergyFee: 100 } };
+      }
+    });
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client }
+    });
+    const quote = await adapter.quoteFeeTiers({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      fromAddress: "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7",
+      toAddress: "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL",
+      token: "USDT" as unknown as never,
+      amountRaw: "1000000" as unknown as never
+    });
+    // 200 000 floor × 100 SUN + 345 000 bandwidth = 20 000 000 + 345 000 = 20 345 000.
+    expect(quote.medium.nativeAmountRaw).toBe("20345000");
   });
 });

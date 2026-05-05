@@ -560,7 +560,7 @@ export function moneroChainAdapter(config: MoneroChainAdapterConfig): MoneroChai
       return { num: 100n, den: 100n };
     },
 
-    feeWalletCapability(_chainId: ChainId): "none" | "delegate" | "co-sign" {
+    feeWalletCapability(_chainId: ChainId): "none" | "top-up" | "delegate" | "co-sign" {
       return "none";
     },
 

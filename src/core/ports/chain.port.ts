@@ -165,6 +165,15 @@ export interface ChainAdapter {
   //   - "none":    no native fee-wallet concept on this chain today. The
   //                planner uses the self-pay / sponsor-topup flow as
   //                before. EVM lives here pending account abstraction.
+  //   - "top-up":  the fee wallet holds native (e.g. TRX) and is offered
+  //                to the planner as an additional sponsor candidate
+  //                alongside pool addresses. The payout flow is otherwise
+  //                unchanged: the fee wallet sends a top-up tx to the
+  //                source, which then broadcasts the actual payout. Used
+  //                for Tron when the operator has not staked into energy
+  //                (or the source has no delegated resources). Cheaper
+  //                than running the picker against ad-hoc pool sponsors
+  //                and lets one funded wallet sponsor every Tron payout.
   //   - "delegate": the fee wallet provides resources out-of-band (Tron's
   //                DelegateResource). The payout tx is unchanged at sign
   //                time; the chain substitutes delegated resources for
@@ -176,7 +185,7 @@ export interface ChainAdapter {
   //                the source entirely when a fee wallet is configured and
   //                funded; `withFeePayer` rewrites the unsigned tx to
   //                declare the fee wallet as the fee payer before sign.
-  feeWalletCapability(chainId: ChainId): "none" | "delegate" | "co-sign";
+  feeWalletCapability(chainId: ChainId): "none" | "top-up" | "delegate" | "co-sign";
 
   // (Fee-payer application is now expressed via `BuildTransferArgs.feePayerAddress`
   // set at build time + `options.feePayerPrivateKey` passed at broadcast. No

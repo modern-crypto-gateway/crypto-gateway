@@ -44,12 +44,35 @@ export function isTronChainAdapter(adapter: ChainAdapter): adapter is TronChainA
 
 const DEFAULT_FEE_LIMIT_SUN = 100_000_000; // 100 TRX cap per payout tx (generous, rarely consumed)
 // Hard energy cap for TRC-20 `transfer(address,uint256)`. Standard SRC-20
-// transfers use 14k-65k energy; 150k leaves headroom for cold-slot writes
-// and first-time recipient state. If the simulation reports more than this,
+// transfers use 14k-65k energy in the common case but real on-chain payments
+// have been observed at 106k+ (USDT to a fresh destination, plus contract-
+// internal blacklist/freeze checks). 250k is the refusal ceiling: above this
 // the target is almost certainly NOT a standard TRC-20 (proxy, fee-on-transfer,
-// or worse — a loop contract that would burn the full fee_limit). Refusing
-// to broadcast turns a silent fee burn into a loud build-time error.
-const MAX_EXPECTED_TRANSFER_ENERGY = 150_000;
+// or a loop contract that would burn the full fee_limit). Refusing to
+// broadcast turns a silent fee burn into a loud build-time error.
+const MAX_EXPECTED_TRANSFER_ENERGY = 250_000;
+
+// Floor for the TRC-20 `transfer` energy estimate. `triggerConstantContract`
+// underreports real on-chain energy across the board, but especially when:
+//   - the destination is a fresh account (Tron charges a 1 TRX activation
+//     fee + extra cold-slot SSTORE that the simulation doesn't include)
+//   - cold-slot writes on the recipient's balance slot (~15-20k extra energy)
+//   - USDT-specific overhead (blacklist + freeze + deprecated() guards)
+// Production observations: a USDT transfer where simulation reported ~14k
+// energy actually burned > 106 782 energy on chain (10.68 TRX consumed at
+// 100 SUN/energy, then OUT_OF_ENERGY revert). Without a floor, the planner
+// sizes the top-up off the simulation, the source runs out of TRX mid-
+// execution, the tx reverts, the source's TRX is consumed, USDT stays stuck.
+//
+// 200 000 covers observed real on-chain costs (~107k seen in production)
+// with comfortable headroom for the 1 TRX account-activation fee, occasional
+// USDT freeze-list checks, and SR-voted energyFee changes between estimate
+// and broadcast. Sized just below MAX_EXPECTED_TRANSFER_ENERGY so any
+// simulation reporting MORE than the floor still has room to grow into the
+// ceiling before being refused. At the current 100 SUN/energy this reserves
+// ~20 TRX per payout (×1.30 safety ×1.20 cushion = ~31 TRX top-up); high
+// for warm-slot transfers but the right floor for reliability.
+const MIN_EXPECTED_TRC20_ENERGY = 200_000;
 const DEFAULT_ACCOUNT_INDEX = 0;
 const DEFAULT_CHANGE_INDEX = 0;
 
@@ -66,11 +89,14 @@ const NOW_BLOCK_CACHE_TTL_MS = 10_000;
 const CHAIN_PARAM_CACHE_TTL_MS = 60_000;
 
 // Fallback SUN-per-energy rate used when /wallet/getchainparameters is
-// unavailable. 210 SUN/energy is the current mainnet value (post-2024 vote).
-// Using the live rate where possible means we're correct even if Tron votes
-// again to change it; the fallback keeps quotes conservative (round up, not
-// down) during RPC flaps.
-const ENERGY_FEE_FALLBACK_SUN = 210n;
+// unavailable. 100 SUN/energy is the current mainnet value (post the
+// round-2 SR halving in late 2024). The live rate from getChainParameters
+// takes precedence; this fallback only applies during RPC flaps. Sizing it
+// LOW (matches reality) is safer than HIGH for fee estimation here because
+// the energy floor (MIN_EXPECTED_TRC20_ENERGY) is the dominant term in the
+// quote, and a too-high fallback rate would over-quote and reject viable
+// sources during transient RPC failures.
+const ENERGY_FEE_FALLBACK_SUN = 100n;
 
 // Dust threshold for address-poisoning spam on Tron. TRX sun and USDT/USDC
 // base units (both 6 decimals on Tron) below this are dropped at scan time.
@@ -475,12 +501,11 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
         // Tron uses resource delegation, not co-signing: a fee wallet stakes
         // TRX and pre-delegates energy via DelegateResource. At broadcast
         // time the tx has a single signer (the source). Supplying a
-        // feePayerPrivateKey here is a caller bug — the domain layer should
-        // route Tron through the delegation path, not the co-sign path.
+        // feePayerPrivateKey here is a caller bug — Tron has no co-sign path.
         throw new Error(
-          "Tron signAndBroadcast: feePayerPrivateKey is not supported on Tron (capability='delegate'). " +
-            "Tron fee wallets provide resources via DelegateResource, not co-signing. If you see this " +
-            "error, the domain layer confused capability='delegate' with capability='co-sign'."
+          "Tron signAndBroadcast: feePayerPrivateKey is not supported on Tron. " +
+            "Tron has no co-sign capability — fee wallets provide resources via DelegateResource. " +
+            "If you see this error, the domain layer is treating Tron like a co-sign chain (Solana)."
         );
       }
       const raw = unsignedTx.raw as { txID: string; raw_data_hex: string; raw_data: unknown };
@@ -532,33 +557,40 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
     },
 
     gasSafetyFactor(_chainId: ChainId) {
-      // 1.05× is the right floor for Tron. energyFee only changes on a
-      // Super-Representative vote (years apart — the last change was the
-      // 2024 halving from 420 to 210 SUN/energy), and the energy_used we
-      // quote comes from a real VM simulation via triggerConstantContract
-      // — it's exact for warm-slot transfers and conservatively pessimistic
-      // for cold-slot transfers (the state flips warm mid-execution, so
-      // the actual on-chain cost is ≤ simulated). 5% is enough to absorb:
-      //   - fractional SUN rounding in the (energy × energyFee) product
-      //   - the unlikely case where a source's own token slot went cold
-      //     between plan and broadcast (would require an admin action)
-      // A tighter value like 1.1× over-reserves native by ~5% on every
-      // payout, which looks harmless but bites at funding boundaries —
-      // a source with 7.30 TRX and a 6.77 TRX real quote was getting
-      // sponsor-gated over a 0.15 TRX phantom shortfall. 1.05× matches
-      // reality.
-      return { num: 105n, den: 100n };
+      // 1.30× covers the gap between `triggerConstantContract`'s reported
+      // energy_used and what's actually consumed on broadcast. The simulation
+      // is supposed to mirror VM execution, but in practice it underreports
+      // cold-slot SSTOREs and first-time-recipient activation by 3-7×: we've
+      // seen ~4k reported on USDT transfers that burned ~14-31k. The energy
+      // floor (MIN_EXPECTED_TRC20_ENERGY = 65 000) handles the worst case;
+      // this multiplier covers the remaining nondeterminism:
+      //   - fractional SUN rounding in (energy × energyFee)
+      //   - source's own token slot going cold between plan and broadcast
+      //   - SR-voted energyFee changes between estimate cache hit and broadcast
+      //   - bandwidth burning slightly more than the 345-byte estimate when
+      //     the tx is signed with a longer expiration window
+      // The previous 1.05× was based on the (incorrect) belief that
+      // triggerConstantContract was exact for warm-slot transfers; production
+      // payouts proved otherwise. 30% over-reservation is the right floor
+      // for delegate/co-sign-less Tron payouts.
+      return { num: 130n, den: 100n };
     },
 
     feeWalletCapability(_chainId: ChainId) {
-      // Tron uses resource delegation, not co-signing: a fee wallet stakes
-      // TRX and calls DelegateResource to grant energy/bandwidth to pool
-      // addresses. At payout time the tx is unchanged — same single-signer
-      // flow — but consumed energy comes from the delegation rather than
-      // burning the source's TRX. Full integration (admin delegate ops +
-      // planner energy-availability check) lands alongside the capability
-      // value in Phase 4.
-      return "delegate" as const;
+      // Tron's near-term fee-wallet topology: the registered wallet just
+      // holds TRX and acts as a sponsor for top-up txs to source pool
+      // addresses. The source still burns TRX for energy/bandwidth — same
+      // mechanic as a pool-address sponsor — but the operator funds one
+      // dedicated wallet instead of seeding every pool address.
+      //
+      // The full "delegate" path (operator stakes TRX into the fee wallet,
+      // calls DelegateResource per-source, planner verifies energyAvailable
+      // before picking) is deferred to Phase 4. Until that ships, the
+      // `delegate` capability is unsafe to enable: the picker would drop
+      // the source's TRX requirement on the (incorrect) assumption that
+      // delegation exists, and broadcasts would fail with "Account resource
+      // insufficient error" when no delegation was actually done.
+      return "top-up" as const;
     },
 
     async getBalance(args): Promise<AmountRaw> {
@@ -621,11 +653,14 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
       // routinely returns `energy_used: 0` — it's not a true simulation,
       // so using it here undersells the real energy burn by ~14-65k units.
       // triggerConstantContract actually executes the call in the VM and
-      // reports the real `energy_used`. Historical regression: we were
-      // quoting ~345 000 sun for USDT transfers (bandwidth only, energy=0),
-      // planner reserved the tiny amount, real broadcast burned ~12-27 TRX
-      // of energy, ran out on under-funded sources, and the tx reverted
-      // on-chain with the source's TRX consumed and the USDT still stuck.
+      // reports `energy_used`, but it still underreports cold-slot SSTOREs
+      // and first-time-recipient costs (we've observed ~4k reported vs
+      // ~14-31k actual for USDT). The MIN_EXPECTED_TRC20_ENERGY floor at the
+      // bottom of this function corrects for that. Historical regression:
+      // we were quoting ~345 000 sun for USDT transfers (bandwidth only,
+      // energy=0), planner reserved the tiny amount, real broadcast burned
+      // ~12-27 TRX of energy, ran out on under-funded sources, and the tx
+      // reverted on-chain with the source's TRX consumed and USDT stuck.
       const token = findToken(args.chainId as ChainId, args.token);
       if (!token || token.contractAddress === null) {
         return "0" as AmountRaw;
@@ -647,7 +682,8 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
         const message = resp.result.message ?? "unknown";
         throw new Error(`Tron simulation failed: ${message}`);
       }
-      const energy = resp.energy_used ?? 0;
+      const reportedEnergy = resp.energy_used ?? 0;
+      const energy = Math.max(reportedEnergy, MIN_EXPECTED_TRC20_ENERGY);
       return energy.toString() as AmountRaw;
     },
 

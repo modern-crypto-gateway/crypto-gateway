@@ -18,10 +18,15 @@ describe("ChainAdapter.gasSafetyFactor — per-chain picker multipliers", () => 
     expect(adapter.gasSafetyFactor(1 as ChainId)).toEqual({ num: 150n, den: 100n });
   });
 
-  it("Tron returns 1.05× (real VM simulation + SR-voted stable energyFee)", () => {
+  it("Tron returns 1.30× (covers triggerConstantContract underreporting + cold-slot variance)", () => {
+    // Bumped from 1.05× after production payouts proved triggerConstantContract
+    // routinely underreports energy_used (~4k reported vs ~14-31k actually
+    // burned for USDT). The MIN_EXPECTED_TRC20_ENERGY floor handles the worst
+    // case; this multiplier covers the residual nondeterminism (cold-slot
+    // transitions, SR-voted rate changes between estimate and broadcast).
     const adapter = tronChainAdapter();
     expect(adapter.gasSafetyFactor(TRON_MAINNET_CHAIN_ID as ChainId)).toEqual({
-      num: 105n,
+      num: 130n,
       den: 100n
     });
   });

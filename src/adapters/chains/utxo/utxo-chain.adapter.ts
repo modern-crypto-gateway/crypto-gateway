@@ -167,7 +167,7 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
       return { num: 105n, den: 100n };
     },
 
-    feeWalletCapability(_chainId: ChainId): "none" | "delegate" | "co-sign" {
+    feeWalletCapability(_chainId: ChainId): "none" | "top-up" | "delegate" | "co-sign" {
       // UTXO has no concept of a separate fee payer — every input carries
       // the value that funds its own output's fee. Same answer as EVM today.
       return "none";

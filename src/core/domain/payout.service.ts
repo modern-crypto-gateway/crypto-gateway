@@ -570,6 +570,13 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   // source wasn't funded — same as it does today without any fee wallet).
   const feeWalletAvailable = await deps.feeWalletStore.has(chainAdapter.family);
 
+  // For "top-up" capability chains (Tron today), pre-fetch the fee wallet's
+  // native balance so the picker can offer it as a sponsor candidate
+  // without doing an RPC inside the writer lock. Returns null when
+  // capability !== "top-up", no fee wallet is registered, or the live
+  // balance read failed — all those degrade cleanly to pool-only sponsors.
+  const feeWalletSponsor = await loadFeeWalletSponsor(deps, chainAdapter, parsed.chainId);
+
   // Transaction returns a discriminated result instead of throwing, so
   // we can do error-enrichment work (oracle call for USD conversion)
   // OUTSIDE the IMMEDIATE writer lock. Throwing the enriched PayoutError
@@ -624,7 +631,8 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         amountRaw,
         feeTier: parsed.feeTier ?? null,
         gasNeeded,
-        feeWalletAvailable
+        feeWalletAvailable,
+        feeWalletSponsor
       });
 
       if (
@@ -1182,15 +1190,25 @@ export async function estimatePayoutFees(
   const minNativeReserve = chainAdapter.minimumNativeReserve(parsed.chainId as ChainId);
 
   // Same fee-wallet gate the planner uses — keeps estimate in sync with plan.
-  // For token payouts where a fee wallet is registered AND the chain has
-  // a fee-wallet topology (Solana co-sign OR Tron delegate), source drops
-  // its native-gas requirement entirely (only rent-exempt keeper remains).
+  // For token payouts where a fee wallet is registered AND the chain has a
+  // gas-covering topology (Solana co-sign OR Tron delegate, future), source
+  // drops its native-gas requirement entirely (only rent-exempt keeper
+  // remains). For "top-up" capability (Tron today), the fee wallet does NOT
+  // cover gas — it just acts as a sponsor candidate for the top-up tx, so
+  // source still needs gas, just from a top-up rather than its own balance.
   const estimateCapability = chainAdapter.feeWalletCapability(parsed.chainId as ChainId);
   const estimateFeeWalletAvailable = await deps.feeWalletStore.has(chainAdapter.family);
   const estimateFeeWalletCovers =
     (estimateCapability === "co-sign" || estimateCapability === "delegate") &&
     estimateFeeWalletAvailable &&
     !isNativePayout;
+  // Pre-fetch the fee wallet's TRX balance for the "top-up" capability
+  // path. Surfaced into the estimate response as the sponsor of choice when
+  // it has enough native to cover the top-up; mirrors what selectSource
+  // does at plan time.
+  const estimateFeeWalletSponsor = !isNativePayout
+    ? await loadFeeWalletSponsor(deps, chainAdapter, parsed.chainId)
+    : null;
 
   // Sort by token balance descending; richest token holder first.
   enriched.sort((a, b) => (a.tokenBalance < b.tokenBalance ? 1 : a.tokenBalance > b.tokenBalance ? -1 : 0));
@@ -1231,11 +1249,21 @@ export async function estimatePayoutFees(
       // Sponsor needs native to send `topUpAmount` AND its own gas AND keep
       // its own rent-exempt reserve.
       const sponsorOwnGas = gasNeeded;
-      const sponsor = enriched.find(
+      // Prefer the registered fee wallet (capability="top-up") when it has
+      // enough TRX. Mirrors selectSource — keeps /payouts/estimate showing
+      // the same sponsor that POST /payouts will actually pick.
+      const feeWalletPick =
+        estimateFeeWalletSponsor !== null &&
+        estimateFeeWalletSponsor.address !== tokenHolder.address &&
+        estimateFeeWalletSponsor.nativeBalance >= topUpAmount + sponsorOwnGas + minNativeReserve
+          ? estimateFeeWalletSponsor
+          : null;
+      const poolSponsor = enriched.find(
         (e) =>
           e.address !== tokenHolder.address &&
           e.nativeBalance >= topUpAmount + sponsorOwnGas + minNativeReserve
       );
+      const sponsor = feeWalletPick ?? poolSponsor ?? null;
       if (sponsor) {
         return {
           amountRaw,
@@ -1597,22 +1625,44 @@ async function startTopUpFromReservation(
     return "deferred";
   }
 
-  // Sponsor's HD index for signing.
-  const [sponsorPool] = await deps.db
-    .select({ addressIndex: addressPool.addressIndex })
-    .from(addressPool)
-    .where(
-      and(
-        eq(addressPool.family, chainAdapter.family),
-        eq(addressPool.address, sponsorAddress)
+  // Resolve the sponsor's signer scope. Two paths:
+  //   - Fee-wallet sponsor (capability="top-up"): scope is { kind: "fee-wallet" }
+  //     and signerStore decrypts/derives the fee wallet's key. The fee wallet
+  //     isn't in addressPool, so the pool lookup correctly returns no row.
+  //   - Pool-derived sponsor (default): scope carries the HD derivationIndex
+  //     so signerStore can derive the key from MASTER_SEED on demand.
+  // Resolution order: check feeWalletStore first (cheap single-row lookup
+  // and unambiguous when matched), fall back to addressPool. Failing both
+  // means the sponsor row was deleted between plan and broadcast — fail
+  // loudly so the executor doesn't retry a phantom sponsor forever.
+  const feeWallet = await deps.feeWalletStore.get(chainAdapter.family);
+  const sponsorIsFeeWallet = feeWallet !== null && feeWallet.address === sponsorAddress;
+
+  let sponsorScope: SignerScope;
+  if (sponsorIsFeeWallet) {
+    sponsorScope = { kind: "fee-wallet", family: chainAdapter.family };
+  } else {
+    const [sponsorPool] = await deps.db
+      .select({ addressIndex: addressPool.addressIndex })
+      .from(addressPool)
+      .where(
+        and(
+          eq(addressPool.family, chainAdapter.family),
+          eq(addressPool.address, sponsorAddress)
+        )
       )
-    )
-    .limit(1);
-  if (!sponsorPool) {
-    return failPayout(
-      deps, parent, "TOP_UP_BROADCAST_FAILED",
-      `Sponsor ${sponsorAddress} no longer exists in address_pool`
-    );
+      .limit(1);
+    if (!sponsorPool) {
+      return failPayout(
+        deps, parent, "TOP_UP_BROADCAST_FAILED",
+        `Sponsor ${sponsorAddress} is neither the registered fee wallet nor in address_pool`
+      );
+    }
+    sponsorScope = {
+      kind: "pool-address",
+      family: chainAdapter.family,
+      derivationIndex: sponsorPool.addressIndex
+    };
   }
 
   const nativeSymbol = chainAdapter.nativeSymbol(parent.chainId as ChainId);
@@ -1667,12 +1717,7 @@ async function startTopUpFromReservation(
         ? { feeTier: parent.feeTier as "low" | "medium" | "high" }
         : {})
     });
-    const scope: SignerScope = {
-      kind: "pool-address",
-      family: chainAdapter.family,
-      derivationIndex: sponsorPool.addressIndex
-    };
-    const privateKey = await deps.signerStore.get(scope);
+    const privateKey = await deps.signerStore.get(sponsorScope);
     topUpTxHash = await chainAdapter.signAndBroadcast(unsigned, privateKey);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -2704,6 +2749,47 @@ export async function sweepStuckPayoutReservations(
 
 // ---- Source selection (the heart of the new picker) ----
 
+// Fetch the registered fee wallet's native (TRX) balance for use as a top-up
+// sponsor in Tier B. Returns null when the chain doesn't expose the "top-up"
+// capability, no fee wallet is registered, or the live RPC balance read
+// fails. Called BEFORE entering the IMMEDIATE writer transaction in
+// planPayout (and once in simulateSource for /payouts/estimate parity), so
+// the writer-locked window stays free of network RTTs.
+//
+// The balance comes from the live chain (chainAdapter.getBalance) rather
+// than computeSpendable, because the fee wallet isn't in `addressPool` and
+// therefore has no ledger-derived balance. We don't subtract concurrent
+// reservations against the fee wallet here — operators size the fee wallet
+// to cover many payouts at once, so a single in-flight reservation is
+// rounding error. If two parallel plans collide on a thinly-funded fee
+// wallet, the second's top-up tx fails at broadcast (sponsor balance check)
+// and the executor retries on the next tick, same as a pool-sponsor
+// shortfall.
+async function loadFeeWalletSponsor(
+  deps: AppDeps,
+  chainAdapter: ChainAdapter,
+  chainId: number
+): Promise<{ address: string; nativeBalance: bigint } | null> {
+  const capability = chainAdapter.feeWalletCapability(chainId as ChainId);
+  if (capability !== "top-up") return null;
+  const fw = await deps.feeWalletStore.get(chainAdapter.family);
+  if (fw === null) return null;
+  const nativeSym = chainAdapter.nativeSymbol(chainId as ChainId);
+  try {
+    const nativeRaw = await chainAdapter.getBalance({
+      chainId: chainId as ChainId,
+      address: fw.address as Address,
+      token: nativeSym
+    });
+    return { address: fw.address, nativeBalance: BigInt(nativeRaw) };
+  } catch {
+    // RPC flap on fee-wallet balance fetch — degrade to "no sponsor" rather
+    // than blocking plan/estimate. The picker will surface
+    // `no_gas_sponsor_available` if no pool sponsor qualifies either.
+    return null;
+  }
+}
+
 type PickedSource = { address: string; derivationIndex: number };
 
 type SourceSelection =
@@ -2741,6 +2827,13 @@ type SelectionArgs = {
   // from `deps.feeWalletStore.has(family)` so we don't DB-query here
   // inside the IMMEDIATE-transaction path.
   feeWalletAvailable: boolean;
+  // Fee-wallet TRX sponsor candidate when capability === "top-up" and a
+  // fee wallet is registered. Pre-fetched OUTSIDE the IMMEDIATE transaction
+  // (RPC RTT can be 100ms+; we don't want it under the writer lock). The
+  // picker treats this entry as a sponsor candidate alongside pool-derived
+  // sponsors in Tier B. `null` when the capability isn't "top-up", no fee
+  // wallet is registered, or the live balance fetch failed.
+  feeWalletSponsor: { address: string; nativeBalance: bigint } | null;
 };
 
 // Drizzle's transaction handle and the top-level Db both implement these
@@ -2811,18 +2904,25 @@ async function selectSource(
   // an account (0) with insufficient funds for rent". EVM and Tron return 0.
   const minNativeReserve = chainAdapter.minimumNativeReserve(args.chainId as ChainId);
 
-  // Fee-wallet path. Two distinct topologies, both with the same planner
-  // effect: drop the source's native-gas requirement for TOKEN payouts.
+  // Fee-wallet path. Three distinct topologies the picker honors:
   //   - "co-sign"  (Solana): fee wallet signs as feePayer; source spends 0 SOL
   //     for sig fee + ATA rent. Token-holder still keeps its own rent-exempt.
-  //   - "delegate" (Tron):   fee wallet pre-delegated energy via
+  //   - "delegate" (Tron, future): fee wallet pre-delegates energy via
   //     DelegateResource; the source's TRC-20 tx consumes delegated energy
-  //     without burning TRX. We trust the operator set the delegation up;
-  //     the dedicated status endpoint /admin/fee-wallets/tron/resources
-  //     is the tool for verifying that ahead of payouts.
-  // Both paths are gated on `feeWalletAvailable` (a row exists in
-  // fee_wallets for the family), and BOTH only apply to token payouts —
-  // native payouts still need the source to fund the amount itself.
+  //     without burning TRX. Not enabled until the planner can verify
+  //     delegated `energyAvailable` per source (Phase 4); Tron currently
+  //     reports "top-up" instead.
+  //   - "top-up"   (Tron today): fee wallet holds native (TRX) and is
+  //     offered as an additional sponsor candidate in Tier B alongside
+  //     pool-derived sponsors. The flow is otherwise unchanged — fee
+  //     wallet sends a top-up tx to the source, which then broadcasts the
+  //     payout. Lets one funded wallet sponsor every Tron payout instead
+  //     of seeding TRX into every pool address.
+  // co-sign + delegate drop the source's native-gas requirement entirely;
+  // top-up does NOT (the source still burns TRX, just out of a top-up
+  // received from the fee wallet rather than its own funded balance).
+  // All three are gated on `feeWalletAvailable` and apply only to token
+  // payouts — native payouts still need the source to fund the amount.
   const capability = chainAdapter.feeWalletCapability(args.chainId as ChainId);
   const feeWalletCovers =
     (capability === "co-sign" || capability === "delegate") &&
@@ -2885,6 +2985,44 @@ async function selectSource(
   const topUpAmount = gap + cushion;
   const sponsorOwnGas = gasNeeded;
   const sponsorMinKeep = minNativeReserve;
+
+  // Sponsor candidates: prefer the registered fee wallet (capability
+  // === "top-up") when it has enough TRX. Falling back to pool-derived
+  // sponsors keeps the flow working for chains/topologies without a fee
+  // wallet, and for cases where the fee wallet is under-funded. Pool
+  // sponsors are tried in token-balance-descending order (inherited from
+  // the existing `enriched.sort`) — same ordering as before.
+  const feeWalletSponsor =
+    args.feeWalletSponsor !== null &&
+    args.feeWalletSponsor.address !== tokenHolder.address &&
+    args.feeWalletSponsor.nativeBalance >= topUpAmount + sponsorOwnGas + sponsorMinKeep
+      ? args.feeWalletSponsor
+      : null;
+
+  if (feeWalletSponsor) {
+    // derivationIndex = -1 marks "not in addressPool" — the broadcast path
+    // routes this through the fee-wallet signer scope instead of the
+    // pool-address scope. The reservation row is keyed by address, no FK
+    // to addressPool, so writing it with a fee-wallet address is safe.
+    const sponsorPicked = {
+      address: feeWalletSponsor.address,
+      derivationIndex: -1,
+      tokenBalance: 0n,
+      nativeBalance: feeWalletSponsor.nativeBalance
+    };
+    await insertReservationsForTopUp(
+      deps, tx, args.payoutId, args.chainId,
+      tokenHolder, sponsorPicked,
+      requiredAmount, topUpAmount, sponsorOwnGas,
+      tokenSym, nativeSymbol
+    );
+    return {
+      kind: "with_sponsor",
+      source: { address: tokenHolder.address, derivationIndex: tokenHolder.derivationIndex },
+      sponsor: { address: sponsorPicked.address, derivationIndex: -1 },
+      topUpAmountRaw: topUpAmount.toString()
+    };
+  }
 
   for (const sponsor of enriched) {
     if (sponsor.address === tokenHolder.address) continue;
