@@ -593,6 +593,46 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
       return "top-up" as const;
     },
 
+    async hasSufficientFreeGas(args: {
+      readonly chainId: ChainId;
+      readonly address: Address;
+      readonly token: TokenSymbol;
+    }): Promise<boolean> {
+      // Native (TRX) transfers don't go through this path — gas IS the
+      // asset, so "free gas" doesn't apply. Bail false to keep the
+      // planner on its standard native-balance check.
+      if (args.token === "TRX") return false;
+
+      // Only TRC-20 transfers benefit from delegated energy. Anything we
+      // can't price is treated as "no free gas" — the planner will fall
+      // back to the standard top-up flow. Same conservative default as
+      // the per-call estimate path uses.
+      const token = findToken(args.chainId as ChainId, args.token);
+      if (!token || token.contractAddress === null) return false;
+
+      try {
+        const client = getClient(args.chainId);
+        const resources = await client.getAccountResources(args.address);
+        // The MIN floor used by quoteFeeTiers is the right comparator —
+        // it matches what the gateway is willing to broadcast for a
+        // standard TRC-20 transfer. Sources delegated less than this
+        // would still need to burn TRX to cover the gap; treating them
+        // as "free gas" would set up a same-tx revert. Bandwidth is a
+        // minor factor (free 600/day usually covers the ~345-byte tx),
+        // so we don't gate on it; Tron's protocol charges TRX for
+        // bandwidth shortfall but the source's mid-tx auto-burn there
+        // is dust (~1 TRX worst case) and acceptable noise.
+        return resources.energyAvailable >= MIN_EXPECTED_TRC20_ENERGY;
+      } catch {
+        // RPC flap on getAccountResource → return false. Planner falls
+        // back to native-gas-or-top-up; a payout that would have worked
+        // via delegation lands in the regular flow and either succeeds
+        // (top-up sponsor available) or surfaces a clean
+        // no_gas_sponsor_available, which the operator can act on.
+        return false;
+      }
+    },
+
     async getBalance(args): Promise<AmountRaw> {
       const client = getClient(args.chainId);
       // Native gas (TRX) isn't in TOKEN_REGISTRY (only USDC/USDT for Tron),

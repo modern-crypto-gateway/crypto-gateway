@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { and, asc, desc, eq, gte, inArray, isNull, lt, lte, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lt, lte, sql, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import { ChainIdSchema, type Address, type ChainFamily, type ChainId, type TxHash } from "../types/chain.js";
@@ -594,6 +594,18 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   // balance read failed — all those degrade cleanly to pool-only sponsors.
   const feeWalletSponsor = await loadFeeWalletSponsor(deps, chainAdapter, parsed.chainId);
 
+  // For chains that expose `hasSufficientFreeGas` (Tron's delegated-
+  // energy probe today), pre-compute the set of pool addresses already
+  // covered by chain-side resources. Picker uses this to skip the
+  // native-gas requirement on Tier A for delegated sources. Empty Set
+  // on chains without the probe — no behavior change for them.
+  const freeGasAddresses = await loadFreeGasAddresses(
+    deps,
+    chainAdapter,
+    parsed.chainId,
+    parsed.token
+  );
+
   // Transaction returns a discriminated result instead of throwing, so
   // we can do error-enrichment work (oracle call for USD conversion)
   // OUTSIDE the IMMEDIATE writer lock. Throwing the enriched PayoutError
@@ -655,7 +667,8 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         gasNeeded,
         feeWalletAvailable,
         feeWalletSponsor,
-        forceSourceAddress: parsed.forceSourceAddress ?? null
+        forceSourceAddress: parsed.forceSourceAddress ?? null,
+        freeGasAddresses
       });
 
       if (
@@ -892,6 +905,31 @@ export interface EstimatePayoutFeesResult {
   // Next-best candidates by token balance, capped at 4. Lets the operator
   // see the broader pool state without paginating.
   alternatives: readonly SourceCandidate[];
+  // Diagnostic block for the registered fee wallet. Present ONLY when the
+  // chain's `feeWalletCapability` is "top-up" (Tron today) AND a fee
+  // wallet is registered for the family. Lets operators see at a glance
+  // why the fee wallet was or wasn't picked as the top-up sponsor — the
+  // most common confusion when a payout returns `no_gas_sponsor_available`
+  // despite a fee wallet being configured.
+  //
+  //   - `address`: the registered fee wallet address.
+  //   - `nativeBalance`: live on-chain native balance at estimate time.
+  //   - `topUpRequired`: native units the fee wallet would need to send
+  //                      to fund this specific payout's source.
+  //   - `shortfall`: max(topUpRequired - nativeBalance, 0). 0 means the
+  //                  fee wallet has enough; positive means the operator
+  //                  needs to top up the FEE WALLET itself (not the
+  //                  pool address) by that many units.
+  //   - `selected`: true when this fee wallet was actually picked as
+  //                 the top-up sponsor in the response above.
+  feeWallet?: {
+    address: string;
+    capability: "none" | "top-up" | "delegate" | "co-sign";
+    nativeBalance: string;
+    topUpRequired: string;
+    shortfall: string;
+    selected: boolean;
+  };
   warnings: string[];
 }
 
@@ -1260,6 +1298,46 @@ export async function estimatePayoutFees(
     ? await loadFeeWalletSponsor(deps, chainAdapter, parsed.chainId)
     : null;
 
+  // Mirror the planner's free-gas probe so the estimate reflects what
+  // POST /payouts will actually do for sources covered by delegated
+  // chain resources (Tron's delegated-energy model). Without this, an
+  // estimate would show "needs top-up" for a delegated source while
+  // the planner would correctly pick it as direct — confusing the
+  // dashboard.
+  const estimateFreeGasAddresses = !isNativePayout
+    ? await loadFreeGasAddresses(deps, chainAdapter, parsed.chainId, parsed.token)
+    : new Set<string>();
+
+  // Diagnostic helper for the `feeWallet` block in the response. Operators
+  // who configure a fee wallet but see `no_gas_sponsor_available` need to
+  // know WHY — most often because the fee wallet's liquid native balance is
+  // insufficient (common when the operator staked the TRX into energy
+  // instead of leaving it liquid). Surface live balance vs. needed top-up
+  // so the dashboard can show "fee wallet has X, needs Y, fund it" without
+  // requiring a second admin call. Returns undefined when capability isn't
+  // "top-up" or no fee wallet is registered — in those cases the field is
+  // omitted from the response.
+  const buildFeeWalletDiag = (args: {
+    topUpRequired: bigint;
+    selectedSponsorAddress: string | null;
+  }): EstimatePayoutFeesResult["feeWallet"] | undefined => {
+    if (estimateCapability !== "top-up") return undefined;
+    if (estimateFeeWalletSponsor === null) return undefined;
+    const fw = estimateFeeWalletSponsor;
+    const shortfall =
+      args.topUpRequired > fw.nativeBalance
+        ? args.topUpRequired - fw.nativeBalance
+        : 0n;
+    return {
+      address: fw.address,
+      capability: estimateCapability,
+      nativeBalance: fw.nativeBalance.toString(),
+      topUpRequired: args.topUpRequired.toString(),
+      shortfall: shortfall.toString(),
+      selected: args.selectedSponsorAddress === fw.address
+    };
+  };
+
   // Sort by token balance descending; richest token holder first.
   enriched.sort((a, b) => (a.tokenBalance < b.tokenBalance ? 1 : a.tokenBalance > b.tokenBalance ? -1 : 0));
 
@@ -1270,10 +1348,20 @@ export async function estimatePayoutFees(
     : estimateFeeWalletCovers
       ? minNativeReserve
       : gasNeeded + minNativeReserve;
+  // Same free-gas override as the real planner: a delegated source
+  // qualifies for Tier A even with 0 native balance.
   const direct = enriched.find(
-    (e) => e.tokenBalance >= directNeed && e.nativeBalance >= directNative
+    (e) =>
+      e.tokenBalance >= directNeed &&
+      (e.nativeBalance >= directNative ||
+        (!isNativePayout && estimateFreeGasAddresses.has(e.address)))
   );
   if (direct) {
+    // Tier A: source has its own native gas. No top-up is needed, so
+    // topUpRequired = 0; the fee wallet diagnostic still surfaces so the
+    // operator can see its status (selected=false here since we didn't
+    // actually pick it).
+    const feeWallet = buildFeeWalletDiag({ topUpRequired: 0n, selectedSponsorAddress: null });
     return {
       amountRaw,
       quotedAmountUsd,
@@ -1284,6 +1372,7 @@ export async function estimatePayoutFees(
         .filter((e) => e.address !== direct.address)
         .slice(0, 4)
         .map(serializeCandidate),
+      ...(feeWallet !== undefined ? { feeWallet } : {}),
       warnings
     };
   }
@@ -1315,6 +1404,16 @@ export async function estimatePayoutFees(
       );
       const sponsor = feeWalletPick ?? poolSponsor ?? null;
       if (sponsor) {
+        // Compute the actual top-up budget the picker would reserve from
+        // the sponsor (top-up amount + sponsor's own broadcast gas + the
+        // chain's rent-exempt keeper). That's what `feeWallet.shortfall`
+        // measures against — what the fee wallet would need on hand to
+        // act as sponsor for THIS payout.
+        const sponsorBudget = topUpAmount + sponsorOwnGas + minNativeReserve;
+        const feeWallet = buildFeeWalletDiag({
+          topUpRequired: sponsorBudget,
+          selectedSponsorAddress: sponsor.address
+        });
         return {
           amountRaw,
           quotedAmountUsd,
@@ -1330,10 +1429,21 @@ export async function estimatePayoutFees(
             .filter((e) => e.address !== tokenHolder.address && e.address !== sponsor.address)
             .slice(0, 4)
             .map(serializeCandidate),
+          ...(feeWallet !== undefined ? { feeWallet } : {}),
           warnings
         };
       }
-      // Token holder exists but no sponsor.
+      // Token holder exists but no sponsor. The most common reason an
+      // operator with a fee wallet hits this is that the fee wallet's
+      // liquid native balance is below the sponsor budget (e.g. they
+      // staked the TRX into energy thinking it'd help — under the current
+      // "top-up" capability, only liquid TRX counts). The feeWallet
+      // diagnostic block tells them exactly that.
+      const sponsorBudget = topUpAmount + sponsorOwnGas + minNativeReserve;
+      const feeWallet = buildFeeWalletDiag({
+        topUpRequired: sponsorBudget,
+        selectedSponsorAddress: null
+      });
       warnings.push("no_gas_sponsor_available");
       return {
         amountRaw,
@@ -1346,6 +1456,7 @@ export async function estimatePayoutFees(
           .filter((e) => e.address !== tokenHolder.address)
           .slice(0, 4)
           .map(serializeCandidate),
+        ...(feeWallet !== undefined ? { feeWallet } : {}),
         warnings
       };
     }
@@ -2378,6 +2489,135 @@ async function recordGasBurnDebit(
   }
 }
 
+// Cron-triggered reconciliation pass for gas_burn debits that were
+// DEFERRED on failPayout because the RPC didn't yet have the tx
+// receipt. Without this, a transient RPC lag at the moment of failure
+// permanently loses the gas burn from the ledger — `computeSpendable`
+// keeps thinking the source has its pre-failure native balance, the
+// next plan picks the same source as direct (no top-up), and the
+// pre-broadcast safety check at the EVM adapter then fires with
+// "insufficient native balance for broadcast". A cron retry repairs
+// the ledger as soon as the receipt is queryable.
+//
+// What it scans for: any payouts row in `failed` status with
+// `txHash IS NOT NULL` and no `gas_burn` child row pointing at it via
+// `parentPayoutId`. The kind filter explicitly excludes `gas_burn` rows
+// themselves (they're never the parent of another gas_burn) and any
+// other rows that don't represent an on-chain consumed tx (planned-but-
+// never-broadcast rows have `txHash IS NULL` and are filtered out by
+// the `txHash IS NOT NULL` predicate).
+//
+// Idempotency: each call to `recordGasBurnDebit` writes at most one
+// `gas_burn` row keyed by `parentPayoutId`. The reconciler re-checks
+// for an existing child before running, so re-running is a no-op once
+// the burn has been recorded. If `getConsumedNativeFee` still returns
+// null (RPC lag persists), the entry is logged as deferred and we try
+// again on the next tick.
+//
+// Bounded scan: opts.maxBatch caps how many rows we touch per pass,
+// matching the pattern used by `executeReservedPayouts` and
+// `confirmPayouts`. A failed-and-burned-but-unreconciled population
+// shouldn't grow unbounded, but the cap keeps a one-time pile-up from
+// monopolizing a cron tick.
+export interface ReconcileGasBurnsOptions {
+  readonly maxBatch?: number;
+}
+
+export interface ReconcileGasBurnsResult {
+  readonly scanned: number;
+  readonly recorded: number;
+  readonly stillDeferred: number;
+}
+
+export async function reconcileFailedPayoutGasBurns(
+  deps: AppDeps,
+  opts: ReconcileGasBurnsOptions = {}
+): Promise<ReconcileGasBurnsResult> {
+  const limit = opts.maxBatch ?? 200;
+  // Failed rows that broadcast (txHash present) and aren't themselves
+  // gas_burn synth rows. We further filter "no existing gas_burn child"
+  // in JavaScript because the LEFT-JOIN-style anti-join is awkward in
+  // drizzle's SQLite dialect; the row count is small in practice
+  // (failed-and-unreconciled is a recovery situation, not a steady
+  // state) so a follow-up query per candidate is fine.
+  const candidates = await deps.db
+    .select()
+    .from(payouts)
+    .where(
+      and(
+        eq(payouts.status, "failed"),
+        inArray(payouts.kind, ["standard", "gas_top_up", "consolidation_sweep"]),
+        // No drizzle helper for "tx_hash IS NOT NULL"; emit raw SQL.
+        sql`${payouts.txHash} IS NOT NULL`
+      )
+    )
+    .orderBy(asc(payouts.updatedAt))
+    .limit(limit);
+
+  let recorded = 0;
+  let stillDeferred = 0;
+
+  for (const row of candidates) {
+    // Skip if we already wrote a gas_burn for this parent.
+    const existing = await deps.db
+      .select({ id: payouts.id })
+      .from(payouts)
+      .where(
+        and(
+          eq(payouts.kind, "gas_burn"),
+          eq(payouts.parentPayoutId, row.id)
+        )
+      )
+      .limit(1);
+    if (existing.length > 0) continue;
+
+    // Reuse the same recorder used by failPayout. It logs both success
+    // (payout.gas_burn.recorded) and still-deferred (payout.gas_burn.deferred)
+    // outcomes — we observe via post-call payouts query rather than
+    // changing recordGasBurnDebit's signature.
+    let chainAdapter: ChainAdapter;
+    try {
+      chainAdapter = findChainAdapter(deps, row.chainId);
+    } catch (err) {
+      // Chain adapter went away (e.g. operator removed it from config).
+      // Nothing we can do — the burn is unrecoverable until the adapter
+      // is wired back. Log and skip; don't fail the whole batch.
+      deps.logger.warn("payout.gas_burn.reconcile.no_adapter", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      continue;
+    }
+
+    await recordGasBurnDebit(deps, row, chainAdapter);
+
+    // Re-query to see if the row was created (recordGasBurnDebit is
+    // fire-and-forget over its own deferred / error paths).
+    const after = await deps.db
+      .select({ id: payouts.id })
+      .from(payouts)
+      .where(
+        and(
+          eq(payouts.kind, "gas_burn"),
+          eq(payouts.parentPayoutId, row.id)
+        )
+      )
+      .limit(1);
+    if (after.length > 0) {
+      recorded += 1;
+    } else {
+      stillDeferred += 1;
+    }
+  }
+
+  return {
+    scanned: candidates.length,
+    recorded,
+    stillDeferred
+  };
+}
+
 async function failPayout(
   deps: AppDeps,
   row: typeof payouts.$inferSelect,
@@ -2842,6 +3082,58 @@ export async function sweepStuckPayoutReservations(
 // wallet, the second's top-up tx fails at broadcast (sponsor balance check)
 // and the executor retries on the next tick, same as a pool-sponsor
 // shortfall.
+// Probe each pool address for "free gas" — chain-side resources
+// (Tron's delegated energy, today) sufficient to broadcast a token
+// transfer WITHOUT burning native. Returns the addresses that qualify
+// as a Set for O(1) lookup inside the picker.
+//
+// Runs OUTSIDE the IMMEDIATE transaction (RPC fan-out: one
+// `getAccountResources` per pool address on Tron, ~50-150ms total
+// parallel). Empty Set when the chain adapter doesn't expose
+// `hasSufficientFreeGas` (every non-Tron family today).
+//
+// The picker uses this Set to override the native-gas requirement on
+// Tier A: a source already covered by delegated energy doesn't need
+// liquid TRX, so it qualifies for direct picking even with 0 native
+// balance. Without this probe, an operator who staked + delegated
+// energy from the fee wallet would still see the picker demand TRX
+// from the source — defeating the purpose of stake-and-delegate.
+async function loadFreeGasAddresses(
+  deps: AppDeps,
+  chainAdapter: ChainAdapter,
+  chainId: number,
+  token: string
+): Promise<Set<string>> {
+  if (typeof chainAdapter.hasSufficientFreeGas !== "function") {
+    return new Set();
+  }
+  const family = chainAdapter.family;
+  const poolRows = await deps.db
+    .select({ address: addressPool.address })
+    .from(addressPool)
+    .where(eq(addressPool.family, family));
+  if (poolRows.length === 0) return new Set();
+
+  const probe = chainAdapter.hasSufficientFreeGas.bind(chainAdapter);
+  const probes = await Promise.all(
+    poolRows.map(async (row) => {
+      try {
+        const ok = await probe({
+          chainId: chainId as ChainId,
+          address: row.address as Address,
+          token: token as TokenSymbol
+        });
+        return ok ? row.address : null;
+      } catch {
+        // Per-address RPC flap — caller already documents this should
+        // degrade to "no free gas" rather than block the whole plan.
+        return null;
+      }
+    })
+  );
+  return new Set(probes.filter((a): a is string => a !== null));
+}
+
 async function loadFeeWalletSponsor(
   deps: AppDeps,
   chainAdapter: ChainAdapter,
@@ -2927,6 +3219,15 @@ type SelectionArgs = {
   // source's full balance; without this, the picker would pick the same
   // richest address every time and never drain the others.
   forceSourceAddress: string | null;
+  // Set of pool addresses with sufficient delegated/staked chain
+  // resources to broadcast a token transfer WITHOUT burning native
+  // (Tron's delegated-energy model). Pre-computed via
+  // `chainAdapter.hasSufficientFreeGas` outside the writer lock — the
+  // probe is one RPC per pool address, parallelized. Empty Set on chains
+  // that don't expose the probe (EVM, UTXO, Solana). The picker uses
+  // membership here to override the native-gas requirement on Tier A
+  // direct picks: a delegated source qualifies even with 0 native.
+  freeGasAddresses: ReadonlySet<string>;
 };
 
 // Drizzle's transaction handle and the top-level Db both implement these
@@ -3051,9 +3352,17 @@ async function selectSource(
   // Tier A scans only sourceCandidates (= forced address, or all candidates
   // when no override). Sponsor selection in Tier B still scans the full
   // enriched pool below.
+  //
+  // freeGasAddresses overrides the native-gas requirement: a source
+  // already covered by delegated chain resources (Tron's
+  // delegated-energy model) qualifies for Tier A direct even with 0
+  // native balance. The token-payout broadcast itself draws on those
+  // resources at execution time — no liquid native is consumed. For
+  // native payouts the set is irrelevant (gas IS the asset being sent).
   for (const cand of sourceCandidates) {
     if (cand.tokenBalance < directNeed) continue;
-    if (cand.nativeBalance < directNative) continue;
+    const hasFreeGas = !isNativePayout && args.freeGasAddresses.has(cand.address);
+    if (cand.nativeBalance < directNative && !hasFreeGas) continue;
     await insertReservationsForDirect(
       deps, tx, args.payoutId, args.chainId, cand,
       requiredAmount, gasNeeded, tokenSym, nativeSymbol, isNativePayout

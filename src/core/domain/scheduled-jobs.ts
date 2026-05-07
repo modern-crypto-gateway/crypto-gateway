@@ -4,6 +4,7 @@ import { confirmTransactions, recheckConfirmedTransactionsForReorg } from "./pay
 import {
   confirmPayouts,
   executeReservedPayouts,
+  reconcileFailedPayoutGasBurns,
   sweepStuckPayoutReservations
 } from "./payout.service.js";
 import { pollPayments } from "./poll-payments.js";
@@ -34,6 +35,7 @@ export interface ScheduledJobsResult {
   recheckConfirmedForReorg: JobOutcome;
   executeReservedPayouts: JobOutcome;
   confirmPayouts: JobOutcome;
+  reconcileFailedPayoutGasBurns: JobOutcome;
   sweepStuckPayoutReservations: JobOutcome;
   sweepExpiredInvoices: JobOutcome;
   reconcileOrphanedAllocations: JobOutcome;
@@ -64,6 +66,14 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     recheckConfirmedForReorg: await run(() => recheckConfirmedTransactionsForReorg(deps)),
     executeReservedPayouts: await run(() => executeReservedPayouts(deps)),
     confirmPayouts: await run(() => confirmPayouts(deps)),
+    // Gas-burn reconciliation: retry `gas_burn` synthesis for any
+    // failed-and-broadcast payout whose receipt wasn't yet visible to
+    // the RPC at fail-time. Without this, transient RPC lag at the
+    // moment of failure permanently loses the burn from the ledger,
+    // causing the next plan to reuse a now-underfunded source. Runs
+    // AFTER confirmPayouts so any payout that just flipped to failed
+    // this tick gets a same-tick retry on its gas_burn.
+    reconcileFailedPayoutGasBurns: await run(() => reconcileFailedPayoutGasBurns(deps)),
     sweepStuckPayoutReservations: await run(() => sweepStuckPayoutReservations(deps)),
     // Expire-then-deliver: must run BEFORE sweepWebhookDeliveries so the
     // invoice.expired events published here insert webhook rows that get

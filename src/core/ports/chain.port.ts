@@ -187,6 +187,38 @@ export interface ChainAdapter {
   //                declare the fee wallet as the fee payer before sign.
   feeWalletCapability(chainId: ChainId): "none" | "top-up" | "delegate" | "co-sign";
 
+  // Probe whether `address` already has enough chain-native gas resources
+  // pre-allocated to broadcast a token transfer of `token` WITHOUT
+  // burning native balance. Tron implements this against its
+  // delegated-energy + bandwidth view (an address that's been delegated
+  // ≥ MIN_EXPECTED_TRC20_ENERGY of energy from a fee wallet's stake can
+  // broadcast TRC-20 transfers free of TRX burn). EVM/UTXO/Solana have
+  // no equivalent concept and return false unconditionally.
+  //
+  // The planner uses this in Tier A to skip the native-gas requirement
+  // for sources that come pre-funded with delegated resources. Without
+  // this probe, the planner would still require liquid TRX on the source
+  // even when the fee wallet had delegated ample energy — defeating the
+  // purpose of Tron's stake-and-delegate model.
+  //
+  // OPTIONAL — adapters that don't need it return false (or omit, in
+  // which case callers default to false). When defined, it's invoked
+  // per-candidate inside the writer-locked transaction, so
+  // implementations should be cheap (one RPC call) or cache. Tron's
+  // implementation queries getAccountResource and is not cached because
+  // delegations change quickly via admin endpoints — but the call is a
+  // single cheap RPC.
+  //
+  // Errors propagate as false: if the probe RPC fails, the planner
+  // falls back to the existing native-gas requirement, which is the safe
+  // default (a payout that would have succeeded with delegated energy
+  // will fail through the regular insufficient-balance / no-sponsor path).
+  hasSufficientFreeGas?(args: {
+    readonly chainId: ChainId;
+    readonly address: Address;
+    readonly token: TokenSymbol;
+  }): Promise<boolean>;
+
   // (Fee-payer application is now expressed via `BuildTransferArgs.feePayerAddress`
   // set at build time + `options.feePayerPrivateKey` passed at broadcast. No
   // separate `withFeePayer` port method is needed — the adapter emits the

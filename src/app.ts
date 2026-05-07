@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { AppDeps } from "./core/app-deps.js";
 import { confirmTransactions } from "./core/domain/payment.service.js";
-import { confirmPayouts, executeReservedPayouts } from "./core/domain/payout.service.js";
+import { confirmPayouts, executeReservedPayouts, reconcileFailedPayoutGasBurns } from "./core/domain/payout.service.js";
 import { pollPayments } from "./core/domain/poll-payments.js";
 import { registerPoolReleaseHandler } from "./core/domain/pool.service.js";
 import { registerWebhookSubscriber } from "./core/domain/webhook-subscriber.js";
@@ -129,6 +129,19 @@ export function buildApp(deps: AppDeps): App {
       // confirmed/failed based on the chain's current view.
       confirmPayouts: async () => {
         await confirmPayouts(deps);
+      },
+      // Gas-burn reconciliation — retries `gas_burn` synthesis for any
+      // failed-and-broadcast payout whose receipt wasn't yet visible to
+      // the RPC at fail-time. Without this, a transient RPC lag at the
+      // moment of failure permanently loses the gas-burn debit from the
+      // ledger, leaving `computeSpendable` thinking the source still has
+      // its pre-failure native balance, the next plan picks it as direct
+      // (no top-up), and the EVM adapter's pre-broadcast safety check
+      // fires "insufficient native balance for broadcast". The cron
+      // self-heals: each tick re-attempts every failed-with-txHash row
+      // that has no gas_burn child yet.
+      reconcileFailedPayoutGasBurns: async () => {
+        await reconcileFailedPayoutGasBurns(deps);
       }
     }
   };

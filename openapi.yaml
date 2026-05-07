@@ -3294,6 +3294,56 @@ components:
               derivationIndex: { type: integer }
               tokenBalance: { type: string }
               nativeBalance: { type: string }
+        feeWallet:
+          type: object
+          description: |
+            Diagnostic block for the registered fee wallet. Present ONLY
+            when the chain's `feeWalletCapability` is `top-up` (Tron today)
+            AND a fee wallet is registered for the family. Lets operators
+            see at a glance why the fee wallet was or wasn't picked as
+            the top-up sponsor — the most common confusion when a payout
+            returns `no_gas_sponsor_available` despite a fee wallet being
+            configured (typical cause: the operator staked the TRX into
+            energy thinking it'd help; under "top-up" capability only
+            liquid native is counted).
+          required: [address, capability, nativeBalance, topUpRequired, shortfall, selected]
+          properties:
+            address:
+              type: string
+              description: Registered fee wallet address.
+            capability:
+              type: string
+              enum: [none, top-up, delegate, co-sign]
+              description: |
+                The chain's current capability. The diagnostic block is
+                only emitted when this is `top-up`; other values are
+                listed here for type stability.
+            nativeBalance:
+              type: string
+              description: |
+                Live on-chain native balance at estimate time, in
+                smallest units (sun on Tron, wei on EVM, etc.).
+            topUpRequired:
+              type: string
+              description: |
+                Native units the fee wallet would need to send to fund
+                this specific payout's top-up — top-up amount + sponsor's
+                own broadcast gas + chain rent-exempt keeper. 0 when no
+                top-up was needed (Tier A direct picked).
+            shortfall:
+              type: string
+              description: |
+                `max(topUpRequired - nativeBalance, 0)`. 0 means the fee
+                wallet has enough native to sponsor; positive means the
+                operator needs to send the FEE WALLET (not the pool
+                address) that many native units to enable sponsorship.
+            selected:
+              type: boolean
+              description: |
+                True when this fee wallet was actually picked as the
+                top-up sponsor in the response above; false when it was
+                considered but rejected (insufficient native), not
+                applicable (Tier A direct), or not in the running.
         warnings:
           type: array
           description: |
