@@ -13,9 +13,53 @@ import type { ChainId } from "../../../core/types/chain.js";
 // back the over-reservation bug.
 
 describe("ChainAdapter.gasSafetyFactor — per-chain picker multipliers", () => {
-  it("EVM returns 1.5× (absorbs ~6 blocks of EIP-1559 baseFee drift)", () => {
-    const adapter = evmChainAdapter({ chainIds: [1] });
-    expect(adapter.gasSafetyFactor(1 as ChainId)).toEqual({ num: 150n, den: 100n });
+  // EVM moved to per-chainId values after a 2026-05 production incident
+  // where 9 of 15 Polygon consolidation legs failed with
+  // `insufficient native balance for broadcast` because gas spiked
+  // ~2.7× between plan time and broadcast time. The old fixed 1.5× was
+  // tuned for stable mainnet/L2 conditions and didn't cover Polygon's
+  // 2-3× spikes during congestion. Per-chain values reflect observed
+  // worst-case spike multipliers.
+  describe("EVM per-chain values", () => {
+    it("Ethereum mainnet returns 2.0× (typical 6-block baseFee growth)", () => {
+      const adapter = evmChainAdapter({ chainIds: [1] });
+      expect(adapter.gasSafetyFactor(1 as ChainId)).toEqual({ num: 200n, den: 100n });
+    });
+
+    it("Polygon returns 3.0× (covers observed 2-3× spikes during congestion)", () => {
+      const adapter = evmChainAdapter({ chainIds: [137] });
+      expect(adapter.gasSafetyFactor(137 as ChainId)).toEqual({ num: 300n, den: 100n });
+    });
+
+    it("BSC returns 2.5× (high-volatility L1)", () => {
+      const adapter = evmChainAdapter({ chainIds: [56] });
+      expect(adapter.gasSafetyFactor(56 as ChainId)).toEqual({ num: 250n, den: 100n });
+    });
+
+    it("Avalanche returns 2.5× (high-volatility L1)", () => {
+      const adapter = evmChainAdapter({ chainIds: [43114] });
+      expect(adapter.gasSafetyFactor(43114 as ChainId)).toEqual({ num: 250n, den: 100n });
+    });
+
+    it("Optimism returns 1.5× (sequenced rollup, predictable gas)", () => {
+      const adapter = evmChainAdapter({ chainIds: [10] });
+      expect(adapter.gasSafetyFactor(10 as ChainId)).toEqual({ num: 150n, den: 100n });
+    });
+
+    it("Arbitrum returns 1.5× (sequenced rollup, predictable gas)", () => {
+      const adapter = evmChainAdapter({ chainIds: [42161] });
+      expect(adapter.gasSafetyFactor(42161 as ChainId)).toEqual({ num: 150n, den: 100n });
+    });
+
+    it("Base returns 1.5× (sequenced rollup, predictable gas)", () => {
+      const adapter = evmChainAdapter({ chainIds: [8453] });
+      expect(adapter.gasSafetyFactor(8453 as ChainId)).toEqual({ num: 150n, den: 100n });
+    });
+
+    it("unknown EVM chainId falls back to 2.0× (mainnet-ETH conservative default)", () => {
+      const adapter = evmChainAdapter({ chainIds: [999_999] });
+      expect(adapter.gasSafetyFactor(999_999 as ChainId)).toEqual({ num: 200n, den: 100n });
+    });
   });
 
   it("Tron returns 1.30× (covers triggerConstantContract underreporting + cold-slot variance)", () => {

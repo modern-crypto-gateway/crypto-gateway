@@ -669,9 +669,54 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       return 0n;
     },
 
-    gasSafetyFactor(_chainId: ChainId) {
-      // 1.5× covers ~6 blocks of EIP-1559 baseFee growth (12.5%/block cap).
-      return { num: 150n, den: 100n };
+    gasSafetyFactor(chainId: ChainId) {
+      // Per-chain safety factor for the picker's gas-budget reservation.
+      // Sized to cover the gap between the gas quote at PLAN time and a
+      // re-quote at BROADCAST time — the inherent race in account-model
+      // payouts where the executor builds the broadcast tx with a fresh
+      // gas snapshot, not the planned one. The fixed 1.5× we used to
+      // quote on every chain was empirically too tight on Polygon: a
+      // ~2.7× plan-to-broadcast gas spike during a 2026-05 consolidation
+      // run failed 9 of 15 legs with `insufficient native balance for
+      // broadcast` because the top-ups (sized at quote × 1.5 × 1.2) were
+      // ~2× short of what broadcast actually charged.
+      //
+      // The picker multiplies this by the chosen tier's gas quote to
+      // compute the source's gas reserve, then adds a 20% cushion in
+      // the planner. Total top-up = quote × safety × 1.2 — needs to
+      // cover the worst plan-to-broadcast gas movement we expect on
+      // each chain.
+      //
+      // Math: pure EIP-1559 baseFee can grow at most 12.5%/block → six
+      // blocks compounded gives 1.125^6 ≈ 2.03×. Priority fees and
+      // congestion-driven mempool spikes layer on top. Polygon and BSC
+      // routinely show 2-3× spikes within a tight time window during
+      // congestion (USDT migrations, NFT mints); L2s have tightly
+      // controlled gas markets and stay within 1.5×. Per-chain values
+      // reflect observed worst-case-spike multipliers from production:
+      const PER_CHAIN: Readonly<Record<number, { num: bigint; den: bigint }>> = {
+        // L2s — sequenced rollups with predictable batched gas,
+        // baseFee moves slowly, 1.5× covers normal drift.
+        10: { num: 150n, den: 100n },     // Optimism
+        42161: { num: 150n, den: 100n },  // Arbitrum
+        8453: { num: 150n, den: 100n },   // Base
+        // Mainnet — moderate volatility, 2× covers typical 6-block
+        // baseFee growth + a margin for priority-fee spikes.
+        1: { num: 200n, den: 100n },      // Ethereum
+        11155111: { num: 200n, den: 100n }, // Sepolia
+        // High-volatility chains — Polygon's gas can 2-3× in a few
+        // blocks during congestion (the failure mode that drove this
+        // change). 3× safety leaves ~50% headroom on top of an
+        // observed 2× spike — combined with the 20% cushion in the
+        // planner, total top-up is quote × 3.6.
+        137: { num: 300n, den: 100n },    // Polygon
+        56: { num: 250n, den: 100n },     // BSC
+        43114: { num: 250n, den: 100n }   // Avalanche
+      };
+      // Default for unknown chainIds is conservative 2.0× — matches
+      // mainnet ETH. Operators adding a new EVM chain should update
+      // PER_CHAIN if they observe different volatility characteristics.
+      return PER_CHAIN[chainId] ?? { num: 200n, den: 100n };
     },
 
     feeWalletCapability(_chainId: ChainId) {
