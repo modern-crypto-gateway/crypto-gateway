@@ -19,7 +19,9 @@ import {
 } from "./payment-config.js";
 import { DomainError } from "../errors.js";
 import { assertWebhookUrlSafe } from "./url-safety.js";
-import { addressPool, merchants, payoutReservations, payouts, utxos } from "../../db/schema.js";
+import { addressPool, merchants, payoutBroadcasts, payoutReservations, payouts, transactions, utxos } from "../../db/schema.js";
+import { isUniqueViolation } from "./db-errors.js";
+import { decodeP2wpkhAddress } from "../../adapters/chains/utxo/bech32-address.js";
 import { computeSpendable } from "./balance-snapshot.service.js";
 import { loadSpendableUtxos, selectCoins } from "./utxo-coin-select.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
@@ -2261,12 +2263,17 @@ async function broadcastUtxoMain(
     const outputs: Array<{ scriptPubkey: string; value: bigint }> = [];
     let changeAddressIndex: number | null = null;
     let changeAddress: string | null = null;
+    let changeVout: number | null = null;
     for (const o of selection.outputs) {
       if (o.address === undefined) {
         // Change output: allocate a fresh P2WPKH address from the same counter.
         const allocated = await allocateUtxoAddress(deps, chainAdapter, row.chainId as ChainId, seed);
         changeAddress = allocated.address;
         changeAddressIndex = allocated.addressIndex;
+        // Output index = position we're about to push into. The change
+        // output's vout in the broadcast tx must match this exactly so the
+        // post-confirmation backfill can locate it without re-fetching.
+        changeVout = outputs.length;
         outputs.push({
           scriptPubkey: destinationScriptPubkey(allocated.address, utxoCfg),
           value: BigInt(o.value)
@@ -2353,6 +2360,8 @@ async function broadcastUtxoMain(
         inputs: rbfInputs,
         changeAddress,
         changeValueSats: changeOutput ? BigInt(changeOutput.value) : null,
+        changeAddressIndex,
+        changeVout,
         tx
       });
     });
@@ -2382,6 +2391,177 @@ async function broadcastUtxoMain(
     const message = err instanceof Error ? err.message : String(err);
     return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
   }
+}
+
+// On UTXO payout confirmation, re-import the change output back into the
+// `utxos` spendability table. Without this, change addresses (freshly-derived
+// per-broadcast P2WPKH) accumulate value on-chain that's invisible to:
+//   - balance snapshots (sum over `utxos`)
+//   - coin selection (loadSpendableUtxos reads `utxos`)
+// The detection scanner only watches `invoice_receive_addresses`; change
+// addresses are derived via allocateUtxoAddress (counter bump only) and never
+// registered there, so they were never picked up by rpc-poll's address fan-out.
+//
+// We rely on `payout_broadcasts.{change_address, change_value_sats,
+// change_address_index, change_vout}` populated at broadcast time — no extra
+// Esplora lookup needed. Idempotent on both writes (UNIQUE on transactions
+// identity; PK on utxos.id), so a re-run on the same confirmed payout no-ops.
+// Pre-migration broadcast rows (NULL index/vout) are skipped.
+//
+// Best-effort: failures log at error level but never block the parent
+// confirmation flow. The change output stays on-chain regardless; a later
+// admin path (or a re-run of this helper) can recover it.
+export async function backfillChangeUtxo(
+  deps: AppDeps,
+  payoutRow: Payout,
+  chainAdapter: ChainAdapter
+): Promise<void> {
+  if (chainAdapter.family !== "utxo") return;
+  if (payoutRow.txHash === null) return;
+
+  // Find the broadcast row whose txHash matches the on-chain confirmed tx.
+  // RBF chains have multiple attempts; only the one that actually landed has
+  // its txHash equal to payouts.txHash (the others are 'replaced' with a
+  // different hash). Filtering on (payoutId, txHash) selects exactly that one.
+  const matched = await deps.db
+    .select()
+    .from(payoutBroadcasts)
+    .where(
+      and(
+        eq(payoutBroadcasts.payoutId, payoutRow.id),
+        eq(payoutBroadcasts.txHash, payoutRow.txHash)
+      )
+    )
+    .limit(1);
+  const broadcastRow = matched[0];
+  if (!broadcastRow) return;
+
+  if (
+    broadcastRow.changeAddress === null ||
+    broadcastRow.changeValueSats === null ||
+    broadcastRow.changeAddressIndex === null ||
+    broadcastRow.changeVout === null
+  ) {
+    return;
+  }
+
+  // Re-derive scriptPubkey from the change address. It's always P2WPKH (we
+  // generate it ourselves via BIP84), so OP_0 + 20-byte hash160.
+  const decoded = decodeP2wpkhAddress(broadcastRow.changeAddress);
+  if (decoded === null) {
+    deps.logger.error("payout.utxo.change_backfill.bad_address", {
+      payoutId: payoutRow.id,
+      changeAddress: broadcastRow.changeAddress
+    });
+    return;
+  }
+  let hex = "";
+  for (let i = 0; i < decoded.program.length; i += 1) {
+    hex += decoded.program[i]!.toString(16).padStart(2, "0");
+  }
+  const scriptPubkey = `0014${hex}`;
+
+  // Pull a representative input address for the synthetic transactions row's
+  // from_address. Multi-input UTXO txs don't have a single source, so this
+  // is informational only (transactions row purpose for change is bookkeeping;
+  // the user-visible audit lives on payout_broadcasts already).
+  let fromAddress = broadcastRow.changeAddress;
+  try {
+    const inputs = JSON.parse(broadcastRow.inputsJson) as ReadonlyArray<{ address?: string }>;
+    if (inputs[0]?.address !== undefined) fromAddress = inputs[0].address;
+  } catch {
+    // inputsJson is corrupt; keep self-send fallback. Doesn't block backfill.
+  }
+
+  const nativeSymbol = chainAdapter.nativeSymbol(payoutRow.chainId as ChainId);
+  const now = deps.clock.now().getTime();
+  const changeVout = broadcastRow.changeVout;
+
+  // Insert the transactions row. Idempotent on the (chain_id, tx_hash, log_index)
+  // unique index — a re-run lands on UNIQUE violation, swallowed.
+  let transactionId: string | null = null;
+  try {
+    const newTxId = globalThis.crypto.randomUUID();
+    await deps.db.insert(transactions).values({
+      id: newTxId,
+      invoiceId: null,
+      chainId: payoutRow.chainId,
+      txHash: payoutRow.txHash,
+      logIndex: changeVout,
+      fromAddress,
+      toAddress: broadcastRow.changeAddress,
+      token: nativeSymbol,
+      amountRaw: broadcastRow.changeValueSats,
+      blockNumber: null,
+      confirmations: 0,
+      status: "confirmed",
+      detectedAt: now,
+      confirmedAt: now,
+      amountUsd: null,
+      usdRate: null
+    });
+    transactionId = newTxId;
+  } catch (err) {
+    if (!isUniqueViolation(err)) {
+      deps.logger.error("payout.utxo.change_backfill.transactions_insert_failed", {
+        payoutId: payoutRow.id,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      return;
+    }
+    // Existing row from a prior backfill run; pick up its id so the FK on
+    // utxos.transaction_id resolves. Only one row can match (chain_id,
+    // tx_hash, log_index) is unique.
+    const existing = await deps.db
+      .select({ id: transactions.id })
+      .from(transactions)
+      .where(
+        and(
+          eq(transactions.chainId, payoutRow.chainId),
+          eq(transactions.txHash, payoutRow.txHash),
+          eq(transactions.logIndex, changeVout)
+        )
+      )
+      .limit(1);
+    if (!existing[0]) return;
+    transactionId = existing[0].id;
+  }
+
+  // Insert the utxos overlay. Outpoint-id format matches insertUtxoRow in
+  // payment.service.ts (`{txHash}:{vout}`); PK collision means a prior run
+  // already wrote this row, which is fine.
+  try {
+    await deps.db.insert(utxos).values({
+      id: `${payoutRow.txHash}:${changeVout}`,
+      transactionId,
+      chainId: payoutRow.chainId,
+      address: broadcastRow.changeAddress,
+      addressIndex: broadcastRow.changeAddressIndex,
+      vout: changeVout,
+      valueSats: broadcastRow.changeValueSats,
+      scriptPubkey,
+      spentInPayoutId: null,
+      spentAt: null,
+      createdAt: now
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) return; // already there; idempotent re-run
+    deps.logger.error("payout.utxo.change_backfill.utxos_insert_failed", {
+      payoutId: payoutRow.id,
+      error: err instanceof Error ? err.message : String(err)
+    });
+    return;
+  }
+
+  deps.logger.info("payout.utxo.change_backfill.ok", {
+    payoutId: payoutRow.id,
+    chainId: payoutRow.chainId,
+    txHash: payoutRow.txHash,
+    changeAddress: broadcastRow.changeAddress,
+    changeAddressIndex: broadcastRow.changeAddressIndex,
+    changeVout,
+    valueSats: broadcastRow.changeValueSats
+  });
 }
 
 // Move a payout to `failed`, release ALL of its reservation rows (the source
@@ -2796,6 +2976,20 @@ export async function confirmPayouts(
       const releaseStmt = releaseReservationsStmt(deps, row.id);
       await deps.db.batch([confirmStmt, releaseStmt] as [typeof confirmStmt, typeof releaseStmt]);
       const updated = await fetchPayout(deps, row.id);
+      // UTXO change-output backfill. Re-import the change UTXO into the
+      // spendability table so balance + future coin selection see it. Runs
+      // AFTER the payout flips to confirmed (the parent `transactions` row
+      // we'll insert depends on it being a confirmed payout for the
+      // status='confirmed' label to be honest). Best-effort; failures log
+      // but don't block confirmation.
+      if (updated && chainAdapter.family === "utxo") {
+        await backfillChangeUtxo(deps, updated, chainAdapter).catch((err) => {
+          deps.logger.error("payout.utxo.change_backfill.unexpected", {
+            payoutId: row.id,
+            error: err instanceof Error ? err.message : String(err)
+          });
+        });
+      }
       if (updated) {
         await deps.events.publish({ type: "payout.confirmed", payoutId: updated.id, payout: updated, at: new Date(now) });
       }

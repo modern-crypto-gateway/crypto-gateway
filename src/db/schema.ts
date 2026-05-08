@@ -638,6 +638,15 @@ export const payoutBroadcasts = sqliteTable(
     // NULL when the attempt drops change entirely (fees consumed it).
     changeAddress: text("change_address"),
     changeValueSats: text("change_value_sats"),
+    // BIP44 derivation index + output index of the change output. Stored at
+    // broadcast time so confirmPayouts can backfill a `utxos` row for the
+    // change without an extra Esplora lookup or pool scan. NULL when there's
+    // no change output (changeAddress IS NULL too — both nullables stay in
+    // sync). Pre-migration broadcast rows have NULL for back-compat; their
+    // change outputs aren't auto-imported and stay invisible to balance
+    // until an admin re-attribution path runs.
+    changeAddressIndex: integer("change_address_index"),
+    changeVout: integer("change_vout"),
     // Lifecycle:
     //   creating  — DB row inserted, broadcast not yet attempted
     //   submitted — broadcast acknowledged by network

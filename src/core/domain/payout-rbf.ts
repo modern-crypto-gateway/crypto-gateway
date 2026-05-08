@@ -346,6 +346,8 @@ export async function bumpPayoutFee(
   const outputs: Array<{ scriptPubkey: string; value: bigint }> = [
     { scriptPubkey: merchantScript, value: merchantValueSats }
   ];
+  let changeAddressIndex: number | null = null;
+  let changeVout: number | null = null;
   if (changeValueSats !== null) {
     const allocated = await allocateUtxoAddress(
       deps,
@@ -354,6 +356,11 @@ export async function bumpPayoutFee(
       seed
     );
     changeAddress = allocated.address;
+    changeAddressIndex = allocated.addressIndex;
+    // Merchant is at vout=0; change is the next slot we're about to push.
+    // Recorded so the post-confirmation backfill can locate it without
+    // re-fetching the broadcast tx from Esplora.
+    changeVout = outputs.length;
     outputs.push({
       scriptPubkey: destinationScriptPubkey(allocated.address, utxoCfg),
       value: changeValueSats
@@ -424,6 +431,8 @@ export async function bumpPayoutFee(
         ),
         changeAddress,
         changeValueSats: changeValueSats?.toString() ?? null,
+        changeAddressIndex,
+        changeVout,
         status: "creating",
         createdAt: now
       });
@@ -568,6 +577,8 @@ export async function journalInitialBroadcast(
     readonly inputs: ReadonlyArray<RbfInput>;
     readonly changeAddress: string | null;
     readonly changeValueSats: bigint | null;
+    readonly changeAddressIndex: number | null;
+    readonly changeVout: number | null;
     readonly tx: Parameters<Parameters<AppDeps["db"]["transaction"]>[0]>[0];
   }
 ): Promise<void> {
@@ -584,6 +595,8 @@ export async function journalInitialBroadcast(
     inputsJson: JSON.stringify(args.inputs),
     changeAddress: args.changeAddress,
     changeValueSats: args.changeValueSats?.toString() ?? null,
+    changeAddressIndex: args.changeAddressIndex,
+    changeVout: args.changeVout,
     status: "submitted",
     broadcastAt: now,
     createdAt: now
