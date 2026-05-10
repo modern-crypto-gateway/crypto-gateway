@@ -2,6 +2,7 @@ import { z } from "zod";
 import { and, eq } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainIdSchema, type ChainId } from "../types/chain.js";
+import { AmountRawSchema } from "../types/money.js";
 import { TokenSymbolSchema } from "../types/token.js";
 import { addressPool, payouts } from "../../db/schema.js";
 import { findChainAdapter } from "./chain-lookup.js";
@@ -39,7 +40,20 @@ export const PlanConsolidationInputSchema = z
     token: TokenSymbolSchema,
     // The pool address that will receive all the consolidated balances.
     // Must already exist in `address_pool` for the chain's family.
-    targetAddress: z.string().min(1).max(128)
+    targetAddress: z.string().min(1).max(128),
+    // Optional per-source-address dust floor: skip any pool address whose
+    // spendable token balance is below this value. Used by the auto-
+    // consolidation cron to avoid burning gas on dust addresses where the
+    // per-tx gas cost would exceed the value being recovered. Decimal
+    // string in the token's smallest unit (e.g. "10000000" = 10 USDT @
+    // 6 decimals). Omit / set to "0" to consolidate every non-zero source.
+    minSourceBalanceRaw: AmountRawSchema.optional(),
+    // Optional cap on the number of legs planned in this single call.
+    // Sources are processed in pool-iteration order (insertion order from
+    // the address_pool select); the rest are silently deferred to the
+    // caller's next invocation. Used by the auto-consolidation cron to
+    // bound per-tick cost (Workers ~30s CPU budget). Omit for no cap.
+    maxSources: z.number().int().positive().max(200).optional()
   })
   .strict();
 export type PlanConsolidationInput = z.infer<typeof PlanConsolidationInputSchema>;
@@ -187,6 +201,15 @@ export async function planPoolConsolidation(
     .from(addressPool)
     .where(eq(addressPool.family, family));
 
+  // Per-source dust floor. Defaults to 1 (i.e. "any non-zero balance" —
+  // preserves the manual endpoint's pre-extension behavior when the
+  // caller omits the field). Auto-consolidation passes a chain-/token-
+  // appropriate value (e.g. 10 USDT raw = 10000000) so it doesn't burn
+  // gas on dust addresses.
+  const minSourceBalance = parsed.minSourceBalanceRaw !== undefined
+    ? BigInt(parsed.minSourceBalanceRaw)
+    : 1n;
+
   const sources: { address: string; amountRaw: bigint }[] = [];
   for (const row of allPoolRows) {
     if (row.address === parsed.targetAddress) continue;
@@ -195,7 +218,7 @@ export async function planPoolConsolidation(
       address: row.address,
       token: parsed.token
     });
-    if (balance > 0n) {
+    if (balance >= minSourceBalance) {
       sources.push({ address: row.address, amountRaw: balance });
     }
   }
@@ -203,8 +226,19 @@ export async function planPoolConsolidation(
   if (sources.length === 0) {
     throw new ConsolidationError(
       "NO_SOURCES_WITH_BALANCE",
-      `No pool addresses on chain ${parsed.chainId} hold ${parsed.token} (other than the target).`
+      parsed.minSourceBalanceRaw !== undefined && parsed.minSourceBalanceRaw !== "0"
+        ? `No pool addresses on chain ${parsed.chainId} hold at least ${parsed.minSourceBalanceRaw} (smallest unit) of ${parsed.token} (other than the target).`
+        : `No pool addresses on chain ${parsed.chainId} hold ${parsed.token} (other than the target).`
     );
+  }
+
+  // Cap legs-per-call. Auto-consolidation uses this to bound per-tick
+  // cost; the manual endpoint omits maxSources and processes everything.
+  // Sources are sorted by address (deterministic) before slicing so a
+  // re-run picks up exactly where the prior tick left off.
+  if (parsed.maxSources !== undefined && sources.length > parsed.maxSources) {
+    sources.sort((a, b) => (a.address < b.address ? -1 : a.address > b.address ? 1 : 0));
+    sources.length = parsed.maxSources;
   }
 
   // Plan each leg. Each call goes through the regular planPayout path with

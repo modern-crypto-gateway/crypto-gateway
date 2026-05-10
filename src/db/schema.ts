@@ -987,6 +987,82 @@ export const webhookDeliveries = sqliteTable(
   ]
 );
 
+// ---- auto_consolidation_schedules (admin-managed recurring sweeps) ----
+//
+// One row per (chainId, token) describes a recurring consolidation: every
+// `interval_hours`, the cron sweeps any pool address holding ≥ `min_source_balance_raw`
+// of that token into `target_address`. Reuses the existing
+// `planPoolConsolidation` flow — these are the same `consolidation_sweep`
+// payouts the manual /admin/pool/consolidate endpoint creates, just
+// scheduler-triggered.
+//
+// Concurrency: the cron claims due rows via UPDATE...WHERE next_run_due <=
+// now() RETURNING. Two ticks racing see the same WHERE clause; only one
+// UPDATE returns the row, the loser sees zero rows and skips that schedule.
+export const autoConsolidationSchedules = sqliteTable(
+  "auto_consolidation_schedules",
+  {
+    id: text("id").primaryKey(),
+    chainId: integer("chain_id").notNull(),
+    token: text("token").notNull(),
+    // Pool address that receives every consolidation. Must be in
+    // `address_pool` for the chain's family at create-time. Validated
+    // server-side; not enforced via FK because address_pool's PK is `id`
+    // (UUID) while we want to address-match.
+    targetAddress: text("target_address").notNull(),
+    // 1..720 (max 30 days). Drives next_run_due computation.
+    intervalHours: integer("interval_hours").notNull(),
+    // Per-source-address dust floor in token's smallest unit (decimal
+    // string for libsql precision). Sources below this are skipped at
+    // discovery time so we never burn gas to consolidate dust. Required
+    // — operator picks the right number for their economics.
+    minSourceBalanceRaw: text("min_source_balance_raw").notNull(),
+    // Cap on legs planned per cron tick. Prevents a chain with 200
+    // fragmented sources from blowing the Workers ~30s CPU budget AND
+    // avoids broadcasting 200 simultaneous consolidations that would
+    // drive gas prices up. Remaining sources picked up next tick.
+    maxSourcesPerRun: integer("max_sources_per_run").notNull().default(25),
+    // 0/1 for "active". Soft-disabled rows skip the cron's claim WHERE.
+    enabled: integer("enabled").notNull().default(1),
+    // Last fire timestamp (epoch ms). NULL until first run.
+    lastRunAt: integer("last_run_at"),
+    // Denormalized snapshot of the last fire's batchId + counts so the
+    // GET /admin/consolidation-schedules/:id endpoint can show "last
+    // fired N legs at T" without joining payouts.batch_id.
+    lastConsolidationId: text("last_consolidation_id"),
+    lastLegCount: integer("last_leg_count"),
+    lastSkippedCount: integer("last_skipped_count"),
+    // When the cron should fire next (epoch ms). Set on insert =
+    // now + interval_hours*3600000, advanced atomically by the cron.
+    nextRunDue: integer("next_run_due").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull()
+  },
+  (t) => [
+    // One schedule per (chainId, token). A second schedule for the same
+    // pair is meaningless — they'd race for the same source pool. Admin
+    // changes target via PATCH on the existing row.
+    uniqueIndex("uq_auto_consolidation_chain_token").on(t.chainId, t.token),
+    // Hot-path index for the cron's "give me schedules that are due"
+    // query. Partial-on-enabled keeps soft-disabled rows out of the scan.
+    index("idx_auto_consolidation_due")
+      .on(t.nextRunDue)
+      .where(sql`${t.enabled} = 1`),
+    check(
+      "auto_consolidation_interval_check",
+      sql`${t.intervalHours} >= 1 AND ${t.intervalHours} <= 720`
+    ),
+    check(
+      "auto_consolidation_max_sources_check",
+      sql`${t.maxSourcesPerRun} >= 1 AND ${t.maxSourcesPerRun} <= 200`
+    ),
+    check(
+      "auto_consolidation_enabled_check",
+      sql`${t.enabled} IN (0, 1)`
+    )
+  ]
+);
+
 // Aggregate re-export — lets call sites do `import * as schema from "../db/schema"`
 // once and pass it to drizzle() / helpers.
 export const schema = {
@@ -1003,5 +1079,6 @@ export const schema = {
   blockcypherSubscriptions,
   addressPool,
   invoiceReceiveAddresses,
-  webhookDeliveries
+  webhookDeliveries,
+  autoConsolidationSchedules
 };

@@ -17,6 +17,15 @@ import {
   getConsolidationStatus,
   planPoolConsolidation
 } from "../../core/domain/pool-consolidation.service.js";
+import {
+  AutoConsolidationError,
+  autoConsolidationErrorStatus,
+  createSchedule as createAutoSchedule,
+  deleteSchedule as deleteAutoSchedule,
+  getSchedule as getAutoSchedule,
+  listSchedules as listAutoSchedules,
+  updateSchedule as updateAutoSchedule
+} from "../../core/domain/auto-consolidation.service.js";
 import { repairUtxoAddressIndex } from "../../core/domain/utxo-address-index-repair.js";
 import {
   ingestDetectedTransfer,
@@ -1229,6 +1238,108 @@ const hasFeeWallet = adapterFamily !== undefined && adapterFamily !== "monero"
       return c.json({ error: { code: "NOT_FOUND", message: `No consolidation ${id}` } }, 404);
     }
     return c.json(status, 200);
+  });
+
+  // ---- Auto-consolidation schedules ----
+  //
+  // CRUD on the per-(chainId, token) recurring consolidation config.
+  // The cron job `runAutoConsolidations` (registered in scheduled-jobs.ts)
+  // sweeps any due schedules each tick, calling planPoolConsolidation
+  // with the schedule's filter parameters (minSourceBalanceRaw, maxSourcesPerRun).
+
+  // Create a new schedule. 409 if one already exists for the (chainId, token) pair.
+  app.post("/consolidation-schedules", async (c) => {
+    const rawBody = await c.req.text();
+    let parsedBody: unknown;
+    try {
+      parsedBody = rawBody.length > 0 ? JSON.parse(rawBody) : {};
+    } catch {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const schedule = await createAutoSchedule(deps, parsedBody);
+      return c.json({ schedule }, 201);
+    } catch (err) {
+      if (err instanceof AutoConsolidationError) {
+        return c.json(
+          { error: { code: err.code, message: err.message } },
+          autoConsolidationErrorStatus(err.code) as 400
+        );
+      }
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // List schedules with optional filters: ?chainId=, ?token=, ?enabled=true|false.
+  app.get("/consolidation-schedules", async (c) => {
+    try {
+      const query = Object.fromEntries(new URL(c.req.url).searchParams.entries());
+      const schedules = await listAutoSchedules(deps, query);
+      return c.json({ schedules }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Single schedule by id. Includes the snapshot of the most recent
+  // run (lastConsolidationId, lastLegCount, lastSkippedCount) when
+  // the cron has fired this schedule at least once.
+  app.get("/consolidation-schedules/:id", async (c) => {
+    const id = c.req.param("id");
+    const schedule = await getAutoSchedule(deps, id);
+    if (schedule === null) {
+      return c.json(
+        { error: { code: "SCHEDULE_NOT_FOUND", message: `No consolidation schedule with id ${id}` } },
+        404
+      );
+    }
+    return c.json({ schedule }, 200);
+  });
+
+  // Update one or more fields on an existing schedule. Updating
+  // `intervalHours` recomputes `nextRunDue` from the existing baseline
+  // (lastRunAt or createdAt) so changing the interval has intuitive
+  // effects (lower = sooner, higher = later) without resetting the cycle.
+  app.patch("/consolidation-schedules/:id", async (c) => {
+    const id = c.req.param("id");
+    const rawBody = await c.req.text();
+    let parsedBody: unknown;
+    try {
+      parsedBody = rawBody.length > 0 ? JSON.parse(rawBody) : {};
+    } catch {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const schedule = await updateAutoSchedule(deps, id, parsedBody);
+      return c.json({ schedule }, 200);
+    } catch (err) {
+      if (err instanceof AutoConsolidationError) {
+        return c.json(
+          { error: { code: err.code, message: err.message } },
+          autoConsolidationErrorStatus(err.code) as 400
+        );
+      }
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Delete a schedule entirely. Prefer PATCH `enabled: false` when you
+  // expect to re-enable later — that preserves the lastRun snapshot
+  // for forensic value. DELETE is for "this schedule is wrong, start over".
+  app.delete("/consolidation-schedules/:id", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const result = await deleteAutoSchedule(deps, id);
+      return c.json(result, 200);
+    } catch (err) {
+      if (err instanceof AutoConsolidationError) {
+        return c.json(
+          { error: { code: err.code, message: err.message } },
+          autoConsolidationErrorStatus(err.code) as 400
+        );
+      }
+      return renderError(c, err, deps.logger);
+    }
   });
 
   // One-shot repair for the multi-family UTXO `address_index` bug.

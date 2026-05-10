@@ -822,6 +822,87 @@ Gas considerations:
   burn × safety multiplier — see [src/adapters/chains/tron/tron-chain.adapter.ts](src/adapters/chains/tron/tron-chain.adapter.ts)
   for the floor).
 
+### Auto-consolidation schedules
+
+Manual `/admin/pool/consolidate` works, but operators forget to call it
+until a payout fails with `INSUFFICIENT_BALANCE_ANY_SOURCE`. The schedule
+system runs the same consolidation on a fixed interval per (chainId, token),
+so the largest source is kept aggregated automatically.
+
+```bash
+# Create a 12-hour schedule for USDT on Polygon. Skip any pool address
+# holding less than 10 USDT (avoid burning gas on dust).
+curl -X POST "$GATEWAY_URL/admin/consolidation-schedules" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 137,
+    "token": "USDT",
+    "targetAddress": "0xc965c39c...",
+    "intervalHours": 12,
+    "minSourceBalanceRaw": "10000000",
+    "maxSourcesPerRun": 25
+  }'
+# 201 Created
+# { "schedule": {
+#     "id": "...", "chainId": 137, "token": "USDT",
+#     "intervalHours": 12, "minSourceBalanceRaw": "10000000",
+#     "maxSourcesPerRun": 25, "enabled": true,
+#     "lastRunAt": null, "nextRunDue": <now + 12h>,
+#     ...
+# }}
+```
+
+The cron job `runAutoConsolidations` runs every scheduled-jobs tick (~1 min
+on Workers). It atomically claims schedules with `nextRunDue <= now()` and
+calls the same `planPoolConsolidation` flow the manual endpoint uses —
+producing `kind='consolidation_sweep'` payouts indistinguishable from
+manual ones at the executor level.
+
+**`minSourceBalanceRaw` is the most important parameter for cost control.**
+It's a per-source-address dust gate: any pool address holding LESS than
+this amount is silently skipped. Aggregate balance doesn't matter — what
+matters is whether each individual source's balance exceeds the per-tx
+gas cost. A pool of 100 addresses × $5 each has $500 total but consolidating
+all of them costs $50 in gas (at $0.50/tx). Per-source threshold filters
+those out so the cron only acts on addresses where consolidation is
+gas-positive. Sensible defaults by chain:
+
+| Chain | Per-tx cost | Suggested `minSourceBalanceRaw` (USDT, 6 decimals) |
+| --- | --- | --- |
+| Tron with delegated energy | $0 | `"1"` (sweep everything — no cost) |
+| Polygon, Base, Arbitrum, Optimism | ~$0.01–0.10 | `"100000"` (0.1 USDT) |
+| BSC | ~$0.10–0.50 | `"1000000"` (1 USDT) |
+| Avalanche | ~$0.30–2 | `"5000000"` (5 USDT) |
+| Ethereum L1 | ~$1–8 | `"50000000"` (50 USDT) |
+
+`maxSourcesPerRun` (default 25) caps how many legs fire per cron tick.
+Bounds CPU + avoids broadcasting many simultaneous consolidations that
+drive gas prices up. Excess sources pick up next tick.
+
+Other endpoints:
+
+```bash
+# List schedules (filter by chainId / token / enabled)
+GET /admin/consolidation-schedules?chainId=137&enabled=true
+
+# Get one schedule (includes lastRun snapshot — lastConsolidationId,
+# lastLegCount, lastSkippedCount)
+GET /admin/consolidation-schedules/<id>
+
+# Update fields (any subset). Updating intervalHours recomputes nextRunDue.
+PATCH /admin/consolidation-schedules/<id>
+{ "intervalHours": 6, "minSourceBalanceRaw": "50000000", "enabled": false }
+
+# Delete (prefer PATCH enabled:false to preserve forensic history)
+DELETE /admin/consolidation-schedules/<id>
+```
+
+The cron logs each firing at INFO with `auto_consolidation.fired` (or
+`auto_consolidation.skipped_inflight` when the prior batch is still
+pending — it skips rather than piling up). The "no sources to consolidate"
+case logs at INFO too (normal at quiet times); other failures log at WARN.
+
 ### Address subscription lifecycle (automatic)
 
 When `ALCHEMY_NOTIFY_TOKEN` is set, the gateway tracks which of your HD-derived

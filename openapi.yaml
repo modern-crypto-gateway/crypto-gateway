@@ -1590,6 +1590,255 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /admin/consolidation-schedules:
+    post:
+      tags: [admin]
+      summary: Create an auto-consolidation schedule
+      description: |
+        Configures the gateway to recurringly consolidate fragmented
+        token balances on a (chainId, token) into one target pool address.
+        The cron job `runAutoConsolidations` runs on every scheduled-jobs
+        tick (~1 min on Workers); it queries due schedules and calls the
+        same `planPoolConsolidation` machinery the manual endpoint uses.
+
+        **Per-source dust gate (`minSourceBalanceRaw`)** is the single
+        most important parameter for cost control: any pool address
+        holding LESS than this amount of `token` is silently skipped
+        when the schedule fires. Set this above the per-tx gas cost in
+        token units so you don't burn $0.50 in gas to consolidate $5 of
+        dust. For example: USDT on Ethereum L1 with $0.50/tx → set
+        `minSourceBalanceRaw` to ~50 USDT raw (`"50000000"` at 6 decimals).
+
+        Returns 201 with the created schedule. Returns 409 if a schedule
+        already exists for the (chainId, token) pair (PATCH the existing
+        one instead).
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chainId, token, targetAddress, intervalHours, minSourceBalanceRaw]
+              properties:
+                chainId: { type: integer }
+                token:
+                  type: string
+                  description: Token symbol (uppercase, registered on `chainId`).
+                targetAddress:
+                  type: string
+                  description: |
+                    Pool address that receives every consolidated balance.
+                    MUST exist in `address_pool` for the chain's family.
+                intervalHours:
+                  type: integer
+                  minimum: 1
+                  maximum: 720
+                  description: Hours between cron firings (1..720, max 30 days).
+                minSourceBalanceRaw:
+                  type: string
+                  description: |
+                    Per-source-address dust floor in the token's smallest
+                    unit (decimal string). Sources below this are silently
+                    skipped at fire time so the cron doesn't burn gas on
+                    addresses where consolidating costs more than the
+                    recovered balance.
+                maxSourcesPerRun:
+                  type: integer
+                  minimum: 1
+                  maximum: 200
+                  default: 25
+                  description: |
+                    Cap on legs planned per cron tick. Bounds per-tick CPU
+                    + avoids broadcasting many simultaneous consolidations
+                    that drive gas prices up. Remaining sources pick up
+                    next tick.
+                enabled:
+                  type: boolean
+                  default: true
+                  description: Soft-disable flag. Cron skips disabled schedules entirely.
+      responses:
+        "201":
+          description: Schedule created. `nextRunDue = now + intervalHours`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schedule]
+                properties:
+                  schedule: { $ref: "#/components/schemas/AutoConsolidationSchedule" }
+        "400":
+          description: |
+            Validation failure. Codes:
+              - `BAD_JSON` — malformed body
+              - `INVALID_CHAIN` — no chain adapter wired
+              - `INVALID_TOKEN` — token not registered on chainId
+              - `TARGET_NOT_IN_POOL` — targetAddress not in family pool
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: |
+            `SCHEDULE_ALREADY_EXISTS` — a schedule for this (chainId, token)
+            pair already exists. PATCH it to change settings.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      tags: [admin]
+      summary: List auto-consolidation schedules
+      description: |
+        Returns all schedules, newest first. Supports filtering by
+        `chainId`, `token`, and `enabled`.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: chainId
+          in: query
+          required: false
+          schema: { type: integer }
+        - name: token
+          in: query
+          required: false
+          schema: { type: string }
+        - name: enabled
+          in: query
+          required: false
+          schema: { type: string, enum: ["true", "false"] }
+      responses:
+        "200":
+          description: Schedule list (possibly empty)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schedules]
+                properties:
+                  schedules:
+                    type: array
+                    items: { $ref: "#/components/schemas/AutoConsolidationSchedule" }
+
+  /admin/consolidation-schedules/{id}:
+    get:
+      tags: [admin]
+      summary: Get one auto-consolidation schedule
+      description: |
+        Returns the schedule including the snapshot of the most recent
+        cron firing (`lastConsolidationId`, `lastLegCount`,
+        `lastSkippedCount`, `lastRunAt`). Use the `lastConsolidationId`
+        with `GET /admin/pool/consolidations/{id}` to get full per-leg
+        status of the most recent run.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The schedule
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schedule]
+                properties:
+                  schedule: { $ref: "#/components/schemas/AutoConsolidationSchedule" }
+        "404":
+          description: No schedule with this id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    patch:
+      tags: [admin]
+      summary: Update an auto-consolidation schedule
+      description: |
+        Update one or more fields on an existing schedule. All fields are
+        optional but at least one must be provided.
+
+        Updating `intervalHours` recomputes `nextRunDue` from the existing
+        baseline (`lastRunAt` if the schedule has fired, else `createdAt`)
+        — so lowering the interval makes the next fire happen sooner and
+        raising it defers, both intuitively, without arbitrarily resetting
+        the cycle.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                targetAddress: { type: string }
+                intervalHours:
+                  type: integer
+                  minimum: 1
+                  maximum: 720
+                minSourceBalanceRaw: { type: string }
+                maxSourcesPerRun:
+                  type: integer
+                  minimum: 1
+                  maximum: 200
+                enabled: { type: boolean }
+      responses:
+        "200":
+          description: The updated schedule
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schedule]
+                properties:
+                  schedule: { $ref: "#/components/schemas/AutoConsolidationSchedule" }
+        "400":
+          description: Validation failure or `TARGET_NOT_IN_POOL` (when targetAddress changes).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: "`SCHEDULE_NOT_FOUND` — no schedule with this id."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [admin]
+      summary: Delete an auto-consolidation schedule
+      description: |
+        Removes the schedule entirely. Prefer PATCH `enabled: false` when
+        you expect to re-enable later — that preserves the lastRun snapshot
+        for forensic value. DELETE is for "this schedule is wrong, start over".
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted: { type: boolean, enum: [true] }
+        "404":
+          description: "`SCHEDULE_NOT_FOUND`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /admin/webhook-deliveries:
     get:
       tags: [admin]
@@ -2854,6 +3103,57 @@ components:
               type: object
               additionalProperties: true
               description: Optional per-code payload (e.g. Zod issues on VALIDATION)
+
+    AutoConsolidationSchedule:
+      type: object
+      required:
+        - id
+        - chainId
+        - token
+        - targetAddress
+        - intervalHours
+        - minSourceBalanceRaw
+        - maxSourcesPerRun
+        - enabled
+        - nextRunDue
+        - createdAt
+        - updatedAt
+      properties:
+        id: { type: string, format: uuid }
+        chainId: { type: integer }
+        token: { type: string }
+        targetAddress: { type: string }
+        intervalHours:
+          type: integer
+          minimum: 1
+          maximum: 720
+        minSourceBalanceRaw:
+          type: string
+          description: Per-source dust floor in token's smallest unit.
+        maxSourcesPerRun:
+          type: integer
+          description: Cap on legs planned per cron tick.
+        enabled: { type: boolean }
+        lastRunAt:
+          type: [integer, "null"]
+          description: Epoch ms of the most recent cron firing. NULL until first run.
+        lastConsolidationId:
+          type: [string, "null"]
+          description: |
+            UUID of the consolidationId returned by the most recent firing.
+            Use with GET /admin/pool/consolidations/{id} for full per-leg
+            status of the most recent run.
+        lastLegCount:
+          type: [integer, "null"]
+          description: How many legs the most recent firing planned.
+        lastSkippedCount:
+          type: [integer, "null"]
+          description: How many sources the most recent firing skipped (per-leg failures).
+        nextRunDue:
+          type: integer
+          description: Epoch ms when the cron will next attempt to fire this schedule.
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
 
     CreateInvoiceInput:
       type: object

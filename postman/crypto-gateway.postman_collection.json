@@ -370,6 +370,104 @@
           }
         },
         {
+          "name": "3f. Create auto-consolidation schedule (POST /admin/consolidation-schedules)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/admin/consolidation-schedules",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "consolidation-schedules"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chainId\": 137,\n  \"token\": \"USDT\",\n  \"targetAddress\": \"0xc965c39c58c06df2241f6cff7852139269dda1f1\",\n  \"intervalHours\": 12,\n  \"minSourceBalanceRaw\": \"10000000\",\n  \"maxSourcesPerRun\": 25,\n  \"enabled\": true\n}"
+            },
+            "description": "Configure recurring consolidation for a (chainId, token) pair. The cron job `runAutoConsolidations` (registered in scheduled-jobs) sweeps fragmented pool addresses on schedule using the same `planPoolConsolidation` machinery the manual endpoint uses.\n\n**Critical parameter — `minSourceBalanceRaw`**: per-source dust gate. Any pool address holding LESS than this amount (in the token's smallest unit) is silently skipped at fire time. Set above the per-tx gas cost in token units to avoid burning $0.50 in gas to consolidate $5 of dust. Examples:\n- Polygon USDT (~$0.01/tx): `\"100000\"` (0.1 USDT) is fine\n- Ethereum L1 USDT (~$0.50/tx): `\"50000000\"` (50 USDT) — anything less is gas-negative\n- Tron USDT with delegated energy ($0/tx): `\"1\"` — sweep everything\n\n**`maxSourcesPerRun`** caps legs per tick (default 25). Bounds CPU + avoids broadcasting many simultaneous consolidations that drive gas prices up. Remaining sources picked up next tick.\n\n**`intervalHours`** 1..720 (max 30 days). After creation, `nextRunDue = now + intervalHours`.\n\nResponse codes:\n- 201 — schedule created\n- 400 — INVALID_CHAIN, INVALID_TOKEN, TARGET_NOT_IN_POOL\n- 409 — SCHEDULE_ALREADY_EXISTS (one per (chainId, token); PATCH the existing one)"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns schedule object with id', () => pm.expect(body.schedule.id).to.be.a('string'));",
+                  "if (body.schedule && body.schedule.id) pm.collectionVariables.set('lastScheduleId', body.schedule.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3g. List auto-consolidation schedules",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/consolidation-schedules",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "consolidation-schedules"],
+              "query": [
+                { "key": "chainId", "value": "137", "disabled": true },
+                { "key": "token", "value": "USDT", "disabled": true },
+                { "key": "enabled", "value": "true", "disabled": true, "description": "true | false" }
+              ]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "List all schedules, newest first. Query filters: `chainId`, `token`, `enabled` (true/false). Returns `{ schedules: [...] }`."
+          }
+        },
+        {
+          "name": "3h. Get one auto-consolidation schedule (incl. last-run snapshot)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/admin/consolidation-schedules/{{lastScheduleId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "consolidation-schedules", "{{lastScheduleId}}"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Returns the schedule including the snapshot of the most recent cron firing: `lastRunAt`, `lastConsolidationId`, `lastLegCount`, `lastSkippedCount`. Use the `lastConsolidationId` with `GET /admin/pool/consolidations/{id}` for full per-leg status of the most recent run.\n\nThe `lastScheduleId` collection variable is auto-populated by the `3f` request's test script."
+          }
+        },
+        {
+          "name": "3i. Update auto-consolidation schedule (PATCH)",
+          "request": {
+            "method": "PATCH",
+            "url": {
+              "raw": "{{baseUrl}}/admin/consolidation-schedules/{{lastScheduleId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "consolidation-schedules", "{{lastScheduleId}}"]
+            },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{adminKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"intervalHours\": 6,\n  \"minSourceBalanceRaw\": \"50000000\"\n}"
+            },
+            "description": "Update one or more fields on an existing schedule. All fields optional but at least one required: `targetAddress`, `intervalHours`, `minSourceBalanceRaw`, `maxSourcesPerRun`, `enabled`.\n\nUpdating `intervalHours` recomputes `nextRunDue` from the existing baseline (`lastRunAt` if the schedule has fired, else `createdAt`) — lower interval = next fire sooner, higher = deferred.\n\nResponse codes:\n- 200 — updated schedule\n- 400 — TARGET_NOT_IN_POOL (when targetAddress changes)\n- 404 — SCHEDULE_NOT_FOUND"
+          }
+        },
+        {
+          "name": "3j. Delete auto-consolidation schedule",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/admin/consolidation-schedules/{{lastScheduleId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["admin", "consolidation-schedules", "{{lastScheduleId}}"]
+            },
+            "header": [{ "key": "Authorization", "value": "Bearer {{adminKey}}" }],
+            "description": "Removes the schedule entirely. Prefer PATCH `enabled: false` when you expect to re-enable later — that preserves the lastRun snapshot for forensic value. DELETE is for 'this schedule is wrong, start over'."
+          }
+        },
+        {
           "name": "3. Inspect HD payout sources (admin balance snapshot)",
           "request": {
             "method": "GET",

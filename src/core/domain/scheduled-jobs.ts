@@ -1,4 +1,5 @@
 import type { AppDeps } from "../app-deps.js";
+import { runAutoConsolidations } from "./auto-consolidation.service.js";
 import { sweepExpiredInvoices } from "./invoice.service.js";
 import { confirmTransactions, recheckConfirmedTransactionsForReorg } from "./payment.service.js";
 import {
@@ -40,6 +41,10 @@ export interface ScheduledJobsResult {
   sweepExpiredInvoices: JobOutcome;
   reconcileOrphanedAllocations: JobOutcome;
   sweepWebhookDeliveries: JobOutcome;
+  // Auto-consolidation: fires due `(chainId, token)` consolidation
+  // schedules. No env gate — table-driven; with no schedules configured
+  // this is a single indexed lookup that finds nothing.
+  runAutoConsolidations: JobOutcome;
   // Present only when Alchemy is configured for this deployment
   // (`deps.alchemy` set). Absent otherwise — callers should not treat the
   // missing key as a failure.
@@ -86,7 +91,12 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     // callback) gets caught here on the same tick. Honors a grace window so
     // an in-flight create-invoice flow isn't raced.
     reconcileOrphanedAllocations: await run(() => reconcileOrphanedAllocations(deps)),
-    sweepWebhookDeliveries: await run(() => sweepWebhookDeliveries(deps))
+    sweepWebhookDeliveries: await run(() => sweepWebhookDeliveries(deps)),
+    // Runs AFTER reconcileOrphanedAllocations so any address just freed
+    // up by the orphan sweep is visible to the consolidation source-
+    // discovery query. Cheap when no schedules exist (single indexed
+    // lookup); per-tick cost scales with number of due schedules.
+    runAutoConsolidations: await run(() => runAutoConsolidations(deps))
   };
   if (deps.alchemy !== undefined) {
     result.alchemySyncAddresses = await run(() => deps.alchemy!.syncAddresses());
