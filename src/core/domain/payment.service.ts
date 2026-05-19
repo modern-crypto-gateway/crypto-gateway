@@ -149,39 +149,48 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
 
   // Outbound-payout dedupe. Alchemy ADDRESS_ACTIVITY webhooks (and our
   // RPC poller) fire on EVERY transfer touching a watched address — so
-  // when the gateway broadcasts a payout FROM a pool address, the same
-  // tx surfaces here as a "detected transfer" whose `to_address` is the
-  // merchant's destination. There's no invoice that wants to receive at
-  // the merchant's destination address, so without this guard the row
-  // lands as an orphan. The orphan row contributes 0 to spendable
-  // (computeSpendable only sums `confirmed`) — but it's noise in the
-  // admin orphan queue and dilutes the signal of real unattributed
-  // inbound payments.
+  // when the gateway broadcasts ANY payout (kind='standard', 'gas_top_up',
+  // 'consolidation_sweep', etc.) the same tx surfaces here as a
+  // "detected transfer". The payouts table is the authoritative record
+  // for those transfers; we MUST NOT also ingest them as detected-
+  // payments-to-an-invoice.
   //
-  // Authoritative source for this tx already exists in the `payouts`
-  // table (kind='standard' or 'gas_top_up' with txHash set). When the
-  // detected tx_hash matches a known payout, skip the insert entirely:
-  // the payout's existing row is the canonical record, and `failPayout`'s
-  // gas_burn debit + `confirmPayouts`' value debit handle the ledger.
-  if (isOrphanRow) {
-    const [matchingPayout] = await deps.db
-      .select({ id: payouts.id })
-      .from(payouts)
-      .where(
-        and(
-          eq(payouts.txHash, transfer.txHash),
-          eq(payouts.chainId, transfer.chainId)
-        )
+  // CRITICAL: this check runs unconditionally (not just on orphans).
+  // The earlier behavior gated it on `isOrphanRow`, which was correct
+  // ONLY for standard payouts (destination = external merchant address,
+  // never an invoice address). For consolidation_sweep + gas_top_up the
+  // destination is a POOL ADDRESS, which gets re-allocated to invoices
+  // over time. So a consolidation tx whose target had previously been
+  // an invoice receive address would non-orphan-match the prior invoice
+  // and credit it as if a customer paid — a real-money data corruption
+  // bug. Same risk applies to a standard payout that happens to send
+  // to one of our own pool addresses (rare but legal).
+  //
+  // The fix is straightforward: any tx_hash that matches one of our own
+  // payouts is internal movement, never customer payment. Skip it for
+  // invoice attribution regardless of whether the destination address
+  // happens to be in invoice_receive_addresses.
+  const [matchingPayout] = await deps.db
+    .select({ id: payouts.id, kind: payouts.kind })
+    .from(payouts)
+    .where(
+      and(
+        eq(payouts.txHash, transfer.txHash),
+        eq(payouts.chainId, transfer.chainId)
       )
-      .limit(1);
-    if (matchingPayout) {
-      deps.logger.debug("ingest.skip.payout_self_detect", {
-        chainId: transfer.chainId,
-        txHash: transfer.txHash,
-        payoutId: matchingPayout.id
-      });
-      return { inserted: false };
-    }
+    )
+    .limit(1);
+  if (matchingPayout) {
+    deps.logger.debug("ingest.skip.payout_self_detect", {
+      chainId: transfer.chainId,
+      txHash: transfer.txHash,
+      payoutId: matchingPayout.id,
+      payoutKind: matchingPayout.kind,
+      // Logged so operators can see whether the guard saved a real
+      // mis-attribution (non-orphan match) or just removed orphan noise.
+      wouldHaveOrphaned: isOrphanRow
+    });
+    return { inserted: false };
   }
 
   // Decide initial tx status using the reported confirmation count.

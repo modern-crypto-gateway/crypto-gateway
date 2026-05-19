@@ -210,6 +210,53 @@ export async function planPoolConsolidation(
     ? BigInt(parsed.minSourceBalanceRaw)
     : 1n;
 
+  // Native consolidation requires per-source rent + gas reserve. Unlike
+  // token consolidation (where the source's gas budget is independent of
+  // the token amount), a native sweep can't drain the source — Solana
+  // requires rent-exempt SOL on every account, and EVM/Tron sources
+  // need to retain enough native to pay for the broadcast tx itself.
+  //
+  // For each native source we compute `sweepableAmount = balance -
+  // (gasNeeded × race-buffer) - minNativeReserve`. This is the maximum
+  // we can ask planPayout to send while still satisfying the picker's
+  // `directNeed = amount + gasNeeded + minReserve` invariant
+  // (selectSource at payout.service.ts).
+  //
+  // Race-buffer (2×) absorbs gas-price drift between this consolidation
+  // call's quote and planPayout's independent re-quote — Solana's sig
+  // fee is essentially fixed but EVM gas can spike. If the source's
+  // balance can't cover even the buffer, we skip it (would otherwise
+  // surface as INSUFFICIENT_BALANCE_ANY_SOURCE per leg, which is what
+  // the user hit in the original bug report).
+  const isNativeConsolidation = tokenInfo.contractAddress === null;
+  let nativeSweepBuffer = 0n;
+  if (isNativeConsolidation) {
+    let tierQuotes;
+    try {
+      tierQuotes = await chainAdapter.quoteFeeTiers({
+        chainId: parsed.chainId as ChainId,
+        fromAddress: parsed.targetAddress as never,
+        toAddress: parsed.targetAddress as never,
+        token: parsed.token as never,
+        amountRaw: "1" as never
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new ConsolidationError(
+        "INVALID_CHAIN",
+        `Could not quote gas for native consolidation on chain ${parsed.chainId}: ${message}`
+      );
+    }
+    const safety = chainAdapter.gasSafetyFactor(parsed.chainId as ChainId);
+    const gasNeeded = (BigInt(tierQuotes.medium.nativeAmountRaw) * safety.num) / safety.den;
+    const minReserve = chainAdapter.minimumNativeReserve(parsed.chainId as ChainId);
+    // 2× gasNeeded buffer: planPayout re-quotes independently, so a fee
+    // spike between this estimate and broadcast could push the picker's
+    // gasNeeded above ours. 2× covers up to a 100% drift — generous on
+    // Solana (fixed sig fee), still safe on EVM under normal congestion.
+    nativeSweepBuffer = gasNeeded * 2n + minReserve;
+  }
+
   const sources: { address: string; amountRaw: bigint }[] = [];
   for (const row of allPoolRows) {
     if (row.address === parsed.targetAddress) continue;
@@ -218,8 +265,15 @@ export async function planPoolConsolidation(
       address: row.address,
       token: parsed.token
     });
-    if (balance >= minSourceBalance) {
-      sources.push({ address: row.address, amountRaw: balance });
+    // For native: deduct the per-source gas + reserve buffer so the
+    // amount we hand to planPayout is actually sweepable. For token
+    // consolidation the source's gas comes from a separate sponsor /
+    // fee wallet, so the full balance is sweepable.
+    const sweepable = isNativeConsolidation
+      ? (balance > nativeSweepBuffer ? balance - nativeSweepBuffer : 0n)
+      : balance;
+    if (sweepable >= minSourceBalance) {
+      sources.push({ address: row.address, amountRaw: sweepable });
     }
   }
 

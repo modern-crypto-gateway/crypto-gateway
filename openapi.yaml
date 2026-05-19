@@ -3149,6 +3149,32 @@ components:
         lastSkippedCount:
           type: [integer, "null"]
           description: How many sources the most recent firing skipped (per-leg failures).
+        lastSkippedReasons:
+          type: [array, "null"]
+          description: |
+            Per-leg skip reasons from the most recent firing. Capped at
+            50 entries server-side. NULL when the most recent firing had
+            zero skips, OR when the schedule hasn't fired yet. Most
+            common reasons:
+              - `NO_GAS_SPONSOR_AVAILABLE` — source holds the token but
+                no native; no other pool address (or fee wallet on Tron)
+                has enough native to top it up. Fix by funding a sponsor.
+              - `INSUFFICIENT_BALANCE_ANY_SOURCE` — race; balance moved
+                between discovery and plan. Self-heals next tick.
+              - `INVALID_DESTINATION` — operator-supplied targetAddress
+                stopped validating (rare; would also break manual flow).
+            Each entry: `{ sourceAddress, amountRaw, reason }`.
+          items:
+            type: object
+            required: [sourceAddress, amountRaw, reason]
+            properties:
+              sourceAddress: { type: string }
+              amountRaw:
+                type: string
+                description: Source's token balance (smallest unit) at fire time.
+              reason:
+                type: string
+                description: "Error code + message, e.g. `NO_GAS_SPONSOR_AVAILABLE: Token holder exists but no sponsor has enough native to top it up.`"
         nextRunDue:
           type: integer
           description: Epoch ms when the cron will next attempt to fire this schedule.

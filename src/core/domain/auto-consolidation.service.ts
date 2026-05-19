@@ -96,6 +96,12 @@ export type ListSchedulesQuery = z.infer<typeof ListSchedulesQuerySchema>;
 
 // ---- Output shapes ----
 
+export interface SkippedReason {
+  readonly sourceAddress: string;
+  readonly amountRaw: string;
+  readonly reason: string;
+}
+
 export interface ScheduleRow {
   readonly id: string;
   readonly chainId: number;
@@ -109,12 +115,29 @@ export interface ScheduleRow {
   readonly lastConsolidationId: string | null;
   readonly lastLegCount: number | null;
   readonly lastSkippedCount: number | null;
+  // Per-leg skip reasons from the most recent firing — what address,
+  // what balance, why it was skipped (e.g. "NO_GAS_SPONSOR_AVAILABLE: ...").
+  // Capped at 50 entries by the cron writer; null until first firing.
+  readonly lastSkippedReasons: readonly SkippedReason[] | null;
   readonly nextRunDue: number;
   readonly createdAt: number;
   readonly updatedAt: number;
 }
 
 function toScheduleRow(row: typeof autoConsolidationSchedules.$inferSelect): ScheduleRow {
+  let lastSkippedReasons: readonly SkippedReason[] | null = null;
+  if (row.lastSkippedReasonsJson !== null) {
+    try {
+      const parsed = JSON.parse(row.lastSkippedReasonsJson) as unknown;
+      if (Array.isArray(parsed)) {
+        lastSkippedReasons = parsed as SkippedReason[];
+      }
+    } catch {
+      // Malformed JSON in the column would be a writer-side bug. Fall
+      // through to null — the operator still sees lastSkippedCount;
+      // the parse failure is logged out of band.
+    }
+  }
   return {
     id: row.id,
     chainId: row.chainId,
@@ -128,6 +151,7 @@ function toScheduleRow(row: typeof autoConsolidationSchedules.$inferSelect): Sch
     lastConsolidationId: row.lastConsolidationId,
     lastLegCount: row.lastLegCount,
     lastSkippedCount: row.lastSkippedCount,
+    lastSkippedReasons,
     nextRunDue: row.nextRunDue,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt
@@ -435,12 +459,22 @@ export async function runAutoConsolidations(
 
       // Snapshot last-run summary on the schedule so the GET endpoint
       // can show "last fired N legs at T" without joining payouts.
+      // Skip reasons capped at 50 entries to bound row size — a chain
+      // with hundreds of fragmented sources where every leg fails for
+      // a different reason would otherwise produce an unboundedly
+      // large JSON blob. 50 entries (≈12KB worst case) is plenty for
+      // diagnosing the dominant failure modes.
+      const SKIP_REASONS_CAP = 50;
+      const cappedSkips = result.skipped.slice(0, SKIP_REASONS_CAP);
       await deps.db
         .update(autoConsolidationSchedules)
         .set({
           lastConsolidationId: result.consolidationId,
           lastLegCount: result.legs.length,
           lastSkippedCount: result.skipped.length,
+          lastSkippedReasonsJson: result.skipped.length > 0
+            ? JSON.stringify(cappedSkips)
+            : null,
           updatedAt: deps.clock.now().getTime()
         })
         .where(eq(autoConsolidationSchedules.id, sched.id));

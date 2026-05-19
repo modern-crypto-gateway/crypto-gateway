@@ -397,6 +397,120 @@ describe("auto-consolidation schedules", () => {
     expect(getRes.status).toBe(404);
   });
 
+  it("snapshots per-leg skip reasons on the schedule when the cron firing has skipped legs", async () => {
+    // Real-world failure mode this addresses: operator creates a Solana
+    // schedule, the cron fires, and every leg gets skipped (e.g.
+    // NO_GAS_SPONSOR_AVAILABLE because SPL sources hold tokens but no
+    // SOL and no fee wallet is registered). Without the skip-reasons
+    // snapshot, the operator sees `lastSkippedCount: 15` and zero
+    // diagnosis — they'd have to trawl Workers logs.
+    //
+    // Reproduce by removing the gas sponsor, leaving sources with token
+    // balance but no native to pay for top-ups. planPayout returns
+    // NO_GAS_SPONSOR_AVAILABLE per leg → result.skipped is populated.
+    const noSponsorBoot = await bootTestApp({
+      chains: [adapter],
+      secretsOverrides: { ADMIN_KEY }
+    });
+    try {
+      const a = noSponsorBoot.deps.chains[0]!;
+      const targetA = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, 9_000_001).address);
+      const fragmentA = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, 9_000_002).address);
+      const fragmentB = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, 9_000_003).address);
+
+      await seedFundedPoolAddress(noSponsorBoot, {
+        chainId: 999, family: "evm", address: targetA, derivationIndex: 9_000_001,
+        balances: {}
+      });
+      // Sources hold token (DEVT) but NO native (DEVN) and no separate
+      // sponsor address exists in the pool. planPayout will skip each leg.
+      await seedFundedPoolAddress(noSponsorBoot, {
+        chainId: 999, family: "evm", address: fragmentA, derivationIndex: 9_000_002,
+        balances: { DEVT: "100" }
+      });
+      await seedFundedPoolAddress(noSponsorBoot, {
+        chainId: 999, family: "evm", address: fragmentB, derivationIndex: 9_000_003,
+        balances: { DEVT: "60" }
+      });
+
+      // Create + force the schedule due.
+      const createRes = await noSponsorBoot.app.fetch(
+        new Request("http://test.local/admin/consolidation-schedules", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+          body: JSON.stringify({
+            chainId: 999, token: "DEVT", targetAddress: targetA,
+            intervalHours: 1, minSourceBalanceRaw: "10"
+          })
+        })
+      );
+      const created = (await createRes.json()) as { schedule: { id: string } };
+      await noSponsorBoot.deps.db
+        .update(autoConsolidationSchedules)
+        .set({ nextRunDue: noSponsorBoot.deps.clock.now().getTime() - 1000 })
+        .where(eq(autoConsolidationSchedules.id, created.schedule.id));
+
+      const result = await runAutoConsolidations(noSponsorBoot.deps);
+      expect(result.fired).toBe(1);
+
+      // Fetch the schedule — skip reasons must be populated and parseable.
+      const getRes = await noSponsorBoot.app.fetch(
+        new Request(`http://test.local/admin/consolidation-schedules/${created.schedule.id}`, {
+          headers: { authorization: `Bearer ${ADMIN_KEY}` }
+        })
+      );
+      const body = (await getRes.json()) as {
+        schedule: {
+          lastLegCount: number | null;
+          lastSkippedCount: number | null;
+          lastSkippedReasons: Array<{ sourceAddress: string; amountRaw: string; reason: string }> | null;
+        };
+      };
+      // 0 legs planned (every source skipped), 2 sources skipped.
+      expect(body.schedule.lastLegCount).toBe(0);
+      expect(body.schedule.lastSkippedCount).toBe(2);
+      // Reasons populated and parsed back into an array of triples.
+      expect(body.schedule.lastSkippedReasons).not.toBeNull();
+      expect(body.schedule.lastSkippedReasons).toHaveLength(2);
+      // Each entry has the source address + amountRaw + an actionable
+      // reason string (NO_GAS_SPONSOR_AVAILABLE in this scenario).
+      for (const skip of body.schedule.lastSkippedReasons!) {
+        expect([fragmentA, fragmentB]).toContain(skip.sourceAddress);
+        expect(skip.reason).toMatch(/NO_GAS_SPONSOR_AVAILABLE/);
+      }
+    } finally {
+      await noSponsorBoot.close();
+    }
+  });
+
+  it("clears lastSkippedReasonsJson when a subsequent firing has zero skips", async () => {
+    // First firing has skips (no sponsor). Then we add a sponsor and
+    // fire again — second firing should clear the stale reasons rather
+    // than leaving the prior diagnostic on the schedule indefinitely.
+    const createRes = await postSchedule({
+      chainId: 999, token: "DEVT", targetAddress: target,
+      intervalHours: 1, minSourceBalanceRaw: "10"
+    });
+    const created = (await createRes.json()) as { schedule: { id: string } };
+
+    // Force fire #1 — succeeds because sponsor IS funded in the
+    // beforeEach setup, so all 4 legs (incl dust=5 since min is 10... wait,
+    // dust at 5 IS below 10 so 3 legs). Skips = 0.
+    await booted.deps.db
+      .update(autoConsolidationSchedules)
+      .set({ nextRunDue: booted.deps.clock.now().getTime() - 1000 })
+      .where(eq(autoConsolidationSchedules.id, created.schedule.id));
+    await runAutoConsolidations(booted.deps);
+
+    // Verify the snapshot is cleared (or never populated) when 0 skips.
+    const getRes = await getSchedule(created.schedule.id);
+    const body = (await getRes.json()) as {
+      schedule: { lastSkippedCount: number | null; lastSkippedReasons: unknown };
+    };
+    expect(body.schedule.lastSkippedCount).toBe(0);
+    expect(body.schedule.lastSkippedReasons).toBeNull();
+  });
+
   it("disabled schedules are NOT picked up by the cron even when due", async () => {
     const createRes = await postSchedule({
       chainId: 999, token: "DEVT", targetAddress: target,

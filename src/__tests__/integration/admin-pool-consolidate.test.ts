@@ -306,3 +306,130 @@ describe("POST /admin/pool/consolidate", () => {
     expect(internalRows.length).toBeGreaterThan(0);
   });
 });
+
+// Native (gas-token) consolidation has different math than token consolidation:
+// the source can't be drained because it must retain `gasNeeded + minNativeReserve`.
+// The amount we plan must be `balance - gas - reserve`, otherwise the picker
+// rejects every leg with INSUFFICIENT_BALANCE_ANY_SOURCE (the bug the
+// production Solana SOL schedule hit — sources had 5 SOL each but planPayout
+// asked them to send the FULL 5 SOL, leaving no room for sig fee + rent).
+describe("POST /admin/pool/consolidate — native token math", () => {
+  const NATIVE_CHAIN_ID = 999 as ChainId;
+  const TARGET_INDEX = 6_100_001;
+  const SOURCE_A_INDEX = 6_100_002;
+  const SOURCE_B_INDEX = 6_100_003;
+  const TINY_INDEX = 6_100_004;
+
+  // Wrapper that simulates a Solana-style native chain: non-zero
+  // minimumNativeReserve (rent-exempt minimum) + a small gas quote.
+  // Critical: the dev adapter's default minimumNativeReserve is 0, which
+  // would mask the bug we're testing.
+  function nativeAdapter(): ChainAdapter {
+    const base = devChainAdapter({ deterministicTxHashes: true });
+    return {
+      ...base,
+      // Solana-like rent-exempt minimum (890_880 lamports). Source must
+      // retain at least this much native after the consolidation.
+      minimumNativeReserve(_chainId: ChainId): bigint {
+        return 890_880n;
+      }
+    };
+  }
+
+  it("subtracts gas + minNativeReserve from the swept amount so the picker accepts every leg", async () => {
+    const adapter = nativeAdapter();
+    const booted = await bootTestApp({ chains: [adapter], secretsOverrides: { ADMIN_KEY } });
+    try {
+      const a = booted.deps.chains[0]!;
+      const target = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, TARGET_INDEX).address);
+      const sourceA = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_A_INDEX).address);
+      const sourceB = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_B_INDEX).address);
+
+      await seedFundedPoolAddress(booted, {
+        chainId: Number(NATIVE_CHAIN_ID), family: "evm",
+        address: target, derivationIndex: TARGET_INDEX, balances: {}
+      });
+      // Native (DEV) balances. Each source has 1_000_000 native units —
+      // enough to cover an amount + 21k gas + 890k reserve, just barely.
+      await seedFundedPoolAddress(booted, {
+        chainId: Number(NATIVE_CHAIN_ID), family: "evm",
+        address: sourceA, derivationIndex: SOURCE_A_INDEX,
+        balances: { DEV: "1000000" }
+      });
+      await seedFundedPoolAddress(booted, {
+        chainId: Number(NATIVE_CHAIN_ID), family: "evm",
+        address: sourceB, derivationIndex: SOURCE_B_INDEX,
+        balances: { DEV: "2000000" }
+      });
+
+      const res = await booted.app.fetch(
+        new Request("http://test.local/admin/pool/consolidate", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+          body: JSON.stringify({ chainId: Number(NATIVE_CHAIN_ID), token: "DEV", targetAddress: target })
+        })
+      );
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as {
+        legs: Array<{ sourceAddress: string; amountRaw: string }>;
+        skipped: Array<{ sourceAddress: string; reason: string }>;
+      };
+      // Pre-fix behavior: both sources land in `skipped` with
+      // INSUFFICIENT_BALANCE_ANY_SOURCE because planPayout asked them
+      // to send their full balance plus reserve+gas.
+      // Post-fix: both sources land in `legs` with amount = balance - 2×gas - reserve.
+      expect(body.legs).toHaveLength(2);
+      expect(body.skipped).toHaveLength(0);
+
+      // Sanity: each leg's amountRaw must be strictly less than its source
+      // balance (we deducted gas + reserve).
+      const amountByAddress = new Map(body.legs.map((l) => [l.sourceAddress, BigInt(l.amountRaw)]));
+      expect(amountByAddress.get(sourceA)!).toBeLessThan(1_000_000n);
+      expect(amountByAddress.get(sourceB)!).toBeLessThan(2_000_000n);
+      // Roughly = balance - reserve - 2×gas. Reserve = 890_880, gas at
+      // medium tier × 1.5 safety = 31500, ×2 race buffer = 63000.
+      // Expected amount ≈ balance - 890_880 - 63000 ≈ balance - 953880.
+      expect(amountByAddress.get(sourceA)!).toBe(1_000_000n - 953_880n);
+      expect(amountByAddress.get(sourceB)!).toBe(2_000_000n - 953_880n);
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("skips sources whose balance can't cover even the rent + gas buffer", async () => {
+    const adapter = nativeAdapter();
+    const booted = await bootTestApp({ chains: [adapter], secretsOverrides: { ADMIN_KEY } });
+    try {
+      const a = booted.deps.chains[0]!;
+      const target = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, TARGET_INDEX).address);
+      const tiny = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, TINY_INDEX).address);
+
+      await seedFundedPoolAddress(booted, {
+        chainId: Number(NATIVE_CHAIN_ID), family: "evm",
+        address: target, derivationIndex: TARGET_INDEX, balances: {}
+      });
+      // Tiny balance: less than reserve+gas. Should be filtered out
+      // entirely (not included in skipped[] either — it just doesn't
+      // qualify as a candidate source).
+      await seedFundedPoolAddress(booted, {
+        chainId: Number(NATIVE_CHAIN_ID), family: "evm",
+        address: tiny, derivationIndex: TINY_INDEX,
+        balances: { DEV: "500000" } // < 890_880 reserve, can't sweep anything
+      });
+
+      const res = await booted.app.fetch(
+        new Request("http://test.local/admin/pool/consolidate", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+          body: JSON.stringify({ chainId: Number(NATIVE_CHAIN_ID), token: "DEV", targetAddress: target })
+        })
+      );
+      // No sources qualify after subtracting reserve+gas → 400 NO_SOURCES_WITH_BALANCE.
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("NO_SOURCES_WITH_BALANCE");
+    } finally {
+      await booted.close();
+    }
+  });
+});

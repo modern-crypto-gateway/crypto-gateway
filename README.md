@@ -822,6 +822,38 @@ Gas considerations:
   burn × safety multiplier — see [src/adapters/chains/tron/tron-chain.adapter.ts](src/adapters/chains/tron/tron-chain.adapter.ts)
   for the floor).
 
+#### Native (gas token) consolidation has different math
+
+Token consolidation (USDT, USDC) sweeps the source's full token balance
+because the source's gas comes from a separate sponsor / fee wallet —
+the token amount and gas budget are independent.
+
+**Native** consolidation (SOL on Solana, ETH on Ethereum, MATIC on Polygon,
+TRX on Tron) can't drain the source. The source must retain
+`gasNeeded + minNativeReserve` after the sweep — Solana requires SOL
+above the rent-exempt minimum (~890,880 lamports), and EVM/Tron sources
+need to keep enough native to actually broadcast the consolidation tx.
+
+The flow auto-detects native consolidation (`token.contractAddress === null`)
+and computes per-source `sweepableAmount = balance - 2×gasNeeded - minNativeReserve`.
+The 2× gas factor absorbs plan-to-broadcast price drift between this
+quote and the picker's independent re-quote. Sources whose balance
+can't cover even the buffer are silently filtered — they'd otherwise
+surface as `INSUFFICIENT_BALANCE_ANY_SOURCE` per leg.
+
+Practical impact: consolidating native SOL leaves ~0.001 SOL behind on
+each source (rent + sig fee buffer). For a 15 SOL pool spread across
+18 sources, that's ~0.018 SOL of irrecoverable dust — 0.12% of the pool.
+For tiny native dust addresses where balance < reserve, consolidation
+just skips them (no point burning gas to recover less than the reserve
+they have to keep).
+
+If you set `minSourceBalanceRaw` on a native consolidation schedule,
+the threshold compares against the **sweepable amount** (post-deduction),
+not the raw balance. So `minSourceBalanceRaw: "100000000"` on Solana
+means "skip sources whose sweepable amount is below 0.1 SOL", which is
+the operator's actual cost-recovery threshold.
+
 ### Auto-consolidation schedules
 
 Manual `/admin/pool/consolidate` works, but operators forget to call it
@@ -902,6 +934,26 @@ The cron logs each firing at INFO with `auto_consolidation.fired` (or
 `auto_consolidation.skipped_inflight` when the prior batch is still
 pending — it skips rather than piling up). The "no sources to consolidate"
 case logs at INFO too (normal at quiet times); other failures log at WARN.
+
+**Diagnosing skips**: when a firing produces 0 legs but `lastSkippedCount > 0`
+(i.e. sources existed but each `planPayout` rejected them), the per-leg
+reasons are snapshotted on the schedule via `lastSkippedReasons` — no need
+to trawl Workers logs. Each entry is `{ sourceAddress, amountRaw, reason }`.
+Common patterns:
+
+- **Solana SPL schedule, all skipped with `NO_GAS_SPONSOR_AVAILABLE`**:
+  the SPL pool addresses hold tokens but no SOL, AND no fee wallet is
+  registered for the Solana family. Either fund some pool addresses
+  with SOL OR register a Solana fee wallet via `/admin/fee-wallets/solana/import`.
+- **Tron schedule, all skipped with `NO_GAS_SPONSOR_AVAILABLE`**: the
+  registered Tron fee wallet ran dry on TRX. Top it up.
+- **EVM schedule, all skipped with `NO_GAS_SPONSOR_AVAILABLE`**: no pool
+  address has enough native to act as a Tier-B sponsor. Fund a sponsor
+  pool address with the chain's native.
+
+The reasons array is capped at 50 entries server-side to bound row size
+on chains with hundreds of fragmented sources. The `lastSkippedCount`
+remains the authoritative total.
 
 ### Address subscription lifecycle (automatic)
 

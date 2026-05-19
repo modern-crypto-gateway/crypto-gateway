@@ -1032,6 +1032,14 @@ export const autoConsolidationSchedules = sqliteTable(
     lastConsolidationId: text("last_consolidation_id"),
     lastLegCount: integer("last_leg_count"),
     lastSkippedCount: integer("last_skipped_count"),
+    // JSON array of `{sourceAddress, amountRaw, reason}` from the most
+    // recent firing's per-leg failures. Capped at 50 entries (bounded
+    // row size on chains with hundreds of fragmented sources) by the
+    // cron writer. Lets operators diagnose "why are my legs all
+    // skipping?" without needing Workers log access — most common case
+    // on Solana is NO_GAS_SPONSOR_AVAILABLE because SPL sources hold
+    // tokens but no SOL and no fee wallet is registered.
+    lastSkippedReasonsJson: text("last_skipped_reasons_json"),
     // When the cron should fire next (epoch ms). Set on insert =
     // now + interval_hours*3600000, advanced atomically by the cron.
     nextRunDue: integer("next_run_due").notNull(),
