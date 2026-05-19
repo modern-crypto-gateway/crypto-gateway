@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { and, asc, desc, eq, gte, inArray, isNull, lt, lte, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import { ChainIdSchema, type Address, type ChainFamily, type ChainId, type TxHash } from "../types/chain.js";
@@ -3132,6 +3132,9 @@ export async function cancelPayout(
 
 const LIST_PAYOUTS_MAX_LIMIT = 100;
 
+// Inclusive unix-ms epoch bound. The HTTP layer parses ISO strings to ms.
+const PayoutTimestampBoundSchema = z.number().int().nonnegative().optional();
+
 export const ListPayoutsInputSchema = z
   .object({
     merchantId: MerchantIdSchema,
@@ -3149,18 +3152,63 @@ export const ListPayoutsInputSchema = z
       )
       .optional(),
     chainId: ChainIdSchema.optional(),
-    token: TokenSymbolSchema.optional(),
+    // Multi-token OR filter. The HTTP layer comma-splits; a single
+    // `?token=USDT` still works (one-element array).
+    token: z.array(TokenSymbolSchema).optional(),
     destinationAddress: z.string().min(1).max(128).optional(),
+    // Case-insensitive substring match on `destination_address` (LIKE %term%).
+    destinationAddressContains: z.string().min(1).max(128).optional(),
     sourceAddress: z.string().min(1).max(128).optional(),
+    // Case-insensitive substring match on `source_address` (LIKE %term%).
+    sourceAddressContains: z.string().min(1).max(128).optional(),
     batchId: z.string().min(1).max(64).optional(),
-    createdFrom: z.number().int().nonnegative().optional(),
-    createdTo: z.number().int().nonnegative().optional(),
+    // Exact on-chain tx hash. NULL until the payout reaches `submitted`, so
+    // this implicitly filters to broadcast payouts.
+    txHash: z.string().min(1).max(128).optional(),
+    // Fee tier bound on the broadcast tx. NULL-tier rows excluded when set.
+    feeTier: z.array(z.enum(["low", "medium", "high"])).optional(),
+    // true → only payouts carrying a `last_error`; false → only clean ones.
+    hasError: z.boolean().optional(),
+    // Inclusive USD bounds on `quoted_amount_usd` (decimal string, CAST to
+    // REAL). Payouts created via the raw-amount path (quoted_amount_usd NULL)
+    // are excluded when an `amountUsd*` bound is set.
+    amountUsdMin: z.number().nonnegative().optional(),
+    amountUsdMax: z.number().nonnegative().optional(),
+    // Inclusive lower / upper bounds. Either or both; both omitted = unbounded.
+    createdFrom: PayoutTimestampBoundSchema,
+    createdTo: PayoutTimestampBoundSchema,
+    submittedFrom: PayoutTimestampBoundSchema,
+    submittedTo: PayoutTimestampBoundSchema,
+    confirmedFrom: PayoutTimestampBoundSchema,
+    confirmedTo: PayoutTimestampBoundSchema,
+    updatedFrom: PayoutTimestampBoundSchema,
+    updatedTo: PayoutTimestampBoundSchema,
+    // Sort column + direction. Default createdAt DESC (newest first).
+    sortBy: z
+      .enum(["createdAt", "updatedAt", "submittedAt", "confirmedAt", "amountUsd"])
+      .default("createdAt"),
+    sortDir: z.enum(["asc", "desc"]).default("desc"),
     limit: z.number().int().min(1).max(LIST_PAYOUTS_MAX_LIMIT).default(25),
     offset: z.number().int().min(0).default(0)
   })
   .refine(
-    (v) => v.createdFrom === undefined || v.createdTo === undefined || v.createdFrom <= v.createdTo,
-    { message: "`createdFrom` must be <= `createdTo`" }
+    (v) =>
+      (
+        [
+          [v.createdFrom, v.createdTo],
+          [v.submittedFrom, v.submittedTo],
+          [v.confirmedFrom, v.confirmedTo],
+          [v.updatedFrom, v.updatedTo]
+        ] as const
+      ).every(([from, to]) => from === undefined || to === undefined || from <= to),
+    { message: "each `*From` bound must be <= its matching `*To` bound" }
+  )
+  .refine(
+    (v) =>
+      v.amountUsdMin === undefined ||
+      v.amountUsdMax === undefined ||
+      v.amountUsdMin <= v.amountUsdMax,
+    { message: "`amountUsdMin` must be <= `amountUsdMax`" }
   );
 export type ListPayoutsInput = z.infer<typeof ListPayoutsInputSchema>;
 
@@ -3168,7 +3216,16 @@ export interface ListPayoutsResult {
   payouts: readonly Payout[];
   limit: number;
   offset: number;
+  // Echo of the resolved sort so the caller can render it without re-deriving.
+  sortBy: ListPayoutsInput["sortBy"];
+  sortDir: ListPayoutsInput["sortDir"];
   hasMore: boolean;
+}
+
+// Escape LIKE metacharacters so a user-supplied substring is matched
+// literally. Paired with `ESCAPE '\'` in the SQL fragment below.
+function escapeLikeTerm(term: string): string {
+  return term.replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
 
 export async function listPayouts(deps: AppDeps, input: unknown): Promise<ListPayoutsResult> {
@@ -3184,24 +3241,70 @@ export async function listPayouts(deps: AppDeps, input: unknown): Promise<ListPa
     conditions.push(inArray(payouts.status, parsed.status));
   }
   if (parsed.chainId !== undefined) conditions.push(eq(payouts.chainId, parsed.chainId));
-  if (parsed.token !== undefined) conditions.push(eq(payouts.token, parsed.token));
+  if (parsed.token && parsed.token.length > 0) {
+    conditions.push(inArray(payouts.token, parsed.token));
+  }
   if (parsed.destinationAddress !== undefined) {
     conditions.push(eq(payouts.destinationAddress, parsed.destinationAddress));
+  }
+  if (parsed.destinationAddressContains !== undefined) {
+    const term = `%${escapeLikeTerm(parsed.destinationAddressContains)}%`;
+    conditions.push(sql`${payouts.destinationAddress} LIKE ${term} ESCAPE '\\'`);
   }
   if (parsed.sourceAddress !== undefined) {
     conditions.push(eq(payouts.sourceAddress, parsed.sourceAddress));
   }
+  if (parsed.sourceAddressContains !== undefined) {
+    const term = `%${escapeLikeTerm(parsed.sourceAddressContains)}%`;
+    conditions.push(sql`${payouts.sourceAddress} LIKE ${term} ESCAPE '\\'`);
+  }
   if (parsed.batchId !== undefined) {
     conditions.push(eq(payouts.batchId, parsed.batchId));
   }
+  if (parsed.txHash !== undefined) conditions.push(eq(payouts.txHash, parsed.txHash));
+  if (parsed.feeTier && parsed.feeTier.length > 0) {
+    // fee_tier is nullable; inArray over non-null values excludes NULLs.
+    conditions.push(inArray(payouts.feeTier, parsed.feeTier));
+  }
+  if (parsed.hasError === true) conditions.push(isNotNull(payouts.lastError));
+  else if (parsed.hasError === false) conditions.push(isNull(payouts.lastError));
+  // USD bounds. CAST(... AS REAL): NULL quoted_amount_usd casts to NULL and
+  // every comparison against NULL is false, so raw-amount payouts drop out
+  // the moment an amountUsd bound is applied (documented on the schema).
+  if (parsed.amountUsdMin !== undefined) {
+    conditions.push(sql`CAST(${payouts.quotedAmountUsd} AS REAL) >= ${parsed.amountUsdMin}`);
+  }
+  if (parsed.amountUsdMax !== undefined) {
+    conditions.push(sql`CAST(${payouts.quotedAmountUsd} AS REAL) <= ${parsed.amountUsdMax}`);
+  }
   if (parsed.createdFrom !== undefined) conditions.push(gte(payouts.createdAt, parsed.createdFrom));
   if (parsed.createdTo !== undefined) conditions.push(lte(payouts.createdAt, parsed.createdTo));
+  if (parsed.submittedFrom !== undefined) {
+    conditions.push(gte(payouts.submittedAt, parsed.submittedFrom));
+  }
+  if (parsed.submittedTo !== undefined) conditions.push(lte(payouts.submittedAt, parsed.submittedTo));
+  if (parsed.confirmedFrom !== undefined) {
+    conditions.push(gte(payouts.confirmedAt, parsed.confirmedFrom));
+  }
+  if (parsed.confirmedTo !== undefined) conditions.push(lte(payouts.confirmedAt, parsed.confirmedTo));
+  if (parsed.updatedFrom !== undefined) conditions.push(gte(payouts.updatedAt, parsed.updatedFrom));
+  if (parsed.updatedTo !== undefined) conditions.push(lte(payouts.updatedAt, parsed.updatedTo));
+
+  const sortColumn = {
+    createdAt: payouts.createdAt,
+    updatedAt: payouts.updatedAt,
+    submittedAt: payouts.submittedAt,
+    confirmedAt: payouts.confirmedAt,
+    // Numeric sort on a decimal-string column.
+    amountUsd: sql`CAST(${payouts.quotedAmountUsd} AS REAL)`
+  }[parsed.sortBy];
+  const orderBy = parsed.sortDir === "asc" ? asc(sortColumn) : desc(sortColumn);
 
   const rows = await deps.db
     .select()
     .from(payouts)
     .where(and(...conditions))
-    .orderBy(desc(payouts.createdAt))
+    .orderBy(orderBy)
     .limit(parsed.limit + 1)
     .offset(parsed.offset);
 
@@ -3211,6 +3314,8 @@ export async function listPayouts(deps: AppDeps, input: unknown): Promise<ListPa
     payouts: page.map(drizzleRowToPayout),
     limit: parsed.limit,
     offset: parsed.offset,
+    sortBy: parsed.sortBy,
+    sortDir: parsed.sortDir,
     hasMore
   };
 }

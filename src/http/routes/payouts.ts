@@ -63,11 +63,47 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
         return c.json({ error: { code: "BAD_CHAIN_ID", message: "chainId must be a number" } }, 400);
       }
 
-      const createdFrom = parseTimestampQuery(c.req.query("createdFrom"));
-      const createdTo = parseTimestampQuery(c.req.query("createdTo"));
-      if (createdFrom === "invalid" || createdTo === "invalid") {
+      // All inclusive timestamp bounds — ISO-8601 or unix-ms accepted.
+      const tsNames = [
+        "createdFrom",
+        "createdTo",
+        "submittedFrom",
+        "submittedTo",
+        "confirmedFrom",
+        "confirmedTo",
+        "updatedFrom",
+        "updatedTo"
+      ] as const;
+      const ts: Partial<Record<(typeof tsNames)[number], number>> = {};
+      for (const name of tsNames) {
+        const parsed = parseTimestampQuery(c.req.query(name));
+        if (parsed === "invalid") {
+          return c.json(
+            { error: { code: "BAD_TIMESTAMP", message: `${name} must be ISO-8601 or unix-ms` } },
+            400
+          );
+        }
+        if (parsed !== undefined) ts[name] = parsed;
+      }
+
+      // Decimal USD bounds.
+      const numNames = ["amountUsdMin", "amountUsdMax"] as const;
+      const nums: Partial<Record<(typeof numNames)[number], number>> = {};
+      for (const name of numNames) {
+        const parsed = parseNumberQuery(c.req.query(name));
+        if (parsed === "invalid") {
+          return c.json(
+            { error: { code: "BAD_NUMBER", message: `${name} must be a number` } },
+            400
+          );
+        }
+        if (parsed !== undefined) nums[name] = parsed;
+      }
+
+      const hasError = parseBoolQuery(c.req.query("hasError"));
+      if (hasError === "invalid") {
         return c.json(
-          { error: { code: "BAD_TIMESTAMP", message: "createdFrom / createdTo must be ISO-8601 or unix-ms" } },
+          { error: { code: "BAD_BOOLEAN", message: "hasError must be true or false" } },
           400
         );
       }
@@ -76,12 +112,19 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
         merchantId: c.get("merchantId"),
         status,
         chainId,
-        token: c.req.query("token"),
+        token: parseCsvQuery(c.req.query("token")),
         destinationAddress: c.req.query("destinationAddress"),
+        destinationAddressContains: c.req.query("destinationAddressContains"),
         sourceAddress: c.req.query("sourceAddress"),
+        sourceAddressContains: c.req.query("sourceAddressContains"),
         batchId: c.req.query("batchId"),
-        createdFrom,
-        createdTo,
+        txHash: c.req.query("txHash"),
+        feeTier: parseCsvQuery(c.req.query("feeTier")),
+        hasError,
+        ...nums,
+        ...ts,
+        sortBy: c.req.query("sortBy"),
+        sortDir: c.req.query("sortDir"),
         limit: c.req.query("limit") !== undefined ? Number(c.req.query("limit")) : undefined,
         offset: c.req.query("offset") !== undefined ? Number(c.req.query("offset")) : undefined
       });
@@ -89,6 +132,8 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
         payouts: result.payouts.map(serializePayout),
         limit: result.limit,
         offset: result.offset,
+        sortBy: result.sortBy,
+        sortDir: result.sortDir,
         hasMore: result.hasMore
       });
     } catch (err) {
@@ -247,6 +292,30 @@ function parseTimestampQuery(raw: string | undefined): number | undefined | "inv
   }
   const parsed = Date.parse(raw);
   return Number.isFinite(parsed) ? parsed : "invalid";
+}
+
+// Numeric / boolean / CSV query-param parsers. Mirror invoices.ts — same
+// "invalid" sentinel so the caller 400s distinctly from "absent".
+function parseNumberQuery(raw: string | undefined): number | undefined | "invalid" {
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : "invalid";
+}
+
+function parseBoolQuery(raw: string | undefined): boolean | undefined | "invalid" {
+  if (raw === undefined || raw === "") return undefined;
+  if (raw === "true" || raw === "1") return true;
+  if (raw === "false" || raw === "0") return false;
+  return "invalid";
+}
+
+function parseCsvQuery(raw: string | undefined): string[] | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const parts = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return parts.length > 0 ? parts : undefined;
 }
 
 function parsePayoutIdParam(raw: string | undefined): PayoutId | null {

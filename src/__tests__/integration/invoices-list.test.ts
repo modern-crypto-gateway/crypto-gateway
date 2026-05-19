@@ -37,6 +37,8 @@ async function listInvoices(
     limit?: number;
     offset?: number;
     hasMore?: boolean;
+    sortBy?: string;
+    sortDir?: string;
     error?: { code: string };
   };
 }> {
@@ -205,6 +207,100 @@ describe("GET /api/v1/invoices", () => {
     const { body } = await listInvoices(booted, apiKey, `?fromAddress=${payer}`);
     const ids = (body.invoices ?? []).map((i) => i["id"]);
     expect(ids).toEqual([a.id]);
+  });
+
+  it("filters by externalIdContains (case-insensitive substring)", async () => {
+    const hit = await createInvoice(booted, apiKey, { externalId: "order-PICK-123" });
+    await createInvoice(booted, apiKey, { externalId: "unrelated" });
+
+    const { body } = await listInvoices(booted, apiKey, "?externalIdContains=pick");
+    expect(body.invoices).toHaveLength(1);
+    expect(body.invoices?.[0]?.["id"]).toBe(hit.id);
+  });
+
+  it("filters by addressContains (substring of receiveAddress)", async () => {
+    const a = await createInvoice(booted, apiKey, { externalId: "a" });
+    await createInvoice(booted, apiKey, { externalId: "b" });
+    // A mid-string slice of the receive address — exercises LIKE %term%.
+    const slice = a.receiveAddress.slice(4, 14);
+
+    const { body } = await listInvoices(
+      booted,
+      apiKey,
+      `?addressContains=${encodeURIComponent(slice)}`
+    );
+    const ids = (body.invoices ?? []).map((i) => i["id"]);
+    expect(ids).toContain(a.id);
+  });
+
+  it("filters by txHash via the transactions join", async () => {
+    const a = await createInvoice(booted, apiKey, { externalId: "a" });
+    await createInvoice(booted, apiKey, { externalId: "b" });
+    const now = booted.deps.clock.now().getTime();
+    await booted.deps.db.insert(transactions).values({
+      id: globalThis.crypto.randomUUID(),
+      invoiceId: a.id,
+      chainId: 999,
+      txHash: "0xfeedface",
+      logIndex: 0,
+      fromAddress: "0x3333333333333333333333333333333333333333",
+      toAddress: a.receiveAddress,
+      token: "DEV",
+      amountRaw: "1",
+      blockNumber: 1,
+      confirmations: 12,
+      status: "confirmed",
+      detectedAt: now,
+      confirmedAt: now,
+      amountUsd: null,
+      usdRate: null
+    });
+
+    const { body } = await listInvoices(booted, apiKey, "?txHash=0xfeedface");
+    const ids = (body.invoices ?? []).map((i) => i["id"]);
+    expect(ids).toEqual([a.id]);
+  });
+
+  it("filters by token (comma-separated multi)", async () => {
+    const a = await createInvoice(booted, apiKey, { externalId: "a" });
+
+    const dev = await listInvoices(booted, apiKey, "?token=DEV,USDT");
+    expect((dev.body.invoices ?? []).map((i) => i["id"])).toContain(a.id);
+
+    const none = await listInvoices(booted, apiKey, "?token=USDT");
+    expect(none.body.invoices).toHaveLength(0);
+  });
+
+  it("filters by hasPayments (untouched vs. credited)", async () => {
+    await createInvoice(booted, apiKey, { externalId: "fresh" });
+
+    const untouched = await listInvoices(booted, apiKey, "?hasPayments=false");
+    expect(untouched.body.invoices).toHaveLength(1);
+
+    const credited = await listInvoices(booted, apiKey, "?hasPayments=true");
+    expect(credited.body.invoices).toHaveLength(0);
+  });
+
+  it("echoes the resolved sort and accepts sortBy/sortDir", async () => {
+    await createInvoice(booted, apiKey, { externalId: "s" });
+    const { status, body } = await listInvoices(
+      booted,
+      apiKey,
+      "?sortBy=updatedAt&sortDir=asc"
+    );
+    expect(status).toBe(200);
+    expect(body["sortBy"]).toBe("updatedAt");
+    expect(body["sortDir"]).toBe("asc");
+  });
+
+  it("rejects a non-numeric USD bound and a malformed boolean", async () => {
+    const badNum = await listInvoices(booted, apiKey, "?amountUsdMin=abc");
+    expect(badNum.status).toBe(400);
+    expect(badNum.body.error?.code).toBe("BAD_NUMBER");
+
+    const badBool = await listInvoices(booted, apiKey, "?hasPayments=maybe");
+    expect(badBool.status).toBe(400);
+    expect(badBool.body.error?.code).toBe("BAD_BOOLEAN");
   });
 
   it("401s without an API key", async () => {

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { and, asc, desc, eq, gte, inArray, isNotNull, lte, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, lte, sql, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainFamilySchema, ChainIdSchema, type ChainFamily, type ChainId } from "../types/chain.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
@@ -524,36 +524,94 @@ export async function getInvoice(deps: AppDeps, invoiceId: InvoiceId): Promise<I
 // either paginate via `offset` or narrow with filters.
 const LIST_INVOICES_MAX_LIMIT = 100;
 
+// Inclusive unix-ms epoch bound. The HTTP layer parses ISO strings to ms.
+const InvoiceTimestampBoundSchema = z.number().int().nonnegative().optional();
+
 export const ListInvoicesInputSchema = z
   .object({
     merchantId: MerchantIdSchema,
     // Comma-separated in the HTTP layer; the schema accepts either an array or
     // a single status. Empty array = no filter.
     status: z.array(z.enum(["pending", "processing", "completed", "expired", "canceled"])).optional(),
+    // Payment-fidelity signal orthogonal to `status`: 'partial' (underpaid,
+    // status=processing) / 'overpaid' (over threshold, status=completed).
+    // Rows with extra_status NULL are excluded when this filter is set.
+    extraStatus: z.array(z.enum(["partial", "overpaid"])).optional(),
     chainId: ChainIdSchema.optional(),
-    token: TokenSymbolSchema.optional(),
+    // Multi-token OR filter. The HTTP layer comma-splits; a single
+    // `?token=USDT` still works (one-element array).
+    token: z.array(TokenSymbolSchema).optional(),
     // Merchant-supplied dedup / order key. Exact match — usually cart / order id.
     externalId: z.string().max(256).optional(),
+    // Case-insensitive substring match on `external_id` (LIKE %term%).
+    externalIdContains: z.string().min(1).max(256).optional(),
     // The invoice-level `receive_address` (what the payer sees on the checkout
     // page). Matches across any token paid into that address for this merchant.
     // Canonicalized at the HTTP layer before calling — domain does exact match.
     toAddress: z.string().min(1).max(128).optional(),
+    // Case-insensitive substring match on `receive_address` (LIKE %term%).
+    // Not canonicalized — matches whatever casing is stored.
+    addressContains: z.string().min(1).max(128).optional(),
     // Payer address filter. Requires a subquery against `transactions` because
     // invoices don't carry a payer column — an invoice matches when ANY of its
     // confirmed-or-detected transactions has this `from_address`. `reverted` /
     // `orphaned` transactions are excluded so a single stray payment doesn't
     // surface unrelated invoices.
     fromAddress: z.string().min(1).max(128).optional(),
-    // Inclusive lower / upper bounds on `createdAt`. Either or both; both
-    // omitted = unbounded. Unix ms epoch — the HTTP layer parses ISO strings.
-    createdFrom: z.number().int().nonnegative().optional(),
-    createdTo: z.number().int().nonnegative().optional(),
+    // Find the invoice credited by a specific on-chain tx hash. Same
+    // `transactions` subquery as `fromAddress` (detected/confirmed only).
+    txHash: z.string().min(1).max(128).optional(),
+    // Inclusive USD bounds. `amount_usd` / `paid_usd` are decimal strings; the
+    // query CASTs to REAL for comparison. Legacy token-amount invoices
+    // (amount_usd NULL) are excluded when an `amountUsd*` bound is set.
+    amountUsdMin: z.number().nonnegative().optional(),
+    amountUsdMax: z.number().nonnegative().optional(),
+    paidUsdMin: z.number().nonnegative().optional(),
+    paidUsdMax: z.number().nonnegative().optional(),
+    // true → only invoices with any payment recorded (paid_usd <> '0' OR
+    // received_amount_raw <> '0'); false → only untouched invoices.
+    hasPayments: z.boolean().optional(),
+    // Inclusive lower / upper bounds. Either or both; both omitted = unbounded.
+    createdFrom: InvoiceTimestampBoundSchema,
+    createdTo: InvoiceTimestampBoundSchema,
+    updatedFrom: InvoiceTimestampBoundSchema,
+    updatedTo: InvoiceTimestampBoundSchema,
+    confirmedFrom: InvoiceTimestampBoundSchema,
+    confirmedTo: InvoiceTimestampBoundSchema,
+    expiresFrom: InvoiceTimestampBoundSchema,
+    expiresTo: InvoiceTimestampBoundSchema,
+    // Sort column + direction. Default createdAt DESC (newest first), backed
+    // by idx_invoices_merchant. Other columns fall back to a merchant-scoped
+    // scan — acceptable at merchant-history scale.
+    sortBy: z
+      .enum(["createdAt", "updatedAt", "confirmedAt", "expiresAt", "amountUsd", "paidUsd"])
+      .default("createdAt"),
+    sortDir: z.enum(["asc", "desc"]).default("desc"),
     limit: z.number().int().min(1).max(LIST_INVOICES_MAX_LIMIT).default(25),
     offset: z.number().int().min(0).default(0)
   })
   .refine(
-    (v) => v.createdFrom === undefined || v.createdTo === undefined || v.createdFrom <= v.createdTo,
-    { message: "`createdFrom` must be <= `createdTo`" }
+    (v) =>
+      (
+        [
+          [v.createdFrom, v.createdTo],
+          [v.updatedFrom, v.updatedTo],
+          [v.confirmedFrom, v.confirmedTo],
+          [v.expiresFrom, v.expiresTo]
+        ] as const
+      ).every(([from, to]) => from === undefined || to === undefined || from <= to),
+    { message: "each `*From` bound must be <= its matching `*To` bound" }
+  )
+  .refine(
+    (v) =>
+      v.amountUsdMin === undefined ||
+      v.amountUsdMax === undefined ||
+      v.amountUsdMin <= v.amountUsdMax,
+    { message: "`amountUsdMin` must be <= `amountUsdMax`" }
+  )
+  .refine(
+    (v) => v.paidUsdMin === undefined || v.paidUsdMax === undefined || v.paidUsdMin <= v.paidUsdMax,
+    { message: "`paidUsdMin` must be <= `paidUsdMax`" }
   );
 export type ListInvoicesInput = z.infer<typeof ListInvoicesInputSchema>;
 
@@ -561,16 +619,26 @@ export interface ListInvoicesResult {
   invoices: readonly Invoice[];
   limit: number;
   offset: number;
+  // Echo of the resolved sort so the caller can render it without re-deriving.
+  sortBy: ListInvoicesInput["sortBy"];
+  sortDir: ListInvoicesInput["sortDir"];
   // True when another page exists. Computed via fetch-N+1 rather than
   // COUNT(*) — COUNT on a heavily-filtered table with 100k+ invoices adds a
   // second index scan per page, which we don't want on the hot list path.
   hasMore: boolean;
 }
 
-// Merchant-scoped invoice listing. Sort is fixed: createdAt DESC (newest
+// Escape LIKE metacharacters so a user-supplied substring is matched
+// literally. Paired with `ESCAPE '\'` in the SQL fragment below.
+function escapeLikeTerm(term: string): string {
+  return term.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+// Merchant-scoped invoice listing. Default sort createdAt DESC (newest
 // first) — backed by `idx_invoices_merchant` on (merchantId, createdAt DESC).
-// Caller is responsible for ensuring `merchantId` is the authenticated
-// merchant's id (the HTTP layer injects it from the auth context).
+// All filters are optional and AND-combined. Caller is responsible for
+// ensuring `merchantId` is the authenticated merchant's id (the HTTP layer
+// injects it from the auth context).
 export async function listInvoices(
   deps: AppDeps,
   input: unknown
@@ -581,10 +649,24 @@ export async function listInvoices(
   if (parsed.status && parsed.status.length > 0) {
     conditions.push(inArray(invoices.status, parsed.status));
   }
+  if (parsed.extraStatus && parsed.extraStatus.length > 0) {
+    // extra_status is nullable; inArray over non-null values excludes NULLs.
+    conditions.push(inArray(invoices.extraStatus, parsed.extraStatus));
+  }
   if (parsed.chainId !== undefined) conditions.push(eq(invoices.chainId, parsed.chainId));
-  if (parsed.token !== undefined) conditions.push(eq(invoices.token, parsed.token));
+  if (parsed.token && parsed.token.length > 0) {
+    conditions.push(inArray(invoices.token, parsed.token));
+  }
   if (parsed.externalId !== undefined) conditions.push(eq(invoices.externalId, parsed.externalId));
+  if (parsed.externalIdContains !== undefined) {
+    const term = `%${escapeLikeTerm(parsed.externalIdContains)}%`;
+    conditions.push(sql`${invoices.externalId} LIKE ${term} ESCAPE '\\'`);
+  }
   if (parsed.toAddress !== undefined) conditions.push(eq(invoices.receiveAddress, parsed.toAddress));
+  if (parsed.addressContains !== undefined) {
+    const term = `%${escapeLikeTerm(parsed.addressContains)}%`;
+    conditions.push(sql`${invoices.receiveAddress} LIKE ${term} ESCAPE '\\'`);
+  }
   if (parsed.fromAddress !== undefined) {
     // `transactions` has no direct merchant column — the outer
     // `invoices.merchantId = X` filter scopes the result, so the subquery
@@ -607,8 +689,70 @@ export async function listInvoices(
       )
     );
   }
+  if (parsed.txHash !== undefined) {
+    // Same `transactions` subquery shape as `fromAddress` — find the
+    // invoice(s) a given on-chain tx was attributed to.
+    conditions.push(
+      inArray(
+        invoices.id,
+        deps.db
+          .select({ id: transactions.invoiceId })
+          .from(transactions)
+          .where(
+            and(
+              eq(transactions.txHash, parsed.txHash),
+              inArray(transactions.status, ["detected", "confirmed"]),
+              isNotNull(transactions.invoiceId)
+            )
+          )
+      )
+    );
+  }
+  // USD bounds. CAST(... AS REAL): a NULL amount_usd casts to NULL and every
+  // comparison against NULL is false, so legacy token-amount invoices drop
+  // out the moment an amountUsd bound is applied (documented on the schema).
+  if (parsed.amountUsdMin !== undefined) {
+    conditions.push(sql`CAST(${invoices.amountUsd} AS REAL) >= ${parsed.amountUsdMin}`);
+  }
+  if (parsed.amountUsdMax !== undefined) {
+    conditions.push(sql`CAST(${invoices.amountUsd} AS REAL) <= ${parsed.amountUsdMax}`);
+  }
+  if (parsed.paidUsdMin !== undefined) {
+    conditions.push(sql`CAST(${invoices.paidUsd} AS REAL) >= ${parsed.paidUsdMin}`);
+  }
+  if (parsed.paidUsdMax !== undefined) {
+    conditions.push(sql`CAST(${invoices.paidUsd} AS REAL) <= ${parsed.paidUsdMax}`);
+  }
+  if (parsed.hasPayments === true) {
+    conditions.push(
+      sql`(${invoices.paidUsd} <> '0' OR ${invoices.receivedAmountRaw} <> '0')`
+    );
+  } else if (parsed.hasPayments === false) {
+    conditions.push(
+      sql`(${invoices.paidUsd} = '0' AND ${invoices.receivedAmountRaw} = '0')`
+    );
+  }
   if (parsed.createdFrom !== undefined) conditions.push(gte(invoices.createdAt, parsed.createdFrom));
   if (parsed.createdTo !== undefined) conditions.push(lte(invoices.createdAt, parsed.createdTo));
+  if (parsed.updatedFrom !== undefined) conditions.push(gte(invoices.updatedAt, parsed.updatedFrom));
+  if (parsed.updatedTo !== undefined) conditions.push(lte(invoices.updatedAt, parsed.updatedTo));
+  if (parsed.confirmedFrom !== undefined) {
+    conditions.push(gte(invoices.confirmedAt, parsed.confirmedFrom));
+  }
+  if (parsed.confirmedTo !== undefined) conditions.push(lte(invoices.confirmedAt, parsed.confirmedTo));
+  if (parsed.expiresFrom !== undefined) conditions.push(gte(invoices.expiresAt, parsed.expiresFrom));
+  if (parsed.expiresTo !== undefined) conditions.push(lte(invoices.expiresAt, parsed.expiresTo));
+
+  const sortColumn = {
+    createdAt: invoices.createdAt,
+    updatedAt: invoices.updatedAt,
+    confirmedAt: invoices.confirmedAt,
+    expiresAt: invoices.expiresAt,
+    // Numeric sort on a decimal-string column.
+    amountUsd: sql`CAST(${invoices.amountUsd} AS REAL)`,
+    paidUsd: sql`CAST(${invoices.paidUsd} AS REAL)`
+  }[parsed.sortBy];
+  const orderBy = parsed.sortDir === "asc" ? asc(sortColumn) : desc(sortColumn);
 
   // fetch limit+1 to detect hasMore without a COUNT(*) round-trip. The extra
   // row (if any) is dropped before we hydrate addresses.
@@ -616,7 +760,7 @@ export async function listInvoices(
     .select()
     .from(invoices)
     .where(and(...conditions))
-    .orderBy(desc(invoices.createdAt))
+    .orderBy(orderBy)
     .limit(parsed.limit + 1)
     .offset(parsed.offset);
 
@@ -628,7 +772,14 @@ export async function listInvoices(
   // per-request hydration would otherwise be a 100-query fan-out.
   const hydrated = await hydrateInvoicesWithAddresses(deps, page);
 
-  return { invoices: hydrated, limit: parsed.limit, offset: parsed.offset, hasMore };
+  return {
+    invoices: hydrated,
+    limit: parsed.limit,
+    offset: parsed.offset,
+    sortBy: parsed.sortBy,
+    sortDir: parsed.sortDir,
+    hasMore
+  };
 }
 
 async function hydrateInvoicesWithAddresses(

@@ -77,11 +77,47 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
         return c.json({ error: { code: "BAD_CHAIN_ID", message: "chainId must be a number" } }, 400);
       }
 
-      const createdFrom = parseTimestampQuery(c.req.query("createdFrom"));
-      const createdTo = parseTimestampQuery(c.req.query("createdTo"));
-      if (createdFrom === "invalid" || createdTo === "invalid") {
+      // All inclusive timestamp bounds — ISO-8601 or unix-ms accepted.
+      const tsNames = [
+        "createdFrom",
+        "createdTo",
+        "updatedFrom",
+        "updatedTo",
+        "confirmedFrom",
+        "confirmedTo",
+        "expiresFrom",
+        "expiresTo"
+      ] as const;
+      const ts: Partial<Record<(typeof tsNames)[number], number>> = {};
+      for (const name of tsNames) {
+        const parsed = parseTimestampQuery(c.req.query(name));
+        if (parsed === "invalid") {
+          return c.json(
+            { error: { code: "BAD_TIMESTAMP", message: `${name} must be ISO-8601 or unix-ms` } },
+            400
+          );
+        }
+        if (parsed !== undefined) ts[name] = parsed;
+      }
+
+      // Decimal USD bounds.
+      const numNames = ["amountUsdMin", "amountUsdMax", "paidUsdMin", "paidUsdMax"] as const;
+      const nums: Partial<Record<(typeof numNames)[number], number>> = {};
+      for (const name of numNames) {
+        const parsed = parseNumberQuery(c.req.query(name));
+        if (parsed === "invalid") {
+          return c.json(
+            { error: { code: "BAD_NUMBER", message: `${name} must be a number` } },
+            400
+          );
+        }
+        if (parsed !== undefined) nums[name] = parsed;
+      }
+
+      const hasPayments = parseBoolQuery(c.req.query("hasPayments"));
+      if (hasPayments === "invalid") {
         return c.json(
-          { error: { code: "BAD_TIMESTAMP", message: "createdFrom / createdTo must be ISO-8601 or unix-ms" } },
+          { error: { code: "BAD_BOOLEAN", message: "hasPayments must be true or false" } },
           400
         );
       }
@@ -89,13 +125,20 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
       const result = await listInvoices(deps, {
         merchantId: c.get("merchantId"),
         status,
+        extraStatus: parseCsvQuery(c.req.query("extraStatus")),
         chainId,
-        token: c.req.query("token"),
+        token: parseCsvQuery(c.req.query("token")),
         externalId: c.req.query("externalId"),
+        externalIdContains: c.req.query("externalIdContains"),
         toAddress: c.req.query("toAddress"),
+        addressContains: c.req.query("addressContains"),
         fromAddress: c.req.query("fromAddress"),
-        createdFrom,
-        createdTo,
+        txHash: c.req.query("txHash"),
+        ...nums,
+        hasPayments,
+        ...ts,
+        sortBy: c.req.query("sortBy"),
+        sortDir: c.req.query("sortDir"),
         limit: c.req.query("limit") !== undefined ? Number(c.req.query("limit")) : undefined,
         offset: c.req.query("offset") !== undefined ? Number(c.req.query("offset")) : undefined
       });
@@ -103,6 +146,8 @@ export function invoicesRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables
         invoices: result.invoices.map(serializeInvoice),
         limit: result.limit,
         offset: result.offset,
+        sortBy: result.sortBy,
+        sortDir: result.sortDir,
         hasMore: result.hasMore
       });
     } catch (err) {
@@ -174,6 +219,34 @@ function parseTimestampQuery(raw: string | undefined): number | undefined | "inv
   }
   const parsed = Date.parse(raw);
   return Number.isFinite(parsed) ? parsed : "invalid";
+}
+
+// Parse a numeric query param. Returns undefined for absent, the number on
+// success, or the "invalid" sentinel for a non-numeric value (caller 400s).
+function parseNumberQuery(raw: string | undefined): number | undefined | "invalid" {
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : "invalid";
+}
+
+// Parse a boolean query param. Accepts true/false/1/0. "invalid" sentinel
+// for anything else so a typo doesn't silently disable the filter.
+function parseBoolQuery(raw: string | undefined): boolean | undefined | "invalid" {
+  if (raw === undefined || raw === "") return undefined;
+  if (raw === "true" || raw === "1") return true;
+  if (raw === "false" || raw === "0") return false;
+  return "invalid";
+}
+
+// Split a comma-separated query param into a trimmed, non-empty array.
+// undefined when absent or all-empty so the domain treats it as "no filter".
+function parseCsvQuery(raw: string | undefined): string[] | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const parts = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return parts.length > 0 ? parts : undefined;
 }
 
 // Validate that the path-param id is a UUID before it ever touches the DB.

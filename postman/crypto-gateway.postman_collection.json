@@ -915,18 +915,35 @@
               "query": [
                 { "key": "limit", "value": "25", "description": "1..100, default 25" },
                 { "key": "offset", "value": "0", "description": "Page offset." },
-                { "key": "status", "value": "", "description": "Comma-separated: created,partial,detected,confirmed,overpaid,expired,canceled", "disabled": true },
+                { "key": "status", "value": "", "description": "Comma-separated: pending,processing,completed,expired,canceled", "disabled": true },
+                { "key": "extraStatus", "value": "", "description": "Comma-separated payment-fidelity: partial,overpaid. Invoices with no extra status excluded.", "disabled": true },
                 { "key": "chainId", "value": "", "description": "Narrow to one chain id.", "disabled": true },
-                { "key": "token", "value": "", "description": "Narrow to one token symbol (e.g. USDC).", "disabled": true },
+                { "key": "token", "value": "", "description": "Comma-separated token symbols (OR). e.g. USDC,USDT.", "disabled": true },
                 { "key": "externalId", "value": "", "description": "Exact-match on merchant-supplied dedup key.", "disabled": true },
-                { "key": "toAddress", "value": "", "description": "Invoice receive address (canonicalized).", "disabled": true },
+                { "key": "externalIdContains", "value": "", "description": "Case-insensitive substring match on externalId (LIKE %term%).", "disabled": true },
+                { "key": "toAddress", "value": "", "description": "Invoice receive address (exact, canonicalized).", "disabled": true },
+                { "key": "addressContains", "value": "", "description": "Case-insensitive substring match on receiveAddress (not canonicalized).", "disabled": true },
                 { "key": "fromAddress", "value": "", "description": "Payer address. Matches invoices that have any detected/confirmed tx from this address.", "disabled": true },
+                { "key": "txHash", "value": "", "description": "On-chain tx hash. Matches the invoice the tx was attributed to (detected/confirmed transactions only).", "disabled": true },
+                { "key": "amountUsdMin", "value": "", "description": "Inclusive lower bound on amountUsd. Legacy non-USD invoices excluded when set.", "disabled": true },
+                { "key": "amountUsdMax", "value": "", "description": "Inclusive upper bound on amountUsd.", "disabled": true },
+                { "key": "paidUsdMin", "value": "", "description": "Inclusive lower bound on paidUsd (USD received so far).", "disabled": true },
+                { "key": "paidUsdMax", "value": "", "description": "Inclusive upper bound on paidUsd.", "disabled": true },
+                { "key": "hasPayments", "value": "", "description": "true = invoices with any payment recorded; false = untouched.", "disabled": true },
                 { "key": "createdFrom", "value": "", "description": "Inclusive lower bound on createdAt (ISO-8601 or unix ms).", "disabled": true },
-                { "key": "createdTo", "value": "", "description": "Inclusive upper bound on createdAt (ISO-8601 or unix ms).", "disabled": true }
+                { "key": "createdTo", "value": "", "description": "Inclusive upper bound on createdAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "updatedFrom", "value": "", "description": "Inclusive lower bound on updatedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "updatedTo", "value": "", "description": "Inclusive upper bound on updatedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "confirmedFrom", "value": "", "description": "Inclusive lower bound on confirmedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "confirmedTo", "value": "", "description": "Inclusive upper bound on confirmedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "expiresFrom", "value": "", "description": "Inclusive lower bound on expiresAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "expiresTo", "value": "", "description": "Inclusive upper bound on expiresAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "sortBy", "value": "", "description": "createdAt (default) | updatedAt | confirmedAt | expiresAt | amountUsd | paidUsd.", "disabled": true },
+                { "key": "sortDir", "value": "", "description": "asc | desc (default desc).", "disabled": true }
               ]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
-            "description": "Paginated list of the authenticated merchant's invoices, newest first. `merchantId` is always taken from the API key — no way to list another merchant's invoices. Response shape:\n\n```json\n{\n  \"invoices\": [ { ... } ],\n  \"limit\": 25,\n  \"offset\": 0,\n  \"hasMore\": false\n}\n```\n\nPage via `limit` + `offset`; `hasMore` is computed without a COUNT(*) so the list path stays cheap."
+            "description": "Paginated list of the authenticated merchant's invoices. Default sort `createdAt DESC`. All filters optional, AND-combined. `merchantId` is always taken from the API key — no way to list another merchant's invoices.\n\nResponse shape:\n\n```json\n{\n  \"invoices\": [ { ... } ],\n  \"limit\": 25,\n  \"offset\": 0,\n  \"sortBy\": \"createdAt\",\n  \"sortDir\": \"desc\",\n  \"hasMore\": false\n}\n```\n\n**Filter notes:**\n- Exact vs Contains: `externalId`/`toAddress` are exact-match; `externalIdContains`/`addressContains` are case-insensitive `LIKE %term%` (LIKE metacharacters `%`/`_` in the term are escaped).\n- `txHash` joins the `transactions` table — finds the invoice a customer payment was attributed to. A payout hash won't match here (payout txs aren't ingested as transactions); use `GET /payouts?txHash=` for those.\n- USD bounds CAST decimal strings to REAL; legacy token-amount invoices (no `amountUsd`) drop out when an `amountUsd*` bound is set.\n- Page via `limit` + `offset`; `hasMore` is computed without a COUNT(*) so the list path stays cheap.\n\n**Validation errors (400):** `BAD_STATUS`, `BAD_CHAIN_ID`, `BAD_TIMESTAMP`, `BAD_NUMBER`, `BAD_BOOLEAN`, plus `VALIDATION` for an unknown `sortBy`/`sortDir` or `*Min > *Max`."
           },
           "event": [
             {
@@ -1407,17 +1424,33 @@
               "query": [
                 { "key": "limit", "value": "25", "description": "1..100, default 25" },
                 { "key": "offset", "value": "0", "description": "Page offset." },
-                { "key": "status", "value": "", "description": "Comma-separated: planned,reserved,submitted,confirmed,failed,canceled", "disabled": true },
+                { "key": "status", "value": "", "description": "Comma-separated: planned,reserved,topping-up,submitted,confirmed,failed,canceled", "disabled": true },
                 { "key": "chainId", "value": "", "description": "Narrow to one chain id.", "disabled": true },
-                { "key": "token", "value": "", "description": "Narrow to one token symbol (e.g. USDC).", "disabled": true },
+                { "key": "token", "value": "", "description": "Comma-separated token symbols (OR). e.g. USDC,USDT.", "disabled": true },
                 { "key": "destinationAddress", "value": "", "description": "Exact match on the canonicalized destination.", "disabled": true },
-                { "key": "sourceAddress", "value": "", "description": "Fee wallet that funded the payout — implicitly excludes `planned` rows.", "disabled": true },
+                { "key": "destinationAddressContains", "value": "", "description": "Case-insensitive substring match on destinationAddress.", "disabled": true },
+                { "key": "sourceAddress", "value": "", "description": "HD address that funded the payout — implicitly excludes `planned` rows.", "disabled": true },
+                { "key": "sourceAddressContains", "value": "", "description": "Case-insensitive substring match on sourceAddress.", "disabled": true },
+                { "key": "batchId", "value": "", "description": "All payouts in a specific `POST /payouts/batch` group. Null-matched rows are excluded.", "disabled": true },
+                { "key": "txHash", "value": "", "description": "Exact on-chain tx hash. NULL until the payout reaches `submitted`, so this implicitly filters to broadcast payouts.", "disabled": true },
+                { "key": "feeTier", "value": "", "description": "Comma-separated fee tiers: low,medium,high. Payouts with no tier excluded when set.", "disabled": true },
+                { "key": "hasError", "value": "", "description": "true = payouts carrying a lastError; false = clean.", "disabled": true },
+                { "key": "amountUsdMin", "value": "", "description": "Inclusive lower bound on quotedAmountUsd. Raw-amount payouts (no USD quote) excluded when set.", "disabled": true },
+                { "key": "amountUsdMax", "value": "", "description": "Inclusive upper bound on quotedAmountUsd.", "disabled": true },
                 { "key": "createdFrom", "value": "", "description": "Inclusive lower bound on createdAt (ISO-8601 or unix ms).", "disabled": true },
-                { "key": "createdTo", "value": "", "description": "Inclusive upper bound on createdAt (ISO-8601 or unix ms).", "disabled": true }
+                { "key": "createdTo", "value": "", "description": "Inclusive upper bound on createdAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "submittedFrom", "value": "", "description": "Inclusive lower bound on submittedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "submittedTo", "value": "", "description": "Inclusive upper bound on submittedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "confirmedFrom", "value": "", "description": "Inclusive lower bound on confirmedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "confirmedTo", "value": "", "description": "Inclusive upper bound on confirmedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "updatedFrom", "value": "", "description": "Inclusive lower bound on updatedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "updatedTo", "value": "", "description": "Inclusive upper bound on updatedAt (ISO-8601 or unix ms).", "disabled": true },
+                { "key": "sortBy", "value": "", "description": "createdAt (default) | updatedAt | submittedAt | confirmedAt | amountUsd.", "disabled": true },
+                { "key": "sortDir", "value": "", "description": "asc | desc (default desc).", "disabled": true }
               ]
             },
             "header": [{ "key": "Authorization", "value": "Bearer {{merchantApiKey}}" }],
-            "description": "Paginated list of the authenticated merchant's payouts, newest first. Response shape:\n\n```json\n{\n  \"payouts\": [ { ... } ],\n  \"limit\": 25,\n  \"offset\": 0,\n  \"hasMore\": false\n}\n```"
+            "description": "Paginated list of the authenticated merchant's payouts. Default sort `createdAt DESC`. All filters optional, AND-combined. Hardcoded to `kind='standard'` — internal payouts (consolidation_sweep, gas_top_up, gas_burn) never appear here.\n\nResponse shape:\n\n```json\n{\n  \"payouts\": [ { ... } ],\n  \"limit\": 25,\n  \"offset\": 0,\n  \"sortBy\": \"createdAt\",\n  \"sortDir\": \"desc\",\n  \"hasMore\": false\n}\n```\n\n**Filter notes:**\n- Exact vs Contains: `destinationAddress`/`sourceAddress` are exact-match; `destinationAddressContains`/`sourceAddressContains` are case-insensitive `LIKE %term%` (LIKE metacharacters `%`/`_` in the term are escaped).\n- `txHash` is exact on `payouts.tx_hash`. To find the invoice a customer payment was attributed to, use `GET /invoices?txHash=` instead.\n- `feeTier` excludes rows where the tier was never recorded.\n- USD bounds CAST decimal strings to REAL; raw-amount payouts drop out when an `amountUsd*` bound is set.\n\n**Validation errors (400):** `BAD_STATUS`, `BAD_CHAIN_ID`, `BAD_TIMESTAMP`, `BAD_NUMBER`, `BAD_BOOLEAN`, plus `VALIDATION` for an unknown `sortBy`/`sortDir` or `*Min > *Max`."
           },
           "event": [
             {

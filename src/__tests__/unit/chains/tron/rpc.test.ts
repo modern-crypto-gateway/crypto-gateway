@@ -715,8 +715,8 @@ describe("tronChainAdapter.estimateGasForTransfer — TRC-20 simulation failure"
     // returned energy_used ~14-30k for a real USDT transfer that actually
     // burned > 106k on broadcast. With only the simulated value, the planner
     // sized the top-up at ~10.7 TRX, the source ran out, and the tx reverted
-    // OUT_OF_ENERGY with all funds consumed. Floor at 200 000 energy keeps
-    // the quote covering observed real-world worst-case USDT transfers.
+    // OUT_OF_ENERGY with all funds consumed. Floor at MIN_EXPECTED_TRC20_ENERGY
+    // (135 000) keeps the quote covering observed real-world USDT transfers.
     const client = fakeClient({
       async triggerConstantContract() {
         return { energy_used: 14_000, result: { result: true }, constant_result: [] };
@@ -736,7 +736,7 @@ describe("tronChainAdapter.estimateGasForTransfer — TRC-20 simulation failure"
       token: "USDT" as unknown as never,
       amountRaw: "1000000" as unknown as never
     });
-    // 200 000 floor × 100 SUN + 345 000 bandwidth = 20 000 000 + 345 000 = 20 345 000.
-    expect(quote.medium.nativeAmountRaw).toBe("20345000");
+    // 135 000 floor × 100 SUN + 345 000 bandwidth = 13 500 000 + 345 000 = 13 845 000.
+    expect(quote.medium.nativeAmountRaw).toBe("13845000");
   });
 });

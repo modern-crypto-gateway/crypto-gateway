@@ -58,6 +58,8 @@ async function listPayouts(
     limit?: number;
     offset?: number;
     hasMore?: boolean;
+    sortBy?: string;
+    sortDir?: string;
     error?: { code: string };
   };
 }> {
@@ -164,6 +166,60 @@ describe("GET /api/v1/payouts", () => {
     const page2 = await listPayouts(booted, apiKey, "?limit=2&offset=2");
     expect(page2.body.payouts).toHaveLength(2);
     expect(page2.body.hasMore).toBe(false);
+  });
+
+  it("filters by destinationAddressContains (substring)", async () => {
+    const target = "0xc0ffee0000000000000000000000000000000000";
+    const a = await planPayout(booted, apiKey, { destinationAddress: target });
+    await planPayout(booted, apiKey, {
+      destinationAddress: "0xdddddddddddddddddddddddddddddddddddddddd"
+    });
+
+    const { body } = await listPayouts(booted, apiKey, "?destinationAddressContains=c0ffee");
+    expect(body.payouts).toHaveLength(1);
+    expect(body.payouts?.[0]?.["id"]).toBe(a.id);
+  });
+
+  it("filters by token (comma-separated multi)", async () => {
+    const a = await planPayout(booted, apiKey, {});
+
+    const dev = await listPayouts(booted, apiKey, "?token=DEV,USDT");
+    expect((dev.body.payouts ?? []).map((p) => p["id"])).toContain(a.id);
+
+    const none = await listPayouts(booted, apiKey, "?token=USDT");
+    expect(none.body.payouts).toHaveLength(0);
+  });
+
+  it("filters by hasError (clean vs. errored)", async () => {
+    await planPayout(booted, apiKey, {});
+
+    const clean = await listPayouts(booted, apiKey, "?hasError=false");
+    expect(clean.body.payouts).toHaveLength(1);
+
+    const errored = await listPayouts(booted, apiKey, "?hasError=true");
+    expect(errored.body.payouts).toHaveLength(0);
+  });
+
+  it("echoes the resolved sort and accepts sortBy/sortDir", async () => {
+    await planPayout(booted, apiKey, {});
+    const { status, body } = await listPayouts(
+      booted,
+      apiKey,
+      "?sortBy=confirmedAt&sortDir=asc"
+    );
+    expect(status).toBe(200);
+    expect(body["sortBy"]).toBe("confirmedAt");
+    expect(body["sortDir"]).toBe("asc");
+  });
+
+  it("rejects a non-numeric USD bound and a malformed boolean", async () => {
+    const badNum = await listPayouts(booted, apiKey, "?amountUsdMin=abc");
+    expect(badNum.status).toBe(400);
+    expect(badNum.body.error?.code).toBe("BAD_NUMBER");
+
+    const badBool = await listPayouts(booted, apiKey, "?hasError=perhaps");
+    expect(badBool.status).toBe(400);
+    expect(badBool.body.error?.code).toBe("BAD_BOOLEAN");
   });
 
   it("401s without an API key", async () => {

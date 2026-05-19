@@ -1628,6 +1628,88 @@ and Solana SPL shapes) at `/webhooks/alchemy` with a correct HMAC — useful
 for replaying the detection path locally without waiting for a real on-chain
 transfer.
 
+### Listing & filtering invoices / payouts
+
+Both `GET /api/v1/invoices` and `GET /api/v1/payouts` support deep filtering
+so an operator can answer most "where is X" questions without opening the DB.
+All filters are optional, AND-combined, and the response echoes the resolved
+sort: `{ invoices: [...], limit, offset, sortBy, sortDir, hasMore }`.
+
+**`GET /api/v1/invoices` filters**
+
+| Param | Notes |
+|---|---|
+| `status` | csv: `pending,processing,completed,expired,canceled` |
+| `extraStatus` | csv: `partial,overpaid` (rows with no extra status excluded) |
+| `chainId` | exact |
+| `token` | csv (OR), e.g. `USDC,USDT` |
+| `externalId` / `externalIdContains` | exact / case-insensitive substring |
+| `toAddress` / `addressContains` | exact (canonicalized) / case-insensitive substring |
+| `fromAddress` | payer — joins `transactions` (detected/confirmed only) |
+| `txHash` | finds the invoice a customer payment was attributed to |
+| `amountUsdMin` / `amountUsdMax` | USD invoice-amount range |
+| `paidUsdMin` / `paidUsdMax` | USD amount-received-so-far range |
+| `hasPayments` | `true` / `false` |
+| `createdFrom` / `createdTo` | ISO-8601 or unix-ms |
+| `updatedFrom` / `updatedTo` | ISO-8601 or unix-ms |
+| `confirmedFrom` / `confirmedTo` | ISO-8601 or unix-ms |
+| `expiresFrom` / `expiresTo` | ISO-8601 or unix-ms |
+| `sortBy` | `createdAt` (default) ⎮ `updatedAt` ⎮ `confirmedAt` ⎮ `expiresAt` ⎮ `amountUsd` ⎮ `paidUsd` |
+| `sortDir` | `asc` ⎮ `desc` (default `desc`) |
+| `limit` / `offset` | `limit` 1–100, default 25 |
+
+**`GET /api/v1/payouts` filters** (hardcoded to `kind='standard'`; internal
+payouts like `consolidation_sweep` never appear here)
+
+| Param | Notes |
+|---|---|
+| `status` | csv: `planned,reserved,topping-up,submitted,confirmed,failed,canceled` |
+| `chainId` | exact |
+| `token` | csv (OR) |
+| `destinationAddress` / `destinationAddressContains` | exact / substring |
+| `sourceAddress` / `sourceAddressContains` | exact / substring |
+| `batchId` | all payouts in a `/payouts/batch` group |
+| `txHash` | exact (NULL until the payout reaches `submitted`) |
+| `feeTier` | csv: `low,medium,high` |
+| `hasError` | `true` / `false` |
+| `amountUsdMin` / `amountUsdMax` | USD quoted-amount range |
+| `createdFrom` / `createdTo` | ISO-8601 or unix-ms |
+| `submittedFrom` / `submittedTo` | ISO-8601 or unix-ms |
+| `confirmedFrom` / `confirmedTo` | ISO-8601 or unix-ms |
+| `updatedFrom` / `updatedTo` | ISO-8601 or unix-ms |
+| `sortBy` | `createdAt` (default) ⎮ `updatedAt` ⎮ `submittedAt` ⎮ `confirmedAt` ⎮ `amountUsd` |
+| `sortDir` | `asc` ⎮ `desc` (default `desc`) |
+| `limit` / `offset` | `limit` 1–100, default 25 |
+
+Notes:
+- `*Contains` are case-insensitive `LIKE %term%` with `%` / `_` / `\` escaped,
+  so user input matches literally (an underscore in your `externalId` is fine).
+- `txHash` is different per endpoint: on `/invoices` it joins the
+  `transactions` table to find the invoice a *customer payment* was attributed
+  to; on `/payouts` it's an exact match on the payout's own broadcast hash.
+  A payout hash queried against `/invoices` won't match anything (payout txs
+  aren't ingested as transactions).
+- USD bounds CAST decimal strings to REAL; rows with no USD value (legacy
+  token-amount invoices, raw-amount payouts) drop out the moment any
+  `amountUsd*` / `paidUsd*` bound is set.
+- Validation errors return 400 with structured codes: `BAD_STATUS`,
+  `BAD_CHAIN_ID`, `BAD_TIMESTAMP`, `BAD_NUMBER`, `BAD_BOOLEAN`, plus
+  `VALIDATION` for an unknown `sortBy` / `sortDir` or `*Min > *Max`.
+
+```bash
+# Find every overpaid completed invoice >= $100 across USDT + USDC, newest first
+curl -H "Authorization: Bearer $API_KEY" \
+  "$GATEWAY/api/v1/invoices?status=completed&extraStatus=overpaid&token=USDT,USDC&paidUsdMin=100"
+
+# Find the invoice that on-chain hash 0xabc... paid
+curl -H "Authorization: Bearer $API_KEY" \
+  "$GATEWAY/api/v1/invoices?txHash=0xabc..."
+
+# Show recently-failed payouts on BSC, largest first
+curl -H "Authorization: Bearer $API_KEY" \
+  "$GATEWAY/api/v1/payouts?status=failed&hasError=true&chainId=56&sortBy=amountUsd&sortDir=desc"
+```
+
 ## Database migrations
 
 For creating a fresh Turso DB and applying the initial schema, see
