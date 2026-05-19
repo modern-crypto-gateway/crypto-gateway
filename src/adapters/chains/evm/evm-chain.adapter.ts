@@ -742,10 +742,33 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       //   single-digit percent overquote at broadcast time is absorbed by
       //   the 2× baseFee margin in buildTransfer.
       const FALLBACK_GAS_UNITS = token.contractAddress === null ? 21_000n : 65_000n;
-      const isInsufficientFundsError = (err: unknown): boolean => {
-        const message = err instanceof Error ? err.message : String(err);
-        return /insufficient funds|balance/i.test(message);
-      };
+      // `eth_estimateGas` SIMULATES the transfer purely as a REFINEMENT of
+      // the gas-units estimate. It is NOT load-bearing: gas units for an
+      // ERC-20 transfer are a fixed storage-write cost (~45–65k) that does
+      // not depend on chain state or who holds the token. So this method
+      // is TOTAL — it never throws. Any `eth_estimateGas` failure simply
+      // falls back to the constant:
+      //
+      //   - Token-transfer revert — `quoteFeeTiers` calls this with
+      //     `fromAddress = destination`, which never holds the token being
+      //     sent, so the simulated ERC-20 `transfer` reverts. Standard
+      //     tokens revert "transfer amount exceeds balance"; USDT (Tether)
+      //     on Ethereum reverts with NO reason string ("execution
+      //     reverted"). Expected — fall back.
+      //   - Insufficient native — the `from` address has no ETH to pay the
+      //     simulated tx's own gas. Expected — fall back.
+      //   - RPC transport failure — Alchemy 401/429/timeout, provider
+      //     outage. We must NOT hard-fail the whole fee quote over a
+      //     flaky fee oracle: that previously surfaced as
+      //     `FEE_ESTIMATE_FAILED` and blocked EVERY ETH USDT payout.
+      //     Fall back; the gas-PRICE side (`sampleFees` →
+      //     `quoteFeeTiers`) independently degrades to the chain floor
+      //     and marks the quote `degraded`.
+      //
+      // The real broadcast re-pins gas via buildTransfer's hardcoded
+      // 21k/65k anyway — this estimate only feeds the fee QUOTE, never
+      // the broadcast. A genuinely-misconfigured chain (no RPC URL at
+      // all) still fails loudly, but at `getClient`, not here.
       try {
         if (token.contractAddress === null) {
           const gas = await client.estimateGas({
@@ -766,17 +789,11 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
           data
         });
         return gas.toString() as AmountRaw;
-      } catch (err) {
-        // A zero-balance fee wallet (just registered, not yet funded) causes
-        // viem's estimateGas to throw "insufficient funds for gas * price +
-        // value". That's a valid operational state — return the safe
-        // fallback so the estimate endpoint can still quote a tier and tell
-        // the operator how much to fund. Real broadcasts re-run estimation
-        // against the actual reserved wallet, which by then has funds.
-        if (isInsufficientFundsError(err)) {
-          return FALLBACK_GAS_UNITS.toString() as AmountRaw;
-        }
-        throw err;
+      } catch {
+        // Any simulation failure → safe constant. See the comment above:
+        // there is no `eth_estimateGas` error mode where throwing beats
+        // returning the fallback gas units.
+        return FALLBACK_GAS_UNITS.toString() as AmountRaw;
       }
     },
 
@@ -801,12 +818,23 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         const flooredGasPrice =
           legacyGasPrice > floor.minMaxFeePerGas ? legacyGasPrice : floor.minMaxFeePerGas;
         const flat = (gasUnits * flooredGasPrice).toString() as AmountRaw;
+        // `degraded` when we had NO live gas-price signal at all and quoted
+        // purely off the hardcoded chain floor (legacyGasPrice === 0n means
+        // eth_feeHistory, estimateFeesPerGas AND the legacy retry all
+        // failed — the fee oracle is unreachable). The estimate endpoint
+        // turns this into a `fee_quote_degraded` warning so the merchant
+        // sees "rates aren't market-fresh" rather than a hard failure. A
+        // 1559-incapable chain that DID return a legacy gasPrice isn't
+        // degraded — it's just non-tiered, which `tieringSupported:false`
+        // already conveys.
+        const degraded = legacyGasPrice === 0n;
         return {
           low: { tier: "low", nativeAmountRaw: flat },
           medium: { tier: "medium", nativeAmountRaw: flat },
           high: { tier: "high", nativeAmountRaw: flat },
           tieringSupported: false,
-          nativeSymbol
+          nativeSymbol,
+          ...(degraded ? { degraded: true } : {})
         };
       }
 

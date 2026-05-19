@@ -38,7 +38,7 @@ interface MockResponses {
   } | "throw";
   maxPriority?: bigint | "throw";
   gasPrice?: bigint | "throw";
-  estimateGas?: bigint | "throw";
+  estimateGas?: bigint | "throw" | "transport";
 }
 function feeTransport(responses: MockResponses) {
   return custom({
@@ -73,7 +73,14 @@ function feeTransport(responses: MockResponses) {
           return "0x38"; // BSC, overridden by the adapter-level chainId arg anyway
         }
         case "eth_estimateGas": {
-          if (responses.estimateGas === "throw") throw new Error("estimateGas failed");
+          // "throw" — USDT reason-less revert ("execution reverted").
+          // "transport" — Alchemy 401/429/timeout style transport error
+          //   with NO revert keyword. estimateGasForTransfer is total: it
+          //   falls back to the gas-units constant for BOTH.
+          if (responses.estimateGas === "throw") throw new Error("execution reverted");
+          if (responses.estimateGas === "transport") {
+            throw new Error("HTTP request failed. Status code: 429");
+          }
           if (responses.estimateGas === undefined) return hex(21_000n);
           return hex(responses.estimateGas);
         }
@@ -253,6 +260,111 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
     expect(quote.low.nativeAmountRaw).toBe(expected);
     expect(quote.medium.nativeAmountRaw).toBe(expected);
     expect(quote.high.nativeAmountRaw).toBe(expected);
+  });
+
+  it("REGRESSION: quoteFeeTiers succeeds when eth_estimateGas reverts (USDT reason-less revert)", async () => {
+    // The production bug: planPayout calls quoteFeeTiers with
+    // `fromAddress = destination` — the merchant's payout address, which
+    // never holds the USDT being sent. eth_estimateGas SIMULATES the
+    // ERC-20 transfer; USDT (Tether) on Ethereum reverts with NO reason
+    // string when the sender lacks balance, so viem surfaces a bare
+    // "execution reverted". This used to re-throw → quoteFeeTiers threw
+    // → planPayout's FEE_ESTIMATE_FAILED → ETH USDT payouts were
+    // un-plannable. Now: estimateGasForTransfer is TOTAL — any
+    // eth_estimateGas failure falls back to the 65k ERC-20 gas constant.
+    const baseFee = gwei(15);
+    const adapter = evmChainAdapter({
+      chainIds: [1],
+      transports: {
+        1: feeTransport({
+          feeHistory: {
+            baseFeePerGas: Array(21).fill(baseFee),
+            reward: Array(20).fill([gwei(2), gwei(5), gwei(10)])
+          },
+          estimateGas: "throw" // simulates USDT's reason-less revert
+        })
+      }
+    });
+
+    const quote = await adapter.quoteFeeTiers({
+      chainId: 1,
+      fromAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      toAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      token: "USDT",
+      amountRaw: "1050500000"
+    });
+
+    const maxFee = (priority: bigint): bigint => 2n * baseFee + priority;
+    expect(quote.medium.nativeAmountRaw).toBe((65_000n * maxFee(gwei(5))).toString());
+    expect(BigInt(quote.medium.nativeAmountRaw)).toBeGreaterThan(0n);
+    expect(quote.tieringSupported).toBe(true);
+  });
+
+  it("REGRESSION: quoteFeeTiers succeeds when eth_estimateGas hits a transport error (Alchemy 429)", async () => {
+    // The deeper bug: even after the revert fix, a NON-revert
+    // eth_estimateGas failure — Alchemy 401/429/timeout, provider
+    // outage — still re-threw → FEE_ESTIMATE_FAILED → ALL ETH USDT
+    // payouts blocked while the fee oracle was flaky. estimateGasForTransfer
+    // is now total: ANY estimateGas failure falls back to the gas-units
+    // constant. The quote still succeeds (gas units don't depend on a
+    // live simulation); the gas-PRICE side degrades independently.
+    const baseFee = gwei(15);
+    const adapter = evmChainAdapter({
+      chainIds: [1],
+      transports: {
+        1: feeTransport({
+          feeHistory: {
+            baseFeePerGas: Array(21).fill(baseFee),
+            reward: Array(20).fill([gwei(2), gwei(5), gwei(10)])
+          },
+          estimateGas: "transport" // Alchemy 429-style transport error
+        })
+      }
+    });
+
+    // Must NOT throw — feeHistory still works here, so we get a real
+    // tiered quote with the 65k fallback gas units.
+    const quote = await adapter.quoteFeeTiers({
+      chainId: 1,
+      fromAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      toAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      token: "USDT",
+      amountRaw: "1050500000"
+    });
+    const maxFee = (priority: bigint): bigint => 2n * baseFee + priority;
+    expect(quote.medium.nativeAmountRaw).toBe((65_000n * maxFee(gwei(5))).toString());
+    expect(BigInt(quote.medium.nativeAmountRaw)).toBeGreaterThan(0n);
+  });
+
+  it("REGRESSION: total fee-oracle outage still produces a floored quote marked degraded", async () => {
+    // Worst case: feeHistory, estimateFeesPerGas AND eth_estimateGas all
+    // fail (provider fully down). The quote must still come back — quoted
+    // off the chain's hardcoded gas floor — with `degraded: true` so the
+    // estimate endpoint surfaces `fee_quote_degraded` instead of a hard
+    // FEE_ESTIMATE_FAILED. A merchant can still PLAN; the executor
+    // re-quotes at broadcast.
+    const adapter = evmChainAdapter({
+      chainIds: [1],
+      transports: {
+        1: feeTransport({
+          feeHistory: "throw",
+          maxPriority: "throw",
+          gasPrice: "throw",
+          estimateGas: "transport"
+        })
+      }
+    });
+
+    const quote = await adapter.quoteFeeTiers({
+      chainId: 1,
+      fromAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      toAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      token: "USDT",
+      amountRaw: "1050500000"
+    });
+    // Non-zero (quoted off the ETH gas floor), and flagged degraded.
+    expect(BigInt(quote.medium.nativeAmountRaw)).toBeGreaterThan(0n);
+    expect(quote.degraded).toBe(true);
   });
 });
 

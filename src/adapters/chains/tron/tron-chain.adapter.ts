@@ -72,7 +72,7 @@ const MAX_EXPECTED_TRANSFER_ENERGY = 250_000;
 // ceiling before being refused. At the current 100 SUN/energy this reserves
 // ~20 TRX per payout (×1.30 safety ×1.20 cushion = ~31 TRX top-up); high
 // for warm-slot transfers but the right floor for reliability.
-const MIN_EXPECTED_TRC20_ENERGY = 200_000;
+const MIN_EXPECTED_TRC20_ENERGY = 135_000;
 const DEFAULT_ACCOUNT_INDEX = 0;
 const DEFAULT_CHANGE_INDEX = 0;
 

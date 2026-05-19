@@ -3,6 +3,10 @@ import { eq } from "drizzle-orm";
 import { payouts } from "../../db/schema.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 import { seedFundedPoolAddress } from "../helpers/seed-source.js";
+import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
+import type { ChainAdapter } from "../../core/ports/chain.port.js";
+import type { Address, ChainId } from "../../core/types/chain.js";
+import type { TokenSymbol } from "../../core/types/token.js";
 
 const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
 
@@ -170,4 +174,92 @@ describe("POST /api/v1/payouts/estimate", () => {
     expect(typeof body.tiers.low.nativeAmountRaw).toBe("string");
   });
 
+});
+
+// `feeCoveredByDelegatedEnergy` lets the frontend show "$0 — covered by
+// delegated energy" for Tron sources that have enough delegated energy,
+// instead of the chain-level worst-case `tiers` figure (~20 TRX). The
+// chain-level tiers can't know which source will be picked, so on Tron
+// they always quote the burn-all-SUN worst case.
+describe("POST /api/v1/payouts/estimate — delegated-energy fee flag", () => {
+  // Wrapper: dev adapter (family 'evm') with a `hasSufficientFreeGas`
+  // probe that returns true for one specific address. Mirrors how Tron's
+  // adapter reports delegated-energy coverage. nativeSymbol stays "DEV"
+  // so DEVT is treated as a non-native token (free-gas only applies to
+  // token payouts — gas IS the asset for native).
+  function freeGasAdapter(freeAddress: string): ChainAdapter {
+    const base = devChainAdapter({ deterministicTxHashes: true });
+    return {
+      ...base,
+      async hasSufficientFreeGas(args: {
+        readonly chainId: ChainId;
+        readonly address: Address;
+        readonly token: TokenSymbol;
+      }): Promise<boolean> {
+        return args.address.toLowerCase() === freeAddress.toLowerCase();
+      }
+    };
+  }
+
+  it("sets feeCoveredByDelegatedEnergy=true on a source with delegated energy, false on others", async () => {
+    const TEST_SEED = "test test test test test test test test test test test junk";
+    // Pre-derive two addresses; the first is the one with delegated energy.
+    const probe = devChainAdapter({ deterministicTxHashes: true });
+    const delegatedAddr = probe.canonicalizeAddress(probe.deriveAddress(TEST_SEED, 610_001).address);
+    const plainAddr = probe.canonicalizeAddress(probe.deriveAddress(TEST_SEED, 610_002).address);
+
+    const booted2 = await bootTestApp({
+      chains: [freeGasAdapter(delegatedAddr)],
+      merchants: [{ id: MERCHANT_ID }]
+    });
+    try {
+      // Both sources hold the DEVT token; NEITHER holds native (DEV).
+      // The delegated-energy source still qualifies as a Tier-A direct
+      // pick (free-gas override), and its candidate must carry the flag.
+      await seedFundedPoolAddress(booted2, {
+        chainId: 999, family: "evm", address: delegatedAddr, derivationIndex: 610_001,
+        balances: { DEVT: "1000000000" }
+      });
+      await seedFundedPoolAddress(booted2, {
+        chainId: 999, family: "evm", address: plainAddr, derivationIndex: 610_002,
+        balances: { DEVT: "500000000" }
+      });
+
+      const res = await booted2.app.fetch(
+        new Request("http://test.local/api/v1/payouts/estimate", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${booted2.apiKeys[MERCHANT_ID]!}`
+          },
+          body: JSON.stringify({
+            chainId: 999,
+            token: "DEVT",
+            amountRaw: "100000000",
+            destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          })
+        })
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        source: { address: string; feeCoveredByDelegatedEnergy: boolean } | null;
+        alternatives: Array<{ address: string; feeCoveredByDelegatedEnergy: boolean }>;
+      };
+
+      // Picker is richest-first → delegatedAddr (1000 DEVT) is the source.
+      expect(body.source).not.toBeNull();
+      expect(body.source!.address.toLowerCase()).toBe(delegatedAddr.toLowerCase());
+      // It has delegated energy → flagged. Frontend renders "$0".
+      expect(body.source!.feeCoveredByDelegatedEnergy).toBe(true);
+
+      // plainAddr is an alternative and does NOT have delegated energy.
+      const plainAlt = body.alternatives.find(
+        (a) => a.address.toLowerCase() === plainAddr.toLowerCase()
+      );
+      expect(plainAlt).toBeDefined();
+      expect(plainAlt!.feeCoveredByDelegatedEnergy).toBe(false);
+    } finally {
+      await booted2.close();
+    }
+  });
 });

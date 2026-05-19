@@ -877,6 +877,19 @@ export interface SourceCandidate {
   derivationIndex: number;
   tokenBalance: string;
   nativeBalance: string;
+  // True when this source already has enough delegated chain resources
+  // to broadcast the token transfer WITHOUT burning native gas — Tron's
+  // delegated-energy model. When true, the chain-level `tiers` fee quote
+  // does NOT apply to this source: the real broadcast cost is ~0 (just
+  // bandwidth, typically covered by the free daily allowance).
+  //
+  // The frontend should show "$0 — covered by delegated energy" for a
+  // source with this flag instead of the `tiers` amount. The `tiers`
+  // block is a CHAIN-level worst-case quote (Tron's quoteFeeTiers can't
+  // know which source will be picked, so it always returns the burn-all-
+  // SUN figure ~20 TRX) — accurate only for a source WITHOUT delegated
+  // energy. Always false on non-Tron chains and for native payouts.
+  feeCoveredByDelegatedEnergy: boolean;
 }
 
 export interface EstimatePayoutFeesResult {
@@ -1217,7 +1230,10 @@ export async function estimatePayoutFees(
               address: `<utxo-aggregate>`,
               derivationIndex: -1,
               tokenBalance: totalSpendable.toString(),
-              nativeBalance: totalSpendable.toString()
+              nativeBalance: totalSpendable.toString(),
+              // UTXO chains have no delegated-energy concept — gas is
+              // paid from the inputs themselves at coinselect time.
+              feeCoveredByDelegatedEnergy: false
             },
       alternatives: [],
       warnings
@@ -1310,6 +1326,17 @@ export async function estimatePayoutFees(
     ? await loadFreeGasAddresses(deps, chainAdapter, parsed.chainId, parsed.token)
     : new Set<string>();
 
+  // Bind the free-gas set into a candidate serializer so every `source`
+  // / `alternatives` entry carries the `feeCoveredByDelegatedEnergy`
+  // flag. Lets the frontend show "$0" for delegated-energy sources
+  // instead of the chain-level worst-case `tiers` figure.
+  const toCandidate = (c: {
+    address: string;
+    derivationIndex: number;
+    tokenBalance: bigint;
+    nativeBalance: bigint;
+  }): SourceCandidate => serializeCandidate(c, estimateFreeGasAddresses);
+
   // Diagnostic helper for the `feeWallet` block in the response. Operators
   // who configure a fee wallet but see `no_gas_sponsor_available` need to
   // know WHY — most often because the fee wallet's liquid native balance is
@@ -1369,11 +1396,11 @@ export async function estimatePayoutFees(
       quotedAmountUsd,
       quotedRate,
       tiers,
-      source: serializeCandidate(direct),
+      source: toCandidate(direct),
       alternatives: enriched
         .filter((e) => e.address !== direct.address)
         .slice(0, 4)
-        .map(serializeCandidate),
+        .map(toCandidate),
       ...(feeWallet !== undefined ? { feeWallet } : {}),
       warnings
     };
@@ -1421,7 +1448,7 @@ export async function estimatePayoutFees(
           quotedAmountUsd,
           quotedRate,
           tiers,
-          source: serializeCandidate(tokenHolder),
+          source: toCandidate(tokenHolder),
           topUp: {
             required: true,
             sponsor: { address: sponsor.address, nativeBalance: sponsor.nativeBalance.toString() },
@@ -1430,7 +1457,7 @@ export async function estimatePayoutFees(
           alternatives: enriched
             .filter((e) => e.address !== tokenHolder.address && e.address !== sponsor.address)
             .slice(0, 4)
-            .map(serializeCandidate),
+            .map(toCandidate),
           ...(feeWallet !== undefined ? { feeWallet } : {}),
           warnings
         };
@@ -1452,12 +1479,12 @@ export async function estimatePayoutFees(
         quotedAmountUsd,
         quotedRate,
         tiers,
-        source: serializeCandidate(tokenHolder),
+        source: toCandidate(tokenHolder),
         topUp: { required: true, sponsor: null, amountRaw: (gasNeeded - tokenHolder.nativeBalance).toString() },
         alternatives: enriched
           .filter((e) => e.address !== tokenHolder.address)
           .slice(0, 4)
-          .map(serializeCandidate),
+          .map(toCandidate),
         ...(feeWallet !== undefined ? { feeWallet } : {}),
         warnings
       };
@@ -1509,22 +1536,26 @@ export async function estimatePayoutFees(
     quotedRate,
     tiers,
     source: null,
-    alternatives: enriched.slice(0, 4).map(serializeCandidate),
+    alternatives: enriched.slice(0, 4).map(toCandidate),
     warnings
   };
 }
 
-function serializeCandidate(c: {
-  address: string;
-  derivationIndex: number;
-  tokenBalance: bigint;
-  nativeBalance: bigint;
-}): SourceCandidate {
+function serializeCandidate(
+  c: {
+    address: string;
+    derivationIndex: number;
+    tokenBalance: bigint;
+    nativeBalance: bigint;
+  },
+  freeGasAddresses: ReadonlySet<string>
+): SourceCandidate {
   return {
     address: c.address,
     derivationIndex: c.derivationIndex,
     tokenBalance: c.tokenBalance.toString(),
-    nativeBalance: c.nativeBalance.toString()
+    nativeBalance: c.nativeBalance.toString(),
+    feeCoveredByDelegatedEnergy: freeGasAddresses.has(c.address)
   };
 }
 

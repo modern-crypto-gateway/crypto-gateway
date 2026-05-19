@@ -3580,12 +3580,29 @@ components:
           description: |
             HD address the executor would pick. Null when no candidate has
             enough token balance (see `warnings`).
-          required: [address, derivationIndex, tokenBalance, nativeBalance]
+          required: [address, derivationIndex, tokenBalance, nativeBalance, feeCoveredByDelegatedEnergy]
           properties:
             address: { type: string }
             derivationIndex: { type: integer }
             tokenBalance: { type: string, description: "Spendable token balance (smallest units, ledger-derived)." }
             nativeBalance: { type: string }
+            feeCoveredByDelegatedEnergy:
+              type: boolean
+              description: |
+                True when this source has enough delegated chain
+                resources to broadcast the token transfer WITHOUT
+                burning native gas — Tron's delegated-energy model.
+
+                When true, the chain-level `tiers` quote does NOT
+                apply to this source: the real broadcast cost is ~0
+                (just bandwidth, normally covered by the free daily
+                allowance). The frontend should render "$0 — covered
+                by delegated energy" for this source instead of the
+                `tiers` figure. The `tiers` block is a CHAIN-level
+                worst-case quote — on Tron it always returns the
+                burn-all-SUN figure (~20 TRX) because it can't know
+                which source the picker will choose. Always false on
+                non-Tron chains and for native-asset payouts.
         topUp:
           type: object
           description: |
@@ -3614,12 +3631,15 @@ components:
             spendable at insert time.
           items:
             type: object
-            required: [address, derivationIndex, tokenBalance, nativeBalance]
+            required: [address, derivationIndex, tokenBalance, nativeBalance, feeCoveredByDelegatedEnergy]
             properties:
               address: { type: string }
               derivationIndex: { type: integer }
               tokenBalance: { type: string }
               nativeBalance: { type: string }
+              feeCoveredByDelegatedEnergy:
+                type: boolean
+                description: "See `source.feeCoveredByDelegatedEnergy` — same per-source semantics."
         feeWallet:
           type: object
           description: |
