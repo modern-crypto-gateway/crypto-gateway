@@ -4,6 +4,7 @@ import { confirmTransactions } from "./core/domain/payment.service.js";
 import { confirmPayouts, executeReservedPayouts, reconcileFailedPayoutGasBurns } from "./core/domain/payout.service.js";
 import { pollPayments } from "./core/domain/poll-payments.js";
 import { registerPoolReleaseHandler } from "./core/domain/pool.service.js";
+import { registerMoneroPoolReleaseHandler } from "./core/domain/monero-pool.service.js";
 import { registerWebhookSubscriber } from "./core/domain/webhook-subscriber.js";
 import { dbAlchemySubscriptionStore } from "./adapters/detection/alchemy-subscription-store.js";
 import { registerAlchemySubscriptionTracker } from "./adapters/detection/alchemy-subscription-tracker.js";
@@ -39,6 +40,9 @@ export function registerEventSubscribers(deps: AppDeps): void {
   // row(s) to 'available' so the address can serve the next invoice. This is
   // the whole point of the reuse model — one pool row, N invoices, 1 sweep.
   registerPoolReleaseHandler(deps);
+  // Same for the dedicated Monero subaddress pool. Touches a disjoint table
+  // from the shared handler, so the two coexist without double-processing.
+  registerMoneroPoolReleaseHandler(deps);
   // Alchemy subscription tracker is registered only when the deployment has
   // Alchemy configured (deps.alchemy present). It listens for pool.address
   // events and enqueues per-chain subscription rows; chains not in the

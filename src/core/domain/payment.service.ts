@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
-import type { ChainFamily } from "../types/chain.js";
+import type { ChainFamily, ChainId } from "../types/chain.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import type { Invoice, InvoiceExtraStatus, InvoiceId, InvoiceStatus } from "../types/invoice.js";
 import { DetectedTransferSchema, type TransactionId, type TxStatus } from "../types/transaction.js";
@@ -19,6 +19,7 @@ import {
 } from "./payment-config.js";
 import { findToken } from "../types/token-registry.js";
 import { reacquireForInvoice } from "./pool.service.js";
+import { getMoneroPoolAddress, isMoneroAddressInCooldown } from "./monero-pool.service.js";
 import { addUsd, applyBps, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
 import { addressPool, invoices, invoiceReceiveAddresses, payouts, transactions, utxos } from "../../db/schema.js";
 
@@ -136,8 +137,50 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   // records as an orphan for admin reconciliation.
   let invoiceRow: InvoiceRow | null = topCandidate;
   if (topCandidate !== null && ADMIN_TERMINAL_STATES.has(topCandidate.status as InvoiceStatus)) {
-    const inCooldown = await isAddressInCooldown(deps, family, canonicalTo);
+    const inCooldown = await isAddressInCooldown(deps, family, canonicalTo, transfer.chainId);
     if (!inCooldown) invoiceRow = null;
+  }
+
+  // Monero reused-subaddress safety net. Monero has no payment IDs, so a
+  // payment that lands on a subaddress AFTER it was released from one invoice
+  // and reused by another is ambiguous. The cooldown floor keeps a just-
+  // released subaddress out of rotation, so the common late-payment case
+  // credits the original invoice. For the residual — an ACTIVE invoice now
+  // owns a REUSED subaddress and a payment arrives that clearly OVERSHOOTS what
+  // this invoice could accept even at full over-tolerance — park it as an
+  // orphan for admin attribution rather than silently crediting the wrong
+  // invoice. Scoped to native-XMR invoices where atomic amounts compare
+  // directly; USD-pegged invoices (valued at detection-time rates) credit
+  // normally and rely on the cooldown alone. Legitimate exact/under/within-
+  // tolerance payments to the active invoice are never affected.
+  if (
+    family === "monero" &&
+    invoiceRow !== null &&
+    !ADMIN_TERMINAL_STATES.has(invoiceRow.status as InvoiceStatus) &&
+    invoiceRow.amountUsd === null
+  ) {
+    const poolInfo = await getMoneroPoolAddress(deps, transfer.chainId, canonicalTo);
+    const reused = (poolInfo?.totalAllocations ?? 0) > 0;
+    if (reused) {
+      const required = safeBigInt(invoiceRow.requiredAmountRaw);
+      const paid = safeBigInt(transfer.amountRaw);
+      if (required !== null && required > 0n && paid !== null) {
+        const overBps = BigInt(invoiceRow.paymentToleranceOverBps ?? 0);
+        const ceiling = (required * (10_000n + overBps)) / 10_000n;
+        if (paid > ceiling) {
+          deps.logger.warn(
+            "monero: payment overshoots reused-subaddress invoice — orphaning for admin attribution",
+            {
+              address: canonicalTo,
+              invoiceId: invoiceRow.id,
+              amountRaw: transfer.amountRaw,
+              ceilingRaw: ceiling.toString()
+            }
+          );
+          invoiceRow = null;
+        }
+      }
+    }
   }
 
   const invoiceId: string | null = invoiceRow ? invoiceRow.id : null;
@@ -454,8 +497,14 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
 async function isAddressInCooldown(
   deps: AppDeps,
   family: ChainFamily,
-  address: string
+  address: string,
+  chainId: ChainId
 ): Promise<boolean> {
+  // Monero lives in its own pool table (inbound-only, isolated from the shared
+  // address_pool). Delegate so the cooldown gate consults the right table.
+  if (family === "monero") {
+    return isMoneroAddressInCooldown(deps, chainId, address);
+  }
   const now = deps.clock.now().getTime();
   const [row] = await deps.db
     .select({ cooldownUntil: addressPool.cooldownUntil })
@@ -465,6 +514,18 @@ async function isAddressInCooldown(
   if (!row) return false;
   if (row.cooldownUntil === null) return false;
   return row.cooldownUntil > now;
+}
+
+// Parse a decimal-string atomic amount to bigint, returning null on anything
+// non-integer (defensive — the reused-subaddress guard must never throw on a
+// malformed amount and abort an ingest).
+function safeBigInt(value: string | null): bigint | null {
+  if (value === null) return null;
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
 }
 
 // Insert a UTXO ledger row mirroring a just-detected output that paid one of

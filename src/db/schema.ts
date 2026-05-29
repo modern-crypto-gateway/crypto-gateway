@@ -240,6 +240,71 @@ export const moneroSubaddressCounters = sqliteTable("monero_subaddress_counters"
   updatedAt: integer("updated_at").notNull()
 });
 
+// ---- monero_subaddress_pool (reusable subaddress pool, per Monero chain) ----
+//
+// The Monero analogue of `address_pool`. Monero is inbound-only (the gateway
+// holds the view key, never the spend key) so it MUST stay out of the shared
+// `address_pool`, which is coupled to spend-side logic (consolidation, fee
+// wallets, payout sourcing). This dedicated table gives Monero the same
+// allocate → release-on-terminal → reuse lifecycle without any of that
+// coupling. Partitioned by `chainId` (Monero networks live per-chainId:
+// mainnet/stagenet/testnet) rather than by family.
+//
+// Subaddresses are derived under account 0 at `addressIndex` (>= 1; index 0
+// is the operator's primary address). Indices never collide with the legacy
+// per-invoice allocator because the pool refiller seeds at or above
+// `monero_subaddress_counters.next_index` and bumps that counter forward.
+//
+// Reuse is privacy-safe on Monero: each payment produces a fresh one-time
+// stealth output key on-chain; the subaddress itself never appears on-chain,
+// so reusing it across invoices leaks nothing an external observer can link.
+export const moneroSubaddressPool = sqliteTable(
+  "monero_subaddress_pool",
+  {
+    id: text("id").primaryKey(),
+    chainId: integer("chain_id").notNull(),
+    // Subaddress index under account 0. >= 1.
+    addressIndex: integer("address_index").notNull(),
+    // Encoded base58 subaddress for this (chainId, index). Case-sensitive.
+    address: text("address").notNull(),
+    status: text("status", { enum: ["available", "allocated", "quarantined"] }).notNull(),
+    allocatedToInvoiceId: text("allocated_to_invoice_id"),
+    allocatedAt: integer("allocated_at"),
+    // Lifetime reuse counter. Allocation picks MIN(totalAllocations) first so
+    // the same subaddress isn't re-handed-out disproportionately. > 0 means
+    // the subaddress has been reused at least once.
+    totalAllocations: integer("total_allocations").notNull().default(0),
+    lastReleasedAt: integer("last_released_at"),
+    // Cooldown deadline (epoch ms). Allocation skips rows where this is > now.
+    // Floored to MONERO_POOL_COOLDOWN_MS at release so a just-expired invoice's
+    // subaddress can't be re-handed-out while a late payment to it might still
+    // land — the late payment then credits the original invoice rather than a
+    // freshly-reused one. The merchant's `address_cooldown_seconds` can raise
+    // this floor but never lower it.
+    cooldownUntil: integer("cooldown_until"),
+    lastReleasedByMerchantId: text("last_released_by_merchant_id"),
+    createdAt: integer("created_at").notNull()
+  },
+  (t) => [
+    uniqueIndex("uq_monero_pool_chain_index").on(t.chainId, t.addressIndex),
+    uniqueIndex("uq_monero_pool_chain_address").on(t.chainId, t.address),
+    // Allocation candidate index — mirrors address_pool's hot path, keyed by
+    // chainId. Pairs with the cooldown filter in the allocator.
+    index("idx_monero_pool_available").on(
+      t.chainId,
+      t.status,
+      t.totalAllocations,
+      t.lastReleasedAt,
+      t.addressIndex
+    ),
+    index("idx_monero_pool_allocated").on(t.allocatedToInvoiceId),
+    check(
+      "monero_pool_status_check",
+      sql`${t.status} IN ('available','allocated','quarantined')`
+    )
+  ]
+);
+
 // ---- transactions (detected on-chain transfers, tied to an invoice when matched) ----
 
 export const transactions = sqliteTable(
@@ -1078,6 +1143,7 @@ export const schema = {
   invoices,
   addressIndexCounters,
   moneroSubaddressCounters,
+  moneroSubaddressPool,
   transactions,
   utxos,
   payoutReservations,

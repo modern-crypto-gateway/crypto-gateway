@@ -27,6 +27,15 @@ export interface AllocatedMoneroSubaddress {
   readonly addressIndex: number;
 }
 
+/**
+ * @deprecated Monero invoices now allocate from the reusable subaddress pool
+ * (`monero-pool.service.ts`, allocateMoneroFromPool) instead of minting a fresh
+ * subaddress per invoice. This monotonic allocator is no longer on the
+ * invoice-create path. The `monero_subaddress_counters` table it maintains is
+ * retained as the pool's index high-water mark (the pool seeds at or above
+ * `next_index` and bumps it forward), so neither this function nor the table
+ * should be removed without migrating that responsibility.
+ */
 export async function allocateMoneroSubaddress(args: {
   deps: AppDeps;
   chainId: ChainId;

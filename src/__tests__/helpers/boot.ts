@@ -10,6 +10,7 @@ import { createDb, createLibsqlClient } from "../../db/client.js";
 import { merchants as merchantsTable } from "../../db/schema.js";
 import { devCipher } from "../../adapters/crypto/secrets-cipher.js";
 import { initializePool } from "../../core/domain/pool.service.js";
+import { initializeMoneroPool } from "../../core/domain/monero-pool.service.js";
 import { warmRateCache } from "../../core/domain/rate-window.js";
 import { promiseSetJobs } from "../../adapters/jobs/promise-set.adapter.js";
 import { staticPegPriceOracle } from "../../adapters/price-oracle/static-peg.adapter.js";
@@ -293,6 +294,9 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
       ),
       initialSize: options.poolInitialSize ?? 10
     });
+    // Monero lives in its own subaddress pool (inbound-only, separate table).
+    // No-op when no Monero adapter is wired into deps.chains.
+    await initializeMoneroPool(deps, { initialSize: options.poolInitialSize ?? 10 });
   }
 
   // Pre-warm the rate cache. In production this runs every cron tick;

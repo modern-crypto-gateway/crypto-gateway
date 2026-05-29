@@ -11,6 +11,7 @@ import { isTronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../adapters/chains
 import type { TronResourceKind, TronRpcBackend } from "../../adapters/chains/tron/tron-rpc.js";
 import type { UnsignedTx } from "../../core/types/unsigned-tx.js";
 import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
+import { getMoneroPoolStats, initializeMoneroPool } from "../../core/domain/monero-pool.service.js";
 import {
   ConsolidationError,
   consolidationErrorStatus,
@@ -1187,6 +1188,38 @@ const hasFeeWallet = adapterFamily !== undefined && adapterFamily !== "monero"
   // low" before POOL_EXHAUSTED fires on a live invoice-create.
   app.get("/pool/stats", async (c) => {
     const stats = await getPoolStats(deps);
+    return c.json({ stats }, 200);
+  });
+
+  // Dedicated Monero subaddress pool — seeded separately from the shared
+  // address_pool (Monero is inbound-only and lives in its own table). Idempotent
+  // top-up to `initialSize` per wired Monero chain; no-op when XMR isn't wired.
+  app.post("/monero-pool/initialize", async (c) => {
+    const rawBody = await c.req.text();
+    let parsedBody: unknown = {};
+    if (rawBody.length > 0) {
+      try {
+        parsedBody = JSON.parse(rawBody);
+      } catch {
+        return c.json({ error: { code: "BAD_JSON" } }, 400);
+      }
+    }
+    try {
+      const parsed = InitializeMoneroPoolSchema.parse(parsedBody);
+      const results = await initializeMoneroPool(
+        deps,
+        parsed.initialSize !== undefined ? { initialSize: parsed.initialSize } : {}
+      );
+      return c.json({ results }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Per-chain Monero subaddress pool utilization. `highestIndex` lets operators
+  // watch the subaddress index against their wallet's lookahead frontier.
+  app.get("/monero-pool/stats", async (c) => {
+    const stats = await getMoneroPoolStats(deps);
     return c.json({ stats }, 200);
   });
 
@@ -3057,6 +3090,12 @@ type TronChainAdapterRet = ReturnType<typeof findChainAdapter> & {
 const InitializePoolSchema = z.object({
   families: z.array(ChainFamilySchema).min(1).default(["evm", "tron", "solana"] as const),
   initialSize: z.number().int().min(1).max(500).default(5)
+});
+
+// Monero pool seeding. `initialSize` omitted → the service falls back to
+// MONERO_POOL_INITIAL_SIZE (deps.moneroPoolInitialSize), then its built-in 20.
+const InitializeMoneroPoolSchema = z.object({
+  initialSize: z.number().int().min(1).max(200).optional()
 });
 
 function bytesToRandomHex(numBytes: number): string {

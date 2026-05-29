@@ -114,6 +114,19 @@ export const AppConfigSchema = z
     // providers (NOWNodes, Tatum). GetBlock-style URL-embedded keys do
     // not need this.
     moneroRpcHeadersJson: z.string().optional(),
+    // Reusable Monero subaddress pool. Monero invoices allocate a subaddress
+    // from a bounded pool and release it back on terminal for reuse (vs. the
+    // legacy fresh-per-invoice counter). See monero-pool.service.ts.
+    //   - MONERO_POOL_INITIAL_SIZE: subaddresses to seed per Monero chain at
+    //     boot. Auto-grows under load; kept small so it stays inside the
+    //     wallet's default subaddress lookahead. Default 20.
+    //   - MONERO_POOL_COOLDOWN_SECONDS: minimum time a released subaddress
+    //     stays out of rotation before reuse. The guard against a late payment
+    //     to an expired invoice being mis-credited to the next invoice on the
+    //     same subaddress. Default 3600 (60 min). A merchant's
+    //     `address_cooldown_seconds` can raise this floor but never lower it.
+    moneroPoolInitialSize: z.coerce.number().int().min(1).max(200).default(20),
+    moneroPoolCooldownSeconds: z.coerce.number().int().nonnegative().default(3600),
 
     // DB
     databaseUrl: z.string().optional(),
@@ -256,6 +269,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     moneroRestoreHeight: env["MONERO_RESTORE_HEIGHT"],
     moneroRpcUrls: env["MONERO_RPC_URLS"],
     moneroRpcHeadersJson: env["MONERO_RPC_HEADERS_JSON"],
+    moneroPoolInitialSize: env["MONERO_POOL_INITIAL_SIZE"],
+    moneroPoolCooldownSeconds: env["MONERO_POOL_COOLDOWN_SECONDS"],
     gatewayPublicUrl: env["GATEWAY_PUBLIC_URL"],
     // Compulsory Turso post-2026-Q1; the env-var names reflect that.
     // DATABASE_URL / DATABASE_TOKEN are still honored as aliases so existing

@@ -10,6 +10,7 @@ import {
 } from "./payout.service.js";
 import { pollPayments } from "./poll-payments.js";
 import { reconcileOrphanedAllocations } from "./pool.service.js";
+import { reconcileOrphanedMoneroAllocations } from "./monero-pool.service.js";
 import { warmRateCache } from "./rate-window.js";
 import { sweepWebhookDeliveries } from "./webhook-subscriber.js";
 
@@ -40,6 +41,8 @@ export interface ScheduledJobsResult {
   sweepStuckPayoutReservations: JobOutcome;
   sweepExpiredInvoices: JobOutcome;
   reconcileOrphanedAllocations: JobOutcome;
+  // Same defense-in-depth sweep for the dedicated Monero subaddress pool.
+  reconcileOrphanedMoneroAllocations: JobOutcome;
   sweepWebhookDeliveries: JobOutcome;
   // Auto-consolidation: fires due `(chainId, token)` consolidation
   // schedules. No env gate — table-driven; with no schedules configured
@@ -91,6 +94,10 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     // callback) gets caught here on the same tick. Honors a grace window so
     // an in-flight create-invoice flow isn't raced.
     reconcileOrphanedAllocations: await run(() => reconcileOrphanedAllocations(deps)),
+    // Monero pool's own orphan sweep — releases leaked 'allocated' rows whose
+    // invoice is terminal/missing and re-stamps the cooldown floor (so the
+    // reuse-safety window survives the sweeper path, unlike the shared pool).
+    reconcileOrphanedMoneroAllocations: await run(() => reconcileOrphanedMoneroAllocations(deps)),
     sweepWebhookDeliveries: await run(() => sweepWebhookDeliveries(deps)),
     // Runs AFTER reconcileOrphanedAllocations so any address just freed
     // up by the orphan sweep is visible to the consolidation source-

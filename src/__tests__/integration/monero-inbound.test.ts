@@ -3,18 +3,26 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { eq } from "drizzle-orm";
 import { bootTestApp } from "../helpers/boot.js";
+import { initializeMoneroPool, releaseMoneroFromInvoice } from "../../core/domain/monero-pool.service.js";
 import {
   encodeAddress,
   parseAddress
 } from "../../adapters/chains/monero/monero-crypto.js";
-import { moneroChainAdapter } from "../../adapters/chains/monero/monero-chain.adapter.js";
+import { moneroChainAdapter, MONERO_UNKNOWN_SENDER } from "../../adapters/chains/monero/monero-chain.adapter.js";
 import { MONERO_MAINNET_CONFIG } from "../../adapters/chains/monero/monero-config.js";
 import type {
   MoneroDaemonRpcClient,
   MoneroParsedTx
 } from "../../adapters/chains/monero/monero-rpc.js";
-import { invoiceReceiveAddresses } from "../../db/schema.js";
+import {
+  invoiceReceiveAddresses,
+  invoices,
+  moneroSubaddressCounters,
+  moneroSubaddressPool,
+  transactions
+} from "../../db/schema.js";
 import { planPayout } from "../../core/domain/payout.service.js";
+import { ingestDetectedTransfer } from "../../core/domain/payment.service.js";
 
 // Monero (XMR) inbound integration tests. Cover:
 //   1. Adapter construction validates view key ↔ primary address.
@@ -189,6 +197,11 @@ describe("Monero invoice creation", () => {
       // Inject the Monero adapter into deps.chains. bootTestApp doesn't
       // wire it via env vars; we patch the in-memory deps directly.
       (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
+      // Monero now allocates from a seeded reusable pool (vs. the legacy
+      // fresh-per-invoice counter). Seed it after wiring the adapter so invoice
+      // creation has subaddresses to hand out. Indices are pooled sequentially
+      // from 1, so the first/second invoice still land on index 1/2.
+      await initializeMoneroPool(booted.deps, { initialSize: 5 });
 
       const apiKey = booted.apiKeys[MERCHANT_ID]!;
       const r1 = await booted.app.fetch(
@@ -318,6 +331,11 @@ describe("Monero detection — happy path", () => {
         cache: booted.deps.cache
       });
       (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
+      // Monero now allocates from a seeded reusable pool (vs. the legacy
+      // fresh-per-invoice counter). Seed it after wiring the adapter so invoice
+      // creation has subaddresses to hand out. Indices are pooled sequentially
+      // from 1, so the first/second invoice still land on index 1/2.
+      await initializeMoneroPool(booted.deps, { initialSize: 5 });
 
       // Create an invoice. First Monero invoice → subaddress index 1.
       const apiKey = booted.apiKeys[MERCHANT_ID]!;
@@ -488,6 +506,11 @@ describe("Monero detection — happy path", () => {
         cache: booted.deps.cache
       });
       (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
+      // Monero now allocates from a seeded reusable pool (vs. the legacy
+      // fresh-per-invoice counter). Seed it after wiring the adapter so invoice
+      // creation has subaddresses to hand out. Indices are pooled sequentially
+      // from 1, so the first/second invoice still land on index 1/2.
+      await initializeMoneroPool(booted.deps, { initialSize: 5 });
 
       const apiKey = booted.apiKeys[MERCHANT_ID]!;
       const created = await booted.app.fetch(
@@ -609,6 +632,11 @@ describe("Monero detection — happy path", () => {
         cache: booted.deps.cache
       });
       (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
+      // Monero now allocates from a seeded reusable pool (vs. the legacy
+      // fresh-per-invoice counter). Seed it after wiring the adapter so invoice
+      // creation has subaddresses to hand out. Indices are pooled sequentially
+      // from 1, so the first/second invoice still land on index 1/2.
+      await initializeMoneroPool(booted.deps, { initialSize: 5 });
 
       // Create an invoice so we have at least one live subaddress to scan against.
       const apiKey = booted.apiKeys[MERCHANT_ID]!;
@@ -810,6 +838,11 @@ describe("Monero payout (v1 stub)", () => {
         cache: booted.deps.cache
       });
       (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
+      // Monero now allocates from a seeded reusable pool (vs. the legacy
+      // fresh-per-invoice counter). Seed it after wiring the adapter so invoice
+      // creation has subaddresses to hand out. Indices are pooled sequentially
+      // from 1, so the first/second invoice still land on index 1/2.
+      await initializeMoneroPool(booted.deps, { initialSize: 5 });
 
       // Pick any well-formed Monero address as the destination — the
       // family-guard fires before address validation.
@@ -828,6 +861,247 @@ describe("Monero payout (v1 stub)", () => {
       }
       expect(caught).not.toBeNull();
       expect(caught!.code).toBe("PAYOUT_NOT_SUPPORTED_ON_FAMILY");
+    } finally {
+      await booted.close();
+    }
+  });
+});
+
+describe("Monero subaddress pool — reuse, cooldown & safety net", () => {
+  // POST a Monero invoice via the authenticated API; returns the raw Response.
+  function postMoneroInvoice(
+    app: { fetch: (req: Request) => Response | Promise<Response> },
+    apiKey: string,
+    amountRaw: string
+  ): Promise<Response> {
+    return Promise.resolve(
+      app.fetch(
+        new Request("http://test.local/api/v1/invoices", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({ chainId: MONERO_CHAIN_ID, token: "XMR", amountRaw })
+        })
+      )
+    );
+  }
+
+  // Wire a Monero adapter, seed a one-subaddress pool, then HOLD the refill
+  // mutex so the self-healing auto-grow (which fires when available drops below
+  // the threshold) can't add rows and make reuse non-deterministic. Returns the
+  // single seeded subaddress' chain so callers can derive nothing else.
+  async function wireFrozenSingleSubaddressPool(
+    booted: Awaited<ReturnType<typeof bootTestApp>>,
+    seedSuffix: string
+  ): Promise<void> {
+    const w = makeWallet(seedSuffix);
+    const adapter = moneroChainAdapter({
+      chain: MONERO_MAINNET_CONFIG,
+      primaryAddress: w.primaryAddress,
+      viewKey: w.viewKey,
+      restoreHeight: 0,
+      daemonClient: stubDaemonClient(),
+      cache: booted.deps.cache
+    });
+    (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
+    await initializeMoneroPool(booted.deps, { initialSize: 1 });
+    // Freeze the pool at one subaddress for the duration of the test.
+    await booted.deps.cache.putIfAbsent(`monero-pool:refill-lock:${MONERO_CHAIN_ID}`, "1", {
+      ttlSeconds: 86_400
+    });
+  }
+
+  it("releases a subaddress on terminal (with a cooldown floor), blocks reuse during cooldown, and reuses it after", async () => {
+    let nowMs = Date.UTC(2026, 0, 1);
+    const booted = await bootTestApp({
+      merchants: [{ id: MERCHANT_ID }],
+      clock: { now: () => new Date(nowMs) }
+    });
+    try {
+      await wireFrozenSingleSubaddressPool(booted, "pool-reuse");
+      const apiKey = booted.apiKeys[MERCHANT_ID]!;
+
+      const a = await postMoneroInvoice(booted.app, apiKey, "100000000000");
+      expect(a.status).toBe(201);
+      const invA = ((await a.json()) as { invoice: { id: string; receiveAddress: string } }).invoice;
+      const subaddr = invA.receiveAddress;
+
+      const [allocated] = await booted.deps.db
+        .select()
+        .from(moneroSubaddressPool)
+        .where(eq(moneroSubaddressPool.address, subaddr));
+      expect(allocated?.status).toBe("allocated");
+      expect(allocated?.allocatedToInvoiceId).toBe(invA.id);
+
+      // Release — what the invoice.expired/completed/canceled handler does.
+      await releaseMoneroFromInvoice(booted.deps, invA.id, { merchantId: MERCHANT_ID });
+      const [released] = await booted.deps.db
+        .select()
+        .from(moneroSubaddressPool)
+        .where(eq(moneroSubaddressPool.address, subaddr));
+      expect(released?.status).toBe("available");
+      expect(released?.totalAllocations).toBe(1);
+      // 60-min floor stamped even though the merchant's cooldown is 0.
+      expect(released?.cooldownUntil).toBe(nowMs + 3_600_000);
+
+      // During cooldown the only subaddress is out of rotation → exhausted 503.
+      const blocked = await postMoneroInvoice(booted.app, apiKey, "100000000000");
+      expect(blocked.status).toBe(503);
+
+      // After cooldown the same subaddress is reused for the next invoice.
+      nowMs += 3_600_000 + 1_000;
+      const b = await postMoneroInvoice(booted.app, apiKey, "100000000000");
+      expect(b.status).toBe(201);
+      const invB = ((await b.json()) as { invoice: { id: string; receiveAddress: string } }).invoice;
+      expect(invB.id).not.toBe(invA.id);
+      expect(invB.receiveAddress).toBe(subaddr);
+      const [reused] = await booted.deps.db
+        .select()
+        .from(moneroSubaddressPool)
+        .where(eq(moneroSubaddressPool.address, subaddr));
+      expect(reused?.status).toBe("allocated");
+      expect(reused?.allocatedToInvoiceId).toBe(invB.id);
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("credits the original invoice for a late payment that arrives during cooldown", async () => {
+    const nowMs = Date.UTC(2026, 0, 2);
+    const booted = await bootTestApp({
+      merchants: [{ id: MERCHANT_ID }],
+      clock: { now: () => new Date(nowMs) }
+    });
+    try {
+      await wireFrozenSingleSubaddressPool(booted, "pool-late");
+      const apiKey = booted.apiKeys[MERCHANT_ID]!;
+
+      const a = await postMoneroInvoice(booted.app, apiKey, "150000000000");
+      const invA = ((await a.json()) as { invoice: { id: string; receiveAddress: string } }).invoice;
+      const subaddr = invA.receiveAddress;
+
+      // Expire + release (cooldown active; clock not advanced).
+      await booted.deps.db.update(invoices).set({ status: "expired" }).where(eq(invoices.id, invA.id));
+      await releaseMoneroFromInvoice(booted.deps, invA.id, { merchantId: MERCHANT_ID });
+
+      const txHash = "a".repeat(64);
+      const res = await ingestDetectedTransfer(booted.deps, {
+        chainId: MONERO_CHAIN_ID,
+        txHash,
+        logIndex: 0,
+        fromAddress: MONERO_UNKNOWN_SENDER,
+        toAddress: subaddr,
+        token: "XMR",
+        amountRaw: "150000000000",
+        blockNumber: 100,
+        confirmations: 12,
+        seenAt: new Date(nowMs)
+      });
+      // Late payment credits the original (now-expired) invoice — not an orphan.
+      expect(res.invoiceId).toBe(invA.id);
+      const [tx] = await booted.deps.db
+        .select({ invoiceId: transactions.invoiceId })
+        .from(transactions)
+        .where(eq(transactions.txHash, txHash))
+        .limit(1);
+      expect(tx?.invoiceId).toBe(invA.id);
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("orphans an overshooting payment on a reused subaddress instead of crediting the new invoice", async () => {
+    let nowMs = Date.UTC(2026, 0, 3);
+    const booted = await bootTestApp({
+      merchants: [{ id: MERCHANT_ID }],
+      clock: { now: () => new Date(nowMs) }
+    });
+    try {
+      await wireFrozenSingleSubaddressPool(booted, "pool-orphan");
+      const apiKey = booted.apiKeys[MERCHANT_ID]!;
+
+      // Invoice A (0.1 XMR); expire + release.
+      const a = await postMoneroInvoice(booted.app, apiKey, "100000000000");
+      const invA = ((await a.json()) as { invoice: { id: string; receiveAddress: string } }).invoice;
+      const subaddr = invA.receiveAddress;
+      await booted.deps.db.update(invoices).set({ status: "expired" }).where(eq(invoices.id, invA.id));
+      await releaseMoneroFromInvoice(booted.deps, invA.id, { merchantId: MERCHANT_ID });
+
+      // After cooldown, invoice B (also 0.1 XMR) reuses the same subaddress.
+      nowMs += 3_600_000 + 1_000;
+      const b = await postMoneroInvoice(booted.app, apiKey, "100000000000");
+      const invB = ((await b.json()) as { invoice: { id: string; receiveAddress: string } }).invoice;
+      expect(invB.receiveAddress).toBe(subaddr);
+
+      // A 5 XMR payment lands on the reused subaddress — far beyond what B (0.1)
+      // could accept even at full over-tolerance. The safety net parks it as an
+      // orphan for admin review rather than silently crediting invoice B.
+      const txHash = "b".repeat(64);
+      const res = await ingestDetectedTransfer(booted.deps, {
+        chainId: MONERO_CHAIN_ID,
+        txHash,
+        logIndex: 0,
+        fromAddress: MONERO_UNKNOWN_SENDER,
+        toAddress: subaddr,
+        token: "XMR",
+        amountRaw: "5000000000000",
+        blockNumber: 200,
+        confirmations: 12,
+        seenAt: new Date(nowMs)
+      });
+      expect(res.invoiceId).toBeUndefined();
+      const [tx] = await booted.deps.db
+        .select({ invoiceId: transactions.invoiceId, status: transactions.status })
+        .from(transactions)
+        .where(eq(transactions.txHash, txHash))
+        .limit(1);
+      expect(tx?.invoiceId).toBeNull();
+      expect(tx?.status).toBe("orphaned");
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("seeds pool indices at or above the legacy counter high-water mark (migration-safe, no collision)", async () => {
+    const nowMs = Date.UTC(2026, 0, 4);
+    const booted = await bootTestApp({
+      merchants: [{ id: MERCHANT_ID }],
+      clock: { now: () => new Date(nowMs) }
+    });
+    try {
+      const w = makeWallet("pool-hwm");
+      const adapter = moneroChainAdapter({
+        chain: MONERO_MAINNET_CONFIG,
+        primaryAddress: w.primaryAddress,
+        viewKey: w.viewKey,
+        restoreHeight: 0,
+        daemonClient: stubDaemonClient(),
+        cache: booted.deps.cache
+      });
+      (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
+
+      // Simulate a deployment that already minted subaddresses 1..49 via the
+      // legacy per-invoice allocator: counter high-water mark = 50 (next free
+      // index). Pooled subaddresses MUST start at/above this so they can never
+      // collide with one a live/historical invoice already holds.
+      await booted.deps.db
+        .insert(moneroSubaddressCounters)
+        .values({ chainId: MONERO_CHAIN_ID, nextIndex: 50, updatedAt: nowMs });
+
+      await initializeMoneroPool(booted.deps, { initialSize: 3 });
+
+      const rows = await booted.deps.db
+        .select({ idx: moneroSubaddressPool.addressIndex })
+        .from(moneroSubaddressPool)
+        .where(eq(moneroSubaddressPool.chainId, MONERO_CHAIN_ID));
+      const indices = rows.map((r) => r.idx).sort((a, b) => a - b);
+      expect(indices).toEqual([50, 51, 52]);
+
+      // Counter advanced past the seeded batch (also exercises the MAX upsert).
+      const [counter] = await booted.deps.db
+        .select({ nextIndex: moneroSubaddressCounters.nextIndex })
+        .from(moneroSubaddressCounters)
+        .where(eq(moneroSubaddressCounters.chainId, MONERO_CHAIN_ID));
+      expect(counter?.nextIndex).toBe(53);
     } finally {
       await booted.close();
     }

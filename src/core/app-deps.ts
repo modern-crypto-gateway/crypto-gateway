@@ -126,6 +126,17 @@ export interface AppDeps {
   // budget is the real ceiling; tune lower if a tick approaches it. Override
   // via env `PAYOUT_CONCURRENCY_PER_CHAIN`.
   readonly payoutConcurrencyPerChain?: number;
+
+  // Reusable Monero subaddress pool tuning (see monero-pool.service.ts).
+  // Both optional — the service falls back to its built-in defaults (60-min
+  // cooldown, initial size 20) when an entrypoint doesn't thread them through.
+  //   - moneroPoolCooldownSeconds: minimum time a released subaddress stays out
+  //     of rotation before reuse. A merchant's `address_cooldown_seconds` can
+  //     raise this floor but never lower it. From MONERO_POOL_COOLDOWN_SECONDS.
+  //   - moneroPoolInitialSize: subaddresses to seed per Monero chain at boot.
+  //     From MONERO_POOL_INITIAL_SIZE.
+  readonly moneroPoolCooldownSeconds?: number;
+  readonly moneroPoolInitialSize?: number;
 }
 
 // Per-surface rate-limit caps. Populated from AppConfig by the entrypoint so

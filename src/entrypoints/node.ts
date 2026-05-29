@@ -4,6 +4,7 @@ import { serve } from "@hono/node-server";
 import "dotenv/config";
 import { migrate } from "drizzle-orm/libsql/migrator";
 import { buildApp } from "../app.js";
+import { initializeMoneroPool } from "../core/domain/monero-pool.service.js";
 import { createDb, createLibsqlClient } from "../db/client.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { memoryCacheAdapter } from "../adapters/cache/memory.adapter.js";
@@ -397,7 +398,9 @@ async function main(): Promise<void> {
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
     migrationsFolder,
     confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES")),
-    payoutConcurrencyPerChain: config.payoutConcurrencyPerChain
+    payoutConcurrencyPerChain: config.payoutConcurrencyPerChain,
+    moneroPoolCooldownSeconds: config.moneroPoolCooldownSeconds,
+    moneroPoolInitialSize: config.moneroPoolInitialSize
   };
 
   // Schema-drift guard. The project's convention is to edit `0000_initial.sql`
@@ -411,6 +414,22 @@ async function main(): Promise<void> {
   await assertSchemaInSync(libsqlClient, logger);
 
   const app = buildApp(deps);
+
+  // Seed the Monero subaddress pool so the first XMR invoice doesn't have to
+  // pay a PoolExhaustedError + retry. Idempotent (tops up to target) and a
+  // no-op when no Monero adapter is wired. Derivation is local crypto (no I/O),
+  // so a failure here is a wiring bug — log it but don't block boot; the pool
+  // self-heals via the on-allocation refill.
+  try {
+    const seeded = await initializeMoneroPool(deps);
+    if (seeded.some((r) => r.added > 0)) {
+      logger.info("monero subaddress pool seeded", { results: seeded });
+    }
+  } catch (err) {
+    logger.error("monero subaddress pool seeding failed (continuing; pool self-heals on demand)", {
+      error: err instanceof Error ? err.message : String(err)
+    });
+  }
 
   const server = serve(
     { fetch: app.fetch as (req: Request) => Response | Promise<Response>, port: config.port },
