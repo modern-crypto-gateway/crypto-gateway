@@ -1106,4 +1106,42 @@ describe("Monero subaddress pool — reuse, cooldown & safety net", () => {
       await booted.close();
     }
   });
+
+  it("caps pool growth at the wallet subaddress lookahead frontier (index <= 200)", async () => {
+    const nowMs = Date.UTC(2026, 0, 5);
+    const booted = await bootTestApp({
+      merchants: [{ id: MERCHANT_ID }],
+      clock: { now: () => new Date(nowMs) }
+    });
+    try {
+      const w = makeWallet("pool-cap");
+      const adapter = moneroChainAdapter({
+        chain: MONERO_MAINNET_CONFIG,
+        primaryAddress: w.primaryAddress,
+        viewKey: w.viewKey,
+        restoreHeight: 0,
+        daemonClient: stubDaemonClient(),
+        cache: booted.deps.cache
+      });
+      (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
+
+      // High-water mark just below the lookahead cap (200): only indices 199
+      // and 200 remain. A request for 10 must clamp to those two, never mint
+      // subaddresses past the frontier the operator's wallet can see.
+      await booted.deps.db
+        .insert(moneroSubaddressCounters)
+        .values({ chainId: MONERO_CHAIN_ID, nextIndex: 199, updatedAt: nowMs });
+
+      await initializeMoneroPool(booted.deps, { initialSize: 10 });
+
+      const rows = await booted.deps.db
+        .select({ idx: moneroSubaddressPool.addressIndex })
+        .from(moneroSubaddressPool)
+        .where(eq(moneroSubaddressPool.chainId, MONERO_CHAIN_ID));
+      const indices = rows.map((r) => r.idx).sort((a, b) => a - b);
+      expect(indices).toEqual([199, 200]);
+    } finally {
+      await booted.close();
+    }
+  });
 });

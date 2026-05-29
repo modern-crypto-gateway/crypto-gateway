@@ -52,9 +52,17 @@ const DEFAULT_MONERO_POOL_INITIAL_SIZE = 20;
 // Monero wallet software (wallet2) defaults to a subaddress lookahead of ~200
 // minor indices under an account. Beyond that, an operator restoring a vanilla
 // wallet can silently miss credits unless they raise `--subaddress-lookahead`.
-// Warn well before the frontier; growing the account (major) dimension to scale
-// past this is a documented follow-up, not wired in v1.
+// Warn well before the frontier.
 const LOOKAHEAD_WARN_INDEX = 180;
+
+// Hard cap on the minor index under account 0. A pool that never derives past
+// this stays fully visible to a vanilla restored wallet with zero extra config
+// — which is the whole point of bounding the set. When sustained concurrency
+// would push growth beyond the cap, refill stops and allocation surfaces
+// PoolExhaustedError (a clean 503) rather than silently minting subaddresses
+// the operator's wallet can't see. Scaling past this means growing the account
+// (major) dimension — a documented follow-up, not wired in v1.
+const LOOKAHEAD_MAX_INDEX = 200;
 
 // ---- Public API ----
 
@@ -223,9 +231,22 @@ export async function refillMoneroPool(
       .where(eq(moneroSubaddressCounters.chainId, chainId));
     const startIdx = Math.max(1, (maxRow?.maxIdx ?? 0) + 1, counterRow?.nextIndex ?? 1);
 
+    // Stop growing at the wallet lookahead frontier so the pool stays fully
+    // visible to a vanilla restored wallet. Past this, allocation 503s rather
+    // than minting subaddresses the operator can't see without reconfiguring.
+    if (startIdx > LOOKAHEAD_MAX_INDEX) {
+      deps.logger.warn(
+        "monero-pool: at subaddress lookahead cap — not growing further",
+        { chainId, startIndex: startIdx, cap: LOOKAHEAD_MAX_INDEX }
+      );
+      return 0;
+    }
+    // Clamp the batch so the highest derived index never exceeds the cap.
+    const toDerive = Math.min(count, LOOKAHEAD_MAX_INDEX - startIdx + 1);
+
     type DerivedRow = { id: string; address: string; index: number };
     const derived: DerivedRow[] = [];
-    for (let i = 0; i < count; i += 1) {
+    for (let i = 0; i < toDerive; i += 1) {
       const index = startIdx + i;
       const address = deriveSubaddress({
         network: adapter.moneroNetwork,
