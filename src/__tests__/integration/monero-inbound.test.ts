@@ -1107,14 +1107,20 @@ describe("Monero subaddress pool — reuse, cooldown & safety net", () => {
     }
   });
 
-  it("caps pool growth at the wallet subaddress lookahead frontier (index <= 200)", async () => {
+  it("seeds above a LARGE legacy counter high-water mark (no absolute index cap)", async () => {
+    // Regression for the real-world migration case: a deployment that ran
+    // thousands of invoices on the legacy per-invoice allocator has a high
+    // counter (e.g. 2400). The pool MUST still seed/grow above it — an absolute
+    // index cap wrongly froze the pool and produced POOL_EXHAUSTED despite a
+    // tiny live set. Indices grow contiguously above the mark (wallet lookahead
+    // auto-extends to cover them).
     const nowMs = Date.UTC(2026, 0, 5);
     const booted = await bootTestApp({
       merchants: [{ id: MERCHANT_ID }],
       clock: { now: () => new Date(nowMs) }
     });
     try {
-      const w = makeWallet("pool-cap");
+      const w = makeWallet("pool-hwm-large");
       const adapter = moneroChainAdapter({
         chain: MONERO_MAINNET_CONFIG,
         primaryAddress: w.primaryAddress,
@@ -1125,21 +1131,18 @@ describe("Monero subaddress pool — reuse, cooldown & safety net", () => {
       });
       (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
 
-      // High-water mark just below the lookahead cap (200): only indices 199
-      // and 200 remain. A request for 10 must clamp to those two, never mint
-      // subaddresses past the frontier the operator's wallet can see.
       await booted.deps.db
         .insert(moneroSubaddressCounters)
-        .values({ chainId: MONERO_CHAIN_ID, nextIndex: 199, updatedAt: nowMs });
+        .values({ chainId: MONERO_CHAIN_ID, nextIndex: 2400, updatedAt: nowMs });
 
-      await initializeMoneroPool(booted.deps, { initialSize: 10 });
+      await initializeMoneroPool(booted.deps, { initialSize: 5 });
 
       const rows = await booted.deps.db
         .select({ idx: moneroSubaddressPool.addressIndex })
         .from(moneroSubaddressPool)
         .where(eq(moneroSubaddressPool.chainId, MONERO_CHAIN_ID));
       const indices = rows.map((r) => r.idx).sort((a, b) => a - b);
-      expect(indices).toEqual([199, 200]);
+      expect(indices).toEqual([2400, 2401, 2402, 2403, 2404]);
     } finally {
       await booted.close();
     }

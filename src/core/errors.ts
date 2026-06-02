@@ -27,17 +27,23 @@ export class DomainError extends Error {
 }
 
 // 503: no available pool addresses for one of the requested families.
-// Actionable for operators — run `POST /admin/pool/initialize` to mint more.
+// Actionable for operators — run the family's initialize endpoint to mint more.
 // The refill path is also async-triggered at invoice creation when the pool
 // runs low, so in practice this only fires if the initial pool was never
 // seeded or the refill mutex was held through a process death.
+//
+// Monero has its OWN pool table + endpoint (it's inbound-only and isolated
+// from the shared address_pool), so the hint must point at the right one or
+// an operator following it will seed the wrong pool and stay stuck.
 export class PoolExhaustedError extends DomainError {
   constructor(family: string) {
+    const endpoint =
+      family === "monero" ? "POST /admin/monero-pool/initialize" : "POST /admin/pool/initialize";
     super(
       "POOL_EXHAUSTED",
-      `No available pool addresses for family '${family}'. Run POST /admin/pool/initialize to mint more.`,
+      `No available pool addresses for family '${family}'. Run ${endpoint} to mint more.`,
       503,
-      { family, hint: "POST /admin/pool/initialize" }
+      { family, hint: endpoint }
     );
     this.name = "PoolExhaustedError";
   }

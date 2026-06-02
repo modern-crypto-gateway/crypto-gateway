@@ -49,20 +49,18 @@ const RECONCILE_ACTIVE_INVOICE_FETCH_LIMIT = 10_000;
 const DEFAULT_MONERO_POOL_COOLDOWN_SECONDS = 3600; // 60 min
 const DEFAULT_MONERO_POOL_INITIAL_SIZE = 20;
 
-// Monero wallet software (wallet2) defaults to a subaddress lookahead of ~200
-// minor indices under an account. Beyond that, an operator restoring a vanilla
-// wallet can silently miss credits unless they raise `--subaddress-lookahead`.
-// Warn well before the frontier.
-const LOOKAHEAD_WARN_INDEX = 180;
-
-// Hard cap on the minor index under account 0. A pool that never derives past
-// this stays fully visible to a vanilla restored wallet with zero extra config
-// — which is the whole point of bounding the set. When sustained concurrency
-// would push growth beyond the cap, refill stops and allocation surfaces
-// PoolExhaustedError (a clean 503) rather than silently minting subaddresses
-// the operator's wallet can't see. Scaling past this means growing the account
-// (major) dimension — a documented follow-up, not wired in v1.
-const LOOKAHEAD_MAX_INDEX = 200;
+// Soft visibility threshold on the LIVE ROW COUNT (not the absolute index).
+// When the pool exceeds this many rows, churn is outrunning reuse — invoices
+// are being created faster than the cooldown frees subaddresses — so we log a
+// hint to raise MONERO_POOL_INITIAL_SIZE or lower MONERO_POOL_COOLDOWN_SECONDS.
+//
+// This is NOT a hard cap. The pool grows as needed (like the shared pool) so a
+// paying customer is never rejected. Crucially the bound is on COUNT, never on
+// the absolute subaddress index: a deployment migrating off the legacy
+// per-invoice allocator can have a high index high-water mark (thousands) while
+// its live reused set stays tiny. Indices grow contiguously above that mark,
+// which a Monero wallet's subaddress lookahead auto-extends to cover.
+const POOL_SIZE_SOFT_WARN = 200;
 
 // ---- Public API ----
 
@@ -231,22 +229,9 @@ export async function refillMoneroPool(
       .where(eq(moneroSubaddressCounters.chainId, chainId));
     const startIdx = Math.max(1, (maxRow?.maxIdx ?? 0) + 1, counterRow?.nextIndex ?? 1);
 
-    // Stop growing at the wallet lookahead frontier so the pool stays fully
-    // visible to a vanilla restored wallet. Past this, allocation 503s rather
-    // than minting subaddresses the operator can't see without reconfiguring.
-    if (startIdx > LOOKAHEAD_MAX_INDEX) {
-      deps.logger.warn(
-        "monero-pool: at subaddress lookahead cap — not growing further",
-        { chainId, startIndex: startIdx, cap: LOOKAHEAD_MAX_INDEX }
-      );
-      return 0;
-    }
-    // Clamp the batch so the highest derived index never exceeds the cap.
-    const toDerive = Math.min(count, LOOKAHEAD_MAX_INDEX - startIdx + 1);
-
     type DerivedRow = { id: string; address: string; index: number };
     const derived: DerivedRow[] = [];
-    for (let i = 0; i < toDerive; i += 1) {
+    for (let i = 0; i < count; i += 1) {
       const index = startIdx + i;
       const address = deriveSubaddress({
         network: adapter.moneroNetwork,
@@ -290,12 +275,14 @@ export async function refillMoneroPool(
         }
       });
 
-    const highestIndex = startIdx + derived.length - 1;
-    if (highestIndex >= LOOKAHEAD_WARN_INDEX) {
-      deps.logger.warn("monero-pool: subaddress index approaching wallet lookahead frontier", {
+    // Visibility (not a hard cap): a large live set means churn is outrunning
+    // reuse. Surface a tuning hint rather than silently growing forever.
+    const poolSize = await countPool(deps, chainId);
+    if (poolSize >= POOL_SIZE_SOFT_WARN) {
+      deps.logger.warn("monero-pool: live set is large — churn may be outrunning reuse", {
         chainId,
-        highestIndex,
-        hint: "raise wallet --subaddress-lookahead or plan account-dimension growth"
+        size: poolSize,
+        hint: "raise MONERO_POOL_INITIAL_SIZE or lower MONERO_POOL_COOLDOWN_SECONDS"
       });
     }
 
