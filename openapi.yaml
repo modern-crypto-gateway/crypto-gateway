@@ -1806,6 +1806,16 @@ paths:
                     skipped at fire time so the cron doesn't burn gas on
                     addresses where consolidating costs more than the
                     recovered balance.
+                maxFeeUsd:
+                  type: string
+                  description: |
+                    Optional gas ceiling as a USD decimal string (e.g. "5.00").
+                    When set, the cron quotes the live low-tier network fee,
+                    converts it to USD via the price oracle, and DEFERS the
+                    firing (retrying next interval) when the fee exceeds this
+                    ceiling — clustering internal sweeps into cheap-gas windows.
+                    Omit for no ceiling (always run). Primarily an EVM L1 tool;
+                    on Tron prefer energy delegation.
                 maxSourcesPerRun:
                   type: integer
                   minimum: 1
@@ -1946,6 +1956,12 @@ paths:
                   minimum: 1
                   maximum: 720
                 minSourceBalanceRaw: { type: string }
+                maxFeeUsd:
+                  type: string
+                  nullable: true
+                  description: |
+                    USD gas ceiling decimal string; pass `null` to clear it
+                    (back to "always run"). See POST for semantics.
                 maxSourcesPerRun:
                   type: integer
                   minimum: 1
@@ -3292,6 +3308,12 @@ components:
         minSourceBalanceRaw:
           type: string
           description: Per-source dust floor in token's smallest unit.
+        maxFeeUsd:
+          type: string
+          nullable: true
+          description: |
+            Gas ceiling as a USD decimal string, or null for no ceiling. When
+            set, the cron defers firing while the live low-tier fee exceeds it.
         maxSourcesPerRun:
           type: integer
           description: Cap on legs planned per cron tick.

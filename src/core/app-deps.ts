@@ -127,6 +127,22 @@ export interface AppDeps {
   // via env `PAYOUT_CONCURRENCY_PER_CHAIN`.
   readonly payoutConcurrencyPerChain?: number;
 
+  // ---- Consolidation (pool defrag) fee tuning ----
+  // Fee tier for internal consolidation sweeps. Consolidation passes this to
+  // planPayout so internal sweeps (and their EVM gas top-ups) ride the cheapest
+  // tier. Falls back to "low" when an entrypoint doesn't thread it through.
+  // From INTERNAL_CONSOLIDATION_FEE_TIER.
+  readonly internalConsolidationFeeTier?: "low" | "medium" | "high";
+  // Fee-aware dust floor multiplier: a consolidation source is skipped when its
+  // token value is worth less than (this × the estimated per-sweep gas cost).
+  // 0 / unset = OFF (opt-in). From CONSOLIDATION_DUST_GAS_MULTIPLIER.
+  readonly consolidationDustGasMultiplier?: number;
+  // Gas top-up cushion (percent) used for consolidation legs only — tighter
+  // than the 20% merchant-payout default to limit stranded native dust on
+  // single-use deposit addresses. Falls back to 10 when not threaded.
+  // From CONSOLIDATION_TOPUP_CUSHION_PERCENT.
+  readonly consolidationTopUpCushionPercent?: number;
+
   // Reusable Monero subaddress pool tuning (see monero-pool.service.ts).
   // Both optional — the service falls back to its built-in defaults (60-min
   // cooldown, initial size 20) when an entrypoint doesn't thread them through.

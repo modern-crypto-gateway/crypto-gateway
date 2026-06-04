@@ -168,6 +168,9 @@ for the full list. Highlights:
 | `RATE_LIMIT_CHECKOUT_PER_MINUTE`  | no              | `60`       | Per-IP cap on `/checkout/*`                          |
 | `RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE` | no         | `300`      | Per-IP cap on `/webhooks/*`                          |
 | `PAYOUT_CONCURRENCY_PER_CHAIN`    | no              | `16`       | Max concurrent `executeOnePayout` calls per chainId in a single executor tick. Cross-chain runs are unconditionally parallel. Tune lower on Workers under heavy backlog to stay inside the ~50-subrequest budget. Range 1–64. |
+| `INTERNAL_CONSOLIDATION_FEE_TIER` | no              | `low`      | Fee tier for internal consolidation sweeps (`low`/`medium`/`high`). `low` is cheapest and right for non-SLA pool defrag; applies to the ERC-20 sweep and its EVM gas top-up. No-op on Tron. See [Minimizing consolidation fees](#minimizing-consolidation-fees). |
+| `CONSOLIDATION_DUST_GAS_MULTIPLIER` | no            | `0` (off)  | When > 0, skip consolidating a source worth less than `K ×` the estimated per-sweep gas cost (recommended `3`–`5`). Opt-in so it never strands balances silently. |
+| `CONSOLIDATION_TOPUP_CUSHION_PERCENT` | no          | `10`       | Gas cushion % on the native top-up for internal consolidation legs only (merchant payouts keep 20%). Lower = less stranded native dust on single-use deposit addresses. Range 0–100. |
 | `PRICE_ADAPTER`                   | no              | (full chain) | `coingecko` (default ordering), `alchemy` (Alchemy-first — requires `ALCHEMY_API_KEY`), or `static-peg` (disable all live sources). See [Price oracle fallback chain](#price-oracle-fallback-chain). |
 | `COINGECKO_API_KEY`               | no              | —          | Raises the CoinGecko rate budget. Keyless free tier also works. |
 | `COINGECKO_PLAN`                  | no              | `demo`     | `demo` → sends `x-cg-demo-api-key`; `pro` → `x-cg-pro-api-key`. |
@@ -954,6 +957,65 @@ Common patterns:
 The reasons array is capped at 50 entries server-side to bound row size
 on chains with hundreds of fragmented sources. The `lastSkippedCount`
 remains the authoritative total.
+
+### Minimizing consolidation fees
+
+Consolidation moves funds between addresses you own, so on account-model
+chains (EVM, Tron) it is fundamentally **one transaction per source address**
+— you can't merge N externally-owned-account sweeps into a single tx without
+smart contracts. The levers below cut the cost of that per-address sweep
+without changing the address model. They compose; enable what fits.
+
+**1. Cheapest fee tier for internal sweeps (on by default).** Internal sweeps
+have no merchant SLA, so they ride the `low` tier — this lowers the gas paid
+on both the ERC-20 transfer and its EVM gas top-up. Override with
+`INTERNAL_CONSOLIDATION_FEE_TIER=low|medium|high`. No-op on Tron (no tiering).
+
+**2. Gas-aware dust floor (opt-in — recommended for lowest fees).** Set
+`CONSOLIDATION_DUST_GAS_MULTIPLIER=3` (or 4–5 to be stricter) to skip any
+source whose token value is worth less than `K ×` the estimated per-sweep gas
+cost — so every sweep nets positive. This is computed live from the fee quote
++ price oracle and is applied as `max(staticFloor, dynamicFloor)`, so it
+complements the per-schedule `minSourceBalanceRaw`. Default `0` = OFF (never
+strands balances silently). Dynamic-floor skips surface in the consolidation
+result / `lastSkippedReasons` as `BELOW_DYNAMIC_DUST_FLOOR`.
+
+**3. Gas-window gating (per-schedule, opt-in).** Consolidation isn't time-
+sensitive, so set `maxFeeUsd` on a schedule to defer firing while the live
+network fee (converted to USD) exceeds that ceiling — clustering sweeps into
+cheap-gas windows. It retries the next interval. Primarily an EVM L1 lever
+(set the ceiling near your historical median gas); on Tron, fees are
+energy-driven, so prefer delegation (below).
+
+```bash
+# Only sweep USDT on Ethereum L1 when the per-tx fee is ≤ $4.
+PATCH /admin/consolidation-schedules/<id>
+{ "maxFeeUsd": "4.00" }          # pass null to clear the ceiling
+```
+
+**4. Tighter top-up cushion (on by default for internal legs).** A token
+sweep tops up a single-use deposit address with native gas that then sits
+stranded forever. Internal legs use a 10% cushion (vs 20% for merchant
+payouts) to limit that dust; the EVM 1.5× gas-safety factor still backstops
+drift. Tune with `CONSOLIDATION_TOPUP_CUSHION_PERCENT`. Best paired with the
+gas-window gate (#3) so gas can't spike between top-up and sweep.
+
+**5. Fewer, fuller sweeps.** A longer `intervalHours` + a higher dust floor
+let more balance accumulate per address before sweeping, amortizing the fixed
+per-sweep gas over more value → lower fee %. Bias toward this on expensive
+chains.
+
+**6. Tron: delegate energy instead of burning TRX (biggest Tron lever).**
+Every TRC-20 sweep otherwise burns ~13–30 TRX of energy. If you stake TRX for
+energy and **delegate** it (Stake 2.0 `DelegateResource`) to your Tron pool /
+source addresses, the gateway already detects the delegated energy
+(`hasSufficientFreeGas`) and sweeps those sources with **zero TRX top-up** —
+no code change needed, it just works once the energy is delegated. This drops
+the per-sweep TRX cost to ~0 (bandwidth only, usually within the free daily
+allowance). Set `minSourceBalanceRaw: "1"` for delegated Tron schedules since
+there's effectively no per-tx cost to gate against. (A future release will add
+an admin endpoint to drive the freeze/delegate lifecycle from the gateway
+itself; today you delegate out-of-band and the gateway honors it.)
 
 ### Address subscription lifecycle (automatic)
 

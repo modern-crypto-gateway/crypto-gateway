@@ -5,8 +5,10 @@ import { runAutoConsolidations } from "../../core/domain/auto-consolidation.serv
 import { autoConsolidationSchedules, payouts } from "../../db/schema.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 import { seedFundedPoolAddress } from "../helpers/seed-source.js";
-import type { ChainAdapter } from "../../core/ports/chain.port.js";
+import type { ChainAdapter, FeeTierQuote } from "../../core/ports/chain.port.js";
 import type { ChainId } from "../../core/types/chain.js";
+import type { TokenSymbol } from "../../core/types/token.js";
+import type { EstimateArgs } from "../../core/types/unsigned-tx.js";
 
 const ADMIN_KEY = "super-secret-admin-key";
 const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
@@ -529,4 +531,113 @@ describe("auto-consolidation schedules", () => {
 
   // Suppress unused-var warning for `and` (used by some queries we may inline later).
   void and;
+});
+
+describe("auto-consolidation gas-window gating (Lever 3)", () => {
+  const TARGET_INDEX = 8_100_001;
+  const SOURCE_INDEX = 8_100_002;
+
+  // Native = "DEV" (priced $1 by static-peg, 6 decimals) + a controllable LARGE
+  // flat gas quote so the USD ceiling comparison is meaningful (the dev
+  // adapter's default 21000 gas is economically negligible).
+  function bigGasAdapter(gas: string): ChainAdapter {
+    const base = devChainAdapter({ deterministicTxHashes: true });
+    return {
+      ...base,
+      async quoteFeeTiers(_args: EstimateArgs): Promise<FeeTierQuote> {
+        return {
+          low: { tier: "low", nativeAmountRaw: gas as never },
+          medium: { tier: "medium", nativeAmountRaw: gas as never },
+          high: { tier: "high", nativeAmountRaw: gas as never },
+          tieringSupported: false,
+          nativeSymbol: "DEV" as TokenSymbol
+        };
+      }
+    };
+  }
+
+  async function createDueSchedule(
+    booted: BootedTestApp,
+    target: string,
+    maxFeeUsd: string
+  ): Promise<string> {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/consolidation-schedules", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({
+          chainId: 999, token: "DEV", targetAddress: target,
+          intervalHours: 1, minSourceBalanceRaw: "1", maxFeeUsd
+        })
+      })
+    );
+    if (res.status !== 201) throw new Error(`schedule create failed: ${res.status} ${await res.text()}`);
+    const created = (await res.json()) as { schedule: { id: string } };
+    // Rewind nextRunDue so the cron claims it this tick.
+    await booted.deps.db
+      .update(autoConsolidationSchedules)
+      .set({ nextRunDue: booted.deps.clock.now().getTime() - 1000 })
+      .where(eq(autoConsolidationSchedules.id, created.schedule.id));
+    return created.schedule.id;
+  }
+
+  it("defers a schedule when the live fee exceeds its USD ceiling", async () => {
+    // gas 3,000,000 (DEV, 6dec) = $3 fee; ceiling $1 → deferred.
+    const booted = await bootTestApp({ chains: [bigGasAdapter("3000000")], secretsOverrides: { ADMIN_KEY } });
+    try {
+      const a = booted.deps.chains[0]!;
+      const target = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, TARGET_INDEX).address);
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: target, derivationIndex: TARGET_INDEX, balances: {} });
+      const id = await createDueSchedule(booted, target, "1");
+
+      const result = await runAutoConsolidations(booted.deps);
+      expect(result.checked).toBe(1);
+      expect(result.fired).toBe(0);
+      expect(result.skipped).toBe(1);
+
+      const sweeps = await booted.deps.db
+        .select()
+        .from(payouts)
+        .where(eq(payouts.kind, "consolidation_sweep"));
+      expect(sweeps).toHaveLength(0);
+
+      // nextRunDue was still advanced by the atomic claim → it retries next
+      // interval rather than getting stuck.
+      const [row] = await booted.deps.db
+        .select()
+        .from(autoConsolidationSchedules)
+        .where(eq(autoConsolidationSchedules.id, id))
+        .limit(1);
+      expect(row!.nextRunDue).toBeGreaterThan(booted.deps.clock.now().getTime());
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("fires a schedule when the live fee is under its USD ceiling", async () => {
+    // Same $3 fee; ceiling $10 → fires.
+    const booted = await bootTestApp({ chains: [bigGasAdapter("3000000")], secretsOverrides: { ADMIN_KEY } });
+    try {
+      const a = booted.deps.chains[0]!;
+      const target = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, TARGET_INDEX).address);
+      const src = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_INDEX).address);
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: target, derivationIndex: TARGET_INDEX, balances: {} });
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: src, derivationIndex: SOURCE_INDEX, balances: { DEV: "100000000" } });
+      await createDueSchedule(booted, target, "10");
+
+      const result = await runAutoConsolidations(booted.deps);
+      expect(result.checked).toBe(1);
+      expect(result.fired).toBe(1);
+      expect(result.skipped).toBe(0);
+
+      const sweeps = await booted.deps.db
+        .select()
+        .from(payouts)
+        .where(eq(payouts.kind, "consolidation_sweep"));
+      expect(sweeps.length).toBeGreaterThanOrEqual(1);
+      expect(sweeps.every((s) => s.sourceAddress === src)).toBe(true);
+    } finally {
+      await booted.close();
+    }
+  });
 });

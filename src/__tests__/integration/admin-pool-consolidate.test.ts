@@ -5,8 +5,11 @@ import { confirmPayouts, executeReservedPayouts } from "../../core/domain/payout
 import { payouts } from "../../db/schema.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 import { seedFundedPoolAddress } from "../helpers/seed-source.js";
-import type { ChainAdapter } from "../../core/ports/chain.port.js";
+import { staticPegPriceOracle } from "../../adapters/price-oracle/static-peg.adapter.js";
+import type { ChainAdapter, FeeTierQuote } from "../../core/ports/chain.port.js";
 import type { ChainId, TxHash } from "../../core/types/chain.js";
+import type { TokenSymbol } from "../../core/types/token.js";
+import type { EstimateArgs } from "../../core/types/unsigned-tx.js";
 
 const ADMIN_KEY = "super-secret-admin-key";
 const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
@@ -152,6 +155,24 @@ describe("POST /admin/pool/consolidate", () => {
       expect(row.merchantId).toBe("ffffffff-ffff-ffff-ffff-ffffffffffff");
       expect(row.destinationAddress).toBe(target);
     }
+  });
+
+  it("tags internal consolidation legs with the low fee tier by default (Lever 1)", async () => {
+    // Internal sweeps have no merchant SLA, so planPoolConsolidation passes
+    // the configured internal tier (default "low") to planPayout. Verify the
+    // persisted rows carry it — this is what makes the EVM ERC-20 sweep AND
+    // its gas top-up sibling ride the cheapest tier.
+    const res = await consolidate({ chainId: 999, token: "DEVT", targetAddress: target });
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { consolidationId: string };
+    const rows = await booted.deps.db
+      .select()
+      .from(payouts)
+      .where(
+        and(eq(payouts.batchId, body.consolidationId), eq(payouts.kind, "consolidation_sweep"))
+      );
+    expect(rows).toHaveLength(3);
+    for (const row of rows) expect(row.feeTier).toBe("low");
   });
 
   it("returns 400 when the target address isn't in the pool", async () => {
@@ -428,6 +449,144 @@ describe("POST /admin/pool/consolidate — native token math", () => {
       expect(res.status).toBe(400);
       const body = (await res.json()) as { error: { code: string } };
       expect(body.error.code).toBe("NO_SOURCES_WITH_BALANCE");
+    } finally {
+      await booted.close();
+    }
+  });
+});
+
+describe("POST /admin/pool/consolidate — fee tier override + dust floor (Levers 1 & 2)", () => {
+  const TARGET_INDEX = 6_200_001;
+  const SOURCE_SMALL_INDEX = 6_200_002;
+  const SOURCE_LARGE_INDEX = 6_200_003;
+  const SPONSOR_INDEX = 6_200_004;
+
+  // DEVT token sweep where native = "DEV" (priced $1 by static-peg, 6 decimals)
+  // and a LARGE flat gas quote, so the USD-denominated dust-floor math is
+  // economically meaningful — the dev adapter's default 21000 gas is sub-cent
+  // at 18 decimals and would never trip a realistic floor.
+  function bigGasAdapter(gasNativeRaw: string): ChainAdapter {
+    const base = devChainAdapter({ deterministicTxHashes: true });
+    return {
+      ...base,
+      async quoteFeeTiers(_args: EstimateArgs): Promise<FeeTierQuote> {
+        return {
+          low: { tier: "low", nativeAmountRaw: gasNativeRaw as never },
+          medium: { tier: "medium", nativeAmountRaw: gasNativeRaw as never },
+          high: { tier: "high", nativeAmountRaw: gasNativeRaw as never },
+          tieringSupported: false,
+          nativeSymbol: "DEV" as TokenSymbol
+        };
+      }
+    };
+  }
+
+  async function bootWith(opts: {
+    gas: string;
+    dustMultiplier?: number;
+    feeTier?: "low" | "medium" | "high";
+  }): Promise<BootedTestApp> {
+    return await bootTestApp({
+      chains: [bigGasAdapter(opts.gas)],
+      secretsOverrides: { ADMIN_KEY },
+      // Price both the native (DEV, pegged) and the token (DEVT, override) so
+      // the dust-floor conversion has real USD rates.
+      priceOracle: staticPegPriceOracle({ overrideRates: { DEVT: "1" } }),
+      ...(opts.dustMultiplier !== undefined
+        ? { consolidationDustGasMultiplier: opts.dustMultiplier }
+        : {}),
+      ...(opts.feeTier !== undefined ? { internalConsolidationFeeTier: opts.feeTier } : {})
+    });
+  }
+
+  async function consolidateOn(booted: BootedTestApp, target: string): Promise<Response> {
+    return await booted.app.fetch(
+      new Request("http://test.local/admin/pool/consolidate", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ chainId: 999, token: "DEVT", targetAddress: target })
+      })
+    );
+  }
+
+  it("honors a configured internalConsolidationFeeTier override (Lever 1)", async () => {
+    const booted = await bootWith({ gas: "21000", feeTier: "medium" });
+    try {
+      const a = booted.deps.chains[0]!;
+      const target = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, TARGET_INDEX).address);
+      const src = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_LARGE_INDEX).address);
+      const sponsor = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SPONSOR_INDEX).address);
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: target, derivationIndex: TARGET_INDEX, balances: {} });
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: src, derivationIndex: SOURCE_LARGE_INDEX, balances: { DEVT: "100" } });
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: sponsor, derivationIndex: SPONSOR_INDEX, balances: { DEV: "100000000" } });
+
+      const res = await consolidateOn(booted, target);
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { consolidationId: string };
+      const rows = await booted.deps.db
+        .select()
+        .from(payouts)
+        .where(and(eq(payouts.batchId, body.consolidationId), eq(payouts.kind, "consolidation_sweep")));
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+      for (const row of rows) expect(row.feeTier).toBe("medium");
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("skips a source below the gas-aware dynamic dust floor and surfaces it (Lever 2)", async () => {
+    // gas 3,000,000 (DEV, 6dec) = $3; low×1.5 = $4.5; ×2 (token needs a top-up
+    // tx) = $9 per sweep. K=2 → floor = $18 = 18,000,000 raw DEVT.
+    const booted = await bootWith({ gas: "3000000", dustMultiplier: 2 });
+    try {
+      const a = booted.deps.chains[0]!;
+      const target = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, TARGET_INDEX).address);
+      const small = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_SMALL_INDEX).address);
+      const large = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_LARGE_INDEX).address);
+      const sponsor = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SPONSOR_INDEX).address);
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: target, derivationIndex: TARGET_INDEX, balances: {} });
+      // $10 < $18 floor → skipped as dust.
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: small, derivationIndex: SOURCE_SMALL_INDEX, balances: { DEVT: "10000000" } });
+      // $30 > $18 floor → swept.
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: large, derivationIndex: SOURCE_LARGE_INDEX, balances: { DEVT: "30000000" } });
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: sponsor, derivationIndex: SPONSOR_INDEX, balances: { DEV: "100000000" } });
+
+      const res = await consolidateOn(booted, target);
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as {
+        legs: { sourceAddress: string }[];
+        skipped: { sourceAddress: string; reason: string }[];
+      };
+      expect(body.legs.map((l) => l.sourceAddress)).toEqual([large]);
+      const dust = body.skipped.find((s) => s.sourceAddress === small);
+      expect(dust).toBeDefined();
+      expect(dust!.reason).toContain("BELOW_DYNAMIC_DUST_FLOOR");
+    } finally {
+      await booted.close();
+    }
+  });
+
+  it("with the dust floor OFF (default), still sweeps a small token balance (Lever 2 opt-in)", async () => {
+    // Same large gas, but no multiplier → floor disabled → the $10 source that
+    // the previous test skipped now sweeps. Proves the lever is opt-in.
+    const booted = await bootWith({ gas: "3000000" });
+    try {
+      const a = booted.deps.chains[0]!;
+      const target = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, TARGET_INDEX).address);
+      const small = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_SMALL_INDEX).address);
+      const sponsor = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SPONSOR_INDEX).address);
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: target, derivationIndex: TARGET_INDEX, balances: {} });
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: small, derivationIndex: SOURCE_SMALL_INDEX, balances: { DEVT: "10000000" } });
+      await seedFundedPoolAddress(booted, { chainId: 999, family: "evm", address: sponsor, derivationIndex: SPONSOR_INDEX, balances: { DEV: "100000000" } });
+
+      const res = await consolidateOn(booted, target);
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as {
+        legs: { sourceAddress: string }[];
+        skipped: { sourceAddress: string; reason: string }[];
+      };
+      expect(body.legs.map((l) => l.sourceAddress)).toEqual([small]);
+      expect(body.skipped).toHaveLength(0);
     } finally {
       await booted.close();
     }

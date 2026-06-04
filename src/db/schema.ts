@@ -1105,6 +1105,13 @@ export const autoConsolidationSchedules = sqliteTable(
     // on Solana is NO_GAS_SPONSOR_AVAILABLE because SPL sources hold
     // tokens but no SOL and no fee wallet is registered.
     lastSkippedReasonsJson: text("last_skipped_reasons_json"),
+    // Optional gas ceiling (Lever 3): a USD decimal string (e.g. "5.00"). When
+    // set, the cron quotes the live low-tier fee, converts native → USD via the
+    // price oracle, and SKIPS+defers the firing when the fee exceeds this value
+    // — clustering internal sweeps into cheap-gas windows. NULL = no ceiling
+    // (always run). Primarily an EVM L1 tool; on Tron, energy delegation is the
+    // real fee lever (fees aren't gas-price-driven).
+    maxFeeUsd: text("max_fee_usd"),
     // When the cron should fire next (epoch ms). Set on insert =
     // now + interval_hours*3600000, advanced atomically by the cron.
     nextRunDue: integer("next_run_due").notNull(),

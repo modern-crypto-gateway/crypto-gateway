@@ -246,6 +246,15 @@ async function main(): Promise<void> {
     confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES")),
     ...(parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN")) !== undefined
       ? { payoutConcurrencyPerChain: parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN"))! }
+      : {}),
+    ...(parseFeeTierEnv(secrets.getOptional("INTERNAL_CONSOLIDATION_FEE_TIER")) !== undefined
+      ? { internalConsolidationFeeTier: parseFeeTierEnv(secrets.getOptional("INTERNAL_CONSOLIDATION_FEE_TIER"))! }
+      : {}),
+    ...(parseNonNegNumberEnv(secrets.getOptional("CONSOLIDATION_DUST_GAS_MULTIPLIER")) !== undefined
+      ? { consolidationDustGasMultiplier: parseNonNegNumberEnv(secrets.getOptional("CONSOLIDATION_DUST_GAS_MULTIPLIER"))! }
+      : {}),
+    ...(parseNonNegNumberEnv(secrets.getOptional("CONSOLIDATION_TOPUP_CUSHION_PERCENT")) !== undefined
+      ? { consolidationTopUpCushionPercent: parseNonNegNumberEnv(secrets.getOptional("CONSOLIDATION_TOPUP_CUSHION_PERCENT"))! }
       : {})
   };
 
@@ -278,6 +287,19 @@ function parsePayoutConcurrencyEnv(raw: string | undefined): number | undefined 
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 1 || n > 64 || !Number.isInteger(n)) return undefined;
   return n;
+}
+
+// Validate an optional fee-tier env value; undefined when unset/invalid so the
+// consumer falls back to its built-in "low" default.
+function parseFeeTierEnv(raw: string | undefined): "low" | "medium" | "high" | undefined {
+  return raw === "low" || raw === "medium" || raw === "high" ? raw : undefined;
+}
+
+// Parse an optional non-negative number env value; undefined when unset/invalid.
+function parseNonNegNumberEnv(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
 main().catch((err) => {

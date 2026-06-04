@@ -399,6 +399,9 @@ async function main(): Promise<void> {
     migrationsFolder,
     confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES")),
     payoutConcurrencyPerChain: config.payoutConcurrencyPerChain,
+    internalConsolidationFeeTier: config.internalConsolidationFeeTier,
+    consolidationDustGasMultiplier: config.consolidationDustGasMultiplier,
+    consolidationTopUpCushionPercent: config.consolidationTopUpCushionPercent,
     moneroPoolCooldownSeconds: config.moneroPoolCooldownSeconds,
     moneroPoolInitialSize: config.moneroPoolInitialSize
   };

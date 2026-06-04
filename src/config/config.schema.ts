@@ -157,6 +157,29 @@ export const AppConfigSchema = z
     // Workers under heavy backlog.
     payoutConcurrencyPerChain: z.coerce.number().int().min(1).max(64).default(16),
 
+    // ---- Consolidation (pool defrag) fee optimization ----
+    // Internal consolidation sweeps move funds between addresses we own; they
+    // have no merchant SLA, so the cheapest fee tier is the right default. The
+    // tier flows through planPayout to BOTH the ERC-20 sweep and its gas
+    // top-up sibling on EVM. No-op on chains without real tiering (Tron).
+    // Override via INTERNAL_CONSOLIDATION_FEE_TIER.
+    internalConsolidationFeeTier: z.enum(["low", "medium", "high"]).default("low"),
+    // Fee-aware dust floor: skip consolidating a source whose token value is
+    // worth less than (this multiplier × the estimated per-sweep gas cost), so
+    // every sweep nets positive value. Applied as max(staticFloor, dynamicFloor).
+    // Default 0 = OFF (opt-in) so it never silently strands balances on existing
+    // deployments; set to 3–5 to enable (recommended for the lowest-fees goal —
+    // 3 covers gas + headroom; higher sweeps only fuller addresses → lower fee
+    // %). Override via CONSOLIDATION_DUST_GAS_MULTIPLIER.
+    consolidationDustGasMultiplier: z.coerce.number().min(0).default(0),
+    // Gas top-up cushion (percent) added on top of the estimated gas when an
+    // EVM/Tron source needs a native top-up before a TOKEN sweep. A single-use
+    // deposit address keeps any leftover native forever (stranded dust), so
+    // internal consolidation legs use a tighter cushion than merchant payouts
+    // (which keep the built-in 20%). Safe to tighten only alongside gas-window
+    // gating. Override via CONSOLIDATION_TOPUP_CUSHION_PERCENT.
+    consolidationTopUpCushionPercent: z.coerce.number().int().min(0).max(100).default(10),
+
     // Ops alerting: when set, error-level log lines are fan-out POSTed to this
     // URL (Slack/Discord/PagerDuty-compatible JSON body). Normal logs still
     // flow to stdout/stderr; this is the page-the-oncall channel only.
@@ -283,6 +306,9 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     rateLimitWebhookIngestPerMinute: env["RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE"],
     rateLimitAdminPerMinute: env["RATE_LIMIT_ADMIN_PER_MINUTE"],
     payoutConcurrencyPerChain: env["PAYOUT_CONCURRENCY_PER_CHAIN"],
+    internalConsolidationFeeTier: env["INTERNAL_CONSOLIDATION_FEE_TIER"],
+    consolidationDustGasMultiplier: env["CONSOLIDATION_DUST_GAS_MULTIPLIER"],
+    consolidationTopUpCushionPercent: env["CONSOLIDATION_TOPUP_CUSHION_PERCENT"],
     trustedIpHeaders: env["TRUSTED_IP_HEADERS"],
     alertWebhookUrl: env["ALERT_WEBHOOK_URL"],
     alertWebhookAuthHeader: env["ALERT_WEBHOOK_AUTH_HEADER"]

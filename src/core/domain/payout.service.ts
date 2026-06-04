@@ -670,7 +670,13 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         feeWalletAvailable,
         feeWalletSponsor,
         forceSourceAddress: parsed.forceSourceAddress ?? null,
-        freeGasAddresses
+        freeGasAddresses,
+        // Tighter top-up cushion for internal consolidation legs to limit
+        // stranded native dust on single-use deposit addresses; merchant
+        // payouts keep the historical 20%.
+        topUpCushionPercent: parsed.internalKind === "consolidation_sweep"
+          ? (deps.consolidationTopUpCushionPercent ?? 10)
+          : 20
       });
 
       if (
@@ -3558,6 +3564,14 @@ type SelectionArgs = {
   // membership here to override the native-gas requirement on Tier A
   // direct picks: a delegated source qualifies even with 0 native.
   freeGasAddresses: ReadonlySet<string>;
+  // Percentage cushion added on top of the estimated gas when sizing a native
+  // top-up for a token sweep (Lever 5). Merchant payouts pass 20 (the historical
+  // default); internal consolidation legs pass a tighter value
+  // (deps.consolidationTopUpCushionPercent, default 10) so less native is left
+  // stranded on single-use deposit addresses. Safe to tighten for consolidation
+  // because those legs run alongside gas-window gating and the EVM 1.5× gas
+  // safety factor already absorbs normal drift.
+  topUpCushionPercent: number;
 };
 
 // Drizzle's transaction handle and the top-level Db both implement these
@@ -3746,7 +3760,7 @@ async function selectSource(
     // tick.
     return { kind: "insufficient", aggregateTokenBalance, largestSingleHolding };
   }
-  const cushion = (gasNeeded * 20n) / 100n;
+  const cushion = (gasNeeded * BigInt(Math.max(0, Math.trunc(args.topUpCushionPercent)))) / 100n;
   const topUpAmount = gap + cushion;
   const sponsorOwnGas = gasNeeded;
   const sponsorMinKeep = minNativeReserve;

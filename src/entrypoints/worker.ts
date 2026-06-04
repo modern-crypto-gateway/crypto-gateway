@@ -443,8 +443,30 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     ),
     ...(parsePayoutConcurrency(env["PAYOUT_CONCURRENCY_PER_CHAIN"]) !== undefined
       ? { payoutConcurrencyPerChain: parsePayoutConcurrency(env["PAYOUT_CONCURRENCY_PER_CHAIN"])! }
+      : {}),
+    ...(parseFeeTierEnv(env["INTERNAL_CONSOLIDATION_FEE_TIER"]) !== undefined
+      ? { internalConsolidationFeeTier: parseFeeTierEnv(env["INTERNAL_CONSOLIDATION_FEE_TIER"])! }
+      : {}),
+    ...(parseNonNegNumberEnv(env["CONSOLIDATION_DUST_GAS_MULTIPLIER"]) !== undefined
+      ? { consolidationDustGasMultiplier: parseNonNegNumberEnv(env["CONSOLIDATION_DUST_GAS_MULTIPLIER"])! }
+      : {}),
+    ...(parseNonNegNumberEnv(env["CONSOLIDATION_TOPUP_CUSHION_PERCENT"]) !== undefined
+      ? { consolidationTopUpCushionPercent: parseNonNegNumberEnv(env["CONSOLIDATION_TOPUP_CUSHION_PERCENT"])! }
       : {})
   };
+}
+
+// Validate an optional fee-tier env value; undefined when unset/invalid so the
+// consumer falls back to its built-in "low" default.
+function parseFeeTierEnv(raw: unknown): "low" | "medium" | "high" | undefined {
+  return raw === "low" || raw === "medium" || raw === "high" ? raw : undefined;
+}
+
+// Parse an optional non-negative number env value; undefined when unset/invalid.
+function parseNonNegNumberEnv(raw: unknown): number | undefined {
+  if (typeof raw !== "string" || raw === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
 // Parse the env-string into a positive integer. Returns undefined to fall

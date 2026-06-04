@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { and, desc, eq, inArray, lte, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
-import { ChainIdSchema } from "../types/chain.js";
+import { ChainIdSchema, type ChainId } from "../types/chain.js";
 import { AmountRawSchema } from "../types/money.js";
 import { TokenSymbolSchema } from "../types/token.js";
 import { addressPool, autoConsolidationSchedules, payouts } from "../../db/schema.js";
@@ -55,6 +55,12 @@ export function autoConsolidationErrorStatus(
 
 // ---- CRUD: input shapes ----
 
+// USD decimal string, e.g. "5" or "5.00". Non-negative. Used for the optional
+// gas ceiling (Lever 3).
+const UsdDecimalSchema = z
+  .string()
+  .regex(/^\d+(\.\d+)?$/, "must be a non-negative USD decimal string (e.g. \"5.00\")");
+
 export const CreateScheduleInputSchema = z
   .object({
     chainId: ChainIdSchema,
@@ -62,6 +68,9 @@ export const CreateScheduleInputSchema = z
     targetAddress: z.string().min(1).max(128),
     intervalHours: z.number().int().positive().max(720),
     minSourceBalanceRaw: AmountRawSchema,
+    // Optional gas ceiling in USD: defer this schedule's firing when the live
+    // low-tier network fee exceeds it (gas-window gating). Omit for no ceiling.
+    maxFeeUsd: UsdDecimalSchema.optional(),
     maxSourcesPerRun: z.number().int().positive().max(200).default(25),
     enabled: z.boolean().default(true)
   })
@@ -73,6 +82,9 @@ export const UpdateScheduleInputSchema = z
     targetAddress: z.string().min(1).max(128).optional(),
     intervalHours: z.number().int().positive().max(720).optional(),
     minSourceBalanceRaw: AmountRawSchema.optional(),
+    // Pass a decimal string to set/raise/lower the ceiling, or explicit null to
+    // clear it (back to "always run").
+    maxFeeUsd: UsdDecimalSchema.nullable().optional(),
     maxSourcesPerRun: z.number().int().positive().max(200).optional(),
     enabled: z.boolean().optional()
   })
@@ -109,6 +121,8 @@ export interface ScheduleRow {
   readonly targetAddress: string;
   readonly intervalHours: number;
   readonly minSourceBalanceRaw: string;
+  // Optional gas ceiling (USD decimal string). null = no ceiling.
+  readonly maxFeeUsd: string | null;
   readonly maxSourcesPerRun: number;
   readonly enabled: boolean;
   readonly lastRunAt: number | null;
@@ -145,6 +159,7 @@ function toScheduleRow(row: typeof autoConsolidationSchedules.$inferSelect): Sch
     targetAddress: row.targetAddress,
     intervalHours: row.intervalHours,
     minSourceBalanceRaw: row.minSourceBalanceRaw,
+    maxFeeUsd: row.maxFeeUsd,
     maxSourcesPerRun: row.maxSourcesPerRun,
     enabled: row.enabled === 1,
     lastRunAt: row.lastRunAt,
@@ -219,6 +234,7 @@ export async function createSchedule(
         targetAddress: parsed.targetAddress,
         intervalHours: parsed.intervalHours,
         minSourceBalanceRaw: parsed.minSourceBalanceRaw,
+        maxFeeUsd: parsed.maxFeeUsd ?? null,
         maxSourcesPerRun: parsed.maxSourcesPerRun,
         enabled: parsed.enabled ? 1 : 0,
         lastRunAt: null,
@@ -341,6 +357,9 @@ export async function updateSchedule(
   if (parsed.minSourceBalanceRaw !== undefined) {
     updates.minSourceBalanceRaw = parsed.minSourceBalanceRaw;
   }
+  // null explicitly clears the ceiling; a string sets it. `undefined` (absent
+  // from the PATCH body) leaves it unchanged.
+  if (parsed.maxFeeUsd !== undefined) updates.maxFeeUsd = parsed.maxFeeUsd;
   if (parsed.maxSourcesPerRun !== undefined) {
     updates.maxSourcesPerRun = parsed.maxSourcesPerRun;
   }
@@ -448,6 +467,58 @@ export async function runAutoConsolidations(
       continue;
     }
 
+    // Gas-window gating (Lever 3). When a USD ceiling is set, only sweep while
+    // the live low-tier network fee is at/below it — consolidation isn't time-
+    // sensitive, so deferring out of expensive windows lowers total fees. We
+    // DEFER this tick (nextRunDue was already advanced by the atomic claim, so
+    // it naturally retries next interval) both when the fee is too high AND
+    // when we can't determine it: for a schedule that opted into a ceiling,
+    // "don't sweep blind" is the safe default for the lowest-fees objective.
+    if (sched.maxFeeUsd !== null) {
+      let feeUsdMicro: bigint | null = null;
+      try {
+        const adapter = findChainAdapter(deps, sched.chainId);
+        const tier = deps.internalConsolidationFeeTier ?? "low";
+        const quote = await adapter.quoteFeeTiers({
+          chainId: sched.chainId as ChainId,
+          fromAddress: sched.targetAddress as never,
+          toAddress: sched.targetAddress as never,
+          token: sched.token as never,
+          amountRaw: "1" as never
+        });
+        const nativeSymbol = adapter.nativeSymbol(sched.chainId as ChainId);
+        const nativeDecimals =
+          findToken(sched.chainId, nativeSymbol)?.decimals ??
+          (adapter.family === "tron" ? 6 : 18);
+        const rates = await deps.priceOracle.getUsdRates([nativeSymbol]);
+        const nativeUsdMicro = usdRateToMicro(rates[nativeSymbol]);
+        if (nativeUsdMicro > 0n) {
+          feeUsdMicro = (BigInt(quote[tier].nativeAmountRaw) * nativeUsdMicro) / pow10Bi(nativeDecimals);
+        }
+      } catch (err) {
+        deps.logger.warn("auto_consolidation.gas_quote_failed", {
+          scheduleId: sched.id,
+          chainId: sched.chainId,
+          token: sched.token,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+
+      const ceilingMicro = usdRateToMicro(sched.maxFeeUsd);
+      if (feeUsdMicro === null || feeUsdMicro > ceilingMicro) {
+        skipped += 1;
+        deps.logger.info("auto_consolidation.skipped_gas_high", {
+          scheduleId: sched.id,
+          chainId: sched.chainId,
+          token: sched.token,
+          maxFeeUsd: sched.maxFeeUsd,
+          estimatedFeeUsd:
+            feeUsdMicro === null ? null : (Number(feeUsdMicro) / 1_000_000).toString()
+        });
+        continue;
+      }
+    }
+
     try {
       const result = await planPoolConsolidation(deps, {
         chainId: sched.chainId,
@@ -509,4 +580,17 @@ export async function runAutoConsolidations(
   }
 
   return { checked: claimed.length, fired, skipped, errors };
+}
+
+// Parse a decimal USD string ("5", "2500.50") to a micro-USD integer for
+// BigInt comparison. Tolerant of undefined/junk → 0n.
+function usdRateToMicro(rate: string | undefined): bigint {
+  if (rate === undefined) return 0n;
+  const n = Number(rate);
+  if (!Number.isFinite(n) || n < 0) return 0n;
+  return BigInt(Math.round(n * 1_000_000));
+}
+
+function pow10Bi(n: number): bigint {
+  return 10n ** BigInt(Math.max(0, Math.trunc(n)));
 }

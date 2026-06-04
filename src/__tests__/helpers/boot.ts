@@ -80,6 +80,12 @@ export interface BootTestAppOptions {
   // pegged to $1, EVM/Solana/Tron natives at fixed prices). Tests that need to
   // exercise USD-pegged failure paths (oracle outage) pass a stub that throws.
   priceOracle?: AppDeps["priceOracle"];
+  // Consolidation fee-tuning overrides (Levers 1/2/5). Left unset, the services
+  // use their built-in fallbacks: "low" internal tier, dust floor OFF (0), and a
+  // 10% consolidation top-up cushion.
+  internalConsolidationFeeTier?: AppDeps["internalConsolidationFeeTier"];
+  consolidationDustGasMultiplier?: AppDeps["consolidationDustGasMultiplier"];
+  consolidationTopUpCushionPercent?: AppDeps["consolidationTopUpCushionPercent"];
 }
 
 export interface BootedTestApp {
@@ -276,6 +282,15 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
     ...(options.alchemy !== undefined ? { alchemy: options.alchemy } : {}),
     ...(options.alchemySubscribableChainsByFamily !== undefined
       ? { alchemySubscribableChainsByFamily: options.alchemySubscribableChainsByFamily }
+      : {}),
+    ...(options.internalConsolidationFeeTier !== undefined
+      ? { internalConsolidationFeeTier: options.internalConsolidationFeeTier }
+      : {}),
+    ...(options.consolidationDustGasMultiplier !== undefined
+      ? { consolidationDustGasMultiplier: options.consolidationDustGasMultiplier }
+      : {}),
+    ...(options.consolidationTopUpCushionPercent !== undefined
+      ? { consolidationTopUpCushionPercent: options.consolidationTopUpCushionPercent }
       : {})
   };
 

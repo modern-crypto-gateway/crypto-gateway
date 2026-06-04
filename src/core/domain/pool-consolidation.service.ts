@@ -3,7 +3,7 @@ import { and, eq } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainIdSchema, type ChainId } from "../types/chain.js";
 import { AmountRawSchema } from "../types/money.js";
-import { TokenSymbolSchema } from "../types/token.js";
+import { TokenSymbolSchema, type TokenSymbol } from "../types/token.js";
 import { addressPool, payouts } from "../../db/schema.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { findToken } from "../types/token-registry.js";
@@ -144,6 +144,54 @@ function formatLegError(err: unknown): string {
   return messages.join(" | ");
 }
 
+// Convert a native-gas cost into a token-denominated dust floor:
+//   floorRaw = nativeRaw × (nativeUsd / tokenUsd) × 10^(tokenDec − nativeDec) × multiplier
+// All BigInt; USD rates are scaled to micro-USD integers (6 dp is ample for an
+// order-of-magnitude dust threshold). Best-effort: returns 0n (→ caller falls
+// back to the static floor) on any missing rate or failure. Never throws.
+async function nativeGasToTokenFloor(
+  deps: AppDeps,
+  args: {
+    readonly nativeSymbol: string;
+    readonly nativeRaw: bigint;
+    readonly nativeDecimals: number;
+    readonly token: string;
+    readonly tokenDecimals: number;
+    readonly multiplier: number;
+  }
+): Promise<bigint> {
+  try {
+    const rates = await deps.priceOracle.getUsdRates([
+      args.nativeSymbol as TokenSymbol,
+      args.token as TokenSymbol
+    ]);
+    const nativeUsdMicro = usdToMicro(rates[args.nativeSymbol]);
+    const tokenUsdMicro = usdToMicro(rates[args.token]);
+    if (nativeUsdMicro <= 0n || tokenUsdMicro <= 0n) return 0n;
+    // multiplier (possibly fractional) → per-thousand integer to stay in BigInt.
+    const multMilli = BigInt(Math.max(0, Math.round(args.multiplier * 1000)));
+    const num = args.nativeRaw * nativeUsdMicro * pow10(args.tokenDecimals) * multMilli;
+    const den = tokenUsdMicro * pow10(args.nativeDecimals) * 1000n;
+    if (den === 0n) return 0n;
+    return num / den;
+  } catch {
+    return 0n;
+  }
+}
+
+// Parse a decimal USD-rate string ("2500.50") to a micro-USD integer. Tolerant
+// of undefined/junk → 0n (caller treats as "no floor").
+function usdToMicro(rate: string | undefined): bigint {
+  if (rate === undefined) return 0n;
+  const n = Number(rate);
+  if (!Number.isFinite(n) || n < 0) return 0n;
+  return BigInt(Math.round(n * 1_000_000));
+}
+
+function pow10(n: number): bigint {
+  return 10n ** BigInt(Math.max(0, Math.trunc(n)));
+}
+
 export async function planPoolConsolidation(
   deps: AppDeps,
   input: unknown
@@ -201,61 +249,106 @@ export async function planPoolConsolidation(
     .from(addressPool)
     .where(eq(addressPool.family, family));
 
-  // Per-source dust floor. Defaults to 1 (i.e. "any non-zero balance" —
-  // preserves the manual endpoint's pre-extension behavior when the
-  // caller omits the field). Auto-consolidation passes a chain-/token-
-  // appropriate value (e.g. 10 USDT raw = 10000000) so it doesn't burn
-  // gas on dust addresses.
-  const minSourceBalance = parsed.minSourceBalanceRaw !== undefined
+  // Fee tier for internal sweeps (Lever 1). These move funds between
+  // addresses we own — no merchant SLA — so we ride the cheapest tier by
+  // default. The tier flows to planPayout below (and through it to the EVM
+  // gas top-up sibling), and it's the basis for the gas-aware dust floor so
+  // the floor matches what the sweep will actually pay. No-op on Tron.
+  const internalTier = deps.internalConsolidationFeeTier ?? "low";
+
+  // Static per-source dust floor. Defaults to 1 (i.e. "any non-zero balance"
+  // — preserves the manual endpoint's pre-extension behavior when the caller
+  // omits the field). Auto-consolidation passes a chain-/token-appropriate
+  // value. Combined below with a gas-aware dynamic floor via max().
+  const staticFloor = parsed.minSourceBalanceRaw !== undefined
     ? BigInt(parsed.minSourceBalanceRaw)
     : 1n;
 
-  // Native consolidation requires per-source rent + gas reserve. Unlike
-  // token consolidation (where the source's gas budget is independent of
-  // the token amount), a native sweep can't drain the source — Solana
-  // requires rent-exempt SOL on every account, and EVM/Tron sources
-  // need to retain enough native to pay for the broadcast tx itself.
-  //
-  // For each native source we compute `sweepableAmount = balance -
-  // (gasNeeded × race-buffer) - minNativeReserve`. This is the maximum
-  // we can ask planPayout to send while still satisfying the picker's
-  // `directNeed = amount + gasNeeded + minReserve` invariant
-  // (selectSource at payout.service.ts).
-  //
-  // Race-buffer (2×) absorbs gas-price drift between this consolidation
-  // call's quote and planPayout's independent re-quote — Solana's sig
-  // fee is essentially fixed but EVM gas can spike. If the source's
-  // balance can't cover even the buffer, we skip it (would otherwise
-  // surface as INSUFFICIENT_BALANCE_ANY_SOURCE per leg, which is what
-  // the user hit in the original bug report).
   const isNativeConsolidation = tokenInfo.contractAddress === null;
-  let nativeSweepBuffer = 0n;
-  if (isNativeConsolidation) {
-    let tierQuotes;
-    try {
-      tierQuotes = await chainAdapter.quoteFeeTiers({
-        chainId: parsed.chainId as ChainId,
-        fromAddress: parsed.targetAddress as never,
-        toAddress: parsed.targetAddress as never,
-        token: parsed.token as never,
-        amountRaw: "1" as never
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+
+  // Quote the per-sweep gas ONCE, at the tier we'll actually broadcast at, so
+  // both the native sweep buffer and the dust floor use real numbers. This is
+  // REQUIRED for native consolidation (we must know the gas to leave behind)
+  // but only best-effort for token consolidation (the dust floor degrades to
+  // the static floor if the quote is unavailable — never block the whole run).
+  let tierQuotes: Awaited<ReturnType<typeof chainAdapter.quoteFeeTiers>> | null = null;
+  try {
+    tierQuotes = await chainAdapter.quoteFeeTiers({
+      chainId: parsed.chainId as ChainId,
+      fromAddress: parsed.targetAddress as never,
+      toAddress: parsed.targetAddress as never,
+      token: parsed.token as never,
+      amountRaw: "1" as never
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (isNativeConsolidation) {
       throw new ConsolidationError(
         "INVALID_CHAIN",
         `Could not quote gas for native consolidation on chain ${parsed.chainId}: ${message}`
       );
     }
-    const safety = chainAdapter.gasSafetyFactor(parsed.chainId as ChainId);
-    const gasNeeded = (BigInt(tierQuotes.medium.nativeAmountRaw) * safety.num) / safety.den;
-    const minReserve = chainAdapter.minimumNativeReserve(parsed.chainId as ChainId);
-    // 2× gasNeeded buffer: planPayout re-quotes independently, so a fee
-    // spike between this estimate and broadcast could push the picker's
-    // gasNeeded above ours. 2× covers up to a 100% drift — generous on
-    // Solana (fixed sig fee), still safe on EVM under normal congestion.
-    nativeSweepBuffer = gasNeeded * 2n + minReserve;
+    deps.logger.warn("pool-consolidation.fee_quote_failed", {
+      chainId: parsed.chainId,
+      token: parsed.token,
+      error: message
+    });
   }
+
+  const safety = chainAdapter.gasSafetyFactor(parsed.chainId as ChainId);
+  // Per-sweep gas at the broadcast tier with the same safety multiplier the
+  // planner applies. null only when the quote failed (token path).
+  const perSweepGasRaw = tierQuotes !== null
+    ? (BigInt(tierQuotes[internalTier].nativeAmountRaw) * safety.num) / safety.den
+    : null;
+
+  // Native consolidation can't drain the source — EVM/Tron sources must retain
+  // enough native to pay for the broadcast tx itself. `sweepable = balance -
+  // (gasNeeded × 2 race-buffer) - minNativeReserve`. The 2× absorbs gas drift
+  // between this quote and planPayout's independent re-quote.
+  let nativeSweepBuffer = 0n;
+  if (isNativeConsolidation && perSweepGasRaw !== null) {
+    const minReserve = chainAdapter.minimumNativeReserve(parsed.chainId as ChainId);
+    nativeSweepBuffer = perSweepGasRaw * 2n + minReserve;
+  }
+
+  // Fee-aware dynamic dust floor (Lever 2), in the token's smallest unit: skip
+  // a source whose token value is worth less than K × the per-sweep gas cost,
+  // so every sweep nets positive. For EVM/Tron TOKEN sweeps the sweep is TWO
+  // txs (native top-up + ERC-20 transfer), so double the single-tx gas. The
+  // floor degrades to 0 (→ static floor) when the quote or oracle is missing.
+  //
+  // OFF by default (multiplier 0) so it never silently strands balances; the
+  // operator opts in via CONSOLIDATION_DUST_GAS_MULTIPLIER (recommended 3–5 for
+  // the lowest-fees objective).
+  const dustMultiplier = deps.consolidationDustGasMultiplier ?? 0;
+  let dynamicFloor = 0n;
+  if (dustMultiplier > 0 && perSweepGasRaw !== null) {
+    const needsTopUp = !isNativeConsolidation
+      && chainAdapter.feeWalletCapability(parsed.chainId as ChainId) !== "co-sign";
+    const totalGasNativeRaw = needsTopUp ? perSweepGasRaw * 2n : perSweepGasRaw;
+    const nativeSymbol = chainAdapter.nativeSymbol(parsed.chainId as ChainId);
+    const nativeDecimals =
+      findToken(parsed.chainId, nativeSymbol)?.decimals ??
+      (chainAdapter.family === "tron" ? 6 : 18);
+    dynamicFloor = await nativeGasToTokenFloor(deps, {
+      nativeSymbol,
+      nativeRaw: totalGasNativeRaw,
+      nativeDecimals,
+      token: parsed.token,
+      tokenDecimals: tokenInfo.decimals,
+      multiplier: dustMultiplier
+    });
+  }
+
+  // Effective floor: the stricter of the operator's static floor and the
+  // gas-aware dynamic floor.
+  const minSourceBalance = dynamicFloor > staticFloor ? dynamicFloor : staticFloor;
+
+  // Sources held some of the token but fell below the effective floor — worth
+  // surfacing so the operator sees why a balance stayed put (vs. silently
+  // dropping empty addresses). Merged into the returned `skipped` list below.
+  const dustSkipped: ConsolidationSkip[] = [];
 
   const sources: { address: string; amountRaw: bigint }[] = [];
   for (const row of allPoolRows) {
@@ -265,15 +358,25 @@ export async function planPoolConsolidation(
       address: row.address,
       token: parsed.token
     });
-    // For native: deduct the per-source gas + reserve buffer so the
-    // amount we hand to planPayout is actually sweepable. For token
-    // consolidation the source's gas comes from a separate sponsor /
-    // fee wallet, so the full balance is sweepable.
+    // For native: deduct the per-source gas + reserve buffer so the amount we
+    // hand to planPayout is actually sweepable. For token consolidation the
+    // source's gas comes from a separate sponsor / fee wallet, so the full
+    // balance is sweepable.
     const sweepable = isNativeConsolidation
       ? (balance > nativeSweepBuffer ? balance - nativeSweepBuffer : 0n)
       : balance;
     if (sweepable >= minSourceBalance) {
       sources.push({ address: row.address, amountRaw: sweepable });
+    } else if (sweepable >= staticFloor && balance > 0n) {
+      // Excluded specifically by the gas-aware DYNAMIC floor (it cleared the
+      // static floor but isn't worth the gas to sweep). Surfaced so the
+      // operator sees a balance was deliberately left. Sources below the
+      // static floor are dropped silently as before (unchanged behavior).
+      dustSkipped.push({
+        sourceAddress: row.address,
+        amountRaw: sweepable.toString(),
+        reason: `BELOW_DYNAMIC_DUST_FLOOR: token value below ${minSourceBalance.toString()} (smallest unit) ≈ ${dustMultiplier}× sweep gas`
+      });
     }
   }
 
@@ -301,7 +404,9 @@ export async function planPoolConsolidation(
   // — we surface those as `skipped` entries.
   const consolidationId = globalThis.crypto.randomUUID();
   const legs: ConsolidationLeg[] = [];
-  const skipped: ConsolidationSkip[] = [];
+  // Seed with the gas-aware dust skips collected during discovery so the
+  // operator sees both "couldn't plan" and "not worth sweeping" in one list.
+  const skipped: ConsolidationSkip[] = [...dustSkipped];
 
   for (const source of sources) {
     try {
@@ -313,7 +418,8 @@ export async function planPoolConsolidation(
         destinationAddress: parsed.targetAddress,
         batchId: consolidationId,
         forceSourceAddress: source.address,
-        internalKind: "consolidation_sweep"
+        internalKind: "consolidation_sweep",
+        feeTier: internalTier
       });
       legs.push({
         payoutId: result.id,
