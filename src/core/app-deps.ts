@@ -127,6 +127,16 @@ export interface AppDeps {
   // via env `PAYOUT_CONCURRENCY_PER_CHAIN`.
   readonly payoutConcurrencyPerChain?: number;
 
+  // When true, POST /payouts (single + batch) fires executeReservedPayouts
+  // in the background immediately after planning, instead of letting the
+  // fresh reservation wait for the next cron tick (where it would also
+  // queue behind the detection sweep that runs earlier in the tick). Safe
+  // to race with the cron — every broadcast-capable transition is
+  // CAS-guarded at the DB level. Entrypoints enable this; it defaults to
+  // OFF so deterministic test harnesses that assert on 'reserved' rows
+  // right after planning aren't raced by a background broadcast.
+  readonly fastPayoutExecutionEnabled?: boolean;
+
   // ---- Consolidation (pool defrag) fee tuning ----
   // Fee tier for internal consolidation sweeps. Consolidation passes this to
   // planPayout so internal sweeps (and their EVM gas top-ups) ride the cheapest

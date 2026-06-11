@@ -253,6 +253,7 @@ async function getDeps(): Promise<AppDeps> {
     ...(parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN")) !== undefined
       ? { payoutConcurrencyPerChain: parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN"))! }
       : {}),
+    fastPayoutExecutionEnabled: true,
     ...(parseFeeTierEnv(secrets.getOptional("INTERNAL_CONSOLIDATION_FEE_TIER")) !== undefined
       ? { internalConsolidationFeeTier: parseFeeTierEnv(secrets.getOptional("INTERNAL_CONSOLIDATION_FEE_TIER"))! }
       : {}),

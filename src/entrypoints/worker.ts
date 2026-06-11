@@ -464,6 +464,7 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     ...(parsePayoutConcurrency(env["PAYOUT_CONCURRENCY_PER_CHAIN"]) !== undefined
       ? { payoutConcurrencyPerChain: parsePayoutConcurrency(env["PAYOUT_CONCURRENCY_PER_CHAIN"])! }
       : {}),
+    fastPayoutExecutionEnabled: true,
     ...(parseFeeTierEnv(env["INTERNAL_CONSOLIDATION_FEE_TIER"]) !== undefined
       ? { internalConsolidationFeeTier: parseFeeTierEnv(env["INTERNAL_CONSOLIDATION_FEE_TIER"])! }
       : {}),

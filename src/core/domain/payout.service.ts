@@ -15,15 +15,16 @@ import { drizzleRowToPayout } from "./mappers.js";
 import {
   confirmationThreshold,
   evaluateConfirmationTier,
+  INTERNAL_PAYOUT_CONFIRMATIONS,
   lookupTierRules,
-  resolveMerchantConfirmationThreshold
+  resolveMerchantPayoutConfirmationThreshold
 } from "./payment-config.js";
 import { DomainError } from "../errors.js";
 import { assertWebhookUrlSafe } from "./url-safety.js";
 import { addressPool, merchants, payoutBroadcasts, payoutReservations, payouts, transactions, utxos } from "../../db/schema.js";
 import { isUniqueViolation } from "./db-errors.js";
 import { decodeP2wpkhAddress } from "../../adapters/chains/utxo/bech32-address.js";
-import { computeSpendable } from "./balance-snapshot.service.js";
+import { computeSpendableBatch } from "./balance-snapshot.service.js";
 import { loadSpendableUtxos, selectCoins, type CoinSelectionResult } from "./utxo-coin-select.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
 import { buildUtxoUnsignedTx } from "../../adapters/chains/utxo/utxo-chain.adapter.js";
@@ -359,12 +360,19 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   if (merchant.active !== 1) throw new PayoutError("MERCHANT_INACTIVE", "Merchant is inactive");
   // Snapshot the confirmation threshold for THIS payout once at plan time.
   // Frozen for the row's lifetime; merchant policy edits don't reshape
-  // already-planned payouts. Same pattern as invoices.
-  const confirmationThresholdSnapshot = resolveMerchantConfirmationThreshold(
-    parsed.chainId,
-    merchant.confirmationThresholdsJson,
-    deps.confirmationThresholds
-  );
+  // already-planned payouts. Same pattern as invoices, but resolved against
+  // the OUTBOUND default table — our own signed txs don't need inbound
+  // reorg depth (see DEFAULT_PAYOUT_CONFIRMATION_THRESHOLDS). Internal
+  // kinds (consolidation sweeps) go further: they only need the moved
+  // funds spendable by the next internal step, so 1 confirmation.
+  const confirmationThresholdSnapshot =
+    parsed.internalKind !== undefined
+      ? INTERNAL_PAYOUT_CONFIRMATIONS
+      : resolveMerchantPayoutConfirmationThreshold(
+          parsed.chainId,
+          merchant.confirmationThresholdsJson,
+          deps.confirmationThresholds
+        );
   // Snapshot the merchant's tier map verbatim. The confirm sweep evaluates
   // the relevant `${chainId}:${token}` entry against the payout's amount
   // at confirmation time; falls back to the flat threshold above when the
@@ -646,26 +654,22 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   // broadcast-time feeWallet lookup sees null, at which point broadcastMain
   // falls back to self-pay (and likely fails at the rent check if the
   // source wasn't funded — same as it does today without any fee wallet).
-  const feeWalletAvailable = await deps.feeWalletStore.has(chainAdapter.family);
-
-  // For "top-up" capability chains (Tron today), pre-fetch the fee wallet's
-  // native balance so the picker can offer it as a sponsor candidate
-  // without doing an RPC inside the writer lock. Returns null when
-  // capability !== "top-up", no fee wallet is registered, or the live
-  // balance read failed — all those degrade cleanly to pool-only sponsors.
-  const feeWalletSponsor = await loadFeeWalletSponsor(deps, chainAdapter, parsed.chainId);
-
-  // For chains that expose `hasSufficientFreeGas` (Tron's delegated-
-  // energy probe today), pre-compute the set of pool addresses already
-  // covered by chain-side resources. Picker uses this to skip the
-  // native-gas requirement on Tier A for delegated sources. Empty Set
-  // on chains without the probe — no behavior change for them.
-  const freeGasAddresses = await loadFreeGasAddresses(
-    deps,
-    chainAdapter,
-    parsed.chainId,
-    parsed.token
-  );
+  // The three pre-fetches below are independent reads — run them
+  // concurrently (they used to be sequential awaits on the plan critical
+  // path):
+  //   - fee-wallet availability (single row lookup),
+  //   - the fee wallet's native balance for "top-up" capability chains
+  //     (Tron today) so the picker can offer it as a sponsor candidate
+  //     without doing an RPC inside the writer lock — null degrades
+  //     cleanly to pool-only sponsors,
+  //   - the free-gas address set for chains exposing hasSufficientFreeGas
+  //     (Tron), which lets Tier A skip the native-gas requirement for
+  //     delegated/rental-covered sources. Empty Set on other chains.
+  const [feeWalletAvailable, feeWalletSponsor, freeGasAddresses] = await Promise.all([
+    deps.feeWalletStore.has(chainAdapter.family),
+    loadFeeWalletSponsor(deps, chainAdapter, parsed.chainId),
+    loadFreeGasAddresses(deps, chainAdapter, parsed.chainId, parsed.token)
+  ]);
 
   // Transaction returns a discriminated result instead of throwing, so
   // we can do error-enrichment work (oracle call for USD conversion)
@@ -1326,31 +1330,48 @@ export async function estimatePayoutFees(
     };
   }
 
-  // Spendable per candidate (token + native, both ledger-derived).
+  // Spendable per candidate (token + native, both ledger-derived) plus the
+  // fee-wallet and free-gas probes — independent reads fetched concurrently.
+  // These used to run sequentially with per-address spendable math (~4
+  // queries × pool size × 2 tokens), which dominated estimate latency on
+  // remote DBs; the batch computes the same ledger arithmetic in 4 queries.
   const tokenSym = parsed.token;
   const isNativePayout = parsed.token === nativeSymbol;
-  const enriched = await Promise.all(
-    poolRows.map(async (p) => {
-      const tokenBalance = await computeSpendable(deps, {
+  const [spendables, estimateFeeWalletAvailable, estimateFeeWalletSponsor, estimateFreeGasAddresses] =
+    await Promise.all([
+      computeSpendableBatch(deps, {
         chainId: parsed.chainId,
-        address: p.address,
-        token: tokenSym
-      });
-      const nativeBalance = isNativePayout
-        ? tokenBalance
-        : await computeSpendable(deps, {
-            chainId: parsed.chainId,
-            address: p.address,
-            token: nativeSymbol
-          });
-      return {
-        address: p.address,
-        derivationIndex: p.addressIndex,
-        tokenBalance,
-        nativeBalance
-      };
-    })
-  );
+        addresses: poolRows.map((p) => p.address),
+        tokens: isNativePayout ? [tokenSym] : [tokenSym, nativeSymbol]
+      }),
+      // Same fee-wallet gate the planner uses — keeps estimate in sync with
+      // plan (see the capability notes where these are consumed below).
+      deps.feeWalletStore.has(chainAdapter.family),
+      // Fee wallet's native balance for the "top-up" capability path —
+      // surfaced as the sponsor of choice, mirroring selectSource.
+      !isNativePayout
+        ? loadFeeWalletSponsor(deps, chainAdapter, parsed.chainId)
+        : Promise.resolve(null),
+      // Mirror the planner's free-gas probe so the estimate reflects what
+      // POST /payouts will actually do for sources covered by delegated
+      // chain resources (Tron). Without this, an estimate would show
+      // "needs top-up" for a delegated source while the planner would
+      // correctly pick it as direct — confusing the dashboard.
+      !isNativePayout
+        ? loadFreeGasAddresses(deps, chainAdapter, parsed.chainId, parsed.token)
+        : Promise.resolve(new Set<string>())
+    ]);
+  const enriched = poolRows.map((p) => {
+    const byToken = spendables.get(p.address);
+    const tokenBalance = byToken?.get(tokenSym) ?? 0n;
+    const nativeBalance = isNativePayout ? tokenBalance : (byToken?.get(nativeSymbol) ?? 0n);
+    return {
+      address: p.address,
+      derivationIndex: p.addressIndex,
+      tokenBalance,
+      nativeBalance
+    };
+  });
 
   const requiredAmount = BigInt(amountRaw);
 
@@ -1368,29 +1389,14 @@ export async function estimatePayoutFees(
   // remains). For "top-up" capability (Tron today), the fee wallet does NOT
   // cover gas — it just acts as a sponsor candidate for the top-up tx, so
   // source still needs gas, just from a top-up rather than its own balance.
+  // (estimateFeeWalletAvailable / estimateFeeWalletSponsor /
+  // estimateFreeGasAddresses are fetched concurrently with the spendable
+  // batch above.)
   const estimateCapability = chainAdapter.feeWalletCapability(parsed.chainId as ChainId);
-  const estimateFeeWalletAvailable = await deps.feeWalletStore.has(chainAdapter.family);
   const estimateFeeWalletCovers =
     (estimateCapability === "co-sign" || estimateCapability === "delegate") &&
     estimateFeeWalletAvailable &&
     !isNativePayout;
-  // Pre-fetch the fee wallet's TRX balance for the "top-up" capability
-  // path. Surfaced into the estimate response as the sponsor of choice when
-  // it has enough native to cover the top-up; mirrors what selectSource
-  // does at plan time.
-  const estimateFeeWalletSponsor = !isNativePayout
-    ? await loadFeeWalletSponsor(deps, chainAdapter, parsed.chainId)
-    : null;
-
-  // Mirror the planner's free-gas probe so the estimate reflects what
-  // POST /payouts will actually do for sources covered by delegated
-  // chain resources (Tron's delegated-energy model). Without this, an
-  // estimate would show "needs top-up" for a delegated source while
-  // the planner would correctly pick it as direct — confusing the
-  // dashboard.
-  const estimateFreeGasAddresses = !isNativePayout
-    ? await loadFreeGasAddresses(deps, chainAdapter, parsed.chainId, parsed.token)
-    : new Set<string>();
 
   // Bind the free-gas set into a candidate serializer so every `source`
   // / `alternatives` entry carries the `feeCoveredByDelegatedEnergy`
@@ -1979,10 +1985,11 @@ async function startTopUpFromReservation(
     submittedAt: null,
     confirmedAt: null,
     updatedAt: now,
-    // gas_top_up sibling inherits the parent payout's confirmation threshold
-    // — the parent's settlement waits on the parent tx, but for ledger
-    // consistency we record the same finality bar on the sibling.
-    confirmationThreshold: parent.confirmationThreshold,
+    // Internal plumbing leg: spendability is the only requirement, so the
+    // sibling records the 1-conf internal bar (matching the gate
+    // executeTopUp applies before broadcasting the main tx) rather than
+    // the parent's merchant-facing threshold.
+    confirmationThreshold: INTERNAL_PAYOUT_CONFIRMATIONS,
     confirmationTiersJson: parent.confirmationTiersJson,
     webhookUrl: null,
     webhookSecretCiphertext: null
@@ -2157,11 +2164,13 @@ async function executeTopUp(
       sibling?.id
     );
   }
-  // Top-up tx finality uses the parent payout's snapshotted threshold —
-  // same merchant policy applies to the gas-funding leg as the main tx.
-  const threshold = row.confirmationThreshold ??
-    confirmationThreshold(row.chainId, deps.confirmationThresholds);
-  if (status.confirmations < threshold) {
+  // The top-up only needs to make the moved native SPENDABLE by the main
+  // broadcast — one confirmation is that floor. Waiting the parent's
+  // merchant-grade threshold here stalled EVERY topped-up payout by the
+  // full inbound reorg depth (12 blocks on ETH ≈ 2.5 min) for no risk
+  // reduction: if a freak reorg un-confirms the top-up, the main broadcast
+  // fails "insufficient native balance" and the re-top-up rail recovers.
+  if (status.confirmations < INTERNAL_PAYOUT_CONFIRMATIONS) {
     // Not confirmed yet — leave payout in topping-up; next tick re-checks.
     return "deferred";
   }
@@ -4055,6 +4064,17 @@ export async function sweepStuckPayoutReservations(
 // balance. Without this probe, an operator who staked + delegated
 // energy from the fee wallet would still see the picker demand TRX
 // from the source — defeating the purpose of stake-and-delegate.
+// TTL cache for the free-gas probe results, keyed per deps instance via
+// WeakMap so test harnesses with fake adapters never cross-contaminate.
+// The probe costs one RPC per pool address (Tron getaccountresource) and
+// runs on estimate, plan AND broadcast-time re-top-up; its inputs change
+// slowly (delegations are admin events, bandwidth regenerates daily), so a
+// 30s window trades at most one stale pick — which the broadcast-time
+// burn-coverage guard catches anyway — for an O(pool-size) RPC saving on
+// every estimate/plan call.
+const FREE_GAS_CACHE_TTL_MS = 30_000;
+const freeGasCaches = new WeakMap<object, Map<string, { value: Set<string>; at: number }>>();
+
 async function loadFreeGasAddresses(
   deps: AppDeps,
   chainAdapter: ChainAdapter,
@@ -4064,6 +4084,17 @@ async function loadFreeGasAddresses(
   if (typeof chainAdapter.hasSufficientFreeGas !== "function") {
     return new Set();
   }
+  const cacheKey = `${chainAdapter.family}:${chainId}:${token}`;
+  let cache = freeGasCaches.get(deps);
+  if (cache === undefined) {
+    cache = new Map();
+    freeGasCaches.set(deps, cache);
+  }
+  const hit = cache.get(cacheKey);
+  if (hit !== undefined && deps.clock.now().getTime() - hit.at < FREE_GAS_CACHE_TTL_MS) {
+    return hit.value;
+  }
+
   const family = chainAdapter.family;
   const poolRows = await deps.db
     .select({ address: addressPool.address })
@@ -4088,7 +4119,9 @@ async function loadFreeGasAddresses(
       }
     })
   );
-  return new Set(probes.filter((a): a is string => a !== null));
+  const result = new Set(probes.filter((a): a is string => a !== null));
+  cache.set(cacheKey, { value: result, at: deps.clock.now().getTime() });
+  return result;
 }
 
 async function loadFeeWalletSponsor(
@@ -4236,28 +4269,25 @@ async function selectSource(
   // address's native balance to find a viable top-up sponsor, and
   // restricting too early would falsely report "no_sponsor" when a
   // perfectly good sponsor existed in the pool.
-  const enriched = await Promise.all(
-    poolRows.map(async (p) => {
-      const tokenBalance = await computeSpendable(tx, {
-        chainId: args.chainId,
-        address: p.address,
-        token: tokenSym
-      });
-      const nativeBalance = isNativePayout
-        ? tokenBalance
-        : await computeSpendable(tx, {
-            chainId: args.chainId,
-            address: p.address,
-            token: nativeSymbol
-          });
-      return {
-        address: p.address,
-        derivationIndex: p.addressIndex,
-        tokenBalance,
-        nativeBalance
-      };
-    })
-  );
+  // Batched: 4 queries for the whole pool instead of ~4 per (address, token).
+  // This runs inside the BEGIN IMMEDIATE writer lock, so every query saved
+  // here directly shortens the window during which other plans serialize.
+  const spendables = await computeSpendableBatch(tx, {
+    chainId: args.chainId,
+    addresses: poolRows.map((p) => p.address),
+    tokens: isNativePayout ? [tokenSym] : [tokenSym, nativeSymbol]
+  });
+  const enriched = poolRows.map((p) => {
+    const byToken = spendables.get(p.address);
+    const tokenBalance = byToken?.get(tokenSym) ?? 0n;
+    const nativeBalance = isNativePayout ? tokenBalance : (byToken?.get(nativeSymbol) ?? 0n);
+    return {
+      address: p.address,
+      derivationIndex: p.addressIndex,
+      tokenBalance,
+      nativeBalance
+    };
+  });
   // Richest token holder first.
   enriched.sort((a, b) => (a.tokenBalance < b.tokenBalance ? 1 : a.tokenBalance > b.tokenBalance ? -1 : 0));
 

@@ -418,6 +418,7 @@ async function main(): Promise<void> {
     migrationsFolder,
     confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES")),
     payoutConcurrencyPerChain: config.payoutConcurrencyPerChain,
+    fastPayoutExecutionEnabled: true,
     internalConsolidationFeeTier: config.internalConsolidationFeeTier,
     consolidationDustGasMultiplier: config.consolidationDustGasMultiplier,
     consolidationTopUpCushionPercent: config.consolidationTopUpCushionPercent,

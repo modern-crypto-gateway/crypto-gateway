@@ -491,6 +491,127 @@ export async function computeSpendable(
   return total < 0n ? 0n : total;
 }
 
+// Batched variant of `computeSpendable` for the payout planner/estimator
+// hot path. Computing spendable per candidate costs ~4 queries per
+// (address, token) — the source picker needs it for EVERY pool address ×
+// {token, native}, which on a 30-address pool is ~240 sequential-ish DB
+// round trips per estimate/plan (and inside the writer-locked transaction
+// at plan time, where every held millisecond serializes other writers).
+// This computes the same ledger arithmetic for the whole address set in 4
+// queries per ≤200-address chunk, grouping in JS with BigInt (amountRaw is
+// stored as text; SQL SUM would lose precision past 2^53).
+//
+// Semantics match `computeSpendable` exactly: confirmed inbound + intra-pool
+// credits − confirmed outbound − active reservations, clamped at zero.
+// Addresses/tokens absent from the ledger read as 0n.
+export async function computeSpendableBatch(
+  depsOrDb: AppDeps | SpendableQueryRunner,
+  args: { chainId: number; addresses: readonly string[]; tokens: readonly string[] }
+): Promise<Map<string, Map<string, bigint>>> {
+  const db: SpendableQueryRunner =
+    "db" in depsOrDb ? (depsOrDb as AppDeps).db : depsOrDb;
+  const { chainId } = args;
+  const addresses = [...new Set(args.addresses)];
+  const tokens = [...new Set(args.tokens)];
+
+  const out = new Map<string, Map<string, bigint>>();
+  for (const address of addresses) {
+    const byToken = new Map<string, bigint>();
+    for (const token of tokens) byToken.set(token, 0n);
+    out.set(address, byToken);
+  }
+  if (addresses.length === 0 || tokens.length === 0) return out;
+
+  const apply = (address: string | null, token: string, delta: bigint): void => {
+    if (address === null) return;
+    const byToken = out.get(address);
+    if (byToken === undefined) return;
+    byToken.set(token, (byToken.get(token) ?? 0n) + delta);
+  };
+
+  // Chunk the IN() lists so a large pool can't overflow SQLite's bound-
+  // parameter limit (999 by default; each chunk uses |chunk| + |tokens| + a
+  // few fixed params per query).
+  const CHUNK = 200;
+  for (let i = 0; i < addresses.length; i += CHUNK) {
+    const chunk = addresses.slice(i, i + CHUNK);
+    const [creditRows, internalCreditRows, debitRows, reservationRows] = await Promise.all([
+      db
+        .select({
+          address: transactions.toAddress,
+          token: transactions.token,
+          amountRaw: transactions.amountRaw
+        })
+        .from(transactions)
+        .where(
+          and(
+            eq(transactions.status, "confirmed"),
+            eq(transactions.chainId, chainId),
+            inArray(transactions.token, tokens),
+            inArray(transactions.toAddress, chunk)
+          )
+        ),
+      db
+        .select({
+          address: payouts.destinationAddress,
+          token: payouts.token,
+          amountRaw: payouts.amountRaw
+        })
+        .from(payouts)
+        .where(
+          and(
+            eq(payouts.status, "confirmed"),
+            inArray(payouts.kind, ["consolidation_sweep", "gas_top_up"]),
+            eq(payouts.chainId, chainId),
+            inArray(payouts.token, tokens),
+            inArray(payouts.destinationAddress, chunk)
+          )
+        ),
+      db
+        .select({
+          address: payouts.sourceAddress,
+          token: payouts.token,
+          amountRaw: payouts.amountRaw
+        })
+        .from(payouts)
+        .where(
+          and(
+            eq(payouts.status, "confirmed"),
+            eq(payouts.chainId, chainId),
+            inArray(payouts.token, tokens),
+            inArray(payouts.sourceAddress, chunk)
+          )
+        ),
+      db
+        .select({
+          address: payoutReservations.address,
+          token: payoutReservations.token,
+          amountRaw: payoutReservations.amountRaw
+        })
+        .from(payoutReservations)
+        .where(
+          and(
+            isNull(payoutReservations.releasedAt),
+            eq(payoutReservations.chainId, chainId),
+            inArray(payoutReservations.address, chunk),
+            inArray(payoutReservations.token, tokens)
+          )
+        )
+    ]);
+    for (const r of creditRows) apply(r.address, r.token, BigInt(r.amountRaw));
+    for (const r of internalCreditRows) apply(r.address, r.token, BigInt(r.amountRaw));
+    for (const r of debitRows) apply(r.address, r.token, -BigInt(r.amountRaw));
+    for (const r of reservationRows) apply(r.address, r.token, -BigInt(r.amountRaw));
+  }
+
+  for (const byToken of out.values()) {
+    for (const [token, value] of byToken) {
+      if (value < 0n) byToken.set(token, 0n);
+    }
+  }
+  return out;
+}
+
 // Minimal subset of the drizzle Db / transaction surface that
 // `computeSpendable` actually uses. Both `LibSQLDatabase` and the transaction
 // handle returned by `db.transaction()` satisfy this — we type-narrow rather

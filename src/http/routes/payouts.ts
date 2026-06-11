@@ -3,6 +3,7 @@ import type { AppDeps } from "../../core/app-deps.js";
 import {
   cancelPayout,
   estimatePayoutFees,
+  executeReservedPayouts,
   getPayout,
   listPayouts,
   planPayout,
@@ -17,6 +18,35 @@ import { apiKeyAuth, type AuthedVariables } from "../middleware/api-key-auth.js"
 // happen in cron jobs (executeReservedPayouts + confirmPayouts). The POST
 // returns immediately with status='planned' — merchants discover terminal
 // status via webhook or by polling GET /:id.
+//
+// Fast execution: when deps.fastPayoutExecutionEnabled is set, a successful
+// plan additionally fires executeReservedPayouts in the background so the
+// broadcast happens seconds after the POST instead of waiting out the next
+// cron tick (where it would also queue behind the detection sweep). The
+// merchant response NEVER waits on the broadcast.
+
+// Fire the payout executor without blocking the response. Racing the cron is
+// safe — every broadcast-capable transition is CAS-guarded at the DB level
+// (broadcastAttemptedAt claim, reserved→topping-up flip). On Workers the
+// promise is parked on waitUntil so the runtime doesn't cancel it when the
+// response ends; on Node/Deno the floating promise just runs to completion.
+function kickPayoutExecutor(
+  c: { readonly executionCtx?: { waitUntil(promise: Promise<unknown>): void } },
+  deps: AppDeps
+): void {
+  if (deps.fastPayoutExecutionEnabled !== true) return;
+  const task = executeReservedPayouts(deps).catch((err) => {
+    deps.logger.warn("payout.fast_execution_kick_failed", {
+      error: err instanceof Error ? err.message : String(err)
+    });
+  });
+  try {
+    c.executionCtx?.waitUntil(task);
+  } catch {
+    // Hono's executionCtx getter throws on runtimes without one (Node,
+    // Deno) — there the floating promise is exactly what we want.
+  }
+}
 
 export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables }> {
   const app = new Hono<{ Variables: AuthedVariables }>();
@@ -149,6 +179,7 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
     try {
       const input = { ...body, merchantId: c.get("merchantId") };
       const payout = await planPayout(deps, input);
+      kickPayoutExecutor(c, deps);
       return c.json({ payout: serializePayout(payout) }, 201);
     } catch (err) {
       return renderError(c, err, deps.logger);
@@ -205,6 +236,9 @@ export function payoutsRouter(deps: AppDeps): Hono<{ Variables: AuthedVariables 
       }
 
       const result = await planPayoutBatch(deps, merchantId, rows);
+      if (result.results.some((r) => r.status === "planned")) {
+        kickPayoutExecutor(c, deps);
+      }
       // Serialize every planned payout the same way the single-create
       // endpoint does so the client's payload handler is uniform.
       const serialized = {

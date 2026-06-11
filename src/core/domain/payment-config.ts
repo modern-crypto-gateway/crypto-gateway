@@ -72,23 +72,90 @@ export function resolveMerchantConfirmationThreshold(
   merchantOverridesJson: string | null,
   envOverrides?: Readonly<Record<number, number>>
 ): number {
-  if (merchantOverridesJson !== null && merchantOverridesJson.length > 0) {
-    try {
-      const parsed = JSON.parse(merchantOverridesJson) as unknown;
-      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const map = parsed as Record<string, unknown>;
-        const v = map[String(chainId)];
-        if (typeof v === "number" && Number.isInteger(v) && v > 0 && v <= 10_000) {
-          return v;
-        }
-      }
-    } catch {
-      // Malformed JSON — silently fall through. The admin API validated
-      // the shape at write time; reaching this path means someone bypassed
-      // validation (manual DB edit or schema migration footgun).
-    }
-  }
+  const merchantOverride = merchantThresholdOverride(chainId, merchantOverridesJson);
+  if (merchantOverride !== null) return merchantOverride;
   return confirmationThreshold(chainId, envOverrides);
+}
+
+function merchantThresholdOverride(
+  chainId: number,
+  merchantOverridesJson: string | null
+): number | null {
+  if (merchantOverridesJson === null || merchantOverridesJson.length === 0) return null;
+  try {
+    const parsed = JSON.parse(merchantOverridesJson) as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const map = parsed as Record<string, unknown>;
+      const v = map[String(chainId)];
+      if (typeof v === "number" && Number.isInteger(v) && v > 0 && v <= 10_000) {
+        return v;
+      }
+    }
+  } catch {
+    // Malformed JSON — silently fall through. The admin API validated
+    // the shape at write time; reaching this path means someone bypassed
+    // validation (manual DB edit or schema migration footgun).
+  }
+  return null;
+}
+
+// ---- Outbound (payout) confirmation depth ---------------------------------
+//
+// Outbound payouts are the gateway's OWN signed transactions, which inverts
+// the threat model the invoice thresholds defend against. An inbound payment
+// needs reorg-depth confirmation because the SENDER can double-spend it away
+// in a reorg; our payout has no competing spender — a reorged-out tx returns
+// to the mempool and re-mines with the same hash, and the rare permanent
+// drop surfaces as a failed downstream step that the executor's retry rails
+// recover (re-top-up, reservation sweep, gas-burn reconciliation). Waiting
+// invoice depth (12 on ETH, 256 on Polygon, 6 on BTC) buys no safety on this
+// path — it only delays the merchant's payout.confirmed webhook and, far
+// worse, the gas-top-up → main-broadcast handoff.
+//
+// Explicit configuration still wins (merchant per-chain JSON, then the
+// operator's FINALITY_OVERRIDES env) — only the DEFAULTS differ from the
+// invoice path.
+export const DEFAULT_PAYOUT_CONFIRMATION_THRESHOLDS: Readonly<Record<number, number>> = {
+  1: 2,            // Ethereum — depth-2 reorgs are already rare events
+  10: 1,           // Optimism — sequencer reorgs effectively nonexistent
+  56: 2,           // BSC — fast finality post-Maxwell
+  137: 8,          // Polygon PoS — post-Heimdall-2.0 reorgs are shallow; 8 ≈ 16s
+  42161: 1,        // Arbitrum One
+  8453: 1,         // Base
+  11155111: 1,     // Sepolia testnet
+  800: 1,          // Bitcoin — 1 block on our own spend
+  801: 2,          // Litecoin
+  802: 1,          // Bitcoin testnet3
+  803: 1,          // Litecoin testnet
+  728126428: 2,    // Tron mainnet — 2 × 3s blocks
+  3448148188: 1,   // Tron Nile
+  999: 1           // dev chain
+};
+export const PAYOUT_FALLBACK_CONFIRMATION_THRESHOLD = 2;
+
+// Internal plumbing payouts (gas top-ups, consolidation sweeps) only need
+// the moved funds to be SPENDABLE by the next internal step. One
+// confirmation is the floor at which the chain exposes the balance; if a
+// freak reorg un-confirms it, the dependent broadcast fails "insufficient
+// native balance" and the re-top-up rail recovers automatically — so deeper
+// waits add latency on every payout to defend against a self-healing event.
+export const INTERNAL_PAYOUT_CONFIRMATIONS = 1;
+
+// Payout-side counterpart of `resolveMerchantConfirmationThreshold`. Same
+// precedence (merchant JSON → env FINALITY_OVERRIDES → defaults), but
+// resolves against the outbound default table above.
+export function resolveMerchantPayoutConfirmationThreshold(
+  chainId: number,
+  merchantOverridesJson: string | null,
+  envOverrides?: Readonly<Record<number, number>>
+): number {
+  const merchantOverride = merchantThresholdOverride(chainId, merchantOverridesJson);
+  if (merchantOverride !== null) return merchantOverride;
+  return (
+    envOverrides?.[chainId] ??
+    DEFAULT_PAYOUT_CONFIRMATION_THRESHOLDS[chainId] ??
+    PAYOUT_FALLBACK_CONFIRMATION_THRESHOLD
+  );
 }
 
 // ---- Per-(chain, token) confirmation-tier rules ---------------------------

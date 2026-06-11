@@ -300,7 +300,11 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
   // handoff the guard would have to assume the conservative
   // MIN_EXPECTED_TRC20_ENERGY floor, demanding burn-level TRX even on
   // sources whose rented energy covers the precise (smaller) need.
-  const prepSizingCache = new Map<string, { required: number; at: number }>();
+  // `verified` marks entries where prep CONFIRMED on-chain that the source's
+  // delegated energy covers `required` (covered/rented outcomes) — the
+  // burn-coverage guard then skips its own resource + balance reads, saving
+  // 1-2 RPCs on every rented broadcast.
+  const prepSizingCache = new Map<string, { required: number; verified: boolean; at: number }>();
   function prepSizingKey(args: {
     chainId: number;
     fromAddress: string;
@@ -310,19 +314,19 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
   }): string {
     return `${args.chainId}:${args.fromAddress}:${args.toAddress}:${args.token}:${args.amountRaw}`;
   }
-  function rememberPrepSizing(key: string, required: number): void {
+  function rememberPrepSizing(key: string, required: number, verified = false): void {
     if (prepSizingCache.size > 1024) {
       const now = Date.now();
       for (const [k, v] of prepSizingCache) {
         if (now - v.at > PREP_SIZING_TTL_MS) prepSizingCache.delete(k);
       }
     }
-    prepSizingCache.set(key, { required, at: Date.now() });
+    prepSizingCache.set(key, { required, verified, at: Date.now() });
   }
-  function recallPrepSizing(key: string): number | null {
+  function recallPrepSizing(key: string): { required: number; verified: boolean } | null {
     const entry = prepSizingCache.get(key);
     if (entry === undefined || Date.now() - entry.at > PREP_SIZING_TTL_MS) return null;
-    return entry.required;
+    return { required: entry.required, verified: entry.verified };
   }
 
   return {
@@ -566,12 +570,17 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
         const client = getClient(args.chainId);
 
         // Size the rental off the receiver's actual state, not the burn-
-        // reservation floor (see the RENTAL_ENERGY_* comment block). Running
-        // the simulation FIRST also aborts the rental for doomed transfers —
-        // an insufficient-balance / blacklisted-account revert throws here,
-        // before any provider money moves.
-        const simulated = await simulateTrc20TransferEnergy(client, token.contractAddress, args);
-        const receiverBalance = await readTrc20Balance(client, args.toAddress, token.contractAddress);
+        // reservation floor (see the RENTAL_ENERGY_* comment block). The
+        // four reads are independent — one concurrent round trip instead of
+        // four sequential ones. A doomed transfer (insufficient balance /
+        // blacklisted account) still rejects the whole batch via the
+        // simulation, before any provider money moves.
+        const [simulated, receiverBalance, resources, energyFeeSun] = await Promise.all([
+          simulateTrc20TransferEnergy(client, token.contractAddress, args),
+          readTrc20Balance(client, args.toAddress, token.contractAddress),
+          client.getAccountResources(args.fromAddress),
+          getCachedEnergyFee(args.chainId, client)
+        ]);
         const classEnergy = receiverBalance > 0n ? RENTAL_ENERGY_WARM_RECEIVER : RENTAL_ENERGY_COLD_RECEIVER;
         const required = Math.ceil(
           (Math.max(simulated, classEnergy) * (100 + RENTAL_ENERGY_BUFFER_PERCENT)) / 100
@@ -584,14 +593,17 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
         if (required > MAX_EXPECTED_TRANSFER_ENERGY) return { kind: "none" };
 
         // Only rent the shortfall: operator-staked delegations, leftover
-        // energy from a previous rental on this source (1h window), and the
-        // daily regeneration all count toward the transfer for free.
-        const resources = await client.getAccountResources(args.fromAddress);
+        // energy from a previous rental on this source, and the daily
+        // regeneration all count toward the transfer for free.
         const shortfall = required - resources.energyAvailable;
-        if (shortfall <= 0) return { kind: "covered" };
+        if (shortfall <= 0) {
+          // On-chain coverage confirmed — let buildTransfer's guard skip
+          // its duplicate resource/balance reads.
+          rememberPrepSizing(prepSizingKey(args), required, true);
+          return { kind: "covered" };
+        }
 
         // The number to beat: burning the shortfall at the live chain rate.
-        const energyFeeSun = await getCachedEnergyFee(args.chainId, client);
         const burnCostSun = BigInt(shortfall) * energyFeeSun;
         const dynamicCapSun = Number((energyFeeSun * RENTAL_MAX_UNIT_PRICE_PERCENT) / 100n);
         const maxUnitPriceSun = Math.min(dynamicCapSun, rental.maxUnitPriceSun ?? Number.POSITIVE_INFINITY);
@@ -679,6 +691,7 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
               provider: provider.name,
               error: err instanceof Error ? err.message : String(err)
             });
+            rememberPrepSizing(prepSizingKey(args), required, true);
             return { kind: "covered" };
           }
           log?.warn("tron energy rental order failed; falling back to TRX burn", {
@@ -734,6 +747,7 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
         for (;;) {
           const after = await client.getAccountResources(args.fromAddress).catch(() => null);
           if (after !== null && after.energyAvailable >= required) {
+            rememberPrepSizing(prepSizingKey(args), required, true);
             const costSun = paidSun ?? estimate.totalCostSun;
             log?.info("tron energy rented for broadcast", {
               provider: provider.name,
@@ -849,9 +863,16 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
       // exact transfer (rental flows delegate less than the reservation
       // floor); otherwise the conservative floor applies, which burn-path
       // reservations always cover.
-      const sizedRequired = recallPrepSizing(prepSizingKey(args));
-      const neededEnergy = sizedRequired ?? Math.max(resp.energy_used ?? 0, MIN_EXPECTED_TRC20_ENERGY);
-      const resources = await client.getAccountResources(args.fromAddress).catch(() => null);
+      const sized = recallPrepSizing(prepSizingKey(args));
+      // prepareGasForBroadcast already verified on-chain coverage for this
+      // exact transfer moments ago (covered/rented outcomes) — skip the
+      // duplicate resource + balance reads entirely.
+      const skipGuard = sized !== null && sized.verified;
+      const neededEnergy =
+        sized !== null ? sized.required : Math.max(resp.energy_used ?? 0, MIN_EXPECTED_TRC20_ENERGY);
+      const resources = skipGuard
+        ? null
+        : await client.getAccountResources(args.fromAddress).catch(() => null);
       // RPC flap on the resource read → don't block the broadcast on a
       // guard; the chain remains the final arbiter as before this check.
       if (resources !== null) {
