@@ -33,6 +33,31 @@ const NATIVE_SYMBOLS: Readonly<Record<number, string>> = {
   43114: "AVAX"
 };
 
+// ---- Transfer gas-unit sizing ----
+//
+// Native transfers cost exactly 21k to any non-contract destination. ERC-20
+// transfers are NOT a constant: the recipient's balance-slot state moves the
+// cost by ~17-20k (zero→non-zero SSTORE), and token implementations change
+// underneath us — Tether's in-place upgrade of Polygon USDT to the
+// LayerZero-proxied USDT0 moved transfers from ~50k to ~63k (warm recipient)
+// / ~80k (cold recipient), which made the previous hardcoded 65k pin revert
+// payouts to fresh addresses while identical sends to active addresses
+// succeeded. buildTransfer therefore binds a LIVE per-transfer estimate with
+// headroom; these constants are its guard rails.
+const NATIVE_TRANSFER_GAS = 21_000n;
+// Bound when eth_estimateGas is unavailable (transport flap, provider
+// simulation quirks). Generous on purpose: validators refund unused gas, so
+// the only cost of headroom is a larger native buffer at the pre-broadcast
+// balance check — under-binding bricks the transfer instead.
+const ERC20_FALLBACK_GAS_UNITS = 130_000n;
+// Multiplier on a successful live estimate — covers slot-state drift between
+// build and execution plus chains whose estimator undercounts.
+const ERC20_GAS_HEADROOM = { num: 130n, den: 100n } as const;
+// Refusal ceiling (post-headroom). A standard token transfer never comes
+// close; needing more implies a proxy loop / fee-on-transfer storm that
+// would burn the bound gas for nothing. Bail loudly at build time instead.
+const MAX_ERC20_TRANSFER_GAS = 300_000n;
+
 // Per-chain gas floors. These encode network-level consensus rules (e.g.
 // Polygon's Heimdall v2 mandatory 25 gwei priority) and a small "panic
 // minimum" so a misbehaving RPC reporting 0 gwei doesn't produce a starved
@@ -505,18 +530,52 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       // mempool level, where our bound maxFeePerGas is what's used.
       //
       // 21_000 is the EVM-floor cost of a native transfer and is immutable
-      // for any non-contract destination. 65_000 for ERC-20 covers USDT's
-      // branched impl (~45k), first-send-to-new-address USDC (~55k), and
-      // exotic proxy tokens (up to 80k in the wild) with a modest pad.
-      // Validators only charge for gas actually used, so a small overestimate
-      // on ERC-20 is refunded on-chain and costs the merchant nothing.
+      // for any non-contract destination. ERC-20 gas is NOT a constant —
+      // a hardcoded 65_000 pin caused a production revert on Polygon after
+      // Tether upgraded USDT in place to the LayerZero-proxied USDT0: a
+      // transfer to a zero-balance recipient needs ~80k there (cold
+      // balance-slot SSTORE + proxy overhead) while warm recipients fit in
+      // ~63k — so payouts to fresh addresses reverted mid-execution while
+      // others sailed through. Bind a LIVE estimate against the real
+      // from/to/data instead (state-accurate: cold slots and the current
+      // implementation are both priced in), with ×1.3 headroom for state
+      // drift between build and execution. Validators refund unused gas,
+      // so the headroom costs nothing on success. The estimate is OUR
+      // explicit call with a fallback — an estimate failure (provider
+      // quirks like the BSC simulation above, transport flaps, or the
+      // reason-less USDT revert) degrades to a generous constant and lets
+      // the chain arbitrate, preserving the original motivation for the
+      // pin (never let a vendor's estimator block a valid broadcast).
+      let gas: bigint;
+      if (isNative) {
+        gas = NATIVE_TRANSFER_GAS;
+      } else {
+        const estimated = await getClient(args.chainId)
+          .estimateGas({ account: args.fromAddress as Hex, to, data })
+          .catch(() => null);
+        if (estimated === null) {
+          gas = ERC20_FALLBACK_GAS_UNITS;
+        } else {
+          gas = (estimated * ERC20_GAS_HEADROOM.num) / ERC20_GAS_HEADROOM.den;
+          // Refusal ceiling, same rationale as Tron's MAX_EXPECTED energy
+          // guard: a transfer() needing this much gas is almost certainly
+          // not a standard token (proxy loop, fee-on-transfer storm) and
+          // broadcasting it would burn the merchant's native for nothing.
+          if (gas > MAX_ERC20_TRANSFER_GAS) {
+            throw new Error(
+              `EVM transfer gas estimate ${estimated} (×1.3 = ${gas}) exceeds cap ${MAX_ERC20_TRANSFER_GAS}; ` +
+                `refusing to broadcast. Token ${args.token} on chain ${args.chainId} may not be a standard ERC-20.`
+            );
+          }
+        }
+      }
       const raw: EvmUnsignedTxRaw = {
         to,
         data,
         value,
         from: args.fromAddress as Hex,
         chainId: args.chainId,
-        gas: isNative ? 21_000n : 65_000n
+        gas
       };
 
       // Bind maxFeePerGas / maxPriorityFeePerGas on every EIP-1559 broadcast,
@@ -734,20 +793,21 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         throw new Error(`EVM estimateGas: unknown token ${args.token} on chain ${args.chainId}`);
       }
       // Fallback gas units when live estimation can't run (sender has no
-      // balance, RPC flap, etc.). These are industry-standard defaults:
-      // - Native transfer: 21000 (EVM floor)
-      // - ERC-20 transfer: 65000 covers most ERC-20s; USDT's branched impl
-      //   lands around 45k, a first-send-to-new-address USDC around 55k,
-      //   exotic proxy tokens up to 80k. 65000 is the safe middle — any
-      //   single-digit percent overquote at broadcast time is absorbed by
-      //   the 2× baseFee margin in buildTransfer.
-      const FALLBACK_GAS_UNITS = token.contractAddress === null ? 21_000n : 65_000n;
-      // `eth_estimateGas` SIMULATES the transfer purely as a REFINEMENT of
-      // the gas-units estimate. It is NOT load-bearing: gas units for an
-      // ERC-20 transfer are a fixed storage-write cost (~45–65k) that does
-      // not depend on chain state or who holds the token. So this method
-      // is TOTAL — it never throws. Any `eth_estimateGas` failure simply
-      // falls back to the constant:
+      // balance, RPC flap, etc.):
+      // - Native transfer: 21000 (EVM floor, exact).
+      // - ERC-20 transfer: the generous shared constant. ERC-20 gas is NOT
+      //   a fixed cost — it varies with the recipient's slot state (cold
+      //   zero-balance recipients cost ~17-20k more) and the token's
+      //   implementation (Polygon's in-place USDT0 upgrade moved transfers
+      //   from ~50k to ~63-80k). Quoting the generous constant here keeps
+      //   reservations/top-ups sized to cover whatever buildTransfer binds
+      //   at broadcast; over-reserved native is released at reconciliation,
+      //   while UNDER-quoting causes pre-broadcast balance failures and
+      //   re-top-up churn.
+      const FALLBACK_GAS_UNITS = token.contractAddress === null ? 21_000n : ERC20_FALLBACK_GAS_UNITS;
+      // `eth_estimateGas` SIMULATES the transfer as a refinement of the
+      // gas-units estimate. This method is TOTAL — it never throws. Any
+      // `eth_estimateGas` failure simply falls back to the constant:
       //
       //   - Token-transfer revert — `quoteFeeTiers` calls this with
       //     `fromAddress = destination`, which never holds the token being
@@ -765,10 +825,11 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       //     `quoteFeeTiers`) independently degrades to the chain floor
       //     and marks the quote `degraded`.
       //
-      // The real broadcast re-pins gas via buildTransfer's hardcoded
-      // 21k/65k anyway — this estimate only feeds the fee QUOTE, never
-      // the broadcast. A genuinely-misconfigured chain (no RPC URL at
-      // all) still fails loudly, but at `getClient`, not here.
+      // The real broadcast re-pins gas via buildTransfer (live estimate
+      // ×1.3, or the same fallback constant) — this estimate only feeds
+      // the fee QUOTE and the planner's reservation sizing. A genuinely-
+      // misconfigured chain (no RPC URL at all) still fails loudly, but at
+      // `getClient`, not here.
       try {
         if (token.contractAddress === null) {
           const gas = await client.estimateGas({
@@ -788,7 +849,10 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
           to: token.contractAddress as unknown as Hex,
           data
         });
-        return gas.toString() as AmountRaw;
+        // Mirror buildTransfer's ×1.3 headroom so the quote (and the
+        // reservation sized from it) always covers the gas that broadcast
+        // will actually bind for the same transfer.
+        return ((gas * ERC20_GAS_HEADROOM.num) / ERC20_GAS_HEADROOM.den).toString() as AmountRaw;
       } catch {
         // Any simulation failure → safe constant. See the comment above:
         // there is no `eth_estimateGas` error mode where throwing beats

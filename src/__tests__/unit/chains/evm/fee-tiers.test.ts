@@ -191,9 +191,12 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
     });
 
     const maxFee = (priority: bigint): bigint => 2n * baseFee + priority;
-    expect(quote.low.nativeAmountRaw).toBe((65_000n * maxFee(gwei(2))).toString());
-    expect(quote.medium.nativeAmountRaw).toBe((65_000n * maxFee(gwei(5))).toString());
-    expect(quote.high.nativeAmountRaw).toBe((65_000n * maxFee(gwei(10))).toString());
+    // Quote gas = live estimate × the 1.3 broadcast headroom (mirrors the
+    // gas buildTransfer will bind for the same transfer).
+    const quotedGas = (65_000n * 130n) / 100n;
+    expect(quote.low.nativeAmountRaw).toBe((quotedGas * maxFee(gwei(2))).toString());
+    expect(quote.medium.nativeAmountRaw).toBe((quotedGas * maxFee(gwei(5))).toString());
+    expect(quote.high.nativeAmountRaw).toBe((quotedGas * maxFee(gwei(10))).toString());
     expect(quote.tieringSupported).toBe(true);
   });
 
@@ -255,8 +258,8 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
 
     // With priority floored to 25 gwei and baseFee 0, raw maxFeePerGas = 25
     // gwei; but the maxFee floor is 30 gwei, so all three tiers land at
-    // 30 gwei × 65000 gas.
-    const expected = (65_000n * gwei(30)).toString();
+    // 30 gwei × (65000 estimated gas × 1.3 headroom).
+    const expected = (((65_000n * 130n) / 100n) * gwei(30)).toString();
     expect(quote.low.nativeAmountRaw).toBe(expected);
     expect(quote.medium.nativeAmountRaw).toBe(expected);
     expect(quote.high.nativeAmountRaw).toBe(expected);
@@ -271,7 +274,8 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
     // "execution reverted". This used to re-throw → quoteFeeTiers threw
     // → planPayout's FEE_ESTIMATE_FAILED → ETH USDT payouts were
     // un-plannable. Now: estimateGasForTransfer is TOTAL — any
-    // eth_estimateGas failure falls back to the 65k ERC-20 gas constant.
+    // eth_estimateGas failure falls back to the generous 130k ERC-20 gas
+    // constant (raised from 65k after Polygon's USDT0 upgrade).
     const baseFee = gwei(15);
     const adapter = evmChainAdapter({
       chainIds: [1],
@@ -295,7 +299,7 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
     });
 
     const maxFee = (priority: bigint): bigint => 2n * baseFee + priority;
-    expect(quote.medium.nativeAmountRaw).toBe((65_000n * maxFee(gwei(5))).toString());
+    expect(quote.medium.nativeAmountRaw).toBe((130_000n * maxFee(gwei(5))).toString());
     expect(BigInt(quote.medium.nativeAmountRaw)).toBeGreaterThan(0n);
     expect(quote.tieringSupported).toBe(true);
   });
@@ -323,7 +327,7 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
     });
 
     // Must NOT throw — feeHistory still works here, so we get a real
-    // tiered quote with the 65k fallback gas units.
+    // tiered quote with the 130k fallback gas units.
     const quote = await adapter.quoteFeeTiers({
       chainId: 1,
       fromAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
@@ -332,7 +336,7 @@ describe("evmChainAdapter fee quoting — per-chain floors", () => {
       amountRaw: "1050500000"
     });
     const maxFee = (priority: bigint): bigint => 2n * baseFee + priority;
-    expect(quote.medium.nativeAmountRaw).toBe((65_000n * maxFee(gwei(5))).toString());
+    expect(quote.medium.nativeAmountRaw).toBe((130_000n * maxFee(gwei(5))).toString());
     expect(BigInt(quote.medium.nativeAmountRaw)).toBeGreaterThan(0n);
   });
 
@@ -464,7 +468,8 @@ describe("evmChainAdapter.buildTransfer — fee binding uses the same floor as t
           feeHistory: {
             baseFeePerGas: Array(21).fill(gwei(5)),
             reward: Array(20).fill([gwei(1), gwei(2), gwei(3)])
-          }
+          },
+          estimateGas: 65_000n
         })
       }
     });
@@ -489,6 +494,7 @@ describe("evmChainAdapter.buildTransfer — fee binding uses the same floor as t
       feeTier: "high"
     });
     const erc20Raw = erc20.raw as { gas?: bigint };
-    expect(erc20Raw.gas).toBe(65_000n);
+    // Live estimate (65k) × 1.3 broadcast headroom.
+    expect(erc20Raw.gas).toBe(84_500n);
   });
 });
