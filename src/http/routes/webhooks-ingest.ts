@@ -205,10 +205,13 @@ export function webhooksIngestRouter(deps: AppDeps): Hono {
   // Authentication: BlockCypher doesn't HMAC payloads. Instead, the URL
   // itself is the secret — a `?token=<random>` query param the operator
   // generates once and registers with BlockCypher. We validate it against
-  // `BLOCKCYPHER_INGEST_TOKEN` env (when set) before processing.
-  // Without the env var set, the route accepts any caller — fine for a
-  // private deployment behind a firewall, dangerous on the public internet.
-  // Production deployments should always set the token.
+  // `BLOCKCYPHER_INGEST_TOKEN` env before processing. The check is
+  // FAIL-CLOSED: when the env var is unset/empty the route refuses every
+  // caller with 404 NOT_CONFIGURED (matching the strategy-missing path)
+  // instead of trusting the payload's `outputs[].value`/`confirmations`
+  // from anyone on the internet. Config validation additionally requires
+  // the token in production/staging whenever BlockCypher push detection
+  // is enabled (see config.schema.ts).
   //
   // The route ack is fast: defer the actual ingest to deps.jobs so a
   // slow DB write doesn't block BlockCypher's retry budget.
@@ -218,15 +221,23 @@ export function webhooksIngestRouter(deps: AppDeps): Hono {
     if (!Number.isFinite(chainId) || chainId <= 0) {
       return c.json({ error: { code: "BAD_CHAIN_ID" } }, 400);
     }
-    // Optional URL token. When `BLOCKCYPHER_INGEST_TOKEN` is set we require
-    // it; otherwise the route accepts any caller.
+    // Required URL token, fail-closed. An unset/empty `BLOCKCYPHER_INGEST_TOKEN`
+    // means the ingest endpoint is not configured — refuse the request rather
+    // than accept unauthenticated payloads (an attacker could otherwise forge
+    // `outputs[].value` / `confirmations` and mint confirmed payments). 404
+    // NOT_CONFIGURED matches the strategy-missing path below so operators see
+    // "not set up" consistently; real bad tokens get 401.
     const expectedToken = deps.secrets.getOptional("BLOCKCYPHER_INGEST_TOKEN");
-    if (expectedToken !== undefined && expectedToken.length > 0) {
-      const provided = c.req.query("token") ?? "";
-      // Constant-time compare to avoid timing oracle on the token.
-      if (!constantTimeEqualHex(provided, expectedToken)) {
-        return c.json({ error: { code: "UNAUTHORIZED" } }, 401);
-      }
+    if (expectedToken === undefined || expectedToken.length === 0) {
+      return c.json(
+        { error: { code: "NOT_CONFIGURED", message: "BlockCypher ingest not enabled" } },
+        404
+      );
+    }
+    const provided = c.req.query("token") ?? "";
+    // Constant-time compare to avoid timing oracle on the token.
+    if (!constantTimeEqualHex(provided, expectedToken)) {
+      return c.json({ error: { code: "UNAUTHORIZED" } }, 401);
     }
     const strategy = deps.pushStrategies["blockcypher-notify"];
     if (strategy === undefined) {

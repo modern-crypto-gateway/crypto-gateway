@@ -88,6 +88,13 @@ export interface MoneroTxOutput {
   readonly publicKey: string; // hex 32 bytes — `output_public_keys[i]` AKA "K"
   // Encrypted amount (hex 8 bytes) for RingCT v2/v3. Null on coinbase.
   readonly encryptedAmount: string | null;
+  // Pedersen commitment (hex 32 bytes) from `rct_signatures.outPk[i]`.
+  // Monero stores outPk as the ACTUAL commitment point C = mask·G + amount·H.
+  // Null on coinbase / pre-RingCT txs (plaintext amounts, no commitments).
+  // SECURITY: `encryptedAmount` (ecdhInfo) is NOT consensus-validated — the
+  // scanner must verify any decoded amount against this commitment before
+  // crediting, otherwise a malicious payer can fake deposit amounts.
+  readonly commitment: string | null;
 }
 
 export interface MoneroParsedTx {
@@ -108,6 +115,12 @@ export interface MoneroParsedTx {
   // Coinbase txs never credit an external view-key holder; we still surface
   // them so callers can skip cleanly.
   readonly isCoinbase: boolean;
+  // `unlock_time` from the tx prefix. 0 for virtually every real payment.
+  // Non-zero means ALL outputs of the tx are time-locked: a value below
+  // 500_000_000 is a block height, anything above is a unix timestamp.
+  // The scanner skips any tx with a non-zero value (fail closed) — see the
+  // policy comment in monero-chain.adapter.ts.
+  readonly unlockTime: number;
 }
 
 export interface MoneroDaemonRpcClient {
@@ -301,7 +314,11 @@ export function moneroDaemonRpcClient(config: MoneroDaemonRpcConfig): MoneroDaem
         }
         const outputs: MoneroTxOutput[] = (parsed.vout ?? []).map((vout, i) => ({
           publicKey: vout.target?.key ?? vout.target?.tagged_key?.key ?? "",
-          encryptedAmount: parsed.rct_signatures?.ecdhInfo?.[i]?.amount ?? null
+          encryptedAmount: parsed.rct_signatures?.ecdhInfo?.[i]?.amount ?? null,
+          // outPk[i] is the output's Pedersen commitment for all RingCT
+          // types; absent on coinbase / pre-RingCT (type 0) txs where the
+          // amount is plaintext instead.
+          commitment: parsed.rct_signatures?.outPk?.[i] ?? null
         }));
         const blockHeight = t.in_pool ? null : (typeof t.block_height === "number" ? t.block_height : null);
         out.push({
@@ -312,7 +329,8 @@ export function moneroDaemonRpcClient(config: MoneroDaemonRpcConfig): MoneroDaem
           txPubkey: extraKeys.primary ?? "",
           additionalPubkeys: extraKeys.additional,
           outputs,
-          isCoinbase: parsed.vin?.[0]?.gen !== undefined
+          isCoinbase: parsed.vin?.[0]?.gen !== undefined,
+          unlockTime: typeof parsed.unlock_time === "number" ? parsed.unlock_time : 0
         });
       }
       return out;
@@ -360,6 +378,10 @@ export function parseMoneroRpcHeadersEnv(value: string | undefined): Readonly<Re
 // Shape of a tx's `as_json` decoded payload — only the fields we touch.
 interface ParsedTxJson {
   readonly extra?: readonly number[]; // bytes (uint8 array as JSON numbers)
+  // uint64 in the tx prefix; 0 = unlocked. Heights < 500_000_000, unix
+  // timestamps above. (Extremely large timestamps can lose precision
+  // through JSON.parse, but any non-zero value is skipped anyway.)
+  readonly unlock_time?: number;
   readonly vin?: ReadonlyArray<{ readonly gen?: unknown; readonly key?: unknown }>;
   readonly vout?: ReadonlyArray<{
     readonly target?: {
@@ -369,6 +391,8 @@ interface ParsedTxJson {
   }>;
   readonly rct_signatures?: {
     readonly ecdhInfo?: ReadonlyArray<{ readonly amount?: string }>;
+    // Per-output Pedersen commitments (hex 32 bytes each) for RingCT txs.
+    readonly outPk?: ReadonlyArray<string>;
   };
 }
 

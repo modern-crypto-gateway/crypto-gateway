@@ -9,6 +9,7 @@ import type { Payout, PayoutId } from "../types/payout.js";
 import { TokenSymbolSchema, type TokenSymbol } from "../types/token.js";
 import { findToken } from "../types/token-registry.js";
 import type { SignerScope } from "../types/signer.js";
+import type { UnsignedTx } from "../types/unsigned-tx.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { drizzleRowToPayout } from "./mappers.js";
 import {
@@ -23,7 +24,7 @@ import { addressPool, merchants, payoutBroadcasts, payoutReservations, payouts, 
 import { isUniqueViolation } from "./db-errors.js";
 import { decodeP2wpkhAddress } from "../../adapters/chains/utxo/bech32-address.js";
 import { computeSpendable } from "./balance-snapshot.service.js";
-import { loadSpendableUtxos, selectCoins } from "./utxo-coin-select.js";
+import { loadSpendableUtxos, selectCoins, type CoinSelectionResult } from "./utxo-coin-select.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
 import { buildUtxoUnsignedTx } from "../../adapters/chains/utxo/utxo-chain.adapter.js";
 import {
@@ -265,6 +266,64 @@ function isSqliteBusy(err: unknown): boolean {
   }
   if (e.cause !== undefined) return isSqliteBusy(e.cause);
   return false;
+}
+
+// ---- Broadcast-error classification ----
+//
+// A broadcast failure is only safe to treat as TERMINAL when the chain
+// definitively rejected the transaction — it never entered the mempool
+// ("nonce too low", "insufficient funds", dust, signature errors, ...).
+// Transport-level failures — timeouts, connection resets, gateway 5xx —
+// are AMBIGUOUS: the tx may have reached the node and be propagating even
+// though our HTTP call errored. Terminally failing an ambiguous outcome is
+// how double payouts happen (merchant receives payout.failed, retries, and
+// the original lands too), so broadcast catch blocks must keep the payout
+// in flight on "ambiguous" and only call failPayout on "definitive".
+//
+// Default is "definitive": it preserves the historical fail-fast behavior
+// for signing bugs, validation errors, and chain rejections. Only
+// recognizable transport/timeout signatures (plus "already known"-style
+// responses, which mean the tx IS in the mempool) downgrade to "ambiguous".
+const AMBIGUOUS_BROADCAST_ERROR_PATTERNS: readonly RegExp[] = [
+  // Generic transport / socket failures (undici fetch, node:net, viem HTTP).
+  /\btimed? ?out\b/i,
+  /\btimeout\b/i,
+  /\baborted?\b/i,
+  /\bsocket hang ?up\b/i,
+  /\bnetwork\b/i, // includes esplora's wrapped "status=network"
+  /\bfetch failed\b/i,
+  /ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH/,
+  // viem's transport error classes surface via err.name.
+  /HttpRequestError|TimeoutError|AbortError|WebSocketRequestError/,
+  /request took too long/i,
+  // Gateway-layer HTTP failures where the node may still have seen the tx.
+  /\bbad gateway\b|\bservice unavailable\b|\bgateway time-?out\b/i,
+  /status[=: ]?5\d\d/i,
+  // The node already has the tx — an earlier broadcast (ours) succeeded.
+  /already.?known/i,
+  /already in (the )?mempool/i,
+  /already in block ?chain/i,
+  /transaction already exists/i
+];
+
+export function classifyBroadcastError(err: unknown): "definitive" | "ambiguous" {
+  // Adapters wrap errors in layers (drizzle-style `cause` chains, esplora's
+  // EsploraBackendError, viem's BaseError) — collect message/name/code from
+  // every layer so a buried ETIMEDOUT still classifies correctly.
+  const haystack: string[] = [];
+  let cursor: unknown = err;
+  for (let depth = 0; depth < 6 && typeof cursor === "object" && cursor !== null; depth += 1) {
+    const e = cursor as { message?: unknown; name?: unknown; code?: unknown; cause?: unknown };
+    if (typeof e.message === "string") haystack.push(e.message);
+    if (typeof e.name === "string") haystack.push(e.name);
+    if (typeof e.code === "string") haystack.push(e.code);
+    cursor = e.cause;
+  }
+  if (haystack.length === 0) haystack.push(String(err));
+  const text = haystack.join(" | ");
+  return AMBIGUOUS_BROADCAST_ERROR_PATTERNS.some((p) => p.test(text))
+    ? "ambiguous"
+    : "definitive";
 }
 
 // Convert a human-decimal string ("1.5") to the token's smallest-unit uint256
@@ -1929,10 +1988,12 @@ async function startTopUpFromReservation(
     webhookSecretCiphertext: null
   });
 
-  // Broadcast the top-up tx.
-  let topUpTxHash: string;
+  // Build + sign-prep for the top-up tx. Errors here are PRE-broadcast —
+  // nothing reached the network, so terminally failing is safe.
+  let unsignedTopUp: UnsignedTx;
+  let sponsorPrivateKey: string;
   try {
-    const unsigned = await chainAdapter.buildTransfer({
+    unsignedTopUp = await chainAdapter.buildTransfer({
       chainId: parent.chainId,
       fromAddress: sponsorAddress,
       toAddress: parent.sourceAddress,
@@ -1940,8 +2001,7 @@ async function startTopUpFromReservation(
       amountRaw: parent.topUpAmountRaw as AmountRaw,
       feeTier: "high"
     });
-    const privateKey = await deps.signerStore.get(sponsorScope);
-    topUpTxHash = await chainAdapter.signAndBroadcast(unsigned, privateKey);
+    sponsorPrivateKey = await deps.signerStore.get(sponsorScope);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return failPayout(
@@ -1951,22 +2011,71 @@ async function startTopUpFromReservation(
     );
   }
 
+  // Broadcast the top-up tx. Only DEFINITIVE chain rejections may terminally
+  // fail here; an ambiguous transport/timeout error means the tx may already
+  // be propagating — failing now would release the sponsor reservation while
+  // the top-up is potentially live. Leave the parent in `topping-up` with
+  // topUpTxHash NULL instead: executeTopUp's existing grace-window path owns
+  // the eventual decision (and top-up funds only move between gateway-owned
+  // addresses, so the worst case is internal ledger drift, never a merchant
+  // double payout).
+  let topUpTxHash: string;
+  try {
+    topUpTxHash = await chainAdapter.signAndBroadcast(unsignedTopUp, sponsorPrivateKey);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (classifyBroadcastError(err) === "definitive") {
+      return failPayout(
+        deps, parent, "TOP_UP_BROADCAST_FAILED",
+        `Top-up tx (${sponsorAddress} → ${parent.sourceAddress}) failed: ${message}`,
+        topUpId
+      );
+    }
+    deps.logger.error("payout.top_up.broadcast_outcome_unknown", {
+      payoutId: parent.id,
+      topUpId,
+      chainId: parent.chainId,
+      sponsor: sponsorAddress,
+      source: parent.sourceAddress,
+      detail: message.slice(0, 4096)
+    });
+    return "deferred";
+  }
+
+  // Post-broadcast persistence. The top-up tx is live on-chain at this
+  // point, so a DB hiccup (SQLITE_BUSY is the common one) must NEVER fail
+  // the payout — retry with backoff, and if it still fails, log loudly and
+  // defer: the parent stays `topping-up` and the grace-window path picks it
+  // up. Both UPDATEs are idempotent, so re-running the pair on retry is safe.
   const now2 = deps.clock.now().getTime();
-  await deps.db
-    .update(payouts)
-    .set({ status: "submitted", txHash: topUpTxHash, submittedAt: now2, updatedAt: now2 })
-    .where(eq(payouts.id, topUpId));
-  // Status is already 'topping-up' from the CAS at the start; just fill in
-  // the broadcast metadata so the next executor tick's polling has the
-  // tx hash to query against.
-  await deps.db
-    .update(payouts)
-    .set({
-      topUpTxHash,
-      topUpSponsorAddress: sponsorAddress,
-      updatedAt: now2
-    })
-    .where(eq(payouts.id, parent.id));
+  try {
+    await runWithBusyRetry(deps, async () => {
+      await deps.db
+        .update(payouts)
+        .set({ status: "submitted", txHash: topUpTxHash, submittedAt: now2, updatedAt: now2 })
+        .where(eq(payouts.id, topUpId));
+      // Status is already 'topping-up' from the CAS at the start; just fill in
+      // the broadcast metadata so the next executor tick's polling has the
+      // tx hash to query against.
+      await deps.db
+        .update(payouts)
+        .set({
+          topUpTxHash,
+          topUpSponsorAddress: sponsorAddress,
+          updatedAt: now2
+        })
+        .where(eq(payouts.id, parent.id));
+    });
+  } catch (err) {
+    deps.logger.error("payout.top_up.post_broadcast_persist_failed", {
+      payoutId: parent.id,
+      topUpId,
+      chainId: parent.chainId,
+      txHash: topUpTxHash,
+      error: err instanceof Error ? err.message : String(err)
+    });
+    return "deferred";
+  }
 
   deps.logger.info("payout.top_up.broadcast", {
     payoutId: parent.id,
@@ -2147,6 +2256,11 @@ async function broadcastMain(
     return "deferred";
   }
 
+  // ---- (a) Pre-broadcast prep: build + key resolution. Nothing has
+  // reached the network yet, so failures here are safe to fail terminally.
+  let unsigned: UnsignedTx;
+  let privateKey: string;
+  let feePayerPrivateKey: string | undefined;
   try {
     // Decide the fee-wallet topology for this specific payout. We route
     // through the co-sign path when:
@@ -2162,7 +2276,6 @@ async function broadcastMain(
     // signing-topology selector — no balance logic lives in it.
     const capability = chainAdapter.feeWalletCapability(row.chainId as ChainId);
     let feePayerAddress: string | undefined;
-    let feePayerPrivateKey: string | undefined;
     if (capability === "co-sign") {
       const feeWallet = await deps.feeWalletStore.get(chainAdapter.family);
       if (feeWallet !== null && feeWallet.address !== source.address) {
@@ -2173,7 +2286,7 @@ async function broadcastMain(
         });
       }
     }
-    const unsigned = await chainAdapter.buildTransfer({
+    unsigned = await chainAdapter.buildTransfer({
       chainId: row.chainId,
       fromAddress: source.address,
       toAddress: row.destinationAddress,
@@ -2189,19 +2302,107 @@ async function broadcastMain(
       family: chainAdapter.family,
       derivationIndex: source.derivationIndex
     };
-    const privateKey = await deps.signerStore.get(scope);
-    const txHash = await chainAdapter.signAndBroadcast(
+    privateKey = await deps.signerStore.get(scope);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+  }
+
+  // ---- (b) The broadcast itself. Definitive chain rejections (nonce too
+  // low, insufficient funds, dust, ...) are safe to fail terminally — the
+  // tx never entered the mempool. Ambiguous transport/timeout errors are
+  // NOT: the tx may be propagating, and failing the payout here would emit
+  // payout.failed + release reservations while the transfer is potentially
+  // live on-chain (merchant retries → double payout). On ambiguous errors
+  // we keep the row in its current status (`reserved`/`topping-up`) with
+  // `broadcastAttemptedAt` claimed — the CAS guarantees no second broadcast
+  // — and leave resolution to the operator/reconciler.
+  let txHash: TxHash;
+  try {
+    txHash = await chainAdapter.signAndBroadcast(
       unsigned,
       privateKey,
       feePayerPrivateKey !== undefined ? { feePayerPrivateKey } : undefined
     );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Broadcast-time re-top-up (Fix A2): the plan→broadcast window spans several
+    // cron ticks, so baseFee can climb past the top-up sized at plan time and
+    // the EVM adapter's pre-broadcast check rejects the sweep for insufficient
+    // native. Rather than failing terminally, re-evaluate at CURRENT gas and
+    // fund another top-up (bounded). Scoped to that specific shortfall by
+    // matching the adapter's error string. (This check runs BEFORE the EVM
+    // adapter sends anything, so it is a definitive, no-broadcast outcome.)
+    if (message.includes("insufficient native balance")) {
+      return reTopUpForBroadcast(deps, row, chainAdapter, source, message);
+    }
+    if (classifyBroadcastError(err) === "definitive") {
+      return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+    }
+    deps.logger.error("payout.broadcast_outcome_unknown", {
+      payoutId: row.id,
+      chainId: row.chainId,
+      sourceAddress: source.address,
+      detail: message.slice(0, 4096)
+    });
+    // Best-effort breadcrumb for operators (admin views read lastError).
+    // Status deliberately unchanged; reservations deliberately kept.
+    try {
+      await runWithBusyRetry(deps, () =>
+        deps.db
+          .update(payouts)
+          .set({
+            lastError: `[SOURCE_BROADCAST_FAILED] Broadcast outcome unknown (transport error); payout held for reconciliation, not failed.`,
+            updatedAt: deps.clock.now().getTime()
+          })
+          .where(eq(payouts.id, row.id))
+      );
+    } catch (breadcrumbErr) {
+      deps.logger.error("payout.broadcast_outcome_unknown_breadcrumb_failed", {
+        payoutId: row.id,
+        error: breadcrumbErr instanceof Error ? breadcrumbErr.message : String(breadcrumbErr)
+      });
+    }
+    return "deferred";
+  }
 
-    const now2 = deps.clock.now().getTime();
-    await deps.db
-      .update(payouts)
-      .set({ status: "submitted", txHash, submittedAt: now2, updatedAt: now2 })
-      .where(eq(payouts.id, row.id));
+  // ---- (c) Post-broadcast persistence: the tx is live on-chain. A DB
+  // error here (SQLITE_BUSY is the common one) must NEVER fail the payout —
+  // that would emit payout.failed + release reservations for a tx that is
+  // already in flight. Retry with backoff; if it STILL fails, log loudly
+  // and leave the row in its current status with the broadcastAttemptedAt
+  // breadcrumb (the CAS blocks any re-broadcast) for operator recovery.
+  const now2 = deps.clock.now().getTime();
+  try {
+    await runWithBusyRetry(deps, () =>
+      deps.db
+        .update(payouts)
+        .set({ status: "submitted", txHash, submittedAt: now2, updatedAt: now2 })
+        .where(eq(payouts.id, row.id))
+    );
+  } catch (err) {
+    deps.logger.error("payout.post_broadcast_persist_failed", {
+      payoutId: row.id,
+      chainId: row.chainId,
+      txHash,
+      error: err instanceof Error ? err.message : String(err)
+    });
+    // Last-ditch breadcrumb: try to at least pin the txHash on the row so
+    // recovery can correlate the on-chain tx. Best-effort only.
+    try {
+      await deps.db
+        .update(payouts)
+        .set({ txHash, updatedAt: now2 })
+        .where(eq(payouts.id, row.id));
+    } catch {
+      // Nothing more we can safely do — the loud log above carries the txHash.
+    }
+    return "deferred";
+  }
 
+  // Event publishing is observability, not state — never let it fail the
+  // payout after a successful broadcast + commit.
+  try {
     const updated = await fetchPayout(deps, row.id);
     if (updated) {
       await deps.events.publish({
@@ -2211,20 +2412,14 @@ async function broadcastMain(
         at: new Date(now2)
       });
     }
-    return "submitted";
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    // Broadcast-time re-top-up (Fix A2): the plan→broadcast window spans several
-    // cron ticks, so baseFee can climb past the top-up sized at plan time and
-    // the EVM adapter's pre-broadcast check rejects the sweep for insufficient
-    // native. Rather than failing terminally, re-evaluate at CURRENT gas and
-    // fund another top-up (bounded). Scoped to that specific shortfall by
-    // matching the adapter's error string.
-    if (message.includes("insufficient native balance")) {
-      return reTopUpForBroadcast(deps, row, chainAdapter, source, message);
-    }
-    return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+    deps.logger.error("payout.submitted_event_publish_failed", {
+      payoutId: row.id,
+      txHash,
+      error: err instanceof Error ? err.message : String(err)
+    });
   }
+  return "submitted";
 }
 
 // Max gas top-ups we'll send for a single payout before giving up. Each
@@ -2370,10 +2565,13 @@ async function reTopUpForBroadcast(
 // source address that signs everything; UTXO chains coin-select across all
 // owned UTXOs, derive a per-input key from each UTXO's stored
 // `addressIndex`, and (when there's leftover) emit a fresh-derived change
-// output. The whole thing — broadcast + mark-spent — happens inside a
-// single DB transaction so a process crash mid-flight either rolls back
-// (clean retry on next tick) or commits atomically (UTXOs marked spent +
-// payout in `submitted`).
+// output. Structured in three sections with distinct failure semantics:
+//   (a) pre-broadcast prep — safe to terminally fail (nothing on-chain),
+//   (b) the broadcast — only DEFINITIVE node rejections may fail the
+//       payout; ambiguous transport errors hold it for reconciliation,
+//   (c) post-broadcast persistence (mark-spent + `submitted` + RBF journal
+//       in one busy-retried DB transaction) — must NEVER fail the payout,
+//       because the tx is already live on-chain.
 async function broadcastUtxoMain(
   deps: AppDeps,
   row: typeof payouts.$inferSelect,
@@ -2397,6 +2595,16 @@ async function broadcastUtxoMain(
     return "deferred";
   }
 
+  // ---- (a) Pre-broadcast prep: fee quote, coinselect, output/tx build,
+  // per-input key derivation. Nothing reaches the network in this block,
+  // so failures here are safe to terminally fail.
+  let feeRate: number;
+  let selection: CoinSelectionResult;
+  let unsigned: UnsignedTx;
+  const inputPrivateKeys: Array<{ address: Address; privateKey: string }> = [];
+  let changeAddressIndex: number | null = null;
+  let changeAddress: string | null = null;
+  let changeVout: number | null = null;
   try {
     // Determine fee rate (sat/vB) from the merchant's chosen tier. The
     // adapter's quoteFeeTiers returns fee = TYPICAL_VBYTES × rate; we
@@ -2415,16 +2623,16 @@ async function broadcastUtxoMain(
       token: row.token as TokenSymbol,
       amountRaw: row.amountRaw as AmountRaw
     });
-    const feeRate = Math.max(1, Math.ceil(Number(tierQuote[tier].nativeAmountRaw) / TYPICAL_VBYTES));
+    feeRate = Math.max(1, Math.ceil(Number(tierQuote[tier].nativeAmountRaw) / TYPICAL_VBYTES));
 
     // Load every spendable UTXO, run coinselect.
     const spendable = await loadSpendableUtxos(deps, row.chainId as ChainId);
-    const selection = selectCoins(
+    const picked = selectCoins(
       spendable,
       [{ address: row.destinationAddress, value: Number(row.amountRaw) }],
       feeRate
     );
-    if (selection === null) {
+    if (picked === null) {
       // Funds were verified at plan time, but a concurrent payout could
       // have consumed them between then and now. Surface as a clean
       // failure; merchant can retry once balance recovers.
@@ -2433,6 +2641,7 @@ async function broadcastUtxoMain(
         `coinselect could not assemble inputs at fee rate ${feeRate} sat/vB — UTXOs may have been spent by a concurrent payout`
       );
     }
+    selection = picked;
 
     // Build outputs. The first entry is the merchant's destination; any
     // entry without `address` is the change output, which we synthesize a
@@ -2449,9 +2658,6 @@ async function broadcastUtxoMain(
     }
     const seed = deps.secrets.getRequired("MASTER_SEED");
     const outputs: Array<{ scriptPubkey: string; value: bigint }> = [];
-    let changeAddressIndex: number | null = null;
-    let changeAddress: string | null = null;
-    let changeVout: number | null = null;
     for (const o of selection.outputs) {
       if (o.address === undefined) {
         // Change output: allocate a fresh P2WPKH address from the same counter.
@@ -2475,7 +2681,7 @@ async function broadcastUtxoMain(
     }
 
     // Build the unsigned tx + derive private keys for each chosen input.
-    const unsigned = buildUtxoUnsignedTx(
+    unsigned = buildUtxoUnsignedTx(
       row.chainId as ChainId,
       selection.chosenInputs.map((u) => ({
         txid: u.txId,
@@ -2486,7 +2692,6 @@ async function broadcastUtxoMain(
       })),
       outputs
     );
-    const inputPrivateKeys: Array<{ address: Address; privateKey: string }> = [];
     for (const u of selection.chosenInputs) {
       const pk = await deps.signerStore.get({
         kind: "pool-address",
@@ -2500,71 +2705,162 @@ async function broadcastUtxoMain(
       inputPrivateKeys.push({ address: u.address as Address, privateKey: pk });
     }
 
-    const txHash = await chainAdapter.signAndBroadcast(unsigned, "", { inputPrivateKeys });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+  }
 
-    // Atomically mark UTXOs spent + flip the payout to `submitted` + journal
-    // attempt 1 in payout_broadcasts (the RBF audit log). If the broadcast
-    // succeeded but this DB transaction fails, the next executor tick
-    // re-enters `broadcastUtxoMain`, the broadcastAttemptedAt CAS returns
-    // deferred (already set). The DB tx is local writes only — no external I/O.
-    const now2 = deps.clock.now().getTime();
-    const utxoIds = selection.chosenInputs.map((u) => u.utxoId);
-    // Estimate vsize for the journaled attempt — coinselect's fee already
-    // reflects the chosen vbyte budget so we recover it via fee/feeRate.
-    const estimatedVsize = Math.max(1, Math.round(selection.fee / feeRate));
-    const rbfInputs: RbfInput[] = selection.chosenInputs.map((u) => ({
-      utxoId: u.utxoId,
-      txid: u.txId,
-      vout: u.vout,
-      value: u.value,
-      scriptPubkey: u.scriptPubkey,
-      address: u.address,
-      addressIndex: u.addressIndex
-    }));
-    const changeOutput = selection.outputs.find((o) => o.address === undefined);
-    await deps.db.transaction(async (tx) => {
-      await tx
-        .update(utxos)
-        .set({ spentInPayoutId: row.id, spentAt: now2 })
-        .where(inArray(utxos.id, utxoIds));
-      await tx
-        .update(payouts)
-        .set({
-          status: "submitted",
-          txHash,
-          submittedAt: now2,
-          updatedAt: now2,
-          // Stash the actual fee paid for audit; coinselect's `fee` is the
-          // exact sats consumed.
-          feeEstimateNative: selection.fee.toString()
-        })
-        .where(eq(payouts.id, row.id));
-      await journalInitialBroadcast(deps, {
-        payoutId: row.id,
-        txHash: String(txHash),
-        feeSats: BigInt(selection.fee),
-        vsize: estimatedVsize,
-        feerateSatVb: feeRate,
-        inputs: rbfInputs,
-        changeAddress,
-        changeValueSats: changeOutput ? BigInt(changeOutput.value) : null,
-        changeAddressIndex,
-        changeVout,
-        tx
-      });
+  // ---- (b) The broadcast itself. Definitive node rejections (bad-txns-*,
+  // min relay fee, dust, script failures) are safe to terminally fail — the
+  // tx never entered the mempool. Ambiguous transport/timeout errors are
+  // NOT: the tx may be propagating, and calling failPayout here would emit
+  // payout.failed while the transfer is potentially live on-chain (merchant
+  // retries → double payout) AND leave the chosen inputs unmarked for
+  // coinselect to double-select. On ambiguous errors keep the row
+  // `reserved` with `broadcastAttemptedAt` claimed — the CAS guarantees no
+  // second broadcast — and leave resolution to the operator/reconciler.
+  let txHash: TxHash;
+  try {
+    txHash = await chainAdapter.signAndBroadcast(unsigned, "", { inputPrivateKeys });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (classifyBroadcastError(err) === "definitive") {
+      return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+    }
+    deps.logger.error("payout.utxo.broadcast_outcome_unknown", {
+      payoutId: row.id,
+      chainId: row.chainId,
+      inputCount: selection.chosenInputs.length,
+      detail: message.slice(0, 4096)
     });
+    // Best-effort operator breadcrumb; status + claimed broadcast slot
+    // deliberately untouched.
+    try {
+      await runWithBusyRetry(deps, () =>
+        deps.db
+          .update(payouts)
+          .set({
+            lastError:
+              "[SOURCE_BROADCAST_FAILED] Broadcast outcome unknown (transport error); payout held for reconciliation, not failed.",
+            updatedAt: deps.clock.now().getTime()
+          })
+          .where(eq(payouts.id, row.id))
+      );
+    } catch (breadcrumbErr) {
+      deps.logger.error("payout.utxo.broadcast_outcome_unknown_breadcrumb_failed", {
+        payoutId: row.id,
+        error: breadcrumbErr instanceof Error ? breadcrumbErr.message : String(breadcrumbErr)
+      });
+    }
+    return "deferred";
+  }
 
-    deps.logger.info("payout.utxo.broadcast", {
+  // ---- (c) Post-broadcast persistence: the tx is live on-chain from here
+  // on, so NOTHING below may fail the payout — failPayout would emit
+  // payout.failed for a live tx (merchant retries → double payout).
+  //
+  // First, pin the txHash on the row in a minimal retry-wrapped UPDATE so
+  // that even if the bigger transaction below loses, recovery can correlate
+  // the on-chain tx from the payout row alone.
+  const now2 = deps.clock.now().getTime();
+  try {
+    await runWithBusyRetry(deps, () =>
+      deps.db
+        .update(payouts)
+        .set({ txHash, updatedAt: now2 })
+        .where(eq(payouts.id, row.id))
+    );
+  } catch (err) {
+    deps.logger.error("payout.utxo.txhash_breadcrumb_failed", {
+      payoutId: row.id,
+      txHash,
+      error: err instanceof Error ? err.message : String(err)
+    });
+    // Keep going — the main transaction below writes txHash as well.
+  }
+
+  // Atomically mark UTXOs spent + flip the payout to `submitted` + journal
+  // attempt 1 in payout_broadcasts (the RBF audit log). The DB tx is local
+  // writes only — no external I/O — but SQLITE_BUSY is common under
+  // concurrent writers, so it runs under runWithBusyRetry. If it STILL
+  // fails we log loudly and leave the row in `reserved` with the txHash +
+  // broadcastAttemptedAt breadcrumbs: the CAS blocks any re-broadcast on
+  // the next tick, and the worst case for the unmarked inputs is a
+  // definitive "bad-txns-inputs-missingorspent" rejection on a competing
+  // payout — never a double payout.
+  const utxoIds = selection.chosenInputs.map((u) => u.utxoId);
+  // Estimate vsize for the journaled attempt — coinselect's fee already
+  // reflects the chosen vbyte budget so we recover it via fee/feeRate.
+  const estimatedVsize = Math.max(1, Math.round(selection.fee / feeRate));
+  const rbfInputs: RbfInput[] = selection.chosenInputs.map((u) => ({
+    utxoId: u.utxoId,
+    txid: u.txId,
+    vout: u.vout,
+    value: u.value,
+    scriptPubkey: u.scriptPubkey,
+    address: u.address,
+    addressIndex: u.addressIndex
+  }));
+  const changeOutput = selection.outputs.find((o) => o.address === undefined);
+  try {
+    await runWithBusyRetry(deps, () =>
+      deps.db.transaction(async (tx) => {
+        await tx
+          .update(utxos)
+          .set({ spentInPayoutId: row.id, spentAt: now2 })
+          .where(inArray(utxos.id, utxoIds));
+        await tx
+          .update(payouts)
+          .set({
+            status: "submitted",
+            txHash,
+            submittedAt: now2,
+            updatedAt: now2,
+            // Stash the actual fee paid for audit; coinselect's `fee` is the
+            // exact sats consumed.
+            feeEstimateNative: selection.fee.toString()
+          })
+          .where(eq(payouts.id, row.id));
+        await journalInitialBroadcast(deps, {
+          payoutId: row.id,
+          txHash: String(txHash),
+          feeSats: BigInt(selection.fee),
+          vsize: estimatedVsize,
+          feerateSatVb: feeRate,
+          inputs: rbfInputs,
+          changeAddress,
+          changeValueSats: changeOutput ? BigInt(changeOutput.value) : null,
+          changeAddressIndex,
+          changeVout,
+          tx
+        });
+      })
+    );
+  } catch (err) {
+    deps.logger.error("payout.utxo.post_broadcast_persist_failed", {
       payoutId: row.id,
       chainId: row.chainId,
       txHash,
-      inputCount: selection.chosenInputs.length,
-      outputCount: selection.outputs.length,
-      feeSats: selection.fee,
-      changeAddress: changeAddress ?? null,
-      changeAddressIndex
+      utxoIds,
+      error: err instanceof Error ? err.message : String(err)
     });
+    return "deferred";
+  }
 
+  deps.logger.info("payout.utxo.broadcast", {
+    payoutId: row.id,
+    chainId: row.chainId,
+    txHash,
+    inputCount: selection.chosenInputs.length,
+    outputCount: selection.outputs.length,
+    feeSats: selection.fee,
+    changeAddress: changeAddress ?? null,
+    changeAddressIndex
+  });
+
+  // Event publishing is observability, not state — never let it fail the
+  // payout after a successful broadcast + commit.
+  try {
     const updated = await fetchPayout(deps, row.id);
     if (updated) {
       await deps.events.publish({
@@ -2574,11 +2870,14 @@ async function broadcastUtxoMain(
         at: new Date(now2)
       });
     }
-    return "submitted";
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+    deps.logger.error("payout.submitted_event_publish_failed", {
+      payoutId: row.id,
+      txHash,
+      error: err instanceof Error ? err.message : String(err)
+    });
   }
+  return "submitted";
 }
 
 // On UTXO payout confirmation, re-import the change output back into the

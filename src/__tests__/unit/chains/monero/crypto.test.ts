@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import {
+  computeRctCommitment,
   decodeRctAmount,
   deriveSharedSecret,
   deriveSubaddress,
@@ -10,6 +11,7 @@ import {
   expectedOutputPubkey,
   hashToScalar,
   parseAddress,
+  verifyRctCommitment,
   viewKeyMatchesAddress
 } from "../../../../adapters/chains/monero/monero-crypto.js";
 import {
@@ -323,6 +325,68 @@ describe("decodeRctAmount", () => {
     expect(() =>
       decodeRctAmount({ sharedSecret, encryptedAmount: new Uint8Array(7) })
     ).toThrow();
+  });
+});
+
+describe("RingCT commitment verification (fake-deposit defense)", () => {
+  // Monero's fixed second generator H (rct::H) — pinned here independently
+  // of monero-crypto.ts so the test catches a corrupted constant there.
+  const H_HEX = "8b655970153799af2aeadc9ff1add0ea6c7251d54154cfa92c173a0dd39c1f94";
+
+  function hexToBytes(hex: string): Uint8Array {
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i += 1) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return out;
+  }
+
+  // Independently construct C = mask·G + amount·H exactly as a sender's
+  // wallet does (rctOps.cpp: genCommitmentMask + addKeys2), WITHOUT going
+  // through computeRctCommitment — so the test isn't circular.
+  function senderSideCommitment(sharedSecret: Uint8Array, amount: bigint): Uint8Array {
+    const tag = new TextEncoder().encode("commitment_mask");
+    const pre = new Uint8Array(tag.length + sharedSecret.length);
+    pre.set(tag, 0);
+    pre.set(sharedSecret, tag.length);
+    const mask = leBytesToBigIntMod(keccak_256(pre), ED25519_L);
+    const H = ed25519.Point.fromBytes(hexToBytes(H_HEX));
+    return ed25519.Point.BASE.multiply(mask).add(H.multiply(amount)).toBytes();
+  }
+
+  it("accepts a commitment independently constructed as mask·G + amount·H", () => {
+    const sharedSecret = keccak_256(new TextEncoder().encode("commit-test-shared"));
+    const amount = 150000000000n; // 0.15 XMR
+    const commitment = senderSideCommitment(sharedSecret, amount);
+    expect(verifyRctCommitment({ sharedSecret, amount, commitment })).toBe(true);
+    // computeRctCommitment must reproduce the same point byte-for-byte.
+    expect(Buffer.from(computeRctCommitment({ sharedSecret, amount })).toString("hex"))
+      .toBe(Buffer.from(commitment).toString("hex"));
+  });
+
+  it("rejects a tampered amount (attacker commits dust but claims the invoice total)", () => {
+    const sharedSecret = keccak_256(new TextEncoder().encode("commit-test-fake"));
+    // The fake-deposit shape: the on-chain commitment locks in 1 piconero,
+    // but ecdhInfo decodes to the full invoice amount.
+    const committed = 1n;
+    const claimed = 150000000000n;
+    const commitment = senderSideCommitment(sharedSecret, committed);
+    expect(verifyRctCommitment({ sharedSecret, amount: claimed, commitment })).toBe(false);
+    // Sanity: the same commitment verifies for the amount it actually locks.
+    expect(verifyRctCommitment({ sharedSecret, amount: committed, commitment })).toBe(true);
+  });
+
+  it("rejects a wrong shared secret, corrupted commitment bytes, and wrong-length input", () => {
+    const sharedSecret = keccak_256(new TextEncoder().encode("commit-test-misc"));
+    const amount = 42_000_000_000n;
+    const commitment = senderSideCommitment(sharedSecret, amount);
+    // Wrong shared secret → different mask → mismatch.
+    const otherSecret = keccak_256(new TextEncoder().encode("commit-test-other"));
+    expect(verifyRctCommitment({ sharedSecret: otherSecret, amount, commitment })).toBe(false);
+    // Single-byte corruption → mismatch.
+    const corrupted = commitment.slice();
+    corrupted[0] = corrupted[0]! ^ 0x01;
+    expect(verifyRctCommitment({ sharedSecret, amount, commitment: corrupted })).toBe(false);
+    // Wrong length → fail closed (false, no throw).
+    expect(verifyRctCommitment({ sharedSecret, amount, commitment: commitment.subarray(0, 31) })).toBe(false);
   });
 });
 

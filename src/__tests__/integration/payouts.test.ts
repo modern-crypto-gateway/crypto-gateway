@@ -321,6 +321,70 @@ describe("PayoutService.executeReservedPayouts", () => {
       await booted.close();
     }
   });
+
+  it("ambiguous transport error during broadcast defers the payout and keeps reservations (no double payout)", async () => {
+    // A timeout means the tx MAY have reached the chain. Terminally failing
+    // here would emit payout.failed + release the source reservation while
+    // the transfer is potentially live on-chain — the merchant would retry
+    // and pay twice. The executor must hold the payout instead.
+    let broadcastCalls = 0;
+    const base = devChainAdapter({ deterministicTxHashes: true });
+    const flaky = {
+      ...base,
+      async signAndBroadcast(): Promise<never> {
+        broadcastCalls += 1;
+        throw new Error("request timed out after 10000ms");
+      }
+    };
+    const booted = await bootTestApp({ chains: [flaky] });
+    try {
+      await seedFeeWallet(booted, { label: "ambiguous-1" });
+      const planned = await planPayout(booted.deps, {
+        merchantId: MERCHANT_ID,
+        chainId: 999,
+        token: "DEV",
+        amountRaw: "1",
+        destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      });
+      const events: string[] = [];
+      booted.deps.events.subscribeAll((e) => { events.push(e.type); });
+
+      const result = await executeReservedPayouts(booted.deps);
+      expect(result).toEqual({ attempted: 1, submitted: 0, failed: 0, deferred: 1 });
+
+      const [row] = await booted.deps.db
+        .select({
+          status: payouts.status,
+          last_error: payouts.lastError,
+          broadcast_attempted_at: payouts.broadcastAttemptedAt
+        })
+        .from(payouts)
+        .where(eq(payouts.id, planned.id))
+        .limit(1);
+      // NOT failed — held in its current status for reconciliation.
+      expect(row?.status).toBe("reserved");
+      // The broadcast slot stays claimed so no tick can re-send.
+      expect(row?.broadcast_attempted_at).not.toBeNull();
+      // Operator breadcrumb on the row.
+      expect(row?.last_error).toContain("outcome unknown");
+      expect(events).not.toContain("payout.failed");
+
+      // Reservations stay live — the source funds are NOT freed for re-spend.
+      const active = await booted.deps.db
+        .select({ id: payoutReservations.id })
+        .from(payoutReservations)
+        .where(isNull(payoutReservations.releasedAt));
+      expect(active.length).toBeGreaterThan(0);
+
+      // Next tick must NOT re-broadcast (broadcastAttemptedAt CAS holds the
+      // slot): exactly one signAndBroadcast attempt, ever.
+      const second = await executeReservedPayouts(booted.deps);
+      expect(second.failed).toBe(0);
+      expect(broadcastCalls).toBe(1);
+    } finally {
+      await booted.close();
+    }
+  });
 });
 
 describe("PayoutService.confirmPayouts", () => {

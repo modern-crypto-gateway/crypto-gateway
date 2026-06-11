@@ -293,7 +293,76 @@ export function decodeRctAmount(args: {
   return out;
 }
 
+// Monero's fixed second Pedersen generator H (rct::H in
+// monero/src/ringct/rctTypes.h) — the point used for the amount component
+// of output commitments: C = mask·G + amount·H. Derived in the reference
+// implementation as to_point(keccak(G)); we pin the canonical compressed
+// encoding directly.
+const MONERO_H_HEX = "8b655970153799af2aeadc9ff1add0ea6c7251d54154cfa92c173a0dd39c1f94";
+const MONERO_H = ed25519.Point.fromBytes(hexToBytesInternal(MONERO_H_HEX));
+
+// Recompute the Pedersen commitment a RingCT output MUST carry for a given
+// decoded amount:
+//   mask = Hs("commitment_mask" || sharedSecret)   (rctOps.cpp:genCommitmentMask
+//          — same domain-tag construction as decodeRctAmount's "amount" tag)
+//   C'   = mask·G + amount·H
+// Monero stores `rct_signatures.outPk[i]` as the ACTUAL commitment point, so
+// callers compare C' byte-equal against outPk.
+export function computeRctCommitment(args: {
+  sharedSecret: Uint8Array; // 32 bytes — deriveSharedSecret output
+  amount: bigint; // atomic units (piconero), uint64
+}): Uint8Array {
+  if (args.amount < 0n) {
+    throw new Error("computeRctCommitment: negative amount");
+  }
+  const tag = new TextEncoder().encode("commitment_mask");
+  const preimage = new Uint8Array(tag.length + args.sharedSecret.length);
+  preimage.set(tag, 0);
+  preimage.set(args.sharedSecret, tag.length);
+  const mask = hashToScalar(preimage);
+  // mask = 0 is cryptographically unreachable (keccak preimage), but fall
+  // back to the identity point rather than letting noble throw on a zero
+  // scalar. Same for amount = 0 (a real, if unusual, RingCT amount).
+  const maskPart = mask === 0n ? ed25519.Point.ZERO : ed25519.Point.BASE.multiply(mask);
+  const amountScalar = args.amount % ED25519_L;
+  const amountPart = amountScalar === 0n ? ed25519.Point.ZERO : MONERO_H.multiply(amountScalar);
+  return maskPart.add(amountPart).toBytes();
+}
+
+// Verify a decoded RingCT amount against the output's consensus-validated
+// Pedersen commitment. The `ecdhInfo` amount field is NOT validated by
+// Monero consensus — a malicious payer who knows the tx secret can commit
+// ~0 XMR while encoding a large amount in ecdhInfo (fake-deposit attack).
+// The commitment IS validated (range proofs + balance check), so a
+// byte-equal match of C' = mask·G + amount·H against outPk proves the
+// decoded amount is the real on-chain value. Returns false on mismatch or
+// malformed input — callers must treat false as "amount 0 / do not credit"
+// (wallet2 behavior).
+export function verifyRctCommitment(args: {
+  sharedSecret: Uint8Array;
+  amount: bigint;
+  commitment: Uint8Array; // 32 bytes — rct_signatures.outPk[i]
+}): boolean {
+  if (args.commitment.length !== 32) return false;
+  let expected: Uint8Array;
+  try {
+    expected = computeRctCommitment({ sharedSecret: args.sharedSecret, amount: args.amount });
+  } catch {
+    return false;
+  }
+  return constantTimeEqual(expected, args.commitment);
+}
+
 // ---- Internal helpers ----
+
+function hexToBytesInternal(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) throw new Error("hexToBytesInternal: odd-length hex");
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
 
 function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;

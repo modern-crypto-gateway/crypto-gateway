@@ -12,6 +12,7 @@ import {
   deriveSharedSecret,
   expectedOutputPubkey,
   parseAddress,
+  verifyRctCommitment,
   viewKeyMatchesAddress
 } from "./monero-crypto.js";
 import { MONERO_MAINNET_CONFIG, type MoneroChainConfig } from "./monero-config.js";
@@ -354,6 +355,22 @@ export function moneroChainAdapter(config: MoneroChainAdapterConfig): MoneroChai
         }
         for (const tx of txs) {
           if (tx.isCoinbase) continue; // miner txs never credit a view-key holder
+          // unlock_time policy: skip ANY tx with a non-zero unlock_time.
+          // unlock_time delays spendability of every output in the tx —
+          // values below 500_000_000 are block heights, anything above is
+          // a unix timestamp. Legitimate payers never set it; crediting a
+          // locked output would let a "payer" show a confirmed deposit the
+          // merchant cannot actually spend for years. Distinguishing
+          // already-satisfied locks from future ones adds clock/height
+          // parsing risk for zero real-world benefit, so the gateway
+          // treats any non-zero value as suspicious and fails closed.
+          if (tx.unlockTime !== 0) {
+            logger?.warn(
+              "monero scanIncoming: tx has non-zero unlock_time; skipping all outputs (time-locked funds are not creditable)",
+              { chainId, txHash: tx.txHash, unlockTime: tx.unlockTime }
+            );
+            continue;
+          }
           // Each output has up to TWO candidate tx pubkeys to try:
           //   1. The primary R (tx_extra tag 0x01) — used when the sender
           //      treats the recipient as a primary address.
@@ -438,6 +455,46 @@ export function moneroChainAdapter(config: MoneroChainAdapterConfig): MoneroChai
               continue;
             }
             if (amountRaw <= 0n) continue;
+            // SECURITY: verify the decoded amount against the output's
+            // Pedersen commitment (rct_signatures.outPk[i]). The ecdhInfo
+            // field we just decoded is NOT consensus-validated — a
+            // malicious payer who knows the tx secret can commit ~0 XMR
+            // while encoding the full invoice amount in ecdhInfo (fake
+            // deposit). The commitment IS consensus-validated, so
+            // recomputing C' = Hs("commitment_mask"||ss)·G + amount·H and
+            // comparing byte-equal proves the amount is real. On mismatch,
+            // wallet2 treats the output as amount 0 — we skip it. This
+            // check only applies to RingCT outputs decoded via
+            // decodeRctAmount; coinbase/plaintext-amount txs never reach
+            // this branch (coinbase is filtered above, and pre-RingCT
+            // outputs carry no encryptedAmount so they're skipped earlier).
+            if (!output.commitment) {
+              // Fail closed: every RingCT output carries outPk. Missing
+              // here means the RPC layer couldn't surface it — never
+              // credit an amount we cannot verify.
+              logger?.warn(
+                "monero scanIncoming: output has no Pedersen commitment from RPC; skipping (fail closed, cannot verify amount)",
+                { chainId, txHash: tx.txHash, outputIndex: i }
+              );
+              continue;
+            }
+            let commitmentBytes: Uint8Array;
+            try {
+              commitmentBytes = hexToBytes(output.commitment);
+            } catch {
+              logger?.warn(
+                "monero scanIncoming: output commitment is not valid hex; skipping (fail closed)",
+                { chainId, txHash: tx.txHash, outputIndex: i }
+              );
+              continue;
+            }
+            if (!verifyRctCommitment({ sharedSecret, amount: amountRaw, commitment: commitmentBytes })) {
+              logger?.warn(
+                "monero scanIncoming: decoded ecdhInfo amount does NOT match the output's Pedersen commitment; skipping (possible fake-deposit attempt)",
+                { chainId, txHash: tx.txHash, outputIndex: i }
+              );
+              continue;
+            }
             const blockHeight = tx.blockHeight ?? height;
             transfers.push({
               chainId: chain.chainId,

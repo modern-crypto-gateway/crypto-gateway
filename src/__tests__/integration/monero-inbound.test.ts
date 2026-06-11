@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { bootTestApp } from "../helpers/boot.js";
 import { initializeMoneroPool, releaseMoneroFromInvoice } from "../../core/domain/monero-pool.service.js";
 import {
+  computeRctCommitment,
   encodeAddress,
   parseAddress
 } from "../../adapters/chains/monero/monero-crypto.js";
@@ -410,10 +411,17 @@ describe("Monero detection — happy path", () => {
         txPubkey: txPubkeyHex,
         additionalPubkeys: [],
         isCoinbase: false,
+        unlockTime: 0,
         outputs: [
           {
             publicKey: bytesToHex(Kout),
-            encryptedAmount: bytesToHex(encrypted)
+            encryptedAmount: bytesToHex(encrypted),
+            // Real Pedersen commitment for the real amount — the scanner
+            // now refuses to credit outputs whose commitment doesn't match
+            // the decoded ecdhInfo amount.
+            commitment: bytesToHex(
+              computeRctCommitment({ sharedSecret: sharedScalarBytes, amount: realAmount })
+            )
           }
         ]
       });
@@ -574,8 +582,15 @@ describe("Monero detection — happy path", () => {
         txPubkey: decoyPrimary,
         additionalPubkeys: [bytesToHex(additionalTxPubkey)],
         isCoinbase: false,
+        unlockTime: 0,
         outputs: [
-          { publicKey: bytesToHex(Kout), encryptedAmount: bytesToHex(encrypted) }
+          {
+            publicKey: bytesToHex(Kout),
+            encryptedAmount: bytesToHex(encrypted),
+            commitment: bytesToHex(
+              computeRctCommitment({ sharedSecret: sharedScalarBytes, amount: realAmount })
+            )
+          }
         ]
       });
 
@@ -614,10 +629,12 @@ describe("Monero detection — happy path", () => {
             txPubkey: bytesToHex(keccak_256(new TextEncoder().encode("foreign-tx-pub"))),
             additionalPubkeys: [],
             isCoinbase: false,
+            unlockTime: 0,
             outputs: [
               {
                 publicKey: bytesToHex(keccak_256(new TextEncoder().encode("foreign-output"))),
-                encryptedAmount: "0102030405060708"
+                encryptedAmount: "0102030405060708",
+                commitment: null
               }
             ]
           }));
@@ -656,6 +673,157 @@ describe("Monero detection — happy path", () => {
         sinceMs: 0
       });
       expect(transfers).toHaveLength(0);
+    } finally {
+      await booted.close();
+    }
+  });
+
+  // Fake-deposit + unlock_time defenses. Four txs land in one block, all
+  // cryptographically addressed to the invoice's subaddress:
+  //   (a) honest: ecdhInfo amount matches the Pedersen commitment, unlock 0;
+  //   (b) fake deposit: commitment locks 1 piconero, ecdhInfo claims the
+  //       full invoice amount (Monero consensus does NOT validate ecdhInfo,
+  //       so this tx is perfectly relayable by a malicious payer);
+  //   (c) time-locked: valid amount/commitment but non-zero unlock_time;
+  //   (d) no commitment surfaced by the RPC layer (must fail closed).
+  // Only (a) may be credited.
+  it("scanIncoming credits only commitment-verified, unlocked outputs (fake-deposit + unlock_time)", async () => {
+    const w = makeWallet("detect-secure");
+    const booted = await bootTestApp({ merchants: [{ id: MERCHANT_ID }] });
+    try {
+      let stubTipHeight = 0;
+      const stubBlockTxs = new Map<number, readonly string[]>();
+      const stubTxs = new Map<string, MoneroParsedTx>();
+      const daemonClient: MoneroDaemonRpcClient = {
+        async getTipHeight() { return stubTipHeight; },
+        async getBlockTxHashesByHeight(h) { return stubBlockTxs.get(h) ?? []; },
+        async getTransactions(hashes) {
+          return hashes.map((h) => stubTxs.get(h)).filter((t): t is MoneroParsedTx => t !== undefined);
+        }
+      };
+      const adapter = moneroChainAdapter({
+        chain: MONERO_MAINNET_CONFIG,
+        primaryAddress: w.primaryAddress,
+        viewKey: w.viewKey,
+        restoreHeight: 100,
+        daemonClient,
+        cache: booted.deps.cache,
+        logger: booted.logger
+      });
+      (booted.deps.chains as unknown as Array<typeof adapter>).push(adapter);
+      await initializeMoneroPool(booted.deps, { initialSize: 5 });
+
+      const apiKey = booted.apiKeys[MERCHANT_ID]!;
+      const created = await booted.app.fetch(
+        new Request("http://test.local/api/v1/invoices", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({ chainId: MONERO_CHAIN_ID, token: "XMR", amountRaw: "150000000000" })
+        })
+      );
+      expect(created.status).toBe(201);
+      const invoice = ((await created.json()) as { invoice: { receiveAddress: string } }).invoice;
+      const subParsed = parseAddress(invoice.receiveAddress);
+      const D = ed25519.Point.fromBytes(subParsed.publicSpendKey);
+      const C = ed25519.Point.fromBytes(subParsed.publicViewKey);
+
+      // Synthesize a paying tx to the subaddress with independent control
+      // over the CLAIMED amount (ecdhInfo) vs. the COMMITTED amount
+      // (Pedersen commitment) and the unlock_time.
+      function synthesize(args: {
+        rSeed: string;
+        claimedAmount: bigint;
+        committedAmount: bigint | null; // null = RPC surfaced no commitment
+        unlockTime: number;
+        txHash: string;
+      }): MoneroParsedTx {
+        const r = leBytesToBigIntMod(
+          keccak_256(new TextEncoder().encode(args.rSeed)),
+          ED25519_L
+        );
+        const txPubkeyHex = bytesToHex(D.multiply(r).toBytes());
+        const derivationBytes = C.multiply(r).multiply(8n).toBytes();
+        const sharedPreimage = new Uint8Array(derivationBytes.length + 1);
+        sharedPreimage.set(derivationBytes, 0);
+        sharedPreimage[derivationBytes.length] = 0; // varint(0)
+        const sharedScalarBytes = scalarToLEBytes32(
+          leBytesToBigIntMod(keccak_256(sharedPreimage), ED25519_L)
+        );
+        const sharedScalar = leBytesToBigIntMod(sharedScalarBytes, ED25519_L);
+        const Kout = ed25519.Point.BASE.multiply(sharedScalar).add(D).toBytes();
+        const amountPreimage = new Uint8Array("amount".length + 32);
+        amountPreimage.set(new TextEncoder().encode("amount"), 0);
+        amountPreimage.set(sharedScalarBytes, "amount".length);
+        const amountMask = keccak_256(amountPreimage);
+        const encrypted = new Uint8Array(8);
+        let av = args.claimedAmount;
+        for (let i = 0; i < 8; i += 1) {
+          encrypted[i] = (Number(av & 0xffn) ^ amountMask[i]!) & 0xff;
+          av >>= 8n;
+        }
+        return {
+          txHash: args.txHash,
+          blockHeight: 105,
+          txPubkey: txPubkeyHex,
+          additionalPubkeys: [],
+          isCoinbase: false,
+          unlockTime: args.unlockTime,
+          outputs: [
+            {
+              publicKey: bytesToHex(Kout),
+              encryptedAmount: bytesToHex(encrypted),
+              commitment:
+                args.committedAmount === null
+                  ? null
+                  : bytesToHex(
+                      computeRctCommitment({
+                        sharedSecret: sharedScalarBytes,
+                        amount: args.committedAmount
+                      })
+                    )
+            }
+          ]
+        };
+      }
+
+      const invoiceAmount = 150000000000n;
+      const honest = synthesize({
+        rSeed: "secure-r-honest", claimedAmount: invoiceAmount,
+        committedAmount: invoiceAmount, unlockTime: 0, txHash: "aa".repeat(32)
+      });
+      const fakeDeposit = synthesize({
+        rSeed: "secure-r-fake", claimedAmount: invoiceAmount,
+        committedAmount: 1n, unlockTime: 0, txHash: "bb".repeat(32)
+      });
+      const timeLocked = synthesize({
+        rSeed: "secure-r-locked", claimedAmount: invoiceAmount,
+        committedAmount: invoiceAmount, unlockTime: 3_500_000, txHash: "cc".repeat(32)
+      });
+      const noCommitment = synthesize({
+        rSeed: "secure-r-nocommit", claimedAmount: invoiceAmount,
+        committedAmount: null, unlockTime: 0, txHash: "dd".repeat(32)
+      });
+
+      stubTipHeight = 110;
+      const allTxs = [honest, fakeDeposit, timeLocked, noCommitment];
+      stubBlockTxs.set(105, allTxs.map((t) => t.txHash));
+      for (const t of allTxs) stubTxs.set(t.txHash, t);
+
+      const transfers = await adapter.scanIncoming({
+        chainId: MONERO_CHAIN_ID,
+        addresses: [invoice.receiveAddress as never],
+        tokens: ["XMR" as never],
+        sinceMs: 0
+      });
+      // ONLY the honest tx is credited.
+      expect(transfers).toHaveLength(1);
+      expect(transfers[0]!.txHash).toBe(honest.txHash);
+      expect(transfers[0]!.amountRaw).toBe(invoiceAmount.toString());
+      // Each rejection produced an operator-visible warning.
+      const warns = booted.logger.entries.filter((e) => e.level === "warn").map((e) => e.message);
+      expect(warns.some((m) => m.includes("fake-deposit"))).toBe(true);
+      expect(warns.some((m) => m.includes("unlock_time"))).toBe(true);
+      expect(warns.some((m) => m.includes("no Pedersen commitment"))).toBe(true);
     } finally {
       await booted.close();
     }
