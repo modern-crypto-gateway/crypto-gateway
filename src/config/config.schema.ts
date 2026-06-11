@@ -88,6 +88,58 @@ export const AppConfigSchema = z
     // to ~1/5 of cron frequency at the cost of proportional detection lag.
     tronPollIntervalMs: z.coerce.number().int().min(0).optional(),
 
+    // Energy rental for Tron TRC-20 payouts. When any provider's credentials
+    // are set, the payout executor rents delegated energy whenever that's
+    // strictly cheaper than burning TRX at the chain rate, with automatic
+    // fallback to burning on any provider failure — rental can lower a
+    // payout's cost but never raise it. When MULTIPLE providers are
+    // configured, every payout quotes all of them and the cheapest viable
+    // estimate wins.
+    //
+    // tronenergy.market (TEM): cheapest market observed for 10-min rentals
+    // (~35 SUN/unit effective vs TronSave's ~65 → cold-receiver USDT payout
+    // ~5 TRX vs ~8.7). Needs BOTH the API key and the TEM account address
+    // the key was issued for; orders draw from that account's prepaid
+    // credit (deposit ≥10 TRX to TEM's deposit address; withdrawals are
+    // locked 48h after a deposit). Mainnet only — skipped on Nile.
+    tronEnergyMarketApiKey: z.string().optional(),
+    tronEnergyMarketAddress: z.string().optional(),
+    // TronSave: pricier but battle-tested, with server-side price caps and
+    // a Nile dev environment. Orders draw from a prepaid TRX balance at
+    // tronsave.io; keep the float small (1-2 weeks of payout volume) —
+    // withdrawing it back is a manual support flow. TRON_NETWORK=nile
+    // selects TronSave's dev environment automatically (separate key +
+    // balance).
+    tronsaveApiKey: z.string().optional(),
+    // Pin rental to one provider by name, bypassing cheapest-wins selection
+    // across configured markets. Use while a non-withdrawable prepaid
+    // balance must be drained first (TronSave deposits can only be
+    // recovered via manual support). Pinning a provider that isn't
+    // configured disables rental (burn path) with a startup warning rather
+    // than silently substituting another market. Unset = cheapest wins.
+    tronEnergyRentalProvider: z.enum(["tronsave", "tronenergy.market"]).optional(),
+
+    // The knobs below apply to energy rental as a whole (every configured
+    // provider), despite the TRONSAVE_ prefix kept for compatibility with
+    // existing deployments.
+    //
+    // Absolute cap in SUN per energy unit, applied on top of the built-in
+    // dynamic ceiling (90% of the live chain burn rate). Unset = dynamic
+    // ceiling only.
+    tronsaveMaxUnitPriceSun: z.coerce.number().int().min(1).optional(),
+    // Rental duration in seconds. Sub-day pricing is mostly flat with a
+    // premium for longer windows (TronSave: 65 SUN at 10min vs 67.25 at 1h;
+    // TEM: 35 SUN/day-rate for 5min-1h, billed as duration+1day), so the
+    // 10min default is the cheapest practical bucket — the energy is
+    // consumed seconds after the fill anyway. Raise it only if the same
+    // sources broadcast repeatedly and you want leftover delegation reused
+    // across payouts.
+    tronsaveDurationSec: z.coerce.number().int().min(60).default(600),
+    // How long the executor waits for a rental order to fill before
+    // cancelling it (providers that support it) or deferring the payout to
+    // the next cron tick.
+    tronsaveFillTimeoutMs: z.coerce.number().int().min(1000).default(30000),
+
     // Solana wiring:
     //   - SOLANA_RPC_URL (explicit; wins over Alchemy auto-construction)
     //   - ALCHEMY_API_KEY (reused for EVM) auto-builds the Solana URL when
@@ -334,6 +386,13 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     trongridApiKey: env["TRONGRID_API_KEY"],
     tronNetwork: env["TRON_NETWORK"],
     tronPollIntervalMs: env["TRON_POLL_INTERVAL_MS"],
+    tronEnergyMarketApiKey: env["TRONENERGY_MARKET_API_KEY"],
+    tronEnergyMarketAddress: env["TRONENERGY_MARKET_ADDRESS"],
+    tronEnergyRentalProvider: env["TRON_ENERGY_RENTAL_PROVIDER"],
+    tronsaveApiKey: env["TRONSAVE_API_KEY"],
+    tronsaveMaxUnitPriceSun: env["TRONSAVE_MAX_UNIT_PRICE_SUN"],
+    tronsaveDurationSec: env["TRONSAVE_DURATION_SEC"],
+    tronsaveFillTimeoutMs: env["TRONSAVE_FILL_TIMEOUT_MS"],
     solanaRpcUrl: env["SOLANA_RPC_URL"],
     solanaNetwork: env["SOLANA_NETWORK"],
     moneroPrimaryAddress: env["MONERO_PRIMARY_ADDRESS"],

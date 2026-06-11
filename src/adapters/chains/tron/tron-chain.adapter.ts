@@ -1,7 +1,9 @@
 import { HDKey } from "@scure/bip32";
 import { cachedMnemonicToSeed } from "../../crypto/mnemonic-cache.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
-import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.ts";
+import type { ChainAdapter, FeeTierQuote, GasPrepResult } from "../../../core/ports/chain.port.ts";
+import type { Logger } from "../../../core/ports/logger.port.js";
+import type { EnergyRentalEstimate, EnergyRentalProvider } from "../../energy-rental/energy-rental.port.js";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
@@ -76,6 +78,84 @@ const MIN_EXPECTED_TRC20_ENERGY = 135_000;
 const DEFAULT_ACCOUNT_INDEX = 0;
 const DEFAULT_CHANGE_INDEX = 0;
 
+// ---- Energy-rental sizing (prepareGasForBroadcast) ----
+//
+// Rental sizing deliberately does NOT reuse MIN_EXPECTED_TRC20_ENERGY. That
+// floor (×1.30 safety) exists to size BURN-path TRX reservations, where the
+// reserve is refunded at reconciliation if unspent — over-reserving is free.
+// Rented energy is PAID for up front, so renting the reservation-sized 135k
+// for a warm 65k transfer would hand most of the rental savings back.
+//
+// Instead we size off the two deterministic USDT/TRC-20 cost classes, picked
+// by reading the receiver's token balance right before renting:
+//   - warm receiver (already holds the token): ~64.3k energy observed —
+//     the balance-slot SSTORE is a 5k "non-zero → non-zero" write.
+//   - cold receiver (zero balance): ~130.3k — the slot write is the 20k
+//     "zero → non-zero" class plus contract-internal first-touch overhead.
+// We take max(simulation, class constant) so a contract that genuinely
+// reports MORE than the class cost is still fully covered, then add a small
+// buffer for the dynamic-energy-model drift: popular contracts (USDT) carry
+// an energy_factor penalty recalculated every 6h maintenance cycle, so the
+// cost observed at sizing time can grow a few percent by broadcast.
+//
+// The buffer is deliberately THIN. An undershoot is not fatal: Tron spends
+// the delegated energy first and burns the source's TRX only for the GAP
+// (at the chain rate, under fee_limit) — and the planner's burn-path
+// reservation always covers that worst case. The expected gap-burn from a
+// rare maintenance-cycle drift is far smaller than paying rent on a fat
+// buffer for every payout: production data showed the original 8% buffer
+// over-buying ~11k energy (~0.75 TRX) on a cold USDT transfer whose class
+// constant alone already exceeded the actual on-chain consumption.
+const RENTAL_ENERGY_WARM_RECEIVER = 65_000;
+const RENTAL_ENERGY_COLD_RECEIVER = 131_000;
+const RENTAL_ENERGY_BUFFER_PERCENT = 2;
+
+// Never bid above this fraction of the chain's live burn rate (getEnergyFee,
+// 100 SUN/unit today) for rented energy. Passed to the provider as a hard
+// server-side price ceiling (maxPriceAccepted), so a filled order is
+// mathematically guaranteed ≥10% cheaper per unit than burning. Market rates
+// run ~60-70% of burn, so this cap doesn't reject normal fills — it only
+// guards squeezed markets.
+const RENTAL_MAX_UNIT_PRICE_PERCENT = 90n;
+
+// Don't bother renting unless the estimate beats the burn path by at least
+// this much (SUN). Sub-0.5-TRX wins aren't worth the added provider round
+// trips + fill latency on the executor hot path; skipping rental === the
+// pre-rental burn behavior, so this can never make a payout dearer.
+const RENTAL_DEFAULT_MIN_SAVINGS_SUN = 500_000n;
+
+// 10 minutes. Live TronSave order-book reads (2026-06) priced 131k energy at
+// 65 SUN for 600s vs 67.25 for 1h vs 86.5 for 1 day — sub-day pricing is
+// mostly flat with a small duration premium, so 10min is the cheapest bucket
+// that still matters. Duration is only load-bearing between fill and
+// broadcast (seconds in the happy path — energy, once consumed, doesn't care
+// when the delegation expires) and 600s still covers a deferred retry on the
+// next executor tick. Going shorter saves ~nothing further.
+const RENTAL_DEFAULT_DURATION_SEC = 600;
+
+// Fill + on-chain-visibility polling. All-or-nothing orders match against
+// live supply at creation, so fills land in seconds; the timeout exists for
+// provider hiccups, after which the payout defers to the next tick rather
+// than burning on top of a paid order.
+const RENTAL_DEFAULT_FILL_TIMEOUT_MS = 30_000;
+const RENTAL_DEFAULT_VERIFY_TIMEOUT_MS = 15_000;
+const RENTAL_DEFAULT_POLL_INTERVAL_MS = 3_000;
+
+// Bandwidth a TRC-20 transfer consumes (~345 bytes) with margin. Used by the
+// rental-aware free-gas probe: a source whose remaining daily bandwidth
+// covers the tx bytes needs NO liquid TRX at plan time when energy is rented
+// at broadcast (every activated account regenerates 600 free bandwidth/day).
+const TRON_BANDWIDTH_PER_TRANSFER = 400;
+
+// Sun burned for bandwidth when the free allowance is exhausted
+// (~345 bytes × 1000 SUN/byte, rounded up).
+const TRON_BANDWIDTH_BURN_SUN = 350_000n;
+
+// TTL for the prepareGasForBroadcast → buildTransfer sizing handoff. Both
+// run in the same executor pass seconds apart; the TTL only bounds staleness
+// across crashed/retried passes.
+const PREP_SIZING_TTL_MS = 120_000;
+
 // TTL for the per-chain latest-block cache used inside getConfirmationStatus.
 // One cron tick fans out one info+nowblock query per active confirming tx;
 // nowblock is identical for every tx in that tick, so coalesce calls within
@@ -132,6 +212,31 @@ export interface TronChainConfig {
   maxScanWindowMs?: number;
   // Fee limit in sun for payout txs. Defaults to 100 TRX.
   feeLimitSun?: number;
+  // Optional energy-rental market integration. When set, the executor's
+  // prepareGasForBroadcast hook rents delegated energy for TRC-20 payouts
+  // whenever that's strictly cheaper than burning TRX — and falls back to
+  // the burn path on any provider failure. Absent = pure burn (pre-rental
+  // behavior).
+  energyRental?: TronEnergyRentalConfig;
+}
+
+export interface TronEnergyRentalConfig {
+  // Rental markets to quote. Every provider estimates the same shortfall
+  // and the cheapest viable quote wins the order — the others are the
+  // fallback when its book is thin or its API is down. Order in the array
+  // is irrelevant (selection is by price).
+  providers: readonly EnergyRentalProvider[];
+  // Absolute operator cap in SUN per energy unit, applied on top of the
+  // dynamic ceiling (RENTAL_MAX_UNIT_PRICE_PERCENT of the live burn rate).
+  maxUnitPriceSun?: number;
+  // Rental duration (default 10min — see RENTAL_DEFAULT_DURATION_SEC).
+  durationSec?: number;
+  // Minimum SUN the rental must save vs burning before it's attempted.
+  minSavingsSun?: bigint;
+  fillTimeoutMs?: number;
+  verifyTimeoutMs?: number;
+  pollIntervalMs?: number;
+  logger?: Logger;
 }
 
 export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter {
@@ -188,6 +293,36 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
       // transient; stamping a permanent fallback would mask a real recovery.
       return ENERGY_FEE_FALLBACK_SUN;
     }
+  }
+
+  // Sizing handoff from prepareGasForBroadcast to buildTransfer's
+  // burn-coverage guard (same executor pass, seconds apart). Without the
+  // handoff the guard would have to assume the conservative
+  // MIN_EXPECTED_TRC20_ENERGY floor, demanding burn-level TRX even on
+  // sources whose rented energy covers the precise (smaller) need.
+  const prepSizingCache = new Map<string, { required: number; at: number }>();
+  function prepSizingKey(args: {
+    chainId: number;
+    fromAddress: string;
+    toAddress: string;
+    token: string;
+    amountRaw: string;
+  }): string {
+    return `${args.chainId}:${args.fromAddress}:${args.toAddress}:${args.token}:${args.amountRaw}`;
+  }
+  function rememberPrepSizing(key: string, required: number): void {
+    if (prepSizingCache.size > 1024) {
+      const now = Date.now();
+      for (const [k, v] of prepSizingCache) {
+        if (now - v.at > PREP_SIZING_TTL_MS) prepSizingCache.delete(k);
+      }
+    }
+    prepSizingCache.set(key, { required, at: Date.now() });
+  }
+  function recallPrepSizing(key: string): number | null {
+    const entry = prepSizingCache.get(key);
+    if (entry === undefined || Date.now() - entry.at > PREP_SIZING_TTL_MS) return null;
+    return entry.required;
   }
 
   return {
@@ -411,6 +546,228 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
 
     // ---- Payouts ----
 
+    // Pre-broadcast energy acquisition (see ChainAdapter.prepareGasForBroadcast
+    // for the cross-family contract). Rents delegated energy from the
+    // configured market when — and only when — the all-in rental cost beats
+    // burning TRX at the chain rate by at least `minSavingsSun`. Every other
+    // outcome (no provider, native TRX payout, market too thin, price too
+    // high, provider error) resolves to {kind:"none"}: the payout proceeds on
+    // the exact pre-rental burn path, whose worst case the planner has
+    // already reserved for. Rental can therefore lower a payout's cost but
+    // structurally cannot raise it.
+    async prepareGasForBroadcast(args: BuildTransferArgs): Promise<GasPrepResult> {
+      const rental = config.energyRental;
+      if (rental === undefined || rental.providers.length === 0) return { kind: "none" };
+      const log = rental.logger;
+      try {
+        // Native TRX payouts don't consume energy — gas IS the asset.
+        const token = findToken(args.chainId as ChainId, args.token);
+        if (!token || token.contractAddress === null) return { kind: "none" };
+        const client = getClient(args.chainId);
+
+        // Size the rental off the receiver's actual state, not the burn-
+        // reservation floor (see the RENTAL_ENERGY_* comment block). Running
+        // the simulation FIRST also aborts the rental for doomed transfers —
+        // an insufficient-balance / blacklisted-account revert throws here,
+        // before any provider money moves.
+        const simulated = await simulateTrc20TransferEnergy(client, token.contractAddress, args);
+        const receiverBalance = await readTrc20Balance(client, args.toAddress, token.contractAddress);
+        const classEnergy = receiverBalance > 0n ? RENTAL_ENERGY_WARM_RECEIVER : RENTAL_ENERGY_COLD_RECEIVER;
+        const required = Math.ceil(
+          (Math.max(simulated, classEnergy) * (100 + RENTAL_ENERGY_BUFFER_PERCENT)) / 100
+        );
+        // Hand the precise sizing to buildTransfer's burn-coverage guard so
+        // it doesn't fall back to the (much larger) reservation floor.
+        rememberPrepSizing(prepSizingKey(args), required);
+        // Above the standard-TRC-20 ceiling, buildTransfer is going to refuse
+        // the tx anyway — don't spend rental money ahead of that refusal.
+        if (required > MAX_EXPECTED_TRANSFER_ENERGY) return { kind: "none" };
+
+        // Only rent the shortfall: operator-staked delegations, leftover
+        // energy from a previous rental on this source (1h window), and the
+        // daily regeneration all count toward the transfer for free.
+        const resources = await client.getAccountResources(args.fromAddress);
+        const shortfall = required - resources.energyAvailable;
+        if (shortfall <= 0) return { kind: "covered" };
+
+        // The number to beat: burning the shortfall at the live chain rate.
+        const energyFeeSun = await getCachedEnergyFee(args.chainId, client);
+        const burnCostSun = BigInt(shortfall) * energyFeeSun;
+        const dynamicCapSun = Number((energyFeeSun * RENTAL_MAX_UNIT_PRICE_PERCENT) / 100n);
+        const maxUnitPriceSun = Math.min(dynamicCapSun, rental.maxUnitPriceSun ?? Number.POSITIVE_INFINITY);
+        if (!Number.isFinite(maxUnitPriceSun) || maxUnitPriceSun < 1) return { kind: "none" };
+
+        const durationSec = rental.durationSec ?? RENTAL_DEFAULT_DURATION_SEC;
+        const minSavingsSun = rental.minSavingsSun ?? RENTAL_DEFAULT_MIN_SAVINGS_SUN;
+        // Every configured market quotes the same shortfall concurrently and
+        // the cheapest viable estimate wins the order. A provider that
+        // errors, or whose book can't supply the shortfall, is skipped —
+        // with none left the payout takes the burn path.
+        const quotes = await Promise.allSettled(
+          rental.providers.map(async (candidate) => ({
+            candidate,
+            estimate: await candidate.estimateEnergyOrder({
+              receiver: args.fromAddress,
+              energyAmount: shortfall,
+              durationSec
+            })
+          }))
+        );
+        const skippedProviders: Record<string, string> = {};
+        const viable: Array<{ candidate: EnergyRentalProvider; estimate: EnergyRentalEstimate }> = [];
+        for (let i = 0; i < quotes.length; i++) {
+          const quote = quotes[i]!;
+          if (quote.status === "rejected") {
+            skippedProviders[rental.providers[i]!.name] =
+              quote.reason instanceof Error ? quote.reason.message : String(quote.reason);
+            continue;
+          }
+          if (quote.value.estimate.availableEnergy < shortfall) {
+            skippedProviders[quote.value.candidate.name] =
+              `supply ${quote.value.estimate.availableEnergy} below shortfall ${shortfall}`;
+            continue;
+          }
+          viable.push(quote.value);
+        }
+        if (Object.keys(skippedProviders).length > 0) {
+          log?.info("tron energy rental: providers skipped", { skipped: skippedProviders });
+        }
+        if (viable.length === 0) return { kind: "none" };
+        viable.sort((a, b) =>
+          a.estimate.totalCostSun < b.estimate.totalCostSun
+            ? -1
+            : a.estimate.totalCostSun > b.estimate.totalCostSun
+              ? 1
+              : 0
+        );
+        const { candidate: provider, estimate } = viable[0]!;
+        if (estimate.totalCostSun + minSavingsSun > burnCostSun) {
+          log?.info("tron energy rental skipped: not cheaper than burning", {
+            provider: provider.name,
+            shortfall,
+            rentalCostSun: estimate.totalCostSun.toString(),
+            burnCostSun: burnCostSun.toString(),
+            minSavingsSun: minSavingsSun.toString()
+          });
+          return { kind: "none" };
+        }
+
+        // Buy. The provider enforces all-or-nothing + the unit-price ceiling
+        // server-side, so a created order is already guaranteed cheaper than
+        // the burn it replaces.
+        const pollMs = rental.pollIntervalMs ?? RENTAL_DEFAULT_POLL_INTERVAL_MS;
+        let orderId: string;
+        try {
+          ({ orderId } = await provider.createEnergyOrder({
+            receiver: args.fromAddress,
+            energyAmount: shortfall,
+            durationSec,
+            maxUnitPriceSun
+          }));
+        } catch (err) {
+          // Ambiguity guard: a transport error here can't tell us whether
+          // the order was created server-side before the connection died.
+          // If it was, the delegation lands within ~one block — re-read the
+          // source's resources once before falling back to burn, so a paid
+          // order can't be doubled by a burn in the same tick. The common
+          // failure (provider down / order rejected) passes straight
+          // through to the burn path after this single recheck.
+          await sleep(pollMs);
+          const recheck = await client.getAccountResources(args.fromAddress).catch(() => null);
+          if (recheck !== null && recheck.energyAvailable >= required) {
+            log?.info("tron energy rental order errored but delegation landed; using it", {
+              provider: provider.name,
+              error: err instanceof Error ? err.message : String(err)
+            });
+            return { kind: "covered" };
+          }
+          log?.warn("tron energy rental order failed; falling back to TRX burn", {
+            provider: provider.name,
+            error: err instanceof Error ? err.message : String(err)
+          });
+          return { kind: "none" };
+        }
+
+        // From this point money is committed — failures no longer fall back
+        // to burn (that would pay BOTH rails). They defer the payout to the
+        // next executor tick, where the landed delegation resolves "covered".
+        const fillDeadline = Date.now() + (rental.fillTimeoutMs ?? RENTAL_DEFAULT_FILL_TIMEOUT_MS);
+        let paidSun: bigint | null = null;
+        let filled = false;
+        for (;;) {
+          const status = await provider.getOrderStatus(orderId).catch(() => null);
+          if (status !== null && status.fulfilledPercent >= 100) {
+            filled = true;
+            paidSun = status.paidSun;
+            break;
+          }
+          if (Date.now() >= fillDeadline) break;
+          await sleep(pollMs);
+        }
+        if (!filled) {
+          // Order-book providers (TEM) can leave an order sitting unfilled.
+          // When the provider supports cancellation, reclaim the committed
+          // payment and take the burn path THIS tick — strictly better than
+          // deferring, and it prevents a zombie order from double-buying on
+          // the next tick's retry. A failed cancel usually means the order
+          // filled right at the deadline → defer; next tick sees "covered".
+          if (typeof provider.cancelOrder === "function") {
+            const cancelled = await provider.cancelOrder(orderId).catch(() => false);
+            if (cancelled) {
+              log?.warn("tron energy rental fill timed out; order cancelled, burning instead", {
+                provider: provider.name,
+                orderId
+              });
+              return { kind: "none" };
+            }
+          }
+          return {
+            kind: "deferred",
+            reason: `energy rental order ${orderId} (${provider.name}) not confirmed filled within timeout`
+          };
+        }
+
+        // Trust on-chain state, not the provider's word: poll the source's
+        // resource view until the delegation is actually spendable. Fills
+        // are on-chain DelegateResource txs that land within ~1 block (3s).
+        const verifyDeadline = Date.now() + (rental.verifyTimeoutMs ?? RENTAL_DEFAULT_VERIFY_TIMEOUT_MS);
+        for (;;) {
+          const after = await client.getAccountResources(args.fromAddress).catch(() => null);
+          if (after !== null && after.energyAvailable >= required) {
+            const costSun = paidSun ?? estimate.totalCostSun;
+            log?.info("tron energy rented for broadcast", {
+              provider: provider.name,
+              orderId,
+              energyRented: shortfall,
+              rentalCostSun: costSun.toString(),
+              burnCostSun: burnCostSun.toString(),
+              savedSun: (burnCostSun - costSun).toString()
+            });
+            return {
+              kind: "rented",
+              provider: provider.name,
+              orderId,
+              costNativeRaw: costSun.toString() as AmountRaw
+            };
+          }
+          if (Date.now() >= verifyDeadline) break;
+          await sleep(pollMs);
+        }
+        return {
+          kind: "deferred",
+          reason: `energy rental order ${orderId} (${provider.name}) filled but delegation not yet visible on-chain`
+        };
+      } catch (err) {
+        // Pre-spend failures only (post-spend paths return "deferred" above):
+        // fall back to the burn path and surface the provider error loudly.
+        log?.warn("tron energy rental failed; falling back to TRX burn", {
+          providers: rental.providers.map((p) => p.name),
+          error: err instanceof Error ? err.message : String(err)
+        });
+        return { kind: "none" };
+      }
+    },
+
     async buildTransfer(args: BuildTransferArgs): Promise<UnsignedTx> {
       const token = findToken(args.chainId as ChainId, args.token);
       if (!token) {
@@ -478,6 +835,49 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
           `Tron transfer simulation reported ${resp.energy_used} energy (cap=${MAX_EXPECTED_TRANSFER_ENERGY}); ` +
             `refusing to broadcast. Token ${args.token} on chain ${args.chainId} may not be a standard TRC-20.`
         );
+      }
+
+      // Burn-coverage guard. fee_limit doesn't protect the source: a
+      // broadcast whose energy isn't covered by delegation burns liquid TRX
+      // mid-execution, and if THAT runs out the tx reverts OUT_OF_ENERGY
+      // with the TRX consumed and the token stuck (observed in production
+      // pre-floor). Verify coverage up-front and throw the
+      // executor-recognized "insufficient native balance" error instead —
+      // broadcastMain responds by scheduling a sponsor top-up and retrying,
+      // so the payout still completes (one tick later) instead of stranding
+      // funds. Sizing comes from prepareGasForBroadcast when it ran for this
+      // exact transfer (rental flows delegate less than the reservation
+      // floor); otherwise the conservative floor applies, which burn-path
+      // reservations always cover.
+      const sizedRequired = recallPrepSizing(prepSizingKey(args));
+      const neededEnergy = sizedRequired ?? Math.max(resp.energy_used ?? 0, MIN_EXPECTED_TRC20_ENERGY);
+      const resources = await client.getAccountResources(args.fromAddress).catch(() => null);
+      // RPC flap on the resource read → don't block the broadcast on a
+      // guard; the chain remains the final arbiter as before this check.
+      if (resources !== null) {
+        const energyGap = neededEnergy - resources.energyAvailable;
+        if (energyGap > 0) {
+          const energyFeeSun = await getCachedEnergyFee(args.chainId, client);
+          const bandwidthCushion =
+            resources.bandwidthAvailable >= TRON_BANDWIDTH_PER_TRANSFER ? 0n : TRON_BANDWIDTH_BURN_SUN;
+          const burnNeededSun = BigInt(energyGap) * energyFeeSun + bandwidthCushion;
+          const acct = await client.getAccount(args.fromAddress).catch(() => null);
+          let balanceSun: bigint | null = null;
+          if (acct !== null) {
+            try {
+              balanceSun = BigInt(acct.balanceSun);
+            } catch {
+              balanceSun = null;
+            }
+          }
+          if (balanceSun !== null && balanceSun < burnNeededSun) {
+            throw new Error(
+              `Tron buildTransfer: insufficient native balance on ${args.fromAddress} to cover the energy burn ` +
+                `(~${burnNeededSun} sun needed for a ${energyGap}-energy gap, balance ${balanceSun} sun). ` +
+                `Energy rental did not cover this broadcast; a gas top-up is required.`
+            );
+          }
+        }
       }
 
       return {
@@ -562,7 +962,7 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
       // is supposed to mirror VM execution, but in practice it underreports
       // cold-slot SSTOREs and first-time-recipient activation by 3-7×: we've
       // seen ~4k reported on USDT transfers that burned ~14-31k. The energy
-      // floor (MIN_EXPECTED_TRC20_ENERGY = 65 000) handles the worst case;
+      // floor (MIN_EXPECTED_TRC20_ENERGY = 135 000) handles the worst case;
       // this multiplier covers the remaining nondeterminism:
       //   - fractional SUN rounding in (energy × energyFee)
       //   - source's own token slot going cold between plan and broadcast
@@ -622,7 +1022,21 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
         // so we don't gate on it; Tron's protocol charges TRX for
         // bandwidth shortfall but the source's mid-tx auto-burn there
         // is dust (~1 TRX worst case) and acceptable noise.
-        return resources.energyAvailable >= MIN_EXPECTED_TRC20_ENERGY;
+        if (resources.energyAvailable >= MIN_EXPECTED_TRC20_ENERGY) return true;
+        // Rental-enabled: energy is sourced at broadcast time —
+        // prepareGasForBroadcast rents the shortfall, and when the market
+        // fails, buildTransfer's burn-coverage guard routes the payout
+        // through the sponsor top-up rail instead of broadcasting
+        // unfunded. The source itself therefore needs no liquid TRX at
+        // plan time, ONLY bandwidth for the tx bytes (600 free/day per
+        // activated account). Bandwidth-dry sources fall back to the
+        // burn-path planner, which funds them with TRX they'd need for
+        // bandwidth anyway. This is what eliminates the per-payout
+        // ~burn-sized top-up transactions when a rental market is wired.
+        if ((config.energyRental?.providers.length ?? 0) > 0) {
+          return resources.bandwidthAvailable >= TRON_BANDWIDTH_PER_TRANSFER;
+        }
+        return false;
       } catch {
         // RPC flap on getAccountResource → return false. Planner falls
         // back to native-gas-or-top-up; a payout that would have worked
@@ -706,23 +1120,12 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
         return "0" as AmountRaw;
       }
       const client = getClient(args.chainId);
-      const toCoreHex = tronToEvmCoreHex(args.toAddress).slice(2).padStart(64, "0");
-      const amountHex = BigInt(args.amountRaw).toString(16).padStart(64, "0");
-      const resp = await client.triggerConstantContract({
-        owner_address: base58ToHex(args.fromAddress),
-        contract_address: base58ToHex(token.contractAddress),
-        function_selector: "transfer(address,uint256)",
-        parameter: `${toCoreHex}${amountHex}`
-      });
-      // Revert detection — same rationale as buildTransfer: if the simulated
-      // call reverts (insufficient balance, frozen/blacklisted account,
-      // destination-contract reject), `result.result` is false. Quoting a
-      // fee for a doomed tx would just mislead the merchant.
-      if (resp.result.result !== true) {
-        const message = resp.result.message ?? "unknown";
-        throw new Error(`Tron simulation failed: ${message}`);
-      }
-      const reportedEnergy = resp.energy_used ?? 0;
+      // Revert detection happens inside the simulation helper — same
+      // rationale as buildTransfer: if the simulated call reverts
+      // (insufficient balance, frozen/blacklisted account, destination-
+      // contract reject), quoting a fee for a doomed tx would just mislead
+      // the merchant.
+      const reportedEnergy = await simulateTrc20TransferEnergy(client, token.contractAddress, args);
       const energy = Math.max(reportedEnergy, MIN_EXPECTED_TRC20_ENERGY);
       return energy.toString() as AmountRaw;
     },
@@ -754,6 +1157,39 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
 }
 
 // ---- Local helpers ----
+
+// Run the read-only VM simulation for a TRC-20 `transfer(address,uint256)`
+// and return the reported `energy_used`. Uses triggerConstantContract (NOT
+// triggerSmartContract — that one builds an unsigned tx and routinely
+// reports energy_used=0). The result includes the dynamic-energy-model
+// penalty for the CURRENT 6h maintenance cycle but still underreports
+// cold-slot SSTOREs; callers must apply their own floor (estimateGasForTransfer
+// uses MIN_EXPECTED_TRC20_ENERGY for burn reservations, prepareGasForBroadcast
+// uses the warm/cold receiver class constants for rental sizing).
+// Throws when the simulated call reverts.
+async function simulateTrc20TransferEnergy(
+  client: TronRpcBackend,
+  contractAddress: string,
+  args: { readonly fromAddress: string; readonly toAddress: string; readonly amountRaw: string }
+): Promise<number> {
+  const toCoreHex = tronToEvmCoreHex(args.toAddress).slice(2).padStart(64, "0");
+  const amountHex = BigInt(args.amountRaw).toString(16).padStart(64, "0");
+  const resp = await client.triggerConstantContract({
+    owner_address: base58ToHex(args.fromAddress),
+    contract_address: base58ToHex(contractAddress),
+    function_selector: "transfer(address,uint256)",
+    parameter: `${toCoreHex}${amountHex}`
+  });
+  if (resp.result.result !== true) {
+    const message = resp.result.message ?? "unknown";
+    throw new Error(`Tron simulation failed: ${message}`);
+  }
+  return resp.energy_used ?? 0;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // Read a TRC-20 balance via `balanceOf(address)` on the token contract. Used
 // in place of reading getAccount().trc20[contract] because that secondary

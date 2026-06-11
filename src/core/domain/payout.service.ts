@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
-import type { ChainAdapter } from "../ports/chain.port.js";
+import type { ChainAdapter, GasPrepResult } from "../ports/chain.port.js";
 import { ChainIdSchema, type Address, type ChainFamily, type ChainId, type TxHash } from "../types/chain.js";
 import { MerchantIdSchema } from "../types/merchant.js";
 import { AmountRawSchema, type AmountRaw } from "../types/money.js";
@@ -2256,6 +2256,95 @@ async function broadcastMain(
     return "deferred";
   }
 
+  // ---- (a0) Optional pre-broadcast gas acquisition (Tron energy rental
+  // today; see ChainAdapter.prepareGasForBroadcast). Runs AFTER the CAS so
+  // only the claim winner can spend rental money, and BEFORE buildTransfer
+  // because Tron txs expire ~60s after build — waiting out a rental fill on
+  // an already-built tx would let it lapse. Adapters without the hook (every
+  // family but Tron) skip this block entirely.
+  if (typeof chainAdapter.prepareGasForBroadcast === "function") {
+    let prep: GasPrepResult;
+    try {
+      prep = await chainAdapter.prepareGasForBroadcast({
+        chainId: row.chainId,
+        fromAddress: source.address,
+        toAddress: row.destinationAddress,
+        token: row.token,
+        amountRaw: row.amountRaw as AmountRaw,
+        ...(row.feeTier !== null
+          ? { feeTier: row.feeTier as "low" | "medium" | "high" }
+          : {})
+      });
+    } catch (err) {
+      // The hook's contract is "never throw"; treat a violation as "none"
+      // (standard burn path) — rental is an optimization, not a liveness
+      // dependency, and the planner's reservations cover the burn case.
+      deps.logger.warn("payout.gas_prep_threw", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      prep = { kind: "none" };
+    }
+    if (prep.kind === "deferred") {
+      // Rental money is committed but the delegation isn't usable on-chain
+      // yet. Broadcasting now would burn native ON TOP of the paid rental,
+      // so step back instead: nothing has reached the network (we're
+      // strictly before build/sign), which makes releasing the CAS claim
+      // safe — next tick re-runs prep, finds the landed delegation
+      // ("covered") and broadcasts without re-buying.
+      const reason = prep.reason;
+      try {
+        await runWithBusyRetry(deps, () =>
+          deps.db
+            .update(payouts)
+            .set({
+              broadcastAttemptedAt: null,
+              lastError: `[GAS_PREP_DEFERRED] ${reason}`.slice(0, 1024),
+              updatedAt: deps.clock.now().getTime()
+            })
+            .where(eq(payouts.id, row.id))
+        );
+      } catch (err) {
+        // Claim stays held until the next operator touch — log loudly so
+        // the funded-but-waiting payout is visible. Deliberately NOT
+        // broadcasting here: the whole point of the defer is to avoid
+        // paying the burn rail on top of the rental rail.
+        deps.logger.error("payout.gas_prep_defer_persist_failed", {
+          payoutId: row.id,
+          reason,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+      return "deferred";
+    }
+    if (prep.kind === "rented") {
+      // Audit trail. Best-effort: the rented energy is already delegated to
+      // the source, so a failed bookkeeping write must not block the
+      // broadcast that the rental was bought for.
+      const orderRef = `${prep.provider}:${prep.orderId}`;
+      const costNative = prep.costNativeRaw;
+      try {
+        await runWithBusyRetry(deps, () =>
+          deps.db
+            .update(payouts)
+            .set({
+              gasRentalOrderId: orderRef,
+              gasRentalCostNative: costNative,
+              updatedAt: deps.clock.now().getTime()
+            })
+            .where(eq(payouts.id, row.id))
+        );
+      } catch (err) {
+        deps.logger.warn("payout.gas_rental_audit_persist_failed", {
+          payoutId: row.id,
+          orderRef,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+    }
+  }
+
   // ---- (a) Pre-broadcast prep: build + key resolution. Nothing has
   // reached the network yet, so failures here are safe to fail terminally.
   let unsigned: UnsignedTx;
@@ -2305,6 +2394,16 @@ async function broadcastMain(
     privateKey = await deps.signerStore.get(scope);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    // Build-time funding shortfalls route to the same re-top-up rail as the
+    // broadcast-time check below — nothing has reached the network in this
+    // section, so scheduling a sponsor top-up and retrying is always safe.
+    // Tron's buildTransfer burn-coverage guard throws this when a source
+    // planned around rented energy lost its rental path and lacks the TRX
+    // to burn instead; failing terminally here would strand a payout the
+    // sponsor can fund in one tick.
+    if (message.includes("insufficient native balance")) {
+      return reTopUpForBroadcast(deps, row, chainAdapter, source, message);
+    }
     return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
   }
 

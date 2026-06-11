@@ -169,6 +169,25 @@ async function main(): Promise<void> {
   if (config.trongridApiKey !== undefined) tronWiringInput.trongridApiKey = config.trongridApiKey;
   if (config.alchemyApiKey !== undefined) tronWiringInput.alchemyApiKey = config.alchemyApiKey;
   if (config.tronPollIntervalMs !== undefined) tronWiringInput.pollIntervalMs = config.tronPollIntervalMs;
+  if (config.tronEnergyMarketApiKey !== undefined) {
+    tronWiringInput.tronEnergyMarketApiKey = config.tronEnergyMarketApiKey;
+    if (config.tronEnergyMarketAddress !== undefined) {
+      tronWiringInput.tronEnergyMarketAddress = config.tronEnergyMarketAddress;
+    }
+  }
+  if (config.tronEnergyMarketApiKey !== undefined || config.tronsaveApiKey !== undefined) {
+    tronWiringInput.tronsaveDurationSec = config.tronsaveDurationSec;
+    tronWiringInput.tronsaveFillTimeoutMs = config.tronsaveFillTimeoutMs;
+    if (config.tronsaveMaxUnitPriceSun !== undefined) {
+      tronWiringInput.tronsaveMaxUnitPriceSun = config.tronsaveMaxUnitPriceSun;
+    }
+    if (config.tronEnergyRentalProvider !== undefined) {
+      tronWiringInput.energyRentalPinnedProvider = config.tronEnergyRentalProvider;
+    }
+  }
+  if (config.tronsaveApiKey !== undefined) {
+    tronWiringInput.tronsaveApiKey = config.tronsaveApiKey;
+  }
   const tronWiring = wireTron(tronWiringInput);
   if (tronWiring.chainAdapter && tronWiring.chainId !== undefined) {
     chains.push(tronWiring.chainAdapter);

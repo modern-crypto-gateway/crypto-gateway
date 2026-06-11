@@ -35,6 +35,22 @@ export interface FeeTierQuote {
   readonly degraded?: boolean;
 }
 
+// Outcome of `prepareGasForBroadcast`. See the method docs on ChainAdapter
+// for the exact semantics of each variant.
+export type GasPrepResult =
+  | { readonly kind: "none" }
+  | { readonly kind: "covered" }
+  | {
+      readonly kind: "rented";
+      // Provider identifier ("tronsave", ...) for the audit trail.
+      readonly provider: string;
+      readonly orderId: string;
+      // Actual rental cost in native units (sun), paid off-ledger from the
+      // provider's prepaid balance.
+      readonly costNativeRaw: AmountRaw;
+    }
+  | { readonly kind: "deferred"; readonly reason: string };
+
 // The one contract every chain family implements. Adding a new family
 // (Solana, Aptos, Bitcoin, ...) is one file that implements this interface;
 // core/domain never switches on `family` for control flow.
@@ -223,6 +239,36 @@ export interface ChainAdapter {
   // set at build time + `options.feePayerPrivateKey` passed at broadcast. No
   // separate `withFeePayer` port method is needed — the adapter emits the
   // correct message layout directly when `feePayerAddress` is present.)
+
+  // OPTIONAL — pre-broadcast gas/resource acquisition hook. Called by the
+  // executor immediately after it wins the broadcast CAS and before
+  // `buildTransfer`, giving the adapter one chance to source cheaper gas
+  // than the default native burn (Tron: rent delegated energy from a market
+  // like TronSave instead of burning TRX at the chain rate).
+  //
+  // Contract:
+  //   - MUST NOT throw. Any internal failure (provider down, market empty,
+  //     price too high) resolves to {kind:"none"} so the payout proceeds on
+  //     the standard burn path — rental is a cost optimization, never a
+  //     liveness dependency. The planner's reservations are unchanged by
+  //     this hook; they always cover the full burn-path worst case.
+  //   - MUST only spend external funds when the all-in result is strictly
+  //     cheaper than the burn path it replaces.
+  //   - "rented": resources were purchased AND verified usable on-chain —
+  //     safe to broadcast now. `costNativeRaw` is what the rental actually
+  //     cost (native units, paid from the provider's prepaid balance, NOT
+  //     from any pool address — callers record it for audit, not ledger).
+  //   - "covered": existing delegated resources already cover the transfer;
+  //     nothing was spent. Broadcast proceeds and burns ~nothing.
+  //   - "deferred": funds were (or may have been) spent on resources that
+  //     are not yet visible on-chain. Broadcasting now would burn native ON
+  //     TOP of the rental — the caller should release its broadcast claim
+  //     and retry next tick, when the delegation will have landed (the
+  //     recheck then resolves "covered").
+  //   - "none": nothing was done; proceed exactly as before this hook existed.
+  //
+  // Adapters without a cheaper-gas concept simply omit the method.
+  prepareGasForBroadcast?(args: BuildTransferArgs): Promise<GasPrepResult>;
 
   // Raw native units (wei / sun / lamports). Used by source-selection to verify
   // the chosen fee wallet has enough native gas before reserving it.

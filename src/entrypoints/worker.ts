@@ -174,6 +174,26 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
   if (tronPollIntervalMs !== undefined && Number.isFinite(tronPollIntervalMs)) {
     tronWiringInput.pollIntervalMs = tronPollIntervalMs;
   }
+  const tronsaveApiKey = typeof env["TRONSAVE_API_KEY"] === "string" ? env["TRONSAVE_API_KEY"] : undefined;
+  if (tronsaveApiKey !== undefined && tronsaveApiKey.length > 0) {
+    tronWiringInput.tronsaveApiKey = tronsaveApiKey;
+  }
+  const temApiKey = typeof env["TRONENERGY_MARKET_API_KEY"] === "string" ? env["TRONENERGY_MARKET_API_KEY"] : undefined;
+  const temAddress = typeof env["TRONENERGY_MARKET_ADDRESS"] === "string" ? env["TRONENERGY_MARKET_ADDRESS"] : undefined;
+  if (temApiKey !== undefined && temApiKey.length > 0) {
+    tronWiringInput.tronEnergyMarketApiKey = temApiKey;
+    if (temAddress !== undefined && temAddress.length > 0) tronWiringInput.tronEnergyMarketAddress = temAddress;
+  }
+  if (tronWiringInput.tronsaveApiKey !== undefined || tronWiringInput.tronEnergyMarketApiKey !== undefined) {
+    const maxUnit = Number.parseInt(typeof env["TRONSAVE_MAX_UNIT_PRICE_SUN"] === "string" ? env["TRONSAVE_MAX_UNIT_PRICE_SUN"] : "", 10);
+    if (Number.isFinite(maxUnit) && maxUnit >= 1) tronWiringInput.tronsaveMaxUnitPriceSun = maxUnit;
+    const durationSec = Number.parseInt(typeof env["TRONSAVE_DURATION_SEC"] === "string" ? env["TRONSAVE_DURATION_SEC"] : "", 10);
+    if (Number.isFinite(durationSec) && durationSec >= 60) tronWiringInput.tronsaveDurationSec = durationSec;
+    const fillTimeoutMs = Number.parseInt(typeof env["TRONSAVE_FILL_TIMEOUT_MS"] === "string" ? env["TRONSAVE_FILL_TIMEOUT_MS"] : "", 10);
+    if (Number.isFinite(fillTimeoutMs) && fillTimeoutMs >= 1000) tronWiringInput.tronsaveFillTimeoutMs = fillTimeoutMs;
+    const pinnedProvider = typeof env["TRON_ENERGY_RENTAL_PROVIDER"] === "string" ? env["TRON_ENERGY_RENTAL_PROVIDER"] : undefined;
+    if (pinnedProvider !== undefined && pinnedProvider.length > 0) tronWiringInput.energyRentalPinnedProvider = pinnedProvider;
+  }
   const tronWiring = wireTron(tronWiringInput);
   if (tronWiring.chainAdapter && tronWiring.chainId !== undefined) {
     chains.push(tronWiring.chainAdapter);

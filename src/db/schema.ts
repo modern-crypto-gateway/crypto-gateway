@@ -586,6 +586,15 @@ export const payouts = sqliteTable(
     topUpTxHash: text("top_up_tx_hash"),
     topUpSponsorAddress: text("top_up_sponsor_address"),
     topUpAmountRaw: text("top_up_amount_raw"),
+    // Gas/energy-rental audit trail (Tron + TronSave today). Set when the
+    // executor rented delegated resources for the broadcast instead of
+    // burning native at the chain rate. `gasRentalOrderId` is
+    // "<provider>:<orderId>"; cost is in native units (sun), paid OFF-LEDGER
+    // from the provider's prepaid balance — never debited from a pool
+    // address, so it deliberately does NOT feed computeSpendable. NULL on
+    // every non-rented payout.
+    gasRentalOrderId: text("gas_rental_order_id"),
+    gasRentalCostNative: text("gas_rental_cost_native"),
     lastError: text("last_error"),
 
     createdAt: integer("created_at").notNull(),

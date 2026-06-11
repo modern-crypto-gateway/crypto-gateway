@@ -108,6 +108,26 @@ async function getDeps(): Promise<AppDeps> {
   if (tronPollIntervalMs !== undefined && Number.isFinite(tronPollIntervalMs)) {
     tronWiringInput.pollIntervalMs = tronPollIntervalMs;
   }
+  const tronsaveApiKey = secrets.getOptional("TRONSAVE_API_KEY");
+  if (tronsaveApiKey !== undefined && tronsaveApiKey.length > 0) {
+    tronWiringInput.tronsaveApiKey = tronsaveApiKey;
+  }
+  const temApiKey = secrets.getOptional("TRONENERGY_MARKET_API_KEY");
+  const temAddress = secrets.getOptional("TRONENERGY_MARKET_ADDRESS");
+  if (temApiKey !== undefined && temApiKey.length > 0) {
+    tronWiringInput.tronEnergyMarketApiKey = temApiKey;
+    if (temAddress !== undefined && temAddress.length > 0) tronWiringInput.tronEnergyMarketAddress = temAddress;
+  }
+  if (tronWiringInput.tronsaveApiKey !== undefined || tronWiringInput.tronEnergyMarketApiKey !== undefined) {
+    const maxUnit = Number.parseInt(secrets.getOptional("TRONSAVE_MAX_UNIT_PRICE_SUN") ?? "", 10);
+    if (Number.isFinite(maxUnit) && maxUnit >= 1) tronWiringInput.tronsaveMaxUnitPriceSun = maxUnit;
+    const durationSec = Number.parseInt(secrets.getOptional("TRONSAVE_DURATION_SEC") ?? "", 10);
+    if (Number.isFinite(durationSec) && durationSec >= 60) tronWiringInput.tronsaveDurationSec = durationSec;
+    const fillTimeoutMs = Number.parseInt(secrets.getOptional("TRONSAVE_FILL_TIMEOUT_MS") ?? "", 10);
+    if (Number.isFinite(fillTimeoutMs) && fillTimeoutMs >= 1000) tronWiringInput.tronsaveFillTimeoutMs = fillTimeoutMs;
+    const pinnedProvider = secrets.getOptional("TRON_ENERGY_RENTAL_PROVIDER");
+    if (pinnedProvider !== undefined && pinnedProvider.length > 0) tronWiringInput.energyRentalPinnedProvider = pinnedProvider;
+  }
   const tronWiring = wireTron(tronWiringInput);
   if (tronWiring.chainAdapter && tronWiring.chainId !== undefined) {
     chains.push(tronWiring.chainAdapter);
