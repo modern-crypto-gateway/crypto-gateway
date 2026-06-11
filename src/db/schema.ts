@@ -871,6 +871,14 @@ export const addressPool = sqliteTable(
     // payment likely belongs to during the cooldown window. Cleared on next
     // allocation.
     lastReleasedByMerchantId: text("last_released_by_merchant_id"),
+    // Operator "disable" intent (epoch ms), independent of `status`. When set,
+    // the address is parked: the allocator skips it during normal allocation
+    // and only borrows it when the family pool is otherwise exhausted; on
+    // release it re-parks (status → 'quarantined') rather than returning to
+    // 'available'. Cleared when the operator re-enables. NULL = not disabled.
+    // Persisting intent here (not just via status) survives the transient
+    // 'allocated' state during an under-pressure borrow.
+    disabledAt: integer("disabled_at"),
     createdAt: integer("created_at").notNull()
   },
   (t) => [

@@ -10,7 +10,15 @@ import { findChainAdapter } from "../../core/domain/chain-lookup.js";
 import { isTronChainAdapter, TRON_MAINNET_CHAIN_ID } from "../../adapters/chains/tron/tron-chain.adapter.js";
 import type { TronResourceKind, TronRpcBackend } from "../../adapters/chains/tron/tron-rpc.js";
 import type { UnsignedTx } from "../../core/types/unsigned-tx.js";
-import { getStats as getPoolStats, initializePool } from "../../core/domain/pool.service.js";
+import {
+  getStats as getPoolStats,
+  initializePool,
+  disablePoolAddress,
+  enablePoolAddress,
+  listDisabledAddresses,
+  listPoolAddresses,
+  PoolAddressNotFoundError
+} from "../../core/domain/pool.service.js";
 import { getMoneroPoolStats, initializeMoneroPool } from "../../core/domain/monero-pool.service.js";
 import {
   ConsolidationError,
@@ -1189,6 +1197,103 @@ const hasFeeWallet = adapterFamily !== undefined && adapterFamily !== "monero"
   app.get("/pool/stats", async (c) => {
     const stats = await getPoolStats(deps);
     return c.json({ stats }, 200);
+  });
+
+  // List individual pool addresses with their allocation/disable state so an
+  // operator can see what's in the pool and choose disable candidates.
+  // Filters: ?family=evm|tron|solana|utxo, ?status=available|allocated|quarantined.
+  // Paginated: ?limit (1..500, default 100), ?offset (default 0).
+  // Pair with GET /admin/balances to see which addresses hold funds.
+  const ListPoolAddressesQuerySchema = z
+    .object({
+      family: ChainFamilySchema.optional(),
+      status: z.enum(["available", "allocated", "quarantined"]).optional(),
+      limit: z.coerce.number().int().min(1).max(500).optional(),
+      offset: z.coerce.number().int().min(0).optional()
+    })
+    .strict();
+
+  app.get("/pool/addresses", async (c) => {
+    try {
+      const sp = new URL(c.req.url).searchParams;
+      const parsed = ListPoolAddressesQuerySchema.parse({
+        ...(sp.get("family") !== null ? { family: sp.get("family") } : {}),
+        ...(sp.get("status") !== null ? { status: sp.get("status") } : {}),
+        ...(sp.get("limit") !== null ? { limit: sp.get("limit") } : {}),
+        ...(sp.get("offset") !== null ? { offset: sp.get("offset") } : {})
+      });
+      const result = await listPoolAddresses(deps, parsed);
+      return c.json(result, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // ---- Manual address disable / enable (operator pool trimming) ----
+  //
+  // DISABLE pulls a pool address out of normal allocation to keep the active
+  // address set small (cheaper detection, less stranded dust, fewer addresses
+  // cycling). It's a SOFT preference: the allocator still borrows a disabled
+  // address when the family pool is otherwise exhausted, then re-parks it on
+  // release. Disabling is always safe — a parked address stays in the pool, is
+  // still swept by consolidation, and late payments follow the usual cooldown
+  // path. An allocated address can be disabled too; it finishes its invoice
+  // then re-parks instead of returning to rotation.
+  const DisableAddressSchema = z
+    .object({ family: ChainFamilySchema, address: z.string().min(1).max(128) })
+    .strict();
+
+  app.post("/pool/addresses/disable", async (c) => {
+    const rawBody = await c.req.text();
+    let parsedBody: unknown;
+    try {
+      parsedBody = rawBody.length > 0 ? JSON.parse(rawBody) : {};
+    } catch {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const parsed = DisableAddressSchema.parse(parsedBody);
+      const address = await disablePoolAddress(deps, parsed);
+      return c.json({ address }, 200);
+    } catch (err) {
+      if (err instanceof PoolAddressNotFoundError) {
+        return c.json({ error: { code: "ADDRESS_NOT_FOUND", message: err.message } }, 404);
+      }
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  app.post("/pool/addresses/enable", async (c) => {
+    const rawBody = await c.req.text();
+    let parsedBody: unknown;
+    try {
+      parsedBody = rawBody.length > 0 ? JSON.parse(rawBody) : {};
+    } catch {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const parsed = DisableAddressSchema.parse(parsedBody);
+      const address = await enablePoolAddress(deps, parsed);
+      return c.json({ address }, 200);
+    } catch (err) {
+      if (err instanceof PoolAddressNotFoundError) {
+        return c.json({ error: { code: "ADDRESS_NOT_FOUND", message: err.message } }, 404);
+      }
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // List disabled (parked or under-pressure-borrowed) pool addresses.
+  // Optional ?family=evm|tron|solana|utxo filter.
+  app.get("/pool/addresses/disabled", async (c) => {
+    try {
+      const familyRaw = new URL(c.req.url).searchParams.get("family");
+      const family = familyRaw !== null ? ChainFamilySchema.parse(familyRaw) : undefined;
+      const addresses = await listDisabledAddresses(deps, family);
+      return c.json({ addresses }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
   });
 
   // Dedicated Monero subaddress pool — seeded separately from the shared

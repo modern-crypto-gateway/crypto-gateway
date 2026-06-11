@@ -1562,6 +1562,151 @@ paths:
                         available: { type: integer }
                         allocated: { type: integer }
 
+  /admin/pool/addresses:
+    get:
+      tags: [admin]
+      summary: List pool addresses with allocation/disable state
+      description: |
+        Paginated list of individual pool addresses so an operator can see the
+        pool and choose disable candidates. Filter by `family` and/or `status`.
+        Cross-reference GET /admin/balances to see which addresses hold funds.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: family
+          required: false
+          schema: { type: string, enum: [evm, tron, solana, utxo] }
+        - in: query
+          name: status
+          required: false
+          schema: { type: string, enum: [available, allocated, quarantined] }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - in: query
+          name: offset
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Pool addresses page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [addresses, total, limit, offset]
+                properties:
+                  addresses:
+                    type: array
+                    items: { $ref: "#/components/schemas/PoolAddressAdminView" }
+                  total: { type: integer }
+                  limit: { type: integer }
+                  offset: { type: integer }
+
+  /admin/pool/addresses/disable:
+    post:
+      tags: [admin]
+      summary: Disable (park) a pool address
+      description: |
+        Pull a pool address out of normal allocation to keep the active address
+        set small (cheaper detection, less stranded dust). A SOFT preference:
+        the allocator still borrows a disabled address when the family pool is
+        otherwise exhausted, then re-parks it on release (self-balancing).
+        Always safe — a parked address stays in the pool, is still swept by
+        consolidation, and late payments follow the usual cooldown path. An
+        allocated address may be disabled too; it finishes its invoice then
+        re-parks. Idempotent (preserves the original disable timestamp).
+        There is no on-chain "destroy" for EVM/Tron EOAs — this is DB-level.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [family, address]
+              properties:
+                family: { type: string, enum: [evm, tron, solana, utxo] }
+                address: { type: string }
+      responses:
+        "200":
+          description: The updated pool address
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [address]
+                properties:
+                  address: { $ref: "#/components/schemas/PoolAddressAdminView" }
+        "404":
+          description: "`ADDRESS_NOT_FOUND` — address not in the family pool"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/pool/addresses/enable:
+    post:
+      tags: [admin]
+      summary: Re-enable a disabled pool address
+      description: |
+        Clear the disable intent and return the address to normal rotation.
+        Idempotent. Mirrors /admin/pool/addresses/disable.
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [family, address]
+              properties:
+                family: { type: string, enum: [evm, tron, solana, utxo] }
+                address: { type: string }
+      responses:
+        "200":
+          description: The updated pool address
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [address]
+                properties:
+                  address: { $ref: "#/components/schemas/PoolAddressAdminView" }
+        "404":
+          description: "`ADDRESS_NOT_FOUND` — address not in the family pool"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/pool/addresses/disabled:
+    get:
+      tags: [admin]
+      summary: List disabled (parked / borrowed) pool addresses
+      description: Disabled addresses across families, optionally filtered by `family`.
+      security:
+        - AdminKey: []
+      parameters:
+        - in: query
+          name: family
+          required: false
+          schema: { type: string, enum: [evm, tron, solana, utxo] }
+      responses:
+        "200":
+          description: Disabled pool addresses
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [addresses]
+                properties:
+                  addresses:
+                    type: array
+                    items: { $ref: "#/components/schemas/PoolAddressAdminView" }
+
   /admin/pool/consolidate:
     post:
       tags: [admin]
@@ -3281,6 +3426,22 @@ components:
               type: object
               additionalProperties: true
               description: Optional per-code payload (e.g. Zod issues on VALIDATION)
+
+    PoolAddressAdminView:
+      type: object
+      required: [family, address, addressIndex, status, disabledAt, allocatedToInvoiceId]
+      properties:
+        family: { type: string, enum: [evm, tron, solana, utxo] }
+        address: { type: string }
+        addressIndex: { type: integer }
+        status: { type: string, enum: [available, allocated, quarantined] }
+        disabledAt:
+          type: integer
+          nullable: true
+          description: Epoch ms when disabled; null = not disabled.
+        allocatedToInvoiceId:
+          type: string
+          nullable: true
 
     AutoConsolidationSchedule:
       type: object

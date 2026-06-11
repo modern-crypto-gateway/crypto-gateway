@@ -1,4 +1,4 @@
-import { and, asc, count, eq, inArray, isNull, lt, lte, max, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNotNull, isNull, lt, lte, max, notInArray, or, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { PoolExhaustedError } from "../errors.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
@@ -192,9 +192,66 @@ export async function allocateForInvoice(
     // exactly the cost we just removed. Loop and let the retry budget
     // surface PoolExhaustedError if it really is empty.
   }
-  // Pool exhausted (or N concurrent allocators all lost the race against
-  // each other). Schedule a background refill before throwing so the
-  // next request has something to allocate.
+  // No 'available' rows after the retry budget. Before refilling (which mints
+  // NEW addresses — grows the pool, and on Tron re-pays ~1 TRX activation per
+  // fresh account), try to BORROW a parked (operator-disabled) address back
+  // into rotation. This is the "auto re-enable when everything is occupied"
+  // path: an operator disable is a soft preference we honor right up until the
+  // pool would otherwise be exhausted. The borrowed row keeps `disabledAt`
+  // set, so `releaseFromInvoice` re-parks it once the invoice ends — the pool
+  // self-balances back down without manual intervention.
+  for (let attempt = 0; attempt < ALLOCATE_RETRY_LIMIT; attempt += 1) {
+    const parkedSubquery = deps.db
+      .select({ id: addressPool.id })
+      .from(addressPool)
+      .where(
+        and(
+          eq(addressPool.family, family),
+          eq(addressPool.status, "quarantined"),
+          or(isNull(addressPool.cooldownUntil), lte(addressPool.cooldownUntil, now))
+        )
+      )
+      .orderBy(
+        asc(addressPool.totalAllocations),
+        asc(addressPool.lastReleasedAt),
+        asc(addressPool.addressIndex)
+      )
+      .limit(1);
+
+    const [borrowed] = await deps.db
+      .update(addressPool)
+      .set({
+        status: "allocated",
+        allocatedToInvoiceId: invoiceId,
+        allocatedAt: now,
+        cooldownUntil: null,
+        lastReleasedByMerchantId: null
+        // disabledAt intentionally preserved — release re-parks this row.
+      })
+      .where(
+        and(
+          inArray(addressPool.id, parkedSubquery),
+          eq(addressPool.status, "quarantined")
+        )
+      )
+      .returning();
+
+    if (borrowed) {
+      deps.logger.info("pool.borrowed_disabled_under_pressure", {
+        family,
+        address: borrowed.address,
+        invoiceId
+      });
+      // Still kick a refill so the next request finds a true 'available' row
+      // and we stop borrowing parked addresses.
+      scheduleRefill(deps, family);
+      return drizzleRowToPoolAddress(borrowed);
+    }
+  }
+
+  // Pool truly exhausted (no available AND no borrowable parked rows, or N
+  // concurrent allocators all lost the race). Schedule a background refill
+  // before throwing so the next request has something to allocate.
   scheduleRefill(deps, family);
   throw new PoolExhaustedError(family);
 }
@@ -217,7 +274,10 @@ export async function releaseFromInvoice(
   await deps.db
     .update(addressPool)
     .set({
-      status: "available",
+      // Re-park operator-disabled rows (disabledAt set) instead of returning
+      // them to 'available' — keeps the pool self-balancing after an
+      // under-pressure borrow. Non-disabled rows release as usual.
+      status: sql`CASE WHEN ${addressPool.disabledAt} IS NOT NULL THEN 'quarantined' ELSE 'available' END`,
       allocatedToInvoiceId: null,
       allocatedAt: null,
       totalAllocations: sql`${addressPool.totalAllocations} + 1`,
@@ -315,7 +375,9 @@ export async function reconcileOrphanedAllocations(
   const updated = await deps.db
     .update(addressPool)
     .set({
-      status: "available",
+      // Re-park operator-disabled rows so a leaked borrow returns to parked,
+      // not to general rotation (mirrors releaseFromInvoice).
+      status: sql`CASE WHEN ${addressPool.disabledAt} IS NOT NULL THEN 'quarantined' ELSE 'available' END`,
       allocatedToInvoiceId: null,
       allocatedAt: null,
       totalAllocations: sql`${addressPool.totalAllocations} + 1`,
@@ -528,6 +590,162 @@ export async function getStats(deps: AppDeps): Promise<readonly PoolFamilyStats[
     byFamily.set(row.family, agg);
   }
   return Array.from(byFamily.values()).sort((a, b) => a.family.localeCompare(b.family));
+}
+
+// ---- Manual disable / enable (operator pool trimming) ----
+
+// Thrown when an admin disable/enable targets an address that isn't in the
+// family pool (or the family has no wired adapter to canonicalize against).
+export class PoolAddressNotFoundError extends Error {
+  constructor(family: ChainFamily, address: string) {
+    super(`No ${family} pool address ${address}`);
+    this.name = "PoolAddressNotFoundError";
+  }
+}
+
+// Admin-facing view of a pool row's allocation/disable state.
+export interface PoolAddressAdminView {
+  readonly family: ChainFamily;
+  readonly address: string;
+  readonly addressIndex: number;
+  readonly status: "available" | "allocated" | "quarantined";
+  readonly disabledAt: number | null;
+  readonly allocatedToInvoiceId: string | null;
+}
+
+function toAdminView(row: typeof addressPool.$inferSelect): PoolAddressAdminView {
+  return {
+    family: row.family as ChainFamily,
+    address: row.address,
+    addressIndex: row.addressIndex,
+    status: row.status,
+    disabledAt: row.disabledAt,
+    allocatedToInvoiceId: row.allocatedToInvoiceId
+  };
+}
+
+// Manually DISABLE (park) a pool address so the allocator stops handing it out
+// during normal allocation. An idle ('available') row parks immediately; a
+// currently-'allocated' row keeps serving its invoice and re-parks on release
+// (via the disabledAt CASE in releaseFromInvoice). Idempotent — re-disabling
+// preserves the original disable timestamp. Safe by construction: a parked row
+// stays in the pool, is still swept by consolidation, and follows the same
+// late-payment cooldown/orphan path as any released address; account-model
+// keys are HD-derived so funds are always recoverable.
+export async function disablePoolAddress(
+  deps: AppDeps,
+  args: { family: ChainFamily; address: string }
+): Promise<PoolAddressAdminView> {
+  const adapter = findAdapterForFamily(deps, args.family);
+  if (!adapter) throw new PoolAddressNotFoundError(args.family, args.address);
+  const canonical = adapter.canonicalizeAddress(args.address);
+  const now = deps.clock.now().getTime();
+
+  const [updated] = await deps.db
+    .update(addressPool)
+    .set({
+      // Preserve the original disable time on repeat calls.
+      disabledAt: sql`COALESCE(${addressPool.disabledAt}, ${now})`,
+      // Park immediately when idle; an allocated row keeps status until release.
+      status: sql`CASE WHEN ${addressPool.status} = 'available' THEN 'quarantined' ELSE ${addressPool.status} END`
+    })
+    .where(and(eq(addressPool.family, args.family), eq(addressPool.address, canonical)))
+    .returning();
+  if (!updated) throw new PoolAddressNotFoundError(args.family, canonical);
+  deps.logger.info("pool.address_disabled", {
+    family: args.family,
+    address: canonical,
+    status: updated.status
+  });
+  return toAdminView(updated);
+}
+
+// Re-ENABLE a previously disabled pool address: clears the disable intent and
+// un-parks an idle row (status quarantined → available). An allocated row will
+// simply release to 'available' as normal now that disabledAt is cleared.
+// Idempotent.
+export async function enablePoolAddress(
+  deps: AppDeps,
+  args: { family: ChainFamily; address: string }
+): Promise<PoolAddressAdminView> {
+  const adapter = findAdapterForFamily(deps, args.family);
+  if (!adapter) throw new PoolAddressNotFoundError(args.family, args.address);
+  const canonical = adapter.canonicalizeAddress(args.address);
+
+  const [updated] = await deps.db
+    .update(addressPool)
+    .set({
+      disabledAt: null,
+      status: sql`CASE WHEN ${addressPool.status} = 'quarantined' THEN 'available' ELSE ${addressPool.status} END`
+    })
+    .where(and(eq(addressPool.family, args.family), eq(addressPool.address, canonical)))
+    .returning();
+  if (!updated) throw new PoolAddressNotFoundError(args.family, canonical);
+  deps.logger.info("pool.address_enabled", {
+    family: args.family,
+    address: canonical,
+    status: updated.status
+  });
+  return toAdminView(updated);
+}
+
+// List every disabled (parked or borrowed-under-pressure) pool address,
+// optionally filtered by family. Lets operators see what they've trimmed.
+export async function listDisabledAddresses(
+  deps: AppDeps,
+  family?: ChainFamily
+): Promise<readonly PoolAddressAdminView[]> {
+  const where = family
+    ? and(isNotNull(addressPool.disabledAt), eq(addressPool.family, family))
+    : isNotNull(addressPool.disabledAt);
+  const rows = await deps.db
+    .select()
+    .from(addressPool)
+    .where(where)
+    .orderBy(asc(addressPool.family), asc(addressPool.addressIndex));
+  return rows.map(toAdminView);
+}
+
+export interface ListPoolAddressesResult {
+  readonly addresses: readonly PoolAddressAdminView[];
+  readonly total: number;
+  readonly limit: number;
+  readonly offset: number;
+}
+
+// Paginated list of pool addresses with their allocation/disable state, so an
+// operator can SEE the pool before deciding what to disable. Filter by family
+// and/or status. Ordered by (family, addressIndex) for stable paging. To pick
+// disable candidates, combine with GET /admin/balances (which addresses hold
+// funds) — empty + 'available' rows are the safe ones to park.
+export async function listPoolAddresses(
+  deps: AppDeps,
+  args: {
+    family?: ChainFamily | undefined;
+    status?: "available" | "allocated" | "quarantined" | undefined;
+    limit?: number | undefined;
+    offset?: number | undefined;
+  } = {}
+): Promise<ListPoolAddressesResult> {
+  const limit = args.limit ?? 100;
+  const offset = args.offset ?? 0;
+
+  const conds = [];
+  if (args.family) conds.push(eq(addressPool.family, args.family));
+  if (args.status) conds.push(eq(addressPool.status, args.status));
+  const whereClause = conds.length > 0 ? and(...conds) : undefined;
+
+  const countQuery = deps.db.select({ cnt: count() }).from(addressPool);
+  const [countRow] = whereClause ? await countQuery.where(whereClause) : await countQuery;
+
+  const baseQuery = deps.db.select().from(addressPool);
+  const filtered = whereClause ? baseQuery.where(whereClause) : baseQuery;
+  const rows = await filtered
+    .orderBy(asc(addressPool.family), asc(addressPool.addressIndex))
+    .limit(limit)
+    .offset(offset);
+
+  return { addresses: rows.map(toAdminView), total: countRow?.cnt ?? 0, limit, offset };
 }
 
 // ---- Internals ----

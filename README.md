@@ -1017,6 +1017,63 @@ there's effectively no per-tx cost to gate against. (A future release will add
 an admin endpoint to drive the freeze/delegate lifecycle from the gateway
 itself; today you delegate out-of-band and the gateway honors it.)
 
+### Disabling (trimming) pool addresses
+
+Account-model families (EVM, Tron, Solana) reuse a small pool of HD-derived
+addresses across invoices. Over time the pool can grow under load and never
+shrink. You can manually **disable** addresses to keep the active set small —
+cheaper detection (fewer addresses scanned/subscribed), less stranded native
+dust, and fewer addresses cycling.
+
+```bash
+# 1) See what's in the pool and pick candidates. Lists each address with its
+#    status (available/allocated/quarantined) + disabledAt. Filters:
+#    ?family=, ?status=; paginated with ?limit (≤500) & ?offset.
+curl "$GATEWAY_URL/admin/pool/addresses?family=evm&status=available" \
+  -H "Authorization: Bearer $ADMIN_KEY"
+# { "addresses": [ { "family":"evm", "address":"0x…", "addressIndex":7,
+#     "status":"available", "disabledAt":null, "allocatedToInvoiceId":null } ],
+#   "total": 42, "limit": 100, "offset": 0 }
+# Tip: cross-reference GET /admin/balances?family=evm to see which hold funds —
+# disable the idle, empty ones.
+
+# 2) Disable (park) an address — pull it out of normal allocation.
+curl -X POST "$GATEWAY_URL/admin/pool/addresses/disable" \
+  -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{ "family": "evm", "address": "0xc965c39c..." }'
+# 200 { "address": { "family":"evm", "address":"0x…", "status":"quarantined",
+#                    "disabledAt": 1781…, "allocatedToInvoiceId": null } }
+
+# List what's disabled (optional ?family=evm|tron|solana|utxo).
+curl "$GATEWAY_URL/admin/pool/addresses/disabled?family=evm" \
+  -H "Authorization: Bearer $ADMIN_KEY"
+
+# Re-enable.
+curl -X POST "$GATEWAY_URL/admin/pool/addresses/enable" \
+  -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{ "family": "evm", "address": "0xc965c39c..." }'
+```
+
+**Disable is a soft preference, not a removal — it's self-balancing.** The
+allocator skips disabled addresses during normal allocation, but if the family
+pool is otherwise **exhausted** it borrows a disabled one rather than minting a
+brand-new address (which on Tron re-pays the ~1 TRX account-activation cost).
+A borrowed address **re-parks itself on release**, so the pool naturally settles
+back to your trimmed size without manual re-disabling.
+
+**It's always safe.** A disabled address stays in `address_pool`, is still
+swept by consolidation (which scans by family regardless of status), and late
+payments to it follow the same cooldown/orphan path as any released address.
+Account-model addresses are HD-derived, so the key is always recoverable from
+`MASTER_SEED + index` — disabling can never strand funds. You can disable an
+address that's currently serving an invoice too; it finishes the invoice, then
+re-parks instead of returning to rotation.
+
+> Note: there is **no on-chain "destroy"** for EVM/Tron — an externally-owned
+> account always exists and costs nothing to exist, so disabling saves
+> *detection/dust* overhead, not gas. (On Solana you *can* reclaim ATA rent by
+> closing token accounts, but that's a separate, not-yet-built feature.)
+
 ### Address subscription lifecycle (automatic)
 
 When `ALCHEMY_NOTIFY_TOKEN` is set, the gateway tracks which of your HD-derived

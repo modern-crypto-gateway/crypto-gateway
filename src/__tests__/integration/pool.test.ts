@@ -3,8 +3,12 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import { addressPool, invoices } from "../../db/schema.js";
 import {
   allocateForInvoice,
+  disablePoolAddress,
+  enablePoolAddress,
   getStats,
   initializePool,
+  listDisabledAddresses,
+  listPoolAddresses,
   reconcileOrphanedAllocations,
   refillFamily,
   releaseFromInvoice
@@ -497,5 +501,224 @@ describe("pool.service — address cooldown", () => {
     } finally {
       await booted.close();
     }
+  });
+});
+
+describe("pool.service — manual disable / enable (operator trimming)", () => {
+  let booted: BootedTestApp;
+  beforeEach(async () => {
+    booted = await bootTestApp({ poolInitialSize: 2 });
+  });
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  async function poolAddresses(): Promise<{ address: string; id: string }[]> {
+    return booted.deps.db
+      .select({ address: addressPool.address, id: addressPool.id })
+      .from(addressPool)
+      .where(eq(addressPool.family, "evm"))
+      .orderBy(asc(addressPool.addressIndex));
+  }
+
+  it("disable parks an available address; enable restores it", async () => {
+    const [first] = await poolAddresses();
+    const disabled = await disablePoolAddress(booted.deps, { family: "evm", address: first!.address });
+    expect(disabled.status).toBe("quarantined");
+    expect(disabled.disabledAt).not.toBeNull();
+
+    const listed = await listDisabledAddresses(booted.deps, "evm");
+    expect(listed.map((a) => a.address)).toContain(first!.address);
+
+    const enabled = await enablePoolAddress(booted.deps, { family: "evm", address: first!.address });
+    expect(enabled.status).toBe("available");
+    expect(enabled.disabledAt).toBeNull();
+    expect(await listDisabledAddresses(booted.deps, "evm")).toHaveLength(0);
+  });
+
+  it("normal allocation never picks a disabled address while available rows exist", async () => {
+    const [first] = await poolAddresses();
+    await disablePoolAddress(booted.deps, { family: "evm", address: first!.address });
+    // 2 total, 1 parked, 1 available → allocation takes the available one.
+    const a = await allocateForInvoice(booted.deps, "inv-1", "evm");
+    expect(a.address).not.toBe(first!.address);
+  });
+
+  it("borrows a disabled address only when the pool is exhausted, then re-parks on release", async () => {
+    // Hold the refill lock so the eager test job runner can't slip a fresh
+    // 'available' row in and mask the borrow path.
+    await booted.deps.cache.put("pool:refill-lock:evm", "1", { ttlSeconds: 60 });
+    try {
+      const [first] = await poolAddresses();
+      const parkAddr = first!.address;
+      await disablePoolAddress(booted.deps, { family: "evm", address: parkAddr });
+
+      // First allocation takes the remaining available row (not the parked one).
+      const a1 = await allocateForInvoice(booted.deps, "inv-1", "evm");
+      expect(a1.address).not.toBe(parkAddr);
+
+      // No available rows left → the next allocation BORROWS the parked one.
+      const a2 = await allocateForInvoice(booted.deps, "inv-2", "evm");
+      expect(a2.address).toBe(parkAddr);
+      expect(a2.status).toBe("allocated");
+
+      // Releasing the borrowed row RE-PARKS it (quarantined), not 'available',
+      // and preserves the disable intent — the pool self-balances back down.
+      await releaseFromInvoice(booted.deps, "inv-2");
+      const [row] = await booted.deps.db
+        .select({ status: addressPool.status, disabledAt: addressPool.disabledAt })
+        .from(addressPool)
+        .where(eq(addressPool.address, parkAddr))
+        .limit(1);
+      expect(row?.status).toBe("quarantined");
+      expect(row?.disabledAt).not.toBeNull();
+    } finally {
+      await booted.deps.cache.delete("pool:refill-lock:evm");
+    }
+  });
+
+  it("disabling an allocated address lets it finish, then re-parks on release", async () => {
+    const a = await allocateForInvoice(booted.deps, "inv-1", "evm");
+    // Disable while allocated — status stays 'allocated', intent recorded.
+    const disabled = await disablePoolAddress(booted.deps, { family: "evm", address: a.address });
+    expect(disabled.status).toBe("allocated");
+    expect(disabled.disabledAt).not.toBeNull();
+
+    await releaseFromInvoice(booted.deps, "inv-1");
+    const [row] = await booted.deps.db
+      .select({ status: addressPool.status, disabledAt: addressPool.disabledAt })
+      .from(addressPool)
+      .where(eq(addressPool.id, a.id))
+      .limit(1);
+    expect(row?.status).toBe("quarantined");
+    expect(row?.disabledAt).not.toBeNull();
+  });
+
+  it("disable preserves the original timestamp and is idempotent", async () => {
+    const [first] = await poolAddresses();
+    const d1 = await disablePoolAddress(booted.deps, { family: "evm", address: first!.address });
+    const d2 = await disablePoolAddress(booted.deps, { family: "evm", address: first!.address });
+    expect(d2.disabledAt).toBe(d1.disabledAt); // COALESCE preserves the first stamp
+    expect(d2.status).toBe("quarantined");
+  });
+
+  it("listPoolAddresses lists rows with status, supports status filter + pagination", async () => {
+    const all = await listPoolAddresses(booted.deps, { family: "evm" });
+    expect(all.total).toBe(2);
+    expect(all.addresses).toHaveLength(2);
+    expect(all.addresses.every((a) => a.status === "available")).toBe(true);
+
+    const [first] = await poolAddresses();
+    await disablePoolAddress(booted.deps, { family: "evm", address: first!.address });
+
+    const parked = await listPoolAddresses(booted.deps, { family: "evm", status: "quarantined" });
+    expect(parked.addresses.map((a) => a.address)).toEqual([first!.address]);
+    const avail = await listPoolAddresses(booted.deps, { family: "evm", status: "available" });
+    expect(avail.total).toBe(1);
+
+    const page = await listPoolAddresses(booted.deps, { family: "evm", limit: 1, offset: 0 });
+    expect(page.addresses).toHaveLength(1);
+    expect(page.limit).toBe(1);
+    expect(page.total).toBe(2);
+  });
+});
+
+describe("admin /pool/addresses disable + enable (HTTP)", () => {
+  const ADMIN_KEY = "super-secret-admin-key";
+  let booted: BootedTestApp;
+  beforeEach(async () => {
+    booted = await bootTestApp({ poolInitialSize: 2, secretsOverrides: { ADMIN_KEY } });
+  });
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  async function firstAddress(): Promise<string> {
+    const [row] = await booted.deps.db
+      .select({ address: addressPool.address })
+      .from(addressPool)
+      .where(eq(addressPool.family, "evm"))
+      .orderBy(asc(addressPool.addressIndex))
+      .limit(1);
+    return row!.address;
+  }
+
+  it("POST disable → GET disabled → POST enable round-trips via the admin API", async () => {
+    const address = await firstAddress();
+
+    const disableRes = await booted.app.fetch(
+      new Request("http://test.local/admin/pool/addresses/disable", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ family: "evm", address })
+      })
+    );
+    expect(disableRes.status).toBe(200);
+    const disableBody = (await disableRes.json()) as { address: { status: string; disabledAt: number | null } };
+    expect(disableBody.address.status).toBe("quarantined");
+    expect(disableBody.address.disabledAt).not.toBeNull();
+
+    const listRes = await booted.app.fetch(
+      new Request("http://test.local/admin/pool/addresses/disabled?family=evm", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(listRes.status).toBe(200);
+    const listBody = (await listRes.json()) as { addresses: { address: string }[] };
+    expect(listBody.addresses.map((a) => a.address)).toContain(address);
+
+    const enableRes = await booted.app.fetch(
+      new Request("http://test.local/admin/pool/addresses/enable", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ family: "evm", address })
+      })
+    );
+    expect(enableRes.status).toBe(200);
+    const enableBody = (await enableRes.json()) as { address: { status: string; disabledAt: number | null } };
+    expect(enableBody.address.status).toBe("available");
+    expect(enableBody.address.disabledAt).toBeNull();
+  });
+
+  it("GET /pool/addresses lists pool addresses with status (for picking disable candidates)", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/pool/addresses?family=evm", {
+        headers: { authorization: `Bearer ${ADMIN_KEY}` }
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      addresses: { address: string; status: string; disabledAt: number | null }[];
+      total: number;
+      limit: number;
+      offset: number;
+    };
+    expect(body.total).toBe(2);
+    expect(body.addresses).toHaveLength(2);
+    expect(body.addresses.every((a) => a.status === "available")).toBe(true);
+  });
+
+  it("returns 404 ADDRESS_NOT_FOUND for an address not in the pool", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/pool/addresses/disable", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
+        body: JSON.stringify({ family: "evm", address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })
+      })
+    );
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("ADDRESS_NOT_FOUND");
+  });
+
+  it("requires the admin key", async () => {
+    const res = await booted.app.fetch(
+      new Request("http://test.local/admin/pool/addresses/disable", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ family: "evm", address: await firstAddress() })
+      })
+    );
+    expect(res.status).toBe(401);
   });
 });
