@@ -5,6 +5,7 @@ import { confirmTransactions, recheckConfirmedTransactionsForReorg } from "./pay
 import {
   confirmPayouts,
   executeReservedPayouts,
+  reconcileConfirmedPayoutGasBurns,
   reconcileFailedPayoutGasBurns,
   sweepStuckPayoutReservations
 } from "./payout.service.js";
@@ -38,6 +39,11 @@ export interface ScheduledJobsResult {
   executeReservedPayouts: JobOutcome;
   confirmPayouts: JobOutcome;
   reconcileFailedPayoutGasBurns: JobOutcome;
+  // Debits the real native gas burned by SUCCESSFUL account-model payouts
+  // (confirmPayouts only releases the gas reservation; it never records the
+  // actual spend). Keeps tracked native from drifting upward after every
+  // successful sweep. UTXO excluded (fee already in the change backfill).
+  reconcileConfirmedPayoutGasBurns: JobOutcome;
   sweepStuckPayoutReservations: JobOutcome;
   sweepExpiredInvoices: JobOutcome;
   reconcileOrphanedAllocations: JobOutcome;
@@ -82,6 +88,11 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     // AFTER confirmPayouts so any payout that just flipped to failed
     // this tick gets a same-tick retry on its gas_burn.
     reconcileFailedPayoutGasBurns: await run(() => reconcileFailedPayoutGasBurns(deps)),
+    // Same idea for SUCCESSFUL payouts: record the actual gas burned so the
+    // source's tracked native doesn't drift above on-chain reality. Runs after
+    // confirmPayouts (same-tick) and before runAutoConsolidations so the next
+    // consolidation plan sees accurate native balances.
+    reconcileConfirmedPayoutGasBurns: await run(() => reconcileConfirmedPayoutGasBurns(deps)),
     sweepStuckPayoutReservations: await run(() => sweepStuckPayoutReservations(deps)),
     // Expire-then-deliver: must run BEFORE sweepWebhookDeliveries so the
     // invoice.expired events published here insert webhook rows that get

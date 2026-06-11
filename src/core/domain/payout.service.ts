@@ -671,11 +671,12 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
         feeWalletSponsor,
         forceSourceAddress: parsed.forceSourceAddress ?? null,
         freeGasAddresses,
-        // Tighter top-up cushion for internal consolidation legs to limit
-        // stranded native dust on single-use deposit addresses; merchant
-        // payouts keep the historical 20%.
+        // Consolidation legs use deps.consolidationTopUpCushionPercent (default
+        // 20%, same as merchant payouts) for headroom against baseFee movement
+        // between the top-up and the sweep broadcast. Leftover native is now
+        // tracked + reused, so a generous cushion costs nothing.
         topUpCushionPercent: parsed.internalKind === "consolidation_sweep"
-          ? (deps.consolidationTopUpCushionPercent ?? 10)
+          ? (deps.consolidationTopUpCushionPercent ?? 20)
           : 20
       });
 
@@ -1900,7 +1901,11 @@ async function startTopUpFromReservation(
     amountRaw: parent.topUpAmountRaw,
     quotedAmountUsd: null,
     quotedRate: null,
-    feeTier: parent.feeTier,
+    // Top-ups broadcast at the fast ("high") tier regardless of the sweep's
+    // tier: the longer a top-up sits unconfirmed, the more baseFee can climb
+    // before the main sweep broadcasts, under-funding it. A top-up is a tiny
+    // native transfer, so the marginal tier cost is negligible vs. a missed sweep.
+    feeTier: "high",
     feeQuotedNative: null,
     batchId: null,
     destinationAddress: parent.sourceAddress,
@@ -1933,9 +1938,7 @@ async function startTopUpFromReservation(
       toAddress: parent.sourceAddress,
       token: nativeSymbol,
       amountRaw: parent.topUpAmountRaw as AmountRaw,
-      ...(parent.feeTier !== null
-        ? { feeTier: parent.feeTier as "low" | "medium" | "high" }
-        : {})
+      feeTier: "high"
     });
     const privateKey = await deps.signerStore.get(sponsorScope);
     topUpTxHash = await chainAdapter.signAndBroadcast(unsigned, privateKey);
@@ -2211,8 +2214,156 @@ async function broadcastMain(
     return "submitted";
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    // Broadcast-time re-top-up (Fix A2): the plan→broadcast window spans several
+    // cron ticks, so baseFee can climb past the top-up sized at plan time and
+    // the EVM adapter's pre-broadcast check rejects the sweep for insufficient
+    // native. Rather than failing terminally, re-evaluate at CURRENT gas and
+    // fund another top-up (bounded). Scoped to that specific shortfall by
+    // matching the adapter's error string.
+    if (message.includes("insufficient native balance")) {
+      return reTopUpForBroadcast(deps, row, chainAdapter, source, message);
+    }
     return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
   }
+}
+
+// Max gas top-ups we'll send for a single payout before giving up. Each
+// broadcast-time shortfall (live gas outran the funded amount) can trigger one
+// more top-up; bounding the count stops a runaway gas-spike loop from draining
+// sponsors. 3 covers the realistic "gas kept rising across ticks" case.
+const MAX_TOPUP_ATTEMPTS = 3;
+
+// Broadcast-time re-top-up (Fix A2). Invoked when broadcastMain's pre-broadcast
+// native check fails. Re-evaluates the leg against CURRENT gas and the (now
+// accurately tracked — Fix B/C) source balance by releasing the leg's stale
+// reservations and re-running the tested `selectSource` with the SAME forced
+// source. If selection can fund a fresh sponsor top-up, the leg returns to
+// `reserved` and the normal executor flow sends another top-up (at the fast
+// tier) and re-broadcasts; the gas_top_up child count bounds the loop.
+//
+// We deliberately reschedule ONLY on the `with_sponsor` outcome: that's the one
+// that makes progress (adds tracked native to the source) and is naturally
+// bounded by the child count. A `direct` outcome (ledger says funded yet the
+// broadcast just failed) makes no progress and could loop, so we fail and let
+// the higher-level retry (auto-consolidation re-plan / merchant retry) re-decide
+// with a fresh quote.
+//
+// Returns "deferred" when a re-top-up was scheduled, or "failed" when the leg
+// was failed (the caller propagates the status).
+async function reTopUpForBroadcast(
+  deps: AppDeps,
+  row: typeof payouts.$inferSelect,
+  chainAdapter: ChainAdapter,
+  source: { address: string; derivationIndex: number },
+  failMessage: string
+): Promise<"submitted" | "failed" | "deferred"> {
+  const nativeSymbol = chainAdapter.nativeSymbol(row.chainId as ChainId);
+  const isNativePayout = row.token === nativeSymbol;
+  const capability = chainAdapter.feeWalletCapability(row.chainId as ChainId);
+  // Only account-model TOKEN sweeps fund gas via a top-up. Native payouts (gas
+  // IS the asset) and co-sign chains (fee wallet pays) have no top-up rail.
+  if (isNativePayout || capability === "co-sign" || row.sourceAddress === null) {
+    return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", failMessage);
+  }
+
+  const priorTopUps = await deps.db
+    .select({ id: payouts.id })
+    .from(payouts)
+    .where(and(eq(payouts.parentPayoutId, row.id), eq(payouts.kind, "gas_top_up")));
+  if (priorTopUps.length >= MAX_TOPUP_ATTEMPTS) {
+    return failPayout(
+      deps, row, "SOURCE_BROADCAST_FAILED",
+      `${failMessage} (exhausted ${MAX_TOPUP_ATTEMPTS} top-up attempts)`
+    );
+  }
+
+  // Fresh gas quote at CURRENT prices with the same safety multiplier the
+  // planner uses. If we can't re-quote, don't loop — fail.
+  let gasNeeded: bigint;
+  try {
+    const tier: "low" | "medium" | "high" =
+      (row.feeTier as "low" | "medium" | "high" | null) ?? "medium";
+    const q = await chainAdapter.quoteFeeTiers({
+      chainId: row.chainId as ChainId,
+      fromAddress: row.destinationAddress as Address,
+      toAddress: row.destinationAddress as Address,
+      token: row.token as TokenSymbol,
+      amountRaw: row.amountRaw as AmountRaw
+    });
+    const safety = chainAdapter.gasSafetyFactor(row.chainId as ChainId);
+    gasNeeded = (BigInt(q[tier].nativeAmountRaw) * safety.num) / safety.den;
+  } catch {
+    return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", failMessage);
+  }
+
+  const feeWalletAvailable = await deps.feeWalletStore.has(chainAdapter.family);
+  const feeWalletSponsor = await loadFeeWalletSponsor(deps, chainAdapter, row.chainId);
+  const freeGasAddresses = await loadFreeGasAddresses(deps, chainAdapter, row.chainId, row.token);
+
+  const rescheduled = await runWithBusyRetry(deps, () =>
+    deps.db.transaction(async (tx): Promise<boolean> => {
+      // Release the leg's stale reservations so selectSource can re-reserve
+      // cleanly (no double-count). The original sponsor reservation was already
+      // released when the first top-up confirmed; this clears the source one.
+      await tx
+        .update(payoutReservations)
+        .set({ releasedAt: deps.clock.now().getTime() })
+        .where(
+          and(eq(payoutReservations.payoutId, row.id), isNull(payoutReservations.releasedAt))
+        );
+
+      const selection = await selectSource(deps, tx, chainAdapter, {
+        payoutId: row.id,
+        chainId: row.chainId,
+        destinationAddress: row.destinationAddress,
+        token: row.token,
+        amountRaw: row.amountRaw,
+        feeTier: row.feeTier as "low" | "medium" | "high" | null,
+        gasNeeded,
+        feeWalletAvailable,
+        feeWalletSponsor,
+        forceSourceAddress: source.address,
+        freeGasAddresses,
+        topUpCushionPercent:
+          row.kind === "consolidation_sweep"
+            ? (deps.consolidationTopUpCushionPercent ?? 20)
+            : 20
+      });
+
+      if (selection.kind === "with_sponsor") {
+        await tx
+          .update(payouts)
+          .set({
+            status: "reserved",
+            broadcastAttemptedAt: null,
+            txHash: null,
+            topUpAmountRaw: selection.topUpAmountRaw,
+            topUpSponsorAddress: selection.sponsor.address,
+            updatedAt: deps.clock.now().getTime()
+          })
+          .where(eq(payouts.id, row.id));
+        return true;
+      }
+
+      // direct / no_candidates / insufficient / no_sponsor / max_send_exceeded:
+      // throw to roll back the reservation release (the leg keeps its original
+      // reservations) — failPayout below then fails + releases cleanly.
+      throw new Error("__retopup_no_progress__");
+    }, { behavior: "immediate" })
+  ).catch((err: unknown) => {
+    if (err instanceof Error && err.message === "__retopup_no_progress__") return false;
+    throw err;
+  });
+
+  if (rescheduled) {
+    deps.logger.info("payout.retopup.scheduled", {
+      payoutId: row.id,
+      chainId: row.chainId,
+      attempt: priorTopUps.length + 1
+    });
+    return "deferred";
+  }
+  return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", `${failMessage} (re-top-up unavailable)`);
 }
 
 // UTXO equivalent of broadcastMain. Account-model chains have a single
@@ -2833,6 +2984,78 @@ export async function reconcileFailedPayoutGasBurns(
     recorded,
     stillDeferred
   };
+}
+
+// Fix C — debit the ACTUAL native gas burned by a SUCCESSFUL account-model
+// payout. On confirmation `confirmPayouts` only RELEASES the gas reservation (a
+// temporary hold); it never records the real gas spent. So the source's tracked
+// native drifts UPWARD by the gas cost of every successful payout. Combined with
+// the top-up credit (Fix B), an un-debited success would make the planner
+// believe a source holds more native than it does, eventually tripping the
+// pre-broadcast "insufficient native balance" check. This cron pass records the
+// missing `gas_burn` for confirmed payouts, mirroring the failed-path
+// reconciler above and reusing `recordGasBurnDebit`.
+//
+// UTXO is EXCLUDED: its miner fee is already reflected by the change-UTXO
+// backfill on confirmation, so a gas_burn would double-count the fee.
+//
+// Unlike the failed-path reconciler (failed rows are rare, so it filters
+// already-reconciled rows in JS), confirmed payouts are high-volume — we use a
+// SQL NOT EXISTS anti-join so already-reconciled rows drop out of the candidate
+// set and the scan keeps making forward progress instead of re-examining the
+// same oldest rows every tick.
+export async function reconcileConfirmedPayoutGasBurns(
+  deps: AppDeps,
+  opts: ReconcileGasBurnsOptions = {}
+): Promise<ReconcileGasBurnsResult> {
+  const limit = opts.maxBatch ?? 200;
+  const candidates = await deps.db
+    .select()
+    .from(payouts)
+    .where(
+      and(
+        eq(payouts.status, "confirmed"),
+        inArray(payouts.kind, ["standard", "gas_top_up", "consolidation_sweep"]),
+        sql`${payouts.txHash} IS NOT NULL`,
+        // Anti-join: only rows without an existing gas_burn child. Keeps the
+        // candidate window advancing as rows get reconciled.
+        sql`NOT EXISTS (SELECT 1 FROM payouts gb WHERE gb.kind = 'gas_burn' AND gb.parent_payout_id = ${payouts.id})`
+      )
+    )
+    .orderBy(asc(payouts.confirmedAt))
+    .limit(limit);
+
+  let recorded = 0;
+  let stillDeferred = 0;
+
+  for (const row of candidates) {
+    let chainAdapter: ChainAdapter;
+    try {
+      chainAdapter = findChainAdapter(deps, row.chainId);
+    } catch (err) {
+      deps.logger.warn("payout.gas_burn.reconcile_confirmed.no_adapter", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      continue;
+    }
+    // UTXO fee is already captured by the change-UTXO backfill — skip to avoid
+    // double-counting the miner fee.
+    if (chainAdapter.family === "utxo") continue;
+
+    await recordGasBurnDebit(deps, row, chainAdapter);
+
+    const after = await deps.db
+      .select({ id: payouts.id })
+      .from(payouts)
+      .where(and(eq(payouts.kind, "gas_burn"), eq(payouts.parentPayoutId, row.id)))
+      .limit(1);
+    if (after.length > 0) recorded += 1;
+    else stillDeferred += 1;
+  }
+
+  return { scanned: candidates.length, recorded, stillDeferred };
 }
 
 async function failPayout(

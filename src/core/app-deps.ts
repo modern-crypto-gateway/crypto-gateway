@@ -137,9 +137,10 @@ export interface AppDeps {
   // token value is worth less than (this × the estimated per-sweep gas cost).
   // 0 / unset = OFF (opt-in). From CONSOLIDATION_DUST_GAS_MULTIPLIER.
   readonly consolidationDustGasMultiplier?: number;
-  // Gas top-up cushion (percent) used for consolidation legs only — tighter
-  // than the 20% merchant-payout default to limit stranded native dust on
-  // single-use deposit addresses. Falls back to 10 when not threaded.
+  // Gas top-up cushion (percent) for consolidation legs. Defaults to 20 (same
+  // as merchant payouts) for headroom against baseFee movement between the
+  // top-up and the sweep broadcast; leftover native is tracked + reused so a
+  // generous cushion is free. Falls back to 20 when not threaded.
   // From CONSOLIDATION_TOPUP_CUSHION_PERCENT.
   readonly consolidationTopUpCushionPercent?: number;
 

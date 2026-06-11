@@ -162,15 +162,16 @@ async function computeBalanceSnapshotDb(
       .from(payouts)
       .where(and(...debitConds));
 
-    // 3b. Intra-pool credits. A confirmed `consolidation_sweep` moves token
-    //     between two pool addresses; the inbound watcher deliberately does
-    //     not re-ingest our own payout txs, so the destination pool address
-    //     is credited here off the payouts row (mirrors step 3's debit on
-    //     the source). Without this, a consolidation debits the source and
-    //     credits nothing — the swept balance disappears from the snapshot.
+    // 3b. Intra-pool credits. A confirmed `consolidation_sweep` (token) or
+    //     `gas_top_up` (native) moves funds between two pool addresses; the
+    //     inbound watcher deliberately does not re-ingest our own payout txs,
+    //     so the destination pool address is credited here off the payouts row
+    //     (mirrors step 3's debit on the source). gas_top_up MUST be included
+    //     so a topped-up source's native is visible (else it reads 0 and the
+    //     planner re-tops-up endlessly — see computeSpendable for detail).
     const internalCreditConds: SQL[] = [
       eq(payouts.status, "confirmed"),
-      eq(payouts.kind, "consolidation_sweep"),
+      inArray(payouts.kind, ["consolidation_sweep", "gas_top_up"]),
       inArray(payouts.destinationAddress, allAddresses)
     ];
     if (opts.chainId !== undefined) internalCreditConds.push(eq(payouts.chainId, opts.chainId));
@@ -438,17 +439,21 @@ export async function computeSpendable(
           eq(transactions.token, token)
         )
       ),
-    // Intra-pool credits: a confirmed consolidation_sweep moves token from
-    // one pool address to another. The inbound watcher skips re-ingesting
-    // our own payout txs (payout-self-detect guard), so the destination
-    // address only gets credited here, off the payouts row itself.
+    // Intra-pool credits: a confirmed consolidation_sweep (token) OR gas_top_up
+    // (native) moves funds from one pool address to another. The inbound
+    // watcher skips re-ingesting our own payout txs (payout-self-detect guard),
+    // so the destination address only gets credited here, off the payouts row
+    // itself. gas_top_up MUST be included: without it a confirmed top-up debits
+    // the sponsor (below) but credits the source nothing, so the source reads 0
+    // native forever and the planner re-tops-up every payout — leaking native
+    // onto the source and failing broadcasts that thought there was no gas.
     db
       .select({ amountRaw: payouts.amountRaw })
       .from(payouts)
       .where(
         and(
           eq(payouts.status, "confirmed"),
-          eq(payouts.kind, "consolidation_sweep"),
+          inArray(payouts.kind, ["consolidation_sweep", "gas_top_up"]),
           eq(payouts.chainId, chainId),
           eq(payouts.token, token),
           sql`${payouts.destinationAddress} = ${address}`

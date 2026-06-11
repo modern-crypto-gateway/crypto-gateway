@@ -4,13 +4,17 @@ import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js"
 import {
   estimatePayoutFees,
   executeReservedPayouts,
-  planPayout
+  planPayout,
+  reconcileConfirmedPayoutGasBurns
 } from "../../core/domain/payout.service.js";
+import { computeSpendable } from "../../core/domain/balance-snapshot.service.js";
 import { payoutReservations, payouts } from "../../db/schema.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 import { seedFundedPoolAddress } from "../helpers/seed-source.js";
-import type { ChainAdapter } from "../../core/ports/chain.port.js";
+import type { ChainAdapter, FeeTierQuote } from "../../core/ports/chain.port.js";
 import type { ChainId, TxHash } from "../../core/types/chain.js";
+import type { AmountRaw } from "../../core/types/money.js";
+import type { EstimateArgs, UnsignedTx } from "../../core/types/unsigned-tx.js";
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
 const TEST_MASTER_SEED = "test test test test test test test test test test test junk";
@@ -359,5 +363,159 @@ describe("JIT gas top-up — token payout from a source that lacks native", () =
       .from(payoutReservations)
       .where(isNull(payoutReservations.releasedAt));
     expect(stillActive.length).toBe(0);
+  });
+
+  it("Fix B: a confirmed gas_top_up CREDITS the source's native in the ledger (no re-top-up loop)", async () => {
+    const planned = await planPayout(booted.deps, {
+      merchantId: MERCHANT_ID, chainId: 999, token: "DEVT", amountRaw: "30",
+      destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+    await executeReservedPayouts(booted.deps); // tick 1: top-up broadcast
+    const [p1] = await booted.deps.db.select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    expect(p1!.topUpAmountRaw).not.toBeNull();
+    adapter.confirmationStatuses.set(p1!.topUpTxHash!, { blockNumber: 1, confirmations: 30, reverted: false });
+    await executeReservedPayouts(booted.deps); // tick 2: top-up confirmed + main broadcast
+
+    const topUp = BigInt(p1!.topUpAmountRaw!);
+    // The source's native (DEVN) now reflects the confirmed top-up — previously
+    // this read 0 forever, causing the planner to re-top-up every payout.
+    const sourceNative = await computeSpendable(booted.deps, { chainId: 999, address: sourceAddress, token: "DEVN" });
+    expect(sourceNative).toBe(topUp);
+    // And the sponsor is debited by the same amount (double-entry closes).
+    const sponsorNative = await computeSpendable(booted.deps, { chainId: 999, address: sponsorAddress, token: "DEVN" });
+    expect(sponsorNative).toBe(1_000_000n - topUp);
+  });
+
+  it("Fix C: reconcileConfirmedPayoutGasBurns debits real gas for a confirmed payout (idempotent, skips UTXO n/a)", async () => {
+    const FEE = "7000";
+    const feeAdapter = {
+      ...adapter,
+      async getConsumedNativeFee(_c: ChainId, _t: TxHash): Promise<AmountRaw | null> {
+        return FEE as AmountRaw;
+      }
+    } as ChainAdapter & { confirmationStatuses: typeof adapter.confirmationStatuses };
+    feeAdapter.confirmationStatuses = adapter.confirmationStatuses;
+
+    await booted.close();
+    booted = await bootTestApp({ chains: [feeAdapter] });
+    const a = booted.deps.chains[0]!;
+    const src = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_INDEX).address);
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: src, derivationIndex: SOURCE_INDEX, balances: { DEVN: "1000000" }
+    });
+
+    // A confirmed native payout that spent 100 + (real gas FEE, not yet debited).
+    const payoutId = globalThis.crypto.randomUUID();
+    const now = booted.deps.clock.now().getTime();
+    await booted.deps.db.insert(payouts).values({
+      id: payoutId, merchantId: MERCHANT_ID, kind: "standard", parentPayoutId: null,
+      status: "confirmed", chainId: 999, token: "DEVN", amountRaw: "100",
+      quotedAmountUsd: null, quotedRate: null, feeTier: null, feeQuotedNative: null, batchId: null,
+      destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", sourceAddress: src,
+      txHash: "0x" + "ab".repeat(32), feeEstimateNative: null, topUpTxHash: null,
+      topUpSponsorAddress: null, topUpAmountRaw: null, lastError: null,
+      createdAt: now, submittedAt: now, confirmedAt: now, updatedAt: now, broadcastAttemptedAt: now,
+      confirmationThreshold: 1, confirmationTiersJson: null, webhookUrl: null, webhookSecretCiphertext: null
+    });
+
+    const before = await computeSpendable(booted.deps, { chainId: 999, address: src, token: "DEVN" });
+    expect(before).toBe(1_000_000n - 100n); // payout debit only, no gas yet
+
+    const r = await reconcileConfirmedPayoutGasBurns(booted.deps);
+    expect(r.recorded).toBe(1);
+
+    const [burn] = await booted.deps.db
+      .select().from(payouts)
+      .where(and(eq(payouts.kind, "gas_burn"), eq(payouts.parentPayoutId, payoutId))).limit(1);
+    expect(burn).toBeDefined();
+    expect(burn!.amountRaw).toBe(FEE);
+    expect(burn!.sourceAddress).toBe(src);
+
+    const after = await computeSpendable(booted.deps, { chainId: 999, address: src, token: "DEVN" });
+    expect(after).toBe(1_000_000n - 100n - BigInt(FEE)); // gas now debited
+
+    // Idempotent: the anti-join excludes the now-reconciled row.
+    const r2 = await reconcileConfirmedPayoutGasBurns(booted.deps);
+    expect(r2.recorded).toBe(0);
+    expect(r2.scanned).toBe(0);
+  });
+
+  it("Fix A2: an insufficient-native broadcast failure RE-TOPS-UP and then succeeds (not terminal fail)", async () => {
+    // Adapter with a rising gas quote: cheap at plan time, then spikes after
+    // the first main-tx attempt so the re-quote exceeds the first top-up
+    // (forcing selectSource down the with_sponsor re-top-up path). The main
+    // (DEVT) broadcast throws the EVM insufficient-native error once.
+    let gasRaw = "21000";
+    let mainAttempts = 0;
+    const wrapped = {
+      ...adapter,
+      async quoteFeeTiers(_args: EstimateArgs): Promise<FeeTierQuote> {
+        return {
+          low: { tier: "low", nativeAmountRaw: gasRaw as AmountRaw },
+          medium: { tier: "medium", nativeAmountRaw: gasRaw as AmountRaw },
+          high: { tier: "high", nativeAmountRaw: gasRaw as AmountRaw },
+          tieringSupported: false,
+          nativeSymbol: "DEVN" as ReturnType<ChainAdapter["nativeSymbol"]>
+        };
+      },
+      async signAndBroadcast(
+        unsigned: UnsignedTx,
+        pk: string,
+        opts?: { readonly feePayerPrivateKey?: string }
+      ): Promise<TxHash> {
+        const raw = unsigned.raw as { token?: string };
+        if (raw.token === "DEVT") {
+          mainAttempts += 1;
+          if (mainAttempts === 1) {
+            gasRaw = "200000"; // gas spiked — re-quote will now outrun top-up #1
+            throw new Error(
+              "insufficient native balance for broadcast (balance < value + gas × maxFeePerGas): balance=1 wei, gas_budget=2 wei"
+            );
+          }
+        }
+        return adapter.signAndBroadcast(unsigned, pk, opts);
+      }
+    } as ChainAdapter & { confirmationStatuses: typeof adapter.confirmationStatuses };
+    wrapped.confirmationStatuses = adapter.confirmationStatuses;
+
+    await booted.close();
+    booted = await bootTestApp({ chains: [wrapped] });
+    const a = booted.deps.chains[0]!;
+    sourceAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_INDEX).address);
+    sponsorAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SPONSOR_INDEX).address);
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sourceAddress, derivationIndex: SOURCE_INDEX, balances: { DEVT: "100" }
+    });
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sponsorAddress, derivationIndex: SPONSOR_INDEX, balances: { DEVN: "5000000" }
+    });
+
+    const planned = await planPayout(booted.deps, {
+      merchantId: MERCHANT_ID, chainId: 999, token: "DEVT", amountRaw: "30",
+      destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+
+    // Drive ticks, confirming each top-up, until the parent reaches a terminal-ish
+    // state (submitted) or we give up. Asserts the leg recovers via re-top-up.
+    let reservedAgainSeen = false;
+    for (let i = 0; i < 8; i += 1) {
+      await executeReservedPayouts(booted.deps);
+      const [p] = await booted.deps.db.select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+      if (p!.status === "submitted") break;
+      if (p!.status === "reserved" && i > 0) reservedAgainSeen = true; // bounced back for re-top-up
+      if (p!.status === "topping-up" && p!.topUpTxHash) {
+        adapter.confirmationStatuses.set(p!.topUpTxHash, { blockNumber: i + 1, confirmations: 30, reverted: false });
+      }
+    }
+
+    const [finalRow] = await booted.deps.db.select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    expect(finalRow!.status).toBe("submitted"); // recovered, not failed
+    expect(mainAttempts).toBe(2); // failed once, succeeded on the re-top-up
+    expect(reservedAgainSeen).toBe(true); // observed the re-top-up bounce
+    // Two gas_top_up children: the original + the broadcast-time re-top-up.
+    const topups = await booted.deps.db
+      .select().from(payouts)
+      .where(and(eq(payouts.parentPayoutId, planned.id), eq(payouts.kind, "gas_top_up")));
+    expect(topups.length).toBe(2);
   });
 });

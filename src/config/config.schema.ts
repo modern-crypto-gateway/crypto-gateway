@@ -173,12 +173,14 @@ export const AppConfigSchema = z
     // %). Override via CONSOLIDATION_DUST_GAS_MULTIPLIER.
     consolidationDustGasMultiplier: z.coerce.number().min(0).default(0),
     // Gas top-up cushion (percent) added on top of the estimated gas when an
-    // EVM/Tron source needs a native top-up before a TOKEN sweep. A single-use
-    // deposit address keeps any leftover native forever (stranded dust), so
-    // internal consolidation legs use a tighter cushion than merchant payouts
-    // (which keep the built-in 20%). Safe to tighten only alongside gas-window
-    // gating. Override via CONSOLIDATION_TOPUP_CUSHION_PERCENT.
-    consolidationTopUpCushionPercent: z.coerce.number().int().min(0).max(100).default(10),
+    // EVM/Tron consolidation source needs a native top-up before a TOKEN sweep.
+    // Defaults to 20% (same as merchant payouts) for headroom against baseFee
+    // movement between the top-up and the sweep broadcast. (Earlier this was
+    // tightened to 10% to limit "stranded dust" on single-use addresses, but
+    // that rationale no longer holds: leftover top-up native is now tracked in
+    // the ledger and reused by the source's next sweep, so a generous cushion
+    // is free.) Override via CONSOLIDATION_TOPUP_CUSHION_PERCENT.
+    consolidationTopUpCushionPercent: z.coerce.number().int().min(0).max(100).default(20),
 
     // Ops alerting: when set, error-level log lines are fan-out POSTed to this
     // URL (Slack/Discord/PagerDuty-compatible JSON body). Normal logs still
