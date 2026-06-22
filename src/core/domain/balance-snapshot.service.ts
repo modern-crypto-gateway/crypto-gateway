@@ -4,7 +4,7 @@ import type { Address, ChainFamily, ChainId } from "../types/chain.js";
 import { formatRawAmount } from "../types/money.js";
 import type { TokenSymbol } from "../types/token.js";
 import { TOKEN_REGISTRY } from "../types/token-registry.js";
-import { addressPool, payoutReservations, payouts, transactions, utxos } from "../../db/schema.js";
+import { addressPool, balanceAdjustments, payoutReservations, payouts, transactions, utxos } from "../../db/schema.js";
 
 // Admin balance snapshot.
 //
@@ -129,6 +129,7 @@ async function computeBalanceSnapshotDb(
   let internalCreditRows: { address: string; chainId: number; token: string; amountRaw: string }[] = [];
   let debitRows: { address: string | null; chainId: number; token: string; amountRaw: string }[] = [];
   let reservationRows: { address: string; chainId: number; token: string; amountRaw: string }[] = [];
+  let adjustmentRows: { address: string; chainId: number; token: string; deltaRaw: string }[] = [];
   if (allAddresses.length > 0) {
     const creditConds: SQL[] = [
       eq(transactions.status, "confirmed"),
@@ -201,6 +202,20 @@ async function computeBalanceSnapshotDb(
       })
       .from(payoutReservations)
       .where(and(...resConds));
+
+    // 5. Signed reconciliation adjustments (ledger ⇄ chain). Empty in normal
+    //    operation; folded in last so the snapshot matches computeSpendable.
+    const adjConds: SQL[] = [inArray(balanceAdjustments.address, allAddresses)];
+    if (opts.chainId !== undefined) adjConds.push(eq(balanceAdjustments.chainId, opts.chainId));
+    adjustmentRows = await deps.db
+      .select({
+        address: balanceAdjustments.address,
+        chainId: balanceAdjustments.chainId,
+        token: balanceAdjustments.token,
+        deltaRaw: balanceAdjustments.deltaRaw
+      })
+      .from(balanceAdjustments)
+      .where(and(...adjConds));
   }
 
   // 5. Fold credits, debits, and reservations into per-(address, chainId)
@@ -268,6 +283,24 @@ async function computeBalanceSnapshotDb(
     if (existing) {
       existing.amountRaw -= amount;
       if (existing.amountRaw < 0n) existing.amountRaw = 0n;
+    }
+  }
+
+  // Signed reconciliation adjustments, folded last (clamped at 0). A positive
+  // delta on a token not yet present seeds the bucket; a negative delta only
+  // reduces an existing one.
+  for (const r of adjustmentRows) {
+    if (!poolAddressSet.has(r.address)) continue;
+    if (opts.chainId !== undefined && opts.chainId !== r.chainId) continue;
+    const delta = BigInt(r.deltaRaw);
+    if (delta === 0n) continue;
+    const list = ensure(r.address, r.chainId);
+    const existing = list.find((e) => e.token === r.token);
+    if (existing) {
+      existing.amountRaw += delta;
+      if (existing.amountRaw < 0n) existing.amountRaw = 0n;
+    } else if (delta > 0n) {
+      list.push({ token: r.token as TokenSymbol, amountRaw: delta });
     }
   }
 
@@ -427,7 +460,7 @@ export async function computeSpendable(
     "db" in depsOrDb ? (depsOrDb as AppDeps).db : depsOrDb;
   const { chainId, address, token } = args;
 
-  const [creditRowsRaw, internalCreditRowsRaw, debitRowsRaw, resRowsRaw] = await Promise.all([
+  const [creditRowsRaw, internalCreditRowsRaw, debitRowsRaw, resRowsRaw, adjustmentRowsRaw] = await Promise.all([
     db
       .select({ amountRaw: transactions.amountRaw })
       .from(transactions)
@@ -480,6 +513,18 @@ export async function computeSpendable(
           eq(payoutReservations.address, address),
           eq(payoutReservations.token, token)
         )
+      ),
+    // Signed reconciliation adjustments (ledger ⇄ chain). Empty until a
+    // reconcile run writes a delta, so this term is 0 in normal operation.
+    db
+      .select({ deltaRaw: balanceAdjustments.deltaRaw })
+      .from(balanceAdjustments)
+      .where(
+        and(
+          eq(balanceAdjustments.chainId, chainId),
+          eq(balanceAdjustments.address, address),
+          eq(balanceAdjustments.token, token)
+        )
       )
   ]);
 
@@ -488,6 +533,7 @@ export async function computeSpendable(
   for (const r of internalCreditRowsRaw) total += BigInt(r.amountRaw);
   for (const r of debitRowsRaw) total -= BigInt(r.amountRaw);
   for (const r of resRowsRaw) total -= BigInt(r.amountRaw);
+  for (const r of adjustmentRowsRaw) total += BigInt(r.deltaRaw); // signed
   return total < 0n ? 0n : total;
 }
 
@@ -535,7 +581,7 @@ export async function computeSpendableBatch(
   const CHUNK = 200;
   for (let i = 0; i < addresses.length; i += CHUNK) {
     const chunk = addresses.slice(i, i + CHUNK);
-    const [creditRows, internalCreditRows, debitRows, reservationRows] = await Promise.all([
+    const [creditRows, internalCreditRows, debitRows, reservationRows, adjustmentRows] = await Promise.all([
       db
         .select({
           address: transactions.toAddress,
@@ -596,12 +642,28 @@ export async function computeSpendableBatch(
             inArray(payoutReservations.address, chunk),
             inArray(payoutReservations.token, tokens)
           )
+        ),
+      // Signed reconciliation adjustments. Empty in normal operation.
+      db
+        .select({
+          address: balanceAdjustments.address,
+          token: balanceAdjustments.token,
+          deltaRaw: balanceAdjustments.deltaRaw
+        })
+        .from(balanceAdjustments)
+        .where(
+          and(
+            eq(balanceAdjustments.chainId, chainId),
+            inArray(balanceAdjustments.token, tokens),
+            inArray(balanceAdjustments.address, chunk)
+          )
         )
     ]);
     for (const r of creditRows) apply(r.address, r.token, BigInt(r.amountRaw));
     for (const r of internalCreditRows) apply(r.address, r.token, BigInt(r.amountRaw));
     for (const r of debitRows) apply(r.address, r.token, -BigInt(r.amountRaw));
     for (const r of reservationRows) apply(r.address, r.token, -BigInt(r.amountRaw));
+    for (const r of adjustmentRows) apply(r.address, r.token, BigInt(r.deltaRaw)); // signed
   }
 
   for (const byToken of out.values()) {

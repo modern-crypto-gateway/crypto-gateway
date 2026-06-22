@@ -704,6 +704,38 @@ export const payouts = sqliteTable(
   ]
 );
 
+// ---- balance_adjustments (ledger ⇄ chain reconciliation) ----
+//
+// Append-only SIGNED corrections that snap the derived ledger to on-chain
+// reality. `reconcileLedgerToChain` reads each pool address's live on-chain
+// balance, compares it to the settled ledger (confirmed inbound + intra-pool
+// credits − confirmed outbound + prior adjustments, NO reservations), and
+// writes the delta here. `computeSpendable` / `computeSpendableBatch` / the
+// admin snapshot add the sum of deltas per (chainId, token, address), so the
+// correction takes effect WITHOUT ever rewriting transaction/payout history.
+// `deltaRaw` is a SIGNED smallest-unit decimal string (may start with '-').
+// Idempotent: a second reconcile sees delta 0 and writes nothing. Empty table
+// ⇒ the balance math is byte-for-byte unchanged.
+export const balanceAdjustments = sqliteTable(
+  "balance_adjustments",
+  {
+    id: text("id").primaryKey(),
+    chainId: integer("chain_id").notNull(),
+    address: text("address").notNull(),
+    token: text("token").notNull(),
+    // Signed smallest-unit delta applied to (chainId, token, address).
+    deltaRaw: text("delta_raw").notNull(),
+    // Audit: the live on-chain balance observed and the settled-ledger balance
+    // computed at reconciliation time. delta = onChainRaw − ledgerRaw.
+    onChainRaw: text("on_chain_raw"),
+    ledgerRaw: text("ledger_raw"),
+    // Free-text provenance, e.g. "rpc-reconciliation" or an operator note.
+    reason: text("reason").notNull(),
+    createdAt: integer("created_at").notNull()
+  },
+  (t) => [index("idx_balance_adjustments_lookup").on(t.chainId, t.token, t.address)]
+);
+
 // ---- payout_broadcasts (UTXO RBF audit trail + crash-consistency log) ----
 //
 // One row per broadcast attempt for a UTXO payout. The very first broadcast

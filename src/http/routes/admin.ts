@@ -36,6 +36,7 @@ import {
   updateSchedule as updateAutoSchedule
 } from "../../core/domain/auto-consolidation.service.js";
 import { listHeldPayouts, recoverHeldPayout } from "../../core/domain/payout.service.js";
+import { reconcileLedgerToChain } from "../../core/domain/reconcile-balances.service.js";
 import { repairUtxoAddressIndex } from "../../core/domain/utxo-address-index-repair.js";
 import {
   ingestDetectedTransfer,
@@ -179,6 +180,18 @@ const AttributeOrphanSchema = z.object({
 const RecoverPayoutSchema = z
   .object({
     txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/, "txHash must be a 0x-prefixed 32-byte hex string")
+  })
+  .strict();
+
+// Ledger ⇄ chain reconciliation. dryRun defaults to true (preview the deltas);
+// re-invoke with dryRun:false to write the adjustments. Optional family/chainId/
+// address narrow the scope.
+const ReconcileBalancesSchema = z
+  .object({
+    dryRun: z.boolean().optional(),
+    family: ChainFamilySchema.optional(),
+    chainId: z.number().int().positive().optional(),
+    address: z.string().min(1).max(128).optional()
   })
   .strict();
 
@@ -1440,6 +1453,30 @@ const hasFeeWallet = adapterFamily !== undefined && adapterFamily !== "monero"
       const payout = await recoverHeldPayout(deps, { payoutId: id, txHash: parsed.txHash });
       deps.logger.info("admin recovered held payout", { payoutId: id, txHash: parsed.txHash });
       return c.json({ payout }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
+  });
+
+  // Ledger ⇄ chain reconciliation. Reads each account-model pool address's live
+  // on-chain balance and writes a signed adjustment per token so the ledger
+  // reads exactly the chain. dryRun (default true) previews the deltas without
+  // writing. Run with schedules paused. Body (all optional):
+  //   { "dryRun": false, "family": "evm", "chainId": 137, "address": "0x…" }
+  app.post("/balances/reconcile", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as unknown;
+    try {
+      const parsed = ReconcileBalancesSchema.parse(body ?? {});
+      const result = await reconcileLedgerToChain(deps, {
+        ...(parsed.dryRun !== undefined ? { dryRun: parsed.dryRun } : {}),
+        ...(parsed.family !== undefined ? { family: parsed.family } : {}),
+        ...(parsed.chainId !== undefined ? { chainId: parsed.chainId } : {}),
+        ...(parsed.address !== undefined ? { address: parsed.address } : {})
+      });
+      deps.logger.info("admin balance reconcile", {
+        dryRun: result.dryRun, checked: result.checked, adjusted: result.adjusted, deltas: result.deltas.length
+      });
+      return c.json(result, 200);
     } catch (err) {
       return renderError(c, err, deps.logger);
     }
