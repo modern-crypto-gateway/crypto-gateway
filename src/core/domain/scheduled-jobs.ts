@@ -7,6 +7,7 @@ import {
   executeReservedPayouts,
   reconcileConfirmedPayoutGasBurns,
   reconcileFailedPayoutGasBurns,
+  reconcileUnknownBroadcastPayouts,
   sweepStuckPayoutReservations
 } from "./payout.service.js";
 import { pollPayments } from "./poll-payments.js";
@@ -37,6 +38,7 @@ export interface ScheduledJobsResult {
   confirmTransactions: JobOutcome;
   recheckConfirmedForReorg: JobOutcome;
   executeReservedPayouts: JobOutcome;
+  reconcileUnknownBroadcastPayouts: JobOutcome;
   confirmPayouts: JobOutcome;
   reconcileFailedPayoutGasBurns: JobOutcome;
   // Debits the real native gas burned by SUCCESSFUL account-model payouts
@@ -65,6 +67,9 @@ export interface ScheduledJobsResult {
 
 export type JobOutcome = { ok: true; value: unknown } | { ok: false; error: string };
 
+const CONFIRMED_GAS_BURN_RECONCILE_CRON_BATCH = 20;
+const UNKNOWN_BROADCAST_RECONCILE_CRON_BATCH = 10;
+
 export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResult> {
   const result: ScheduledJobsResult = {
     // Pre-warm the price-oracle cache so USD-pegged invoice creation in the
@@ -79,6 +84,14 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     // this tick and reorged out next tick still gets caught promptly.
     recheckConfirmedForReorg: await run(() => recheckConfirmedTransactionsForReorg(deps)),
     executeReservedPayouts: await run(() => executeReservedPayouts(deps)),
+    // Unknown main-broadcast recovery. The executor keeps the broadcast slot
+    // claimed after a transport timeout so it cannot double-send; this pass
+    // only promotes a row when the exact intended transfer is visible on-chain.
+    reconcileUnknownBroadcastPayouts: await run(() =>
+      reconcileUnknownBroadcastPayouts(deps, {
+        maxBatch: UNKNOWN_BROADCAST_RECONCILE_CRON_BATCH
+      })
+    ),
     confirmPayouts: await run(() => confirmPayouts(deps)),
     // Gas-burn reconciliation: retry `gas_burn` synthesis for any
     // failed-and-broadcast payout whose receipt wasn't yet visible to
@@ -92,7 +105,11 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
     // source's tracked native doesn't drift above on-chain reality. Runs after
     // confirmPayouts (same-tick) and before runAutoConsolidations so the next
     // consolidation plan sees accurate native balances.
-    reconcileConfirmedPayoutGasBurns: await run(() => reconcileConfirmedPayoutGasBurns(deps)),
+    reconcileConfirmedPayoutGasBurns: await run(() =>
+      reconcileConfirmedPayoutGasBurns(deps, {
+        maxBatch: CONFIRMED_GAS_BURN_RECONCILE_CRON_BATCH
+      })
+    ),
     sweepStuckPayoutReservations: await run(() => sweepStuckPayoutReservations(deps)),
     // Expire-then-deliver: must run BEFORE sweepWebhookDeliveries so the
     // invoice.expired events published here insert webhook rows that get

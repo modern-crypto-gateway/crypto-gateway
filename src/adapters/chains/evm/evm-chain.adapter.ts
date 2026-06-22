@@ -377,7 +377,7 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
 
     // ---- Detection ----
 
-    async scanIncoming({ chainId, addresses, tokens, sinceMs }) {
+    async scanIncoming({ chainId, addresses, tokens, sinceMs, maxLookbackBlocks }) {
       if (addresses.length === 0) return [];
       const client = getClient(chainId);
 
@@ -388,10 +388,10 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       const blockTimeMs = APPROX_BLOCK_TIME_MS[chainId] ?? 12_000;
       const nowMs = Date.now();
       const spanBlocks = Math.min(
-        maxScanBlocks,
+        maxLookbackBlocks ?? maxScanBlocks,
         Math.max(1, Math.ceil((nowMs - sinceMs) / blockTimeMs))
       );
-      const fromBlock = latest - BigInt(spanBlocks) + 1n;
+      const fromBlock = latest >= BigInt(spanBlocks) ? latest - BigInt(spanBlocks) + 1n : 0n;
 
       // Match tokens (from our registry) on this chain. Unknown symbols silently skipped.
       const targetTokens = tokens
@@ -413,43 +413,50 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       const results: DetectedTransfer[] = [];
       await Promise.all(
         erc20Targets.map(async (token) => {
-          const logs = await client.getLogs({
-            address: token.contractAddress! as Hex,
-            event: {
-              type: "event",
-              name: "Transfer",
-              inputs: [
-                { name: "from", type: "address", indexed: true },
-                { name: "to", type: "address", indexed: true },
-                { name: "value", type: "uint256", indexed: false }
-              ]
-            },
-            args: { to: [...(addresses as readonly Hex[])] },
-            fromBlock,
-            toBlock: latest
-          });
-          // Drop sub-cent stablecoin transfers — address-poisoning spam
-          // sends 0.000099 USDC or similar from a vanity lookalike address
-          // hoping the user later copies the spoofed sender from history.
-          // See tokenDustThreshold for the scaling rationale (returns 0n for
-          // non-stables, so native flow-throughs aren't affected).
           const threshold = tokenDustThreshold(token);
-          for (const log of logs) {
-            // viem-decoded args: { from, to, value }
-            const args = log.args as { from: Hex; to: Hex; value: bigint };
-            if (threshold > 0n && args.value < threshold) continue;
-            results.push({
-              chainId: chainId as ChainId,
-              txHash: log.transactionHash,
-              logIndex: log.logIndex,
-              fromAddress: getAddress(args.from),
-              toAddress: getAddress(args.to),
-              token: token.symbol,
-              amountRaw: args.value.toString() as AmountRaw,
-              blockNumber: Number(log.blockNumber),
-              confirmations: Number(latest - log.blockNumber) + 1,
-              seenAt: new Date()
+          for (
+            let chunkFrom = fromBlock;
+            chunkFrom <= latest;
+            chunkFrom += BigInt(maxScanBlocks)
+          ) {
+            const chunkTo = chunkFrom + BigInt(maxScanBlocks) - 1n;
+            const logs = await client.getLogs({
+              address: token.contractAddress! as Hex,
+              event: {
+                type: "event",
+                name: "Transfer",
+                inputs: [
+                  { name: "from", type: "address", indexed: true },
+                  { name: "to", type: "address", indexed: true },
+                  { name: "value", type: "uint256", indexed: false }
+                ]
+              },
+              args: { to: [...(addresses as readonly Hex[])] },
+              fromBlock: chunkFrom,
+              toBlock: chunkTo > latest ? latest : chunkTo
             });
+            // Drop sub-cent stablecoin transfers — address-poisoning spam
+            // sends 0.000099 USDC or similar from a vanity lookalike address
+            // hoping the user later copies the spoofed sender from history.
+            // See tokenDustThreshold for the scaling rationale (returns 0n for
+            // non-stables, so native flow-throughs aren't affected).
+            for (const log of logs) {
+              // viem-decoded args: { from, to, value }
+              const args = log.args as { from: Hex; to: Hex; value: bigint };
+              if (threshold > 0n && args.value < threshold) continue;
+              results.push({
+                chainId: chainId as ChainId,
+                txHash: log.transactionHash,
+                logIndex: log.logIndex,
+                fromAddress: getAddress(args.from),
+                toAddress: getAddress(args.to),
+                token: token.symbol,
+                amountRaw: args.value.toString() as AmountRaw,
+                blockNumber: Number(log.blockNumber),
+                confirmations: Number(latest - log.blockNumber) + 1,
+                seenAt: new Date()
+              });
+            }
           }
         })
       );
@@ -474,6 +481,32 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
         confirmations: Math.max(0, confirmations),
         reverted: receipt.status === "reverted"
       };
+    },
+
+    // See ChainAdapter.getOutboundNonceState. Reads the sender's latest
+    // (mined) and pending nonces straight from the chain. Intentionally
+    // BYPASSES the process-local nonce cache — that cache rolls back on a
+    // failed broadcast (releaseNonceOnFailure) even when the tx may have
+    // reached the mempool, which is exactly the ambiguous outcome this probe
+    // exists to resolve. `null` on any RPC error so the caller stays safe and
+    // does not re-broadcast.
+    async getOutboundNonceState({
+      chainId,
+      address
+    }: {
+      chainId: ChainId;
+      address: Address;
+    }): Promise<{ latest: number; pending: number } | null> {
+      try {
+        const client = getClient(chainId);
+        const [latest, pending] = await Promise.all([
+          client.getTransactionCount({ address: address as Hex, blockTag: "latest" }),
+          client.getTransactionCount({ address: address as Hex, blockTag: "pending" })
+        ]);
+        return { latest, pending };
+      } catch {
+        return null;
+      }
     },
 
     async getConsumedNativeFee(chainId: ChainId, txHash: TxHash): Promise<AmountRaw | null> {

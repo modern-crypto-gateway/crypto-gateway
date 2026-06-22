@@ -2,10 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { and, eq, isNull } from "drizzle-orm";
 import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js";
 import {
+  confirmPayouts,
   estimatePayoutFees,
   executeReservedPayouts,
+  listHeldPayouts,
   planPayout,
-  reconcileConfirmedPayoutGasBurns
+  recoverHeldPayout,
+  reconcileConfirmedPayoutGasBurns,
+  reconcileUnknownBroadcastPayouts
 } from "../../core/domain/payout.service.js";
 import { computeSpendable } from "../../core/domain/balance-snapshot.service.js";
 import { payoutReservations, payouts } from "../../db/schema.js";
@@ -14,6 +18,7 @@ import { seedFundedPoolAddress } from "../helpers/seed-source.js";
 import type { ChainAdapter, FeeTierQuote } from "../../core/ports/chain.port.js";
 import type { ChainId, TxHash } from "../../core/types/chain.js";
 import type { AmountRaw } from "../../core/types/money.js";
+import type { DetectedTransfer } from "../../core/types/transaction.js";
 import type { EstimateArgs, UnsignedTx } from "../../core/types/unsigned-tx.js";
 
 const MERCHANT_ID = "00000000-0000-0000-0000-000000000001";
@@ -363,6 +368,314 @@ describe("JIT gas top-up — token payout from a source that lacks native", () =
       .from(payoutReservations)
       .where(isNull(payoutReservations.releasedAt));
     expect(stillActive.length).toBe(0);
+  });
+
+  it("recovers a topping-up payout when an ambiguous main broadcast later appears on-chain", async () => {
+    let sigCount = 0;
+    const incoming: DetectedTransfer[] = [];
+    const wrappedAdapter = {
+      ...adapter,
+      async signAndBroadcast(unsigned: Parameters<ChainAdapter["signAndBroadcast"]>[0], pk: string) {
+        sigCount += 1;
+        if (sigCount === 1) return adapter.signAndBroadcast(unsigned, pk);
+        throw new Error("request timed out after 10000ms");
+      },
+      async scanIncoming() {
+        return incoming;
+      }
+    } as ChainAdapter & { confirmationStatuses: Map<string, { blockNumber: number | null; confirmations: number; reverted: boolean }> };
+    wrappedAdapter.confirmationStatuses = adapter.confirmationStatuses;
+
+    await booted.close();
+    booted = await bootTestApp({ chains: [wrappedAdapter] });
+    const a = booted.deps.chains[0]!;
+    sourceAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_INDEX).address);
+    sponsorAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SPONSOR_INDEX).address);
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sourceAddress,
+      derivationIndex: SOURCE_INDEX, balances: { DEVT: "100" }
+    });
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sponsorAddress,
+      derivationIndex: SPONSOR_INDEX, balances: { DEVN: "1000000" }
+    });
+
+    const destinationAddress = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const planned = await planPayout(booted.deps, {
+      merchantId: MERCHANT_ID,
+      chainId: 999,
+      token: "DEVT",
+      amountRaw: "30",
+      destinationAddress
+    });
+
+    await executeReservedPayouts(booted.deps);
+    const [parentAfterTopUp] = await booted.deps.db
+      .select()
+      .from(payouts)
+      .where(eq(payouts.id, planned.id))
+      .limit(1);
+    wrappedAdapter.confirmationStatuses.set(parentAfterTopUp!.topUpTxHash!, {
+      blockNumber: 1, confirmations: 30, reverted: false
+    });
+
+    await executeReservedPayouts(booted.deps);
+    const [held] = await booted.deps.db
+      .select()
+      .from(payouts)
+      .where(eq(payouts.id, planned.id))
+      .limit(1);
+    expect(held?.status).toBe("topping-up");
+    expect(held?.txHash).toBeNull();
+    expect(held?.broadcastAttemptedAt).not.toBeNull();
+    expect(held?.lastError).toContain("outcome unknown");
+
+    const recoveredTxHash = `0x${"ab".repeat(32)}` as TxHash;
+    incoming.push({
+      chainId: 999 as ChainId,
+      txHash: recoveredTxHash,
+      logIndex: 0,
+      fromAddress: sourceAddress,
+      toAddress: destinationAddress,
+      token: "DEVT",
+      amountRaw: "30",
+      blockNumber: 123,
+      confirmations: 2,
+      seenAt: new Date()
+    });
+
+    const result = await reconcileUnknownBroadcastPayouts(booted.deps, { minAgeMs: 0 });
+    expect(result).toEqual({
+      scanned: 1,
+      recovered: 1,
+      stillUnknown: 0,
+      ambiguous: 0,
+      errors: 0,
+      rebroadcastScheduled: 0
+    });
+
+    const [recovered] = await booted.deps.db
+      .select({ status: payouts.status, txHash: payouts.txHash, lastError: payouts.lastError })
+      .from(payouts)
+      .where(eq(payouts.id, planned.id))
+      .limit(1);
+    expect(recovered?.status).toBe("submitted");
+    expect(recovered?.txHash).toBe(recoveredTxHash);
+    expect(recovered?.lastError).toBeNull();
+  });
+
+  it("guards then auto-re-broadcasts a held payout: blocked while a pending outbound exists, released once the source is clear, then it lands", async () => {
+    let sigCount = 0;
+    // Drives the getOutboundNonceState probe. broadcastMain captures `latest`
+    // (7) as the pre-broadcast baseline; the reconciler re-broadcasts only when
+    // the live state is byte-for-byte that baseline (latest == pending == 7).
+    let nonceState: { latest: number; pending: number } | null = { latest: 7, pending: 7 };
+    const wrappedAdapter = {
+      ...adapter,
+      async signAndBroadcast(unsigned: Parameters<ChainAdapter["signAndBroadcast"]>[0], pk: string) {
+        sigCount += 1;
+        // 1 = top-up broadcast (ok), 2 = main broadcast (ambiguous transport
+        // error → held), 3 = the guarded re-broadcast (lands).
+        if (sigCount === 2) throw new Error("request timed out after 10000ms");
+        return adapter.signAndBroadcast(unsigned, pk);
+      },
+      async scanIncoming() {
+        // The sweep never appears on-chain — the reconciler can't recover it
+        // and must fall through to the guarded re-broadcast decision.
+        return [];
+      },
+      async getOutboundNonceState() {
+        return nonceState;
+      }
+    } as ChainAdapter & { confirmationStatuses: Map<string, { blockNumber: number | null; confirmations: number; reverted: boolean }> };
+    wrappedAdapter.confirmationStatuses = adapter.confirmationStatuses;
+
+    await booted.close();
+    booted = await bootTestApp({ chains: [wrappedAdapter] });
+    const a = booted.deps.chains[0]!;
+    sourceAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_INDEX).address);
+    sponsorAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SPONSOR_INDEX).address);
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sourceAddress,
+      derivationIndex: SOURCE_INDEX, balances: { DEVT: "100" }
+    });
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sponsorAddress,
+      derivationIndex: SPONSOR_INDEX, balances: { DEVN: "1000000" }
+    });
+
+    const destinationAddress = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const planned = await planPayout(booted.deps, {
+      merchantId: MERCHANT_ID,
+      chainId: 999,
+      token: "DEVT",
+      amountRaw: "30",
+      destinationAddress
+    });
+
+    // Tick 1: broadcast the top-up, transition to topping-up.
+    await executeReservedPayouts(booted.deps);
+    const [parentAfterTopUp] = await booted.deps.db
+      .select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    wrappedAdapter.confirmationStatuses.set(parentAfterTopUp!.topUpTxHash!, {
+      blockNumber: 1, confirmations: 30, reverted: false
+    });
+
+    // Tick 2: top-up confirmed → main broadcast → ambiguous timeout → held.
+    await executeReservedPayouts(booted.deps);
+    const [held] = await booted.deps.db
+      .select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    expect(held?.status).toBe("topping-up");
+    expect(held?.txHash).toBeNull();
+    expect(held?.broadcastAttemptedAt).not.toBeNull();
+    expect(held?.lastError).toContain("outcome unknown");
+
+    // A pending tx now sits in the mempool (pending 8 > baseline 7) → it could
+    // be ours, so the reconciler must HOLD, not release (re-broadcasting could
+    // double-send).
+    nonceState = { latest: 7, pending: 8 };
+    const blocked = await reconcileUnknownBroadcastPayouts(booted.deps, {
+      minAgeMs: 0, rebroadcastAfterMs: 0
+    });
+    expect(blocked.rebroadcastScheduled).toBe(0);
+    expect(blocked.stillUnknown).toBe(1);
+    const [stillHeld] = await booted.deps.db
+      .select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    expect(stillHeld?.broadcastAttemptedAt).not.toBeNull();
+    expect(stillHeld?.status).toBe("topping-up");
+    expect(stillHeld?.preBroadcastNonce).toBe(7);
+
+    // The pending tx dropped — the source nonce is exactly the pre-broadcast
+    // baseline again (latest == pending == 7), proving our tx never landed →
+    // safe to re-broadcast: slot released, row stays topping-up for the executor.
+    nonceState = { latest: 7, pending: 7 };
+    const released = await reconcileUnknownBroadcastPayouts(booted.deps, {
+      minAgeMs: 0, rebroadcastAfterMs: 0
+    });
+    expect(released.rebroadcastScheduled).toBe(1);
+    expect(released.stillUnknown).toBe(0);
+    const [afterRelease] = await booted.deps.db
+      .select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    expect(afterRelease?.status).toBe("topping-up");
+    expect(afterRelease?.broadcastAttemptedAt).toBeNull();
+    expect(afterRelease?.lastError).toContain("REBROADCAST_SCHEDULED");
+
+    // Tick 3: executor rebuilds + re-broadcasts; this attempt lands.
+    await executeReservedPayouts(booted.deps);
+    const [resent] = await booted.deps.db
+      .select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    expect(resent?.status).toBe("submitted");
+    expect(resent?.txHash).not.toBeNull();
+  });
+
+  it("recoverHeldPayout: verifies the real tx, drives a held leg to submitted/confirmed (posting the source debit), and rejects bad hashes", async () => {
+    let sigCount = 0;
+    const incoming: DetectedTransfer[] = [];
+    const wrappedAdapter = {
+      ...adapter,
+      async signAndBroadcast(unsigned: Parameters<ChainAdapter["signAndBroadcast"]>[0], pk: string) {
+        sigCount += 1;
+        // 1 = top-up (ok), 2 = main broadcast (ambiguous transport error → held).
+        if (sigCount === 1) return adapter.signAndBroadcast(unsigned, pk);
+        throw new Error("request timed out after 10000ms");
+      },
+      async scanIncoming() {
+        return incoming;
+      }
+    } as ChainAdapter & { confirmationStatuses: Map<string, { blockNumber: number | null; confirmations: number; reverted: boolean }> };
+    wrappedAdapter.confirmationStatuses = adapter.confirmationStatuses;
+
+    await booted.close();
+    booted = await bootTestApp({ chains: [wrappedAdapter] });
+    const a = booted.deps.chains[0]!;
+    sourceAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SOURCE_INDEX).address);
+    sponsorAddress = a.canonicalizeAddress(a.deriveAddress(TEST_MASTER_SEED, SPONSOR_INDEX).address);
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sourceAddress,
+      derivationIndex: SOURCE_INDEX, balances: { DEVT: "100" }
+    });
+    await seedFundedPoolAddress(booted, {
+      chainId: 999, family: "evm", address: sponsorAddress,
+      derivationIndex: SPONSOR_INDEX, balances: { DEVN: "1000000" }
+    });
+
+    const destinationAddress = "0xcccccccccccccccccccccccccccccccccccccccc";
+    const planned = await planPayout(booted.deps, {
+      merchantId: MERCHANT_ID, chainId: 999, token: "DEVT", amountRaw: "30", destinationAddress
+    });
+
+    // Tick 1: top-up → topping-up.
+    await executeReservedPayouts(booted.deps);
+    const [afterTopUp] = await booted.deps.db
+      .select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    wrappedAdapter.confirmationStatuses.set(afterTopUp!.topUpTxHash!, {
+      blockNumber: 1, confirmations: 30, reverted: false
+    });
+
+    // Tick 2: main broadcast → ambiguous → held.
+    await executeReservedPayouts(booted.deps);
+    const [held] = await booted.deps.db
+      .select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    expect(held?.status).toBe("topping-up");
+    expect(held?.txHash).toBeNull();
+
+    // The held leg shows up in the recovery queue with its identifying fields.
+    const queue = await listHeldPayouts(booted.deps, {});
+    expect(queue.map((q) => q.id)).toContain(planned.id);
+    const queued = queue.find((q) => q.id === planned.id)!;
+    expect(queued.sourceAddress).toBe(sourceAddress);
+    expect(queued.destinationAddress).toBe(destinationAddress);
+    expect(queued.amountRaw).toBe("30");
+    expect(queued.heldForMs).not.toBeNull();
+
+    const realTxHash = `0x${"cd".repeat(32)}` as TxHash;
+    const revertedTxHash = `0x${"ee".repeat(32)}` as TxHash;
+    const mismatchTxHash = `0x${"ab".repeat(32)}` as TxHash;
+
+    // A reverted tx moved no funds → rejected (would post a phantom debit).
+    wrappedAdapter.confirmationStatuses.set(revertedTxHash, { blockNumber: 2, confirmations: 9, reverted: true });
+    await expect(recoverHeldPayout(booted.deps, { payoutId: planned.id, txHash: revertedTxHash }))
+      .rejects.toMatchObject({ code: "RECOVERY_TX_REVERTED" });
+
+    // Mined + not reverted but not THIS leg's transfer (absent from the scan) → rejected.
+    wrappedAdapter.confirmationStatuses.set(mismatchTxHash, { blockNumber: 3, confirmations: 9, reverted: false });
+    await expect(recoverHeldPayout(booted.deps, { payoutId: planned.id, txHash: mismatchTxHash }))
+      .rejects.toMatchObject({ code: "RECOVERY_TX_MISMATCH" });
+
+    // The real successful sweep is visible on-chain at the destination.
+    incoming.push({
+      chainId: 999 as ChainId, txHash: realTxHash, logIndex: 0,
+      fromAddress: sourceAddress, toAddress: destinationAddress,
+      token: "DEVT", amountRaw: "30", blockNumber: 100, confirmations: 30, seenAt: new Date()
+    });
+    wrappedAdapter.confirmationStatuses.set(realTxHash, { blockNumber: 100, confirmations: 30, reverted: false });
+
+    const recovered = await recoverHeldPayout(booted.deps, { payoutId: planned.id, txHash: realTxHash });
+    expect(recovered.status).toBe("submitted");
+
+    // Once recovered (txHash set) it drops out of the recovery queue.
+    const queueAfter = await listHeldPayouts(booted.deps, {});
+    expect(queueAfter.map((q) => q.id)).not.toContain(planned.id);
+
+    const [afterRecover] = await booted.deps.db
+      .select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    expect(afterRecover?.status).toBe("submitted");
+    expect(afterRecover?.txHash).toBe(realTxHash);
+    expect(afterRecover?.broadcastAttemptedAt).toBeNull();
+    expect(afterRecover?.lastError).toBeNull();
+
+    // confirmPayouts flips it to confirmed → the source debit finally posts.
+    await confirmPayouts(booted.deps);
+    const [confirmed] = await booted.deps.db
+      .select().from(payouts).where(eq(payouts.id, planned.id)).limit(1);
+    expect(confirmed?.status).toBe("confirmed");
+    expect(
+      await computeSpendable(booted.deps, { chainId: 999, address: sourceAddress, token: "DEVT" })
+    ).toBe(70n);
+
+    // Already recovered → no longer a held leg.
+    await expect(recoverHeldPayout(booted.deps, { payoutId: planned.id, txHash: realTxHash }))
+      .rejects.toMatchObject({ code: "PAYOUT_NOT_RECOVERABLE" });
   });
 
   it("Fix B: a confirmed gas_top_up CREDITS the source's native in the ledger (no re-top-up loop)", async () => {

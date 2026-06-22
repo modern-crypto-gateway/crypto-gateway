@@ -1,7 +1,12 @@
 import { Hono } from "hono";
 import type { AppDeps } from "./core/app-deps.js";
 import { confirmTransactions } from "./core/domain/payment.service.js";
-import { confirmPayouts, executeReservedPayouts, reconcileFailedPayoutGasBurns } from "./core/domain/payout.service.js";
+import {
+  confirmPayouts,
+  executeReservedPayouts,
+  reconcileFailedPayoutGasBurns,
+  reconcileUnknownBroadcastPayouts
+} from "./core/domain/payout.service.js";
 import { pollPayments } from "./core/domain/poll-payments.js";
 import { registerPoolReleaseHandler } from "./core/domain/pool.service.js";
 import { registerMoneroPoolReleaseHandler } from "./core/domain/monero-pool.service.js";
@@ -128,6 +133,11 @@ export function buildApp(deps: AppDeps): App {
       // wallet, builds/signs/broadcasts. One tick per cron interval.
       executeReservedPayouts: async () => {
         await executeReservedPayouts(deps);
+      },
+      // Unknown main-broadcast recovery — promotes held rows only when the
+      // exact intended transfer is later visible on-chain.
+      reconcileUnknownBroadcastPayouts: async () => {
+        await reconcileUnknownBroadcastPayouts(deps);
       },
       // Payout confirmation sweeper — moves 'submitted' payouts to
       // confirmed/failed based on the chain's current view.

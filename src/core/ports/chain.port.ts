@@ -91,6 +91,10 @@ export interface ChainAdapter {
     addresses: readonly Address[];
     tokens: readonly TokenSymbol[];
     sinceMs: number;
+    // Optional total lookback override for low-volume forensic jobs. Normal
+    // pollers should leave this unset so adapters keep their cheap hot-path
+    // scan limits.
+    maxLookbackBlocks?: number;
   }): Promise<readonly DetectedTransfer[]>;
 
   getConfirmationStatus(
@@ -116,6 +120,34 @@ export interface ChainAdapter {
   // RPC flap). Callers treat null as "try again later" — debit is
   // deferred, not zeroed.
   getConsumedNativeFee(chainId: ChainId, txHash: TxHash): Promise<AmountRaw | null>;
+
+  // OPTIONAL — reports `address`'s outbound nonce state, used by the
+  // unknown-broadcast reconciler to PROVE whether a held payout's main tx
+  // (broadcast errored ambiguously, on-chain outcome unknown) could have
+  // landed before it dares to re-broadcast.
+  //
+  //   - latest:  count of MINED outbound txs (the nonce the next mined tx
+  //              takes). Advances only when a tx confirms.
+  //   - pending: same but including queued mempool txs. `pending > latest`
+  //              means ≥1 signed tx is in the mempool, not yet mined.
+  //   - null:    couldn't determine (RPC error). Callers MUST treat as unsafe.
+  //
+  // The reconciler captures `latest` just before broadcasting (stored as
+  // `payouts.pre_broadcast_nonce`) and re-broadcasts ONLY when the live state
+  // is byte-for-byte unchanged — `latest == pending == pre_broadcast_nonce`.
+  // That equality proves our tx neither mined (latest unmoved) nor sits in the
+  // mempool (pending unmoved), so re-sending reuses the same nonce and cannot
+  // double-pay a transfer that actually succeeded but wasn't recorded. ANY
+  // advance → the reconciler holds for manual recovery.
+  //
+  // Implemented by nonce-ordered account-model chains (EVM today). Families
+  // without a monotonic per-sender nonce (Tron, Solana) OMIT it; the
+  // reconciler will not auto-re-broadcast them — recovery + manual release
+  // only — because they can't furnish the same proof.
+  getOutboundNonceState?(args: {
+    readonly chainId: ChainId;
+    readonly address: Address;
+  }): Promise<{ readonly latest: number; readonly pending: number } | null>;
 
   // ---- Payouts ----
 

@@ -352,6 +352,9 @@ export const transactions = sqliteTable(
       .where(sql`${t.logIndex} IS NULL`),
     index("idx_transactions_invoice").on(t.invoiceId),
     index("idx_transactions_status").on(t.status, t.chainId),
+    index("idx_transactions_confirmed_to_balance")
+      .on(t.chainId, t.token, t.toAddress)
+      .where(sql`${t.status} = 'confirmed'`),
     // Open orphans (no invoice attribution, not yet dismissed). Powers the
     // admin orphan queue scoped by chain and ordered by detection time.
     index("idx_transactions_orphans_open")
@@ -607,6 +610,18 @@ export const payouts = sqliteTable(
     // into a second on-chain tx.
     broadcastAttemptedAt: integer("broadcast_attempted_at"),
 
+    // Re-broadcast safety baseline. The source's latest MINED nonce, captured
+    // by `broadcastMain` immediately before it signs/sends the main tx
+    // (account-model chains that expose `getOutboundNonceState`; EVM today).
+    // After an ambiguous broadcast (transport error, on-chain outcome
+    // unknown), the unknown-broadcast reconciler compares the live nonce
+    // against this value: re-broadcast is only safe when the source is exactly
+    // where it was here (no new mined tx, nothing pending), which PROVES our
+    // tx never landed. NULL when uncaptured — the reconciler then refuses to
+    // auto-re-broadcast (holds for manual recovery) rather than risk a
+    // double-send. The landed-but-unrecorded case is exactly why this exists.
+    preBroadcastNonce: integer("pre_broadcast_nonce"),
+
     // Confirmation count required for this payout's tx to flip from
     // `submitted` to `confirmed`. Snapshotted at PLAN time by resolving
     // the merchant's per-chain override for the payout's chainId — frozen
@@ -655,13 +670,32 @@ export const payouts = sqliteTable(
     // executor to re-hydrate the top-up state machine and by the admin
     // audit view.
     index("idx_payouts_parent").on(t.parentPayoutId).where(sql`${t.parentPayoutId} IS NOT NULL`),
+    // Hot ledger/reconciliation paths:
+    // - computeSpendableBatch filters confirmed payouts by chain/token/source.
+    // - confirmed gas-burn reconciliation walks oldest confirmed tx-hash rows
+    //   that do not yet have a gas_burn child.
+    index("idx_payouts_confirmed_source_balance")
+      .on(t.chainId, t.token, t.sourceAddress)
+      .where(sql`${t.status} = 'confirmed' AND ${t.sourceAddress} IS NOT NULL`),
+    index("idx_payouts_internal_credit_balance")
+      .on(t.chainId, t.token, t.destinationAddress)
+      .where(sql`${t.status} = 'confirmed' AND ${t.kind} IN ('consolidation_sweep','gas_top_up')`),
+    index("idx_payouts_confirmed_gas_reconcile")
+      .on(t.confirmedAt)
+      .where(sql`${t.status} = 'confirmed' AND ${t.txHash} IS NOT NULL AND ${t.kind} IN ('standard','gas_top_up','consolidation_sweep')`),
+    index("idx_payouts_failed_gas_reconcile")
+      .on(t.updatedAt)
+      .where(sql`${t.status} = 'failed' AND ${t.txHash} IS NOT NULL AND ${t.kind} IN ('standard','gas_top_up','consolidation_sweep')`),
+    index("idx_payouts_unknown_broadcast_reconcile")
+      .on(t.broadcastAttemptedAt)
+      .where(sql`${t.txHash} IS NULL AND ${t.broadcastAttemptedAt} IS NOT NULL AND ${t.sourceAddress} IS NOT NULL AND ${t.status} IN ('reserved','topping-up') AND ${t.kind} IN ('standard','consolidation_sweep')`),
     check(
       "payouts_status_check",
       sql`${t.status} IN ('planned','reserved','topping-up','submitted','confirmed','failed','canceled')`
     ),
     check(
       "payouts_kind_check",
-      sql`${t.kind} IN ('standard','gas_top_up','gas_burn')`
+      sql`${t.kind} IN ('standard','gas_top_up','gas_burn','consolidation_sweep')`
     ),
     check(
       "payouts_fee_tier_check",

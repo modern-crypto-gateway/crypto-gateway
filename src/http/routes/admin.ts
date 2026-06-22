@@ -35,6 +35,7 @@ import {
   listSchedules as listAutoSchedules,
   updateSchedule as updateAutoSchedule
 } from "../../core/domain/auto-consolidation.service.js";
+import { listHeldPayouts, recoverHeldPayout } from "../../core/domain/payout.service.js";
 import { repairUtxoAddressIndex } from "../../core/domain/utxo-address-index-repair.js";
 import {
   ingestDetectedTransfer,
@@ -171,6 +172,15 @@ const RegisterSigningKeySchema = z.object({
 const AttributeOrphanSchema = z.object({
   invoiceId: z.string().uuid()
 });
+
+// Recover a held payout leg whose ambiguous main broadcast actually landed.
+// txHash is the real, successful on-chain transfer the operator read off a
+// block explorer; recoverHeldPayout verifies it before attaching it.
+const RecoverPayoutSchema = z
+  .object({
+    txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/, "txHash must be a 0x-prefixed 32-byte hex string")
+  })
+  .strict();
 
 // Free-text reason capped at 512 chars — enough for "customer refund issued
 // out-of-band, see ticket #123" without letting the admin queue become a
@@ -1376,6 +1386,63 @@ const hasFeeWallet = adapterFamily !== undefined && adapterFamily !== "monero"
       return c.json({ error: { code: "NOT_FOUND", message: `No consolidation ${id}` } }, 404);
     }
     return c.json(status, 200);
+  });
+
+  // Recovery queue: held legs whose main tx errored ambiguously and are still
+  // stuck (reserved/topping-up, no txHash, "Broadcast outcome unknown"). These
+  // are exactly what POST /payouts/:id/recover acts on. Optional filters:
+  // ?chainId=<int>&token=<symbol>&limit=<1..500> (default 100). Returns each
+  // leg's source/destination/token/amount so the operator can find the real
+  // OUT tx on a block explorer, plus heldForMs for age display.
+  app.get("/payouts/held", async (c) => {
+    const sp = new URL(c.req.url).searchParams;
+    const opts: { chainId?: number; token?: string; limit?: number } = {};
+    const chainIdRaw = sp.get("chainId");
+    if (chainIdRaw !== null) {
+      const n = Number(chainIdRaw);
+      if (!Number.isInteger(n)) {
+        return c.json({ error: { code: "BAD_QUERY", message: "chainId must be an integer" } }, 400);
+      }
+      opts.chainId = n;
+    }
+    const token = sp.get("token");
+    if (token !== null) opts.token = token;
+    const limitRaw = sp.get("limit");
+    if (limitRaw !== null) {
+      const n = Number(limitRaw);
+      if (!Number.isInteger(n) || n < 1) {
+        return c.json({ error: { code: "BAD_QUERY", message: "limit must be a positive integer" } }, 400);
+      }
+      opts.limit = n;
+    }
+    const held = await listHeldPayouts(deps, opts);
+    return c.json({ held, count: held.length }, 200);
+  });
+
+  // Manual recovery for a held payout leg whose main tx errored ambiguously
+  // (status reserved/topping-up, txHash NULL, "Broadcast outcome unknown") but
+  // which the operator has confirmed on a block explorer DID land on-chain.
+  // The auto-reconciler recovers these when its exact scan matches; this is the
+  // escape hatch for the cases it can't (amount/token drift, transfer older
+  // than the scan window). The supplied txHash is verified on-chain (mined, not
+  // reverted, exact source→destination transfer of token/amount) before the
+  // leg is driven to `submitted`; confirmPayouts then confirms it, posting the
+  // source debit + destination credit that clears the phantom-balance
+  // over-count. Body: { "txHash": "0x…" }.
+  app.post("/payouts/:id/recover", async (c) => {
+    const id = c.req.param("id");
+    const body = (await c.req.json().catch(() => null)) as unknown;
+    if (body === null) {
+      return c.json({ error: { code: "BAD_JSON" } }, 400);
+    }
+    try {
+      const parsed = RecoverPayoutSchema.parse(body);
+      const payout = await recoverHeldPayout(deps, { payoutId: id, txHash: parsed.txHash });
+      deps.logger.info("admin recovered held payout", { payoutId: id, txHash: parsed.txHash });
+      return c.json({ payout }, 200);
+    } catch (err) {
+      return renderError(c, err, deps.logger);
+    }
   });
 
   // ---- Auto-consolidation schedules ----

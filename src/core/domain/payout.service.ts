@@ -2354,6 +2354,88 @@ async function broadcastMain(
     }
   }
 
+  // ---- (a0.5) Pre-broadcast on-chain balance gate. The chain — not our
+  // derived ledger — is the source of truth for what we can actually send.
+  // Broadcasting a transfer the source can't cover is how doomed sweeps burn
+  // gas on reverts (and how a drifted ledger turns into real loss). The
+  // adapter already guards the NATIVE side pre-broadcast; this covers the
+  // TOKEN side it doesn't. Two behaviors:
+  //   - consolidation_sweep: RE-SIZE to the real on-chain balance. A sweep
+  //     moves "what's actually there", so reading it at broadcast time makes
+  //     the leg self-correcting against any ledger drift — it can neither
+  //     over-send nor revert. A zero balance means nothing to move → fail
+  //     cheap (no broadcast).
+  //   - fixed-amount payout: VERIFY coverage; if the source can't cover the
+  //     requested amount, fail cheap (no gas) instead of broadcasting a
+  //     guaranteed revert.
+  // Native transfers are skipped here (the adapter's own native check owns
+  // them). On an RPC read error, consolidation defers (never broadcast blind);
+  // a merchant payout proceeds to preserve liveness.
+  let effectiveAmountRaw = row.amountRaw;
+  const srcNativeSymbol = chainAdapter.nativeSymbol(row.chainId as ChainId);
+  if (row.token !== srcNativeSymbol) {
+    let onChainToken: bigint | null = null;
+    try {
+      onChainToken = BigInt(
+        await chainAdapter.getBalance({
+          chainId: row.chainId as ChainId,
+          address: source.address as Address,
+          token: row.token as TokenSymbol
+        })
+      );
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      if (row.kind === "consolidation_sweep") {
+        // Not time-sensitive — never broadcast blind. Release the claim so the
+        // next tick re-reads and retries.
+        try {
+          await runWithBusyRetry(deps, () =>
+            deps.db
+              .update(payouts)
+              .set({ broadcastAttemptedAt: null, updatedAt: deps.clock.now().getTime() })
+              .where(eq(payouts.id, row.id))
+          );
+        } catch (releaseErr) {
+          deps.logger.error("payout.balance_gate.release_failed", {
+            payoutId: row.id,
+            error: releaseErr instanceof Error ? releaseErr.message : String(releaseErr)
+          });
+        }
+        deps.logger.warn("payout.balance_gate.deferred_rpc_error", {
+          payoutId: row.id, chainId: row.chainId, token: row.token, error: reason
+        });
+        return "deferred";
+      }
+      deps.logger.warn("payout.balance_gate.unverified_proceeding", {
+        payoutId: row.id, chainId: row.chainId, token: row.token, error: reason
+      });
+      // merchant payout: onChainToken stays null → proceed (liveness).
+    }
+    if (onChainToken !== null) {
+      if (row.kind === "consolidation_sweep") {
+        // Cap the sweep at the real balance — never send more than the source
+        // actually holds (that's exactly what reverts). A drifted-high plan
+        // sizes down to reality; a brand-new deposit above the plan is left
+        // for the next run rather than grabbed mid-flight. Zero balance means
+        // nothing to move → fail cheap (no broadcast).
+        const planned = BigInt(row.amountRaw);
+        const sweepAmount = onChainToken < planned ? onChainToken : planned;
+        if (sweepAmount <= 0n) {
+          return failPayout(
+            deps, row, "SOURCE_BROADCAST_FAILED",
+            `Source holds 0 ${row.token} on-chain; nothing to consolidate (no broadcast).`
+          );
+        }
+        effectiveAmountRaw = sweepAmount.toString();
+      } else if (onChainToken < BigInt(row.amountRaw)) {
+        return failPayout(
+          deps, row, "SOURCE_BROADCAST_FAILED",
+          `Source ${row.token} balance ${onChainToken} is below the payout amount ${row.amountRaw}; not broadcasting.`
+        );
+      }
+    }
+  }
+
   // ---- (a) Pre-broadcast prep: build + key resolution. Nothing has
   // reached the network yet, so failures here are safe to fail terminally.
   let unsigned: UnsignedTx;
@@ -2389,7 +2471,7 @@ async function broadcastMain(
       fromAddress: source.address,
       toAddress: row.destinationAddress,
       token: row.token,
-      amountRaw: row.amountRaw as AmountRaw,
+      amountRaw: effectiveAmountRaw as AmountRaw,
       ...(row.feeTier !== null
         ? { feeTier: row.feeTier as "low" | "medium" | "high" }
         : {}),
@@ -2414,6 +2496,37 @@ async function broadcastMain(
       return reTopUpForBroadcast(deps, row, chainAdapter, source, message);
     }
     return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+  }
+
+  // Capture the source's mined-nonce baseline so the unknown-broadcast
+  // reconciler can later PROVE whether this tx landed before it risks a
+  // re-broadcast (see payouts.pre_broadcast_nonce). Nonce-ordered account
+  // chains only (EVM); others leave it null and are never auto-re-broadcast.
+  // Done BEFORE the broadcast so an ambiguous throw preserves it. Best-effort:
+  // a failed capture leaves null, which makes the reconciler hold for manual
+  // recovery rather than re-send — conservative, never unsafe.
+  if (typeof chainAdapter.getOutboundNonceState === "function") {
+    try {
+      const nonceState = await chainAdapter.getOutboundNonceState({
+        chainId: row.chainId as ChainId,
+        address: source.address as Address
+      });
+      if (nonceState !== null) {
+        const nonceNow = deps.clock.now().getTime();
+        await runWithBusyRetry(deps, () =>
+          deps.db
+            .update(payouts)
+            .set({ preBroadcastNonce: nonceState.latest, updatedAt: nonceNow })
+            .where(eq(payouts.id, row.id))
+        );
+      }
+    } catch (err) {
+      deps.logger.warn("payout.prebroadcast_nonce_capture_failed", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
   }
 
   // ---- (b) The broadcast itself. Definitive chain rejections (nonce too
@@ -2485,7 +2598,10 @@ async function broadcastMain(
     await runWithBusyRetry(deps, () =>
       deps.db
         .update(payouts)
-        .set({ status: "submitted", txHash, submittedAt: now2, updatedAt: now2 })
+        // Persist the amount we actually broadcast — for a re-sized
+        // consolidation sweep this is the real on-chain balance, so the ledger
+        // debit on confirmation matches what truly moved.
+        .set({ status: "submitted", txHash, amountRaw: effectiveAmountRaw, submittedAt: now2, updatedAt: now2 })
         .where(eq(payouts.id, row.id))
     );
   } catch (err) {
@@ -3304,6 +3420,30 @@ export interface ReconcileGasBurnsResult {
   readonly stillDeferred: number;
 }
 
+export interface ReconcileUnknownBroadcastsResult {
+  readonly scanned: number;
+  readonly recovered: number;
+  readonly stillUnknown: number;
+  readonly ambiguous: number;
+  readonly errors: number;
+  // Rows that were absent on-chain past the grace window AND confirmed to
+  // have no pending outbound — their broadcast slot was released so the next
+  // executor tick re-broadcasts (a nonce-reusing retry, so at most one tx can
+  // ever land).
+  readonly rebroadcastScheduled: number;
+}
+
+export interface ReconcileUnknownBroadcastsOptions {
+  readonly maxBatch?: number;
+  readonly minAgeMs?: number;
+  readonly scanPaddingMs?: number;
+  readonly maxDeepScanWindowMs?: number;
+  // How long a held row must stay absent from chain before the reconciler
+  // attempts a guarded re-broadcast. Defaults to
+  // UNKNOWN_BROADCAST_REBROADCAST_AFTER_MS.
+  readonly rebroadcastAfterMs?: number;
+}
+
 export async function reconcileFailedPayoutGasBurns(
   deps: AppDeps,
   opts: ReconcileGasBurnsOptions = {}
@@ -3463,6 +3603,531 @@ export async function reconcileConfirmedPayoutGasBurns(
   }
 
   return { scanned: candidates.length, recorded, stillDeferred };
+}
+
+const UNKNOWN_BROADCAST_RECONCILE_GRACE_MS = 30_000;
+const UNKNOWN_BROADCAST_SCAN_PADDING_MS = 5 * 60_000;
+const UNKNOWN_BROADCAST_MAX_DEEP_SCAN_MS = 7 * 24 * 60 * 60 * 1000;
+// A held row (ambiguous main broadcast, outcome unknown) that stays absent
+// from chain this long is escalated to a guarded re-broadcast. Comfortably
+// above the confirmation latency of every wired chain AND above the mempool
+// lifetime of expiring-tx families (Tron ref-block ~60s, Solana blockhash
+// ~90s), so a non-EVM original can no longer be mined by the time we retry.
+// For EVM (txs don't expire) the `hasUnconfirmedOutbound` probe — not this
+// timer — is the actual double-pay guard.
+const UNKNOWN_BROADCAST_REBROADCAST_AFTER_MS = 15 * 60_000;
+const UNKNOWN_BROADCAST_EVM_BLOCK_TIME_MS: Readonly<Record<number, number>> = {
+  1: 12_000,
+  10: 2_000,
+  42161: 250,
+  8453: 2_000,
+  11155111: 12_000,
+  56: 3_000,
+  137: 2_000
+};
+
+// Recovery for rows held after an ambiguous main-broadcast transport error.
+// The executor intentionally keeps `broadcastAttemptedAt` claimed so it cannot
+// double-send. This pass only promotes a row when the chain scan later shows
+// the exact transfer we intended: same chain/token/source/destination/amount.
+export async function reconcileUnknownBroadcastPayouts(
+  deps: AppDeps,
+  opts: ReconcileUnknownBroadcastsOptions = {}
+): Promise<ReconcileUnknownBroadcastsResult> {
+  const limit = opts.maxBatch ?? 20;
+  const now = deps.clock.now().getTime();
+  const minAgeMs = opts.minAgeMs ?? UNKNOWN_BROADCAST_RECONCILE_GRACE_MS;
+  const scanPaddingMs = opts.scanPaddingMs ?? UNKNOWN_BROADCAST_SCAN_PADDING_MS;
+  const maxDeepScanWindowMs = opts.maxDeepScanWindowMs ?? UNKNOWN_BROADCAST_MAX_DEEP_SCAN_MS;
+  const rebroadcastAfterMs = opts.rebroadcastAfterMs ?? UNKNOWN_BROADCAST_REBROADCAST_AFTER_MS;
+  const candidates = await deps.db
+    .select()
+    .from(payouts)
+    .where(
+      and(
+        inArray(payouts.status, ["reserved", "topping-up"]),
+        inArray(payouts.kind, ["standard", "consolidation_sweep"]),
+        isNull(payouts.txHash),
+        isNotNull(payouts.sourceAddress),
+        isNotNull(payouts.broadcastAttemptedAt),
+        lte(payouts.broadcastAttemptedAt, now - minAgeMs),
+        sql`${payouts.lastError} LIKE '%Broadcast outcome unknown%'`
+      )
+    )
+    .orderBy(asc(payouts.broadcastAttemptedAt))
+    .limit(limit);
+
+  let recovered = 0;
+  let stillUnknown = 0;
+  let ambiguous = 0;
+  let errors = 0;
+  let rebroadcastScheduled = 0;
+
+  for (const row of candidates) {
+    let chainAdapter: ChainAdapter;
+    try {
+      chainAdapter = findChainAdapter(deps, row.chainId);
+      const sinceMs = Math.max(
+        0,
+        (row.broadcastAttemptedAt ?? row.updatedAt) - scanPaddingMs
+      );
+      const maxLookbackBlocks = unknownBroadcastMaxLookbackBlocks(
+        chainAdapter,
+        row.chainId,
+        sinceMs,
+        now,
+        maxDeepScanWindowMs
+      );
+      const transfers = await chainAdapter.scanIncoming({
+        chainId: row.chainId as ChainId,
+        addresses: [row.destinationAddress as Address],
+        tokens: [row.token as TokenSymbol],
+        sinceMs,
+        ...(maxLookbackBlocks === undefined ? {} : { maxLookbackBlocks })
+      });
+      const txHashes = new Set(
+        transfers
+          .filter((t) =>
+            t.chainId === row.chainId &&
+            t.token === row.token &&
+            t.amountRaw === row.amountRaw &&
+            sameChainAddress(chainAdapter, t.fromAddress, row.sourceAddress!) &&
+            sameChainAddress(chainAdapter, t.toAddress, row.destinationAddress)
+          )
+          .map((t) => t.txHash)
+      );
+
+      if (txHashes.size === 0) {
+        // Not visible on-chain. Either the broadcast never reached the node, or
+        // it landed but the scan missed it (the dangerous case: an ambiguous
+        // transport error on a tx that actually mined — re-broadcasting that
+        // would pay the destination twice). Hold until the grace window, then
+        // re-broadcast ONLY when we can PROVE the original never landed.
+        const heldMs = now - (row.broadcastAttemptedAt ?? now);
+        if (heldMs < rebroadcastAfterMs) {
+          stillUnknown += 1;
+          continue;
+        }
+        // Proof needs the source's live nonce vs. the baseline captured just
+        // before our broadcast. No probe (non-nonce chains) or no recorded
+        // baseline (older row / capture failed) → unprovable → hold for manual
+        // recovery, never auto-re-broadcast.
+        if (
+          typeof chainAdapter.getOutboundNonceState !== "function" ||
+          row.preBroadcastNonce === null
+        ) {
+          stillUnknown += 1;
+          deps.logger.info("payout.unknown_broadcast.rebroadcast_unprovable", {
+            payoutId: row.id,
+            chainId: row.chainId,
+            reason:
+              typeof chainAdapter.getOutboundNonceState !== "function"
+                ? "no_nonce_probe"
+                : "no_baseline_nonce"
+          });
+          continue;
+        }
+        const baseline = row.preBroadcastNonce;
+        const nonceState = await chainAdapter.getOutboundNonceState({
+          chainId: row.chainId as ChainId,
+          address: row.sourceAddress as Address
+        });
+        // Safe ONLY when the source is byte-for-byte where it was before our
+        // broadcast: no new mined tx (latest unmoved) AND nothing pending
+        // (pending unmoved). Any advance means our tx may have mined (nonce
+        // ordering) or be sitting in the mempool — hold rather than double-send.
+        if (
+          nonceState === null ||
+          nonceState.latest !== baseline ||
+          nonceState.pending !== baseline
+        ) {
+          stillUnknown += 1;
+          deps.logger.info("payout.unknown_broadcast.rebroadcast_deferred", {
+            payoutId: row.id,
+            chainId: row.chainId,
+            sourceAddress: row.sourceAddress,
+            reason:
+              nonceState === null
+                ? "nonce_unverifiable"
+                : nonceState.latest !== baseline
+                  ? "outbound_mined_since_broadcast"
+                  : "pending_outbound_present",
+            baseline,
+            ...(nonceState !== null
+              ? { latest: nonceState.latest, pending: nonceState.pending }
+              : {})
+          });
+          continue;
+        }
+        // Proven: our tx never mined and isn't pending → release the broadcast
+        // slot so the next executor tick rebuilds + re-sends (reusing the same
+        // nonce). CAS on the exact broadcastAttemptedAt we read so we never
+        // clobber a slot a concurrent broadcaster re-claimed. The row stays in
+        // reserved/topping-up; executeTopUp/broadcastMain re-derive everything.
+        const released = await deps.db
+          .update(payouts)
+          .set({
+            broadcastAttemptedAt: null,
+            lastError:
+              "[REBROADCAST_SCHEDULED] Sweep tx absent on-chain and the source nonce is unchanged from before broadcast (proof it never landed); slot released for a nonce-reusing re-broadcast.",
+            updatedAt: now
+          })
+          .where(
+            and(
+              eq(payouts.id, row.id),
+              inArray(payouts.status, ["reserved", "topping-up"]),
+              isNull(payouts.txHash),
+              eq(payouts.broadcastAttemptedAt, row.broadcastAttemptedAt!)
+            )
+          )
+          .returning({ id: payouts.id });
+        if (released.length > 0) {
+          rebroadcastScheduled += 1;
+          deps.logger.warn("payout.unknown_broadcast.rebroadcast_scheduled", {
+            payoutId: row.id,
+            chainId: row.chainId,
+            sourceAddress: row.sourceAddress,
+            destinationAddress: row.destinationAddress,
+            heldMs,
+            baseline
+          });
+        } else {
+          stillUnknown += 1;
+        }
+        continue;
+      }
+      if (txHashes.size > 1) {
+        ambiguous += 1;
+        deps.logger.warn("payout.unknown_broadcast.reconcile_ambiguous", {
+          payoutId: row.id,
+          chainId: row.chainId,
+          sourceAddress: row.sourceAddress,
+          destinationAddress: row.destinationAddress,
+          amountRaw: row.amountRaw,
+          candidateTxHashes: [...txHashes]
+        });
+        continue;
+      }
+
+      const txHash = [...txHashes][0] as TxHash;
+      const submittedAt = row.broadcastAttemptedAt ?? now;
+      const updated = await deps.db
+        .update(payouts)
+        .set({
+          status: "submitted",
+          txHash,
+          submittedAt,
+          lastError: null,
+          updatedAt: now
+        })
+        .where(
+          and(
+            eq(payouts.id, row.id),
+            inArray(payouts.status, ["reserved", "topping-up"]),
+            isNull(payouts.txHash)
+          )
+        )
+        .returning({ id: payouts.id });
+      if (updated.length > 0) {
+        recovered += 1;
+        deps.logger.info("payout.unknown_broadcast.recovered", {
+          payoutId: row.id,
+          chainId: row.chainId,
+          txHash
+        });
+      }
+    } catch (err) {
+      errors += 1;
+      deps.logger.warn("payout.unknown_broadcast.reconcile_failed", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
+
+  return { scanned: candidates.length, recovered, stillUnknown, ambiguous, errors, rebroadcastScheduled };
+}
+
+function sameChainAddress(chainAdapter: ChainAdapter, a: string, b: string): boolean {
+  try {
+    return chainAdapter.canonicalizeAddress(a) === chainAdapter.canonicalizeAddress(b);
+  } catch {
+    return a.toLowerCase() === b.toLowerCase();
+  }
+}
+
+function unknownBroadcastMaxLookbackBlocks(
+  chainAdapter: ChainAdapter,
+  chainId: number,
+  sinceMs: number,
+  now: number,
+  maxDeepScanWindowMs: number
+): number | undefined {
+  if (chainAdapter.family !== "evm") return undefined;
+  const blockTimeMs = UNKNOWN_BROADCAST_EVM_BLOCK_TIME_MS[chainId] ?? 12_000;
+  const lookbackMs = Math.min(Math.max(1, now - sinceMs), maxDeepScanWindowMs);
+  return Math.max(2_000, Math.ceil(lookbackMs / blockTimeMs) + 16);
+}
+
+export interface HeldPayoutListItem {
+  readonly id: string;
+  readonly kind: string;
+  readonly chainId: number;
+  readonly token: string;
+  readonly amountRaw: string;
+  readonly sourceAddress: string;
+  readonly destinationAddress: string;
+  readonly status: string;
+  readonly topUpTxHash: string | null;
+  readonly batchId: string | null;
+  readonly parentPayoutId: string | null;
+  readonly lastError: string | null;
+  // ISO-8601 (or null). `heldForMs` is the age since the broadcast was
+  // attempted — handy for sorting/age badges in the recovery queue.
+  readonly broadcastAttemptedAt: string | null;
+  readonly heldForMs: number | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface ListHeldPayoutsOptions {
+  readonly chainId?: number;
+  readonly token?: string;
+  readonly limit?: number;
+}
+
+// The recovery queue: legs whose main tx errored ambiguously (broadcast was
+// attempted, "Broadcast outcome unknown" breadcrumb) and are still held —
+// status reserved/topping-up, no txHash. Exactly the set `recoverHeldPayout`
+// acts on. Legs the auto-reconciler has released for re-broadcast
+// (broadcastAttemptedAt cleared) drop out, so this lists only what genuinely
+// needs an operator's attention. Oldest-held first.
+export async function listHeldPayouts(
+  deps: AppDeps,
+  opts: ListHeldPayoutsOptions = {}
+): Promise<HeldPayoutListItem[]> {
+  const limit = Math.min(Math.max(1, opts.limit ?? 100), 500);
+  const now = deps.clock.now().getTime();
+  const conds: SQL[] = [
+    inArray(payouts.status, ["reserved", "topping-up"]),
+    inArray(payouts.kind, ["standard", "consolidation_sweep"]),
+    isNull(payouts.txHash),
+    isNotNull(payouts.sourceAddress),
+    isNotNull(payouts.broadcastAttemptedAt),
+    sql`${payouts.lastError} LIKE '%Broadcast outcome unknown%'`
+  ];
+  if (opts.chainId !== undefined) conds.push(eq(payouts.chainId, opts.chainId));
+  if (opts.token !== undefined) conds.push(eq(payouts.token, opts.token));
+
+  const rows = await deps.db
+    .select()
+    .from(payouts)
+    .where(and(...conds))
+    .orderBy(asc(payouts.broadcastAttemptedAt))
+    .limit(limit);
+
+  return rows.map((row) => ({
+    id: row.id,
+    kind: row.kind,
+    chainId: row.chainId,
+    token: row.token,
+    amountRaw: row.amountRaw,
+    sourceAddress: row.sourceAddress as string,
+    destinationAddress: row.destinationAddress,
+    status: row.status,
+    topUpTxHash: row.topUpTxHash,
+    batchId: row.batchId,
+    parentPayoutId: row.parentPayoutId,
+    lastError: row.lastError,
+    broadcastAttemptedAt:
+      row.broadcastAttemptedAt === null ? null : new Date(row.broadcastAttemptedAt).toISOString(),
+    heldForMs: row.broadcastAttemptedAt === null ? null : now - row.broadcastAttemptedAt,
+    createdAt: new Date(row.createdAt).toISOString(),
+    updatedAt: new Date(row.updatedAt).toISOString()
+  }));
+}
+
+export interface RecoverHeldPayoutInput {
+  readonly payoutId: string;
+  readonly txHash: string;
+}
+
+// Manual recovery for a held leg whose main tx errored ambiguously (status
+// reserved/topping-up, txHash NULL, "outcome unknown") but which the operator
+// has confirmed on an explorer DID land on-chain. The auto-reconciler recovers
+// these when its exact (chain/token/amount/from/to) scan matches; this is the
+// operator escape hatch for the cases it can't match (amount drift, token-
+// symbol drift, transfer older than the scan window).
+//
+// Safety: re-uses the SAME proof the ledger needs — the supplied txHash must be
+// (a) mined and NOT reverted (a reverted sweep moved no funds, so confirming it
+// would post a phantom debit), and (b) the leg's exact transfer
+// source→destination of token/amount. Reverted / mismatched / already-used
+// hashes are rejected. On success it drives the row to `submitted`; the normal
+// confirmPayouts path then flips it to `confirmed`, which posts the source
+// debit + destination credit and releases the reservation — the only state
+// that clears the phantom-balance over-count. Never marks the row failed and
+// never deletes it (both would leave the over-count).
+export async function recoverHeldPayout(
+  deps: AppDeps,
+  input: RecoverHeldPayoutInput
+): Promise<Payout> {
+  const txHash = input.txHash.trim();
+  if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    throw new DomainError(
+      "RECOVERY_BAD_TXHASH",
+      "txHash must be a 0x-prefixed 32-byte hex string.",
+      400
+    );
+  }
+
+  const [row] = await deps.db
+    .select()
+    .from(payouts)
+    .where(eq(payouts.id, input.payoutId))
+    .limit(1);
+  if (!row) {
+    throw new DomainError("PAYOUT_NOT_FOUND", `No payout with id ${input.payoutId}`, 404);
+  }
+
+  // Recoverable only when it's a genuinely-held leg: a token/sweep row still in
+  // reserved/topping-up with no recorded txHash and a known source. Anything
+  // else (already submitted/confirmed/failed, a gas_top_up/gas_burn child, no
+  // source) is refused — recovering those would be wrong, not just useless.
+  if (
+    !["standard", "consolidation_sweep"].includes(row.kind) ||
+    !["reserved", "topping-up"].includes(row.status) ||
+    row.txHash !== null ||
+    row.sourceAddress === null
+  ) {
+    throw new DomainError(
+      "PAYOUT_NOT_RECOVERABLE",
+      `Payout ${input.payoutId} is not a recoverable held leg ` +
+        `(kind=${row.kind}, status=${row.status}, txHash=${row.txHash ?? "null"}). ` +
+        `Recovery applies only to standard/consolidation_sweep rows still in ` +
+        `reserved/topping-up with no txHash.`,
+      409
+    );
+  }
+
+  // Idempotency: never attach one on-chain tx to two payout rows (that would
+  // double-post the debit once both confirm).
+  const [dupe] = await deps.db
+    .select({ id: payouts.id })
+    .from(payouts)
+    .where(and(eq(payouts.txHash, txHash as TxHash), sql`${payouts.id} <> ${input.payoutId}`))
+    .limit(1);
+  if (dupe) {
+    throw new DomainError(
+      "RECOVERY_TX_ALREADY_USED",
+      `Tx ${txHash} is already recorded on payout ${dupe.id}; refusing to attach it to a second payout.`,
+      409
+    );
+  }
+
+  const chainAdapter = findChainAdapter(deps, row.chainId);
+
+  // (1) Mined and NOT reverted. getConfirmationStatus returns blockNumber=null
+  //     when the RPC can't see the tx yet.
+  const status = await chainAdapter.getConfirmationStatus(row.chainId, txHash as TxHash);
+  if (status.blockNumber === null) {
+    throw new DomainError(
+      "RECOVERY_TX_NOT_MINED",
+      `Tx ${txHash} is not mined yet (or not visible to the RPC). Retry once it has confirmations.`,
+      422
+    );
+  }
+  if (status.reverted) {
+    throw new DomainError(
+      "RECOVERY_TX_REVERTED",
+      `Tx ${txHash} reverted on-chain — it moved no funds, so it cannot recover this payout.`,
+      422
+    );
+  }
+
+  // (2) The tx must be THIS leg's exact transfer (source→destination, token,
+  //     amount). Re-uses the reconciler's scan + match, with a wide lookback
+  //     since this is a one-off admin action, not a hot path.
+  const now = deps.clock.now().getTime();
+  const sinceMs = Math.max(
+    0,
+    (row.broadcastAttemptedAt ?? row.createdAt) - UNKNOWN_BROADCAST_SCAN_PADDING_MS
+  );
+  const maxLookbackBlocks = unknownBroadcastMaxLookbackBlocks(
+    chainAdapter,
+    row.chainId,
+    sinceMs,
+    now,
+    UNKNOWN_BROADCAST_MAX_DEEP_SCAN_MS
+  );
+  const transfers = await chainAdapter.scanIncoming({
+    chainId: row.chainId as ChainId,
+    addresses: [row.destinationAddress as Address],
+    tokens: [row.token as TokenSymbol],
+    sinceMs,
+    ...(maxLookbackBlocks === undefined ? {} : { maxLookbackBlocks })
+  });
+  const matches = transfers.some(
+    (t) =>
+      t.txHash === txHash &&
+      t.chainId === row.chainId &&
+      t.token === row.token &&
+      t.amountRaw === row.amountRaw &&
+      sameChainAddress(chainAdapter, t.fromAddress, row.sourceAddress!) &&
+      sameChainAddress(chainAdapter, t.toAddress, row.destinationAddress)
+  );
+  if (!matches) {
+    throw new DomainError(
+      "RECOVERY_TX_MISMATCH",
+      `Tx ${txHash} does not match this leg's transfer ` +
+        `(expected ${row.amountRaw} ${row.token} from ${row.sourceAddress} to ${row.destinationAddress}). ` +
+        `Re-check the txHash; if it's correct the transfer may be older than the scan window.`,
+      422
+    );
+  }
+
+  // Drive to `submitted` with the verified tx — the same transition the auto-
+  // reconciler performs on a match. CAS on the held state so we never clobber a
+  // row the executor advanced concurrently. confirmPayouts finishes it.
+  const submittedAt = row.broadcastAttemptedAt ?? now;
+  const updated = await deps.db
+    .update(payouts)
+    .set({
+      status: "submitted",
+      txHash: txHash as TxHash,
+      submittedAt,
+      broadcastAttemptedAt: null,
+      lastError: null,
+      updatedAt: now
+    })
+    .where(
+      and(
+        eq(payouts.id, input.payoutId),
+        inArray(payouts.status, ["reserved", "topping-up"]),
+        isNull(payouts.txHash)
+      )
+    )
+    .returning({ id: payouts.id });
+  if (updated.length === 0) {
+    throw new DomainError(
+      "PAYOUT_NOT_RECOVERABLE",
+      `Payout ${input.payoutId} changed state during recovery; re-read it and retry.`,
+      409
+    );
+  }
+
+  deps.logger.info("payout.held.manually_recovered", {
+    payoutId: input.payoutId,
+    chainId: row.chainId,
+    txHash,
+    sourceAddress: row.sourceAddress,
+    destinationAddress: row.destinationAddress
+  });
+
+  const result = await fetchPayout(deps, input.payoutId);
+  if (!result) throw new Error(`recoverHeldPayout: row ${input.payoutId} disappeared`);
+  return result;
 }
 
 async function failPayout(

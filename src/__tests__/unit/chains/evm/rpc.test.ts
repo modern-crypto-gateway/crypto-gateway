@@ -87,6 +87,61 @@ describe("evmChainAdapter.scanIncoming", () => {
     });
   });
 
+  it("paginates explicit deep ERC-20 lookbacks in provider-sized chunks", async () => {
+    const fromAddr = "0x1111111111111111111111111111111111111111";
+    const toAddr = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+    const latestBlock = 10_000;
+    const eventBlock = 5_500;
+    const ranges: Array<{ fromBlock: number; toBlock: number }> = [];
+    const parseBlock = (value: unknown): number =>
+      typeof value === "bigint" ? Number(value) : Number(BigInt(value as string));
+
+    const transport = mockTransport({
+      eth_blockNumber: () => hex(latestBlock),
+      eth_getLogs: (params) => {
+        const [filter] = params as [{ fromBlock: string | bigint; toBlock: string | bigint }];
+        const fromBlock = parseBlock(filter.fromBlock);
+        const toBlock = parseBlock(filter.toBlock);
+        ranges.push({ fromBlock, toBlock });
+        if (fromBlock > eventBlock || toBlock < eventBlock) return [];
+        return [
+          {
+            address: USDC_MAINNET.toLowerCase(),
+            topics: [ERC20_TRANSFER_EVENT_TOPIC0, padAddress(fromAddr), padAddress(toAddr)],
+            data: padUint256(1_500_000n),
+            blockNumber: hex(eventBlock),
+            blockHash: `0x${"b".repeat(64)}`,
+            transactionHash: `0x${"c".repeat(64)}`,
+            transactionIndex: "0x0",
+            logIndex: "0x3",
+            removed: false
+          }
+        ];
+      }
+    });
+
+    const adapter = evmChainAdapter({
+      chainIds: [1],
+      transports: { 1: transport }
+    });
+
+    const transfers = await adapter.scanIncoming({
+      chainId: 1,
+      addresses: [toAddr],
+      tokens: ["USDC"],
+      sinceMs: Date.now() - 5_000 * 12_000,
+      maxLookbackBlocks: 5_000
+    });
+
+    expect(ranges).toEqual([
+      { fromBlock: 5_001, toBlock: 7_000 },
+      { fromBlock: 7_001, toBlock: 9_000 },
+      { fromBlock: 9_001, toBlock: 10_000 }
+    ]);
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]?.txHash).toBe(`0x${"c".repeat(64)}`);
+  });
+
   it("returns an empty list when no addresses are supplied", async () => {
     // No RPC should be hit at all.
     const transport = mockTransport({
