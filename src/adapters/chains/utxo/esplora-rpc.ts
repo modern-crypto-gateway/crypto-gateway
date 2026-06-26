@@ -65,6 +65,21 @@ export class EsploraNotFoundError extends Error {
   }
 }
 
+// 400 Bad Request — the backend rejected the request as malformed. For address
+// queries this means the address isn't valid for THIS chain: detection polls
+// the whole UTXO-family address set against each UTXO chain, so a bitcoin
+// `bc1q…` address gets queried against the litecoin backend, which mempool/
+// electrs answers with 400 "Invalid Litecoin address". That's a definitive
+// "nothing here", not an outage — so, like 404, it short-circuits failover
+// (a sibling backend would reject it identically) and callers treat it as an
+// empty result rather than a backend failure.
+export class EsploraBadRequestError extends Error {
+  constructor(public readonly path: string) {
+    super(`esplora: bad request ${path}`);
+    this.name = "EsploraBadRequestError";
+  }
+}
+
 export class EsploraBackendError extends Error {
   constructor(
     public readonly backend: string,
@@ -143,6 +158,11 @@ export function esploraClient(config: EsploraClientConfig): EsploraClient {
         return await op(backend);
       } catch (err) {
         if (err instanceof EsploraNotFoundError) throw err;
+        // A 400 is a property of the request (e.g. an address that isn't valid
+        // for this chain), not of the backend — failing over to another
+        // backend would return the same 400. Short-circuit like 404 so it
+        // doesn't get miscounted as "all backends failed" (a real outage).
+        if (err instanceof EsploraBadRequestError) throw err;
         if (err instanceof EsploraBackendError) {
           errors.push(err);
           continue;
@@ -162,10 +182,12 @@ export function esploraClient(config: EsploraClientConfig): EsploraClient {
     try {
       const res = await fetchImpl(url, { signal: controller.signal });
       if (res.status === 404) throw new EsploraNotFoundError(path);
+      if (res.status === 400) throw new EsploraBadRequestError(path);
       if (!res.ok) throw new EsploraBackendError(backend.baseUrl, res.status, await res.text().catch(() => ""));
       return (await res.json()) as T;
     } catch (err) {
       if (err instanceof EsploraNotFoundError) throw err;
+      if (err instanceof EsploraBadRequestError) throw err;
       if (err instanceof EsploraBackendError) throw err;
       throw new EsploraBackendError(backend.baseUrl, null, err);
     } finally {
@@ -180,10 +202,12 @@ export function esploraClient(config: EsploraClientConfig): EsploraClient {
     try {
       const res = await fetchImpl(url, { signal: controller.signal });
       if (res.status === 404) throw new EsploraNotFoundError(path);
+      if (res.status === 400) throw new EsploraBadRequestError(path);
       if (!res.ok) throw new EsploraBackendError(backend.baseUrl, res.status, await res.text().catch(() => ""));
       return await res.text();
     } catch (err) {
       if (err instanceof EsploraNotFoundError) throw err;
+      if (err instanceof EsploraBadRequestError) throw err;
       if (err instanceof EsploraBackendError) throw err;
       throw new EsploraBackendError(backend.baseUrl, null, err);
     } finally {
@@ -304,5 +328,47 @@ export function esploraClient(config: EsploraClientConfig): EsploraClient {
         }
       });
     }
+  };
+}
+
+// Compose several EsploraClient implementations into one that tries them in
+// order per call, falling over to the next on failure. Use it to put a
+// reliable backend (e.g. Alchemy's Blockbook) ahead of a public Esplora
+// fallback: a single provider outage no longer blinds detection, which is the
+// resilience gap that let a degraded litecoinspace.org silently drop payments.
+//
+// Failover policy mirrors the single-client `withFailover`: an
+// EsploraBadRequestError short-circuits (the input is invalid for the chain —
+// every backend rejects it identically, so don't waste a hop). Any other error
+// advances to the next client; if all clients fail, the last error is rethrown
+// (so a genuine EsploraNotFoundError from the final client still surfaces as
+// not-found to callers like getConfirmationStatus). A successful result —
+// including an empty array — is returned as-is and does NOT trigger failover.
+export function failoverEsploraClient(clients: readonly EsploraClient[]): EsploraClient {
+  if (clients.length === 0) {
+    throw new Error("failoverEsploraClient: at least one client required");
+  }
+
+  async function tryInOrder<T>(op: (c: EsploraClient) => Promise<T>): Promise<T> {
+    let lastErr: unknown;
+    for (const client of clients) {
+      try {
+        return await op(client);
+      } catch (err) {
+        if (err instanceof EsploraBadRequestError) throw err;
+        lastErr = err;
+      }
+    }
+    throw lastErr;
+  }
+
+  return {
+    getAddressTxs: (address) => tryInOrder((c) => c.getAddressTxs(address)),
+    getAddressMempoolTxs: (address) => tryInOrder((c) => c.getAddressMempoolTxs(address)),
+    getTx: (txid) => tryInOrder((c) => c.getTx(txid)),
+    getTipHeight: () => tryInOrder((c) => c.getTipHeight()),
+    broadcastTx: (rawHex) => tryInOrder((c) => c.broadcastTx(rawHex)),
+    getFeeEstimates: () => tryInOrder((c) => c.getFeeEstimates()),
+    getAddressBalanceSats: (address) => tryInOrder((c) => c.getAddressBalanceSats(address))
   };
 }

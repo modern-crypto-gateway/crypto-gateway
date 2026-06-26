@@ -6,6 +6,8 @@ import type {
   EsploraTx
 } from "../../../../adapters/chains/utxo/esplora-rpc.js";
 import {
+  EsploraBadRequestError,
+  EsploraBackendError,
   EsploraNotFoundError
 } from "../../../../adapters/chains/utxo/esplora-rpc.js";
 
@@ -215,6 +217,85 @@ describe("utxoChainAdapter.scanIncoming", () => {
     expect(transfers).toHaveLength(2);
     expect(transfers.map((t) => t.logIndex).sort()).toEqual([0, 1]);
     expect(transfers.map((t) => t.amountRaw).sort()).toEqual(["10000", "25000"]);
+  });
+
+  it("propagates a real backend failure instead of swallowing it", async () => {
+    // Regression: a transient backend outage (litecoinspace.org 520, network
+    // timeout, all-backends-down) must NOT be swallowed to []. If it were,
+    // rpcPollDetection would advance its scan checkpoint past the missed tx's
+    // block_time and the payment would never be detected. scanIncoming must
+    // let the failure bubble so the poll loop leaves the checkpoint untouched.
+    const adapter = utxoChainAdapter({
+      chain: BITCOIN_CONFIG,
+      esplora: fakeClient({
+        async getAddressTxs() {
+          throw new EsploraBackendError("https://x", 520, "origin error");
+        },
+        async getTipHeight() {
+          return 100;
+        }
+      })
+    });
+    await expect(
+      adapter.scanIncoming({
+        chainId: 800 as never,
+        addresses: [WATCHED] as never,
+        tokens: ["BTC"] as never,
+        sinceMs: 0
+      })
+    ).rejects.toThrow();
+  });
+
+  it("treats a 404 (address has no history) as empty, not a failure", async () => {
+    const adapter = utxoChainAdapter({
+      chain: BITCOIN_CONFIG,
+      esplora: fakeClient({
+        async getAddressTxs() {
+          throw new EsploraNotFoundError("/address/x/txs");
+        },
+        async getAddressMempoolTxs() {
+          throw new EsploraNotFoundError("/address/x/txs/mempool");
+        },
+        async getTipHeight() {
+          return 100;
+        }
+      })
+    });
+    const transfers = await adapter.scanIncoming({
+      chainId: 800 as never,
+      addresses: [WATCHED] as never,
+      tokens: ["BTC"] as never,
+      sinceMs: 0
+    });
+    expect(transfers).toEqual([]);
+  });
+
+  it("treats a 400 (address belongs to a sibling UTXO chain) as empty, not a failure", async () => {
+    // pollPayments groups addresses by family, so a bitcoin bech32 address is
+    // queried against the litecoin backend (and vice-versa) — the backend
+    // answers 400 "Invalid <chain> address". That's benign: skip the address,
+    // don't treat it as an outage that blocks the checkpoint.
+    const adapter = utxoChainAdapter({
+      chain: BITCOIN_CONFIG,
+      esplora: fakeClient({
+        async getAddressTxs() {
+          throw new EsploraBadRequestError("/address/x/txs");
+        },
+        async getAddressMempoolTxs() {
+          throw new EsploraBadRequestError("/address/x/txs/mempool");
+        },
+        async getTipHeight() {
+          return 100;
+        }
+      })
+    });
+    const transfers = await adapter.scanIncoming({
+      chainId: 800 as never,
+      addresses: [WATCHED] as never,
+      tokens: ["BTC"] as never,
+      sinceMs: 0
+    });
+    expect(transfers).toEqual([]);
   });
 });
 

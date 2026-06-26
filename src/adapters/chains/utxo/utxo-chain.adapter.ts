@@ -19,6 +19,7 @@ import {
 } from "./destination-script.js";
 import {
   esploraClient,
+  EsploraBadRequestError,
   EsploraNotFoundError,
   type EsploraBackend,
   type EsploraClient,
@@ -196,9 +197,18 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
         // txs have no time so we always include them. The poll cadence is
         // ~30s so a single sinceMs window misses nothing.
         const sinceSec = Math.floor(sinceMs / 1000);
+        // NB: only "definitively nothing here" outcomes (404 no-history, 400
+        // wrong-chain address) are swallowed to []. A real backend failure
+        // (5xx / 520 / network / all-backends-down) propagates out of
+        // scanIncoming so rpcPollDetection leaves its scan checkpoint
+        // untouched and re-scans this window next tick. Previously both calls
+        // were `.catch(() => [])`, which turned a transient litecoinspace.org
+        // outage into a permanent miss: the scan returned [] as if success,
+        // the checkpoint advanced past the payment's block_time, and no later
+        // tick ever looked back far enough to detect it.
         const [confirmed, mempool] = await Promise.all([
-          esplora.getAddressTxs(lc).catch(() => [] as readonly EsploraTx[]),
-          esplora.getAddressMempoolTxs(lc).catch(() => [] as readonly EsploraTx[])
+          scanAddressTxsOrThrow(() => esplora.getAddressTxs(lc)),
+          scanAddressTxsOrThrow(() => esplora.getAddressMempoolTxs(lc))
         ]);
         for (const tx of confirmed) {
           if (
@@ -515,23 +525,49 @@ export class UtxoNotImplementedError extends Error {
 // Convenience constructors so app-deps wires `utxoChainAdapter({ chain: BITCOIN_CONFIG })`
 // vs spelling out the import every time. Mirrors how evmChainAdapter / tronChainAdapter
 // are called from src/core/app-deps.ts.
-export function bitcoinChainAdapter(): ChainAdapter {
-  return utxoChainAdapter({ chain: BITCOIN_CONFIG });
+// Optional `esplora` override lets the entrypoint inject a more reliable
+// detection/broadcast backend (e.g. Alchemy's Blockbook with Esplora fallback,
+// via utxoEsploraClientFor) without the adapter knowing where the data comes
+// from. Omitted → the chain's default public Esplora endpoints.
+export function bitcoinChainAdapter(opts?: { esplora?: EsploraClient }): ChainAdapter {
+  return utxoChainAdapter({ chain: BITCOIN_CONFIG, ...(opts?.esplora ? { esplora: opts.esplora } : {}) });
 }
 
-export function litecoinChainAdapter(): ChainAdapter {
-  return utxoChainAdapter({ chain: LITECOIN_CONFIG });
+export function litecoinChainAdapter(opts?: { esplora?: EsploraClient }): ChainAdapter {
+  return utxoChainAdapter({ chain: LITECOIN_CONFIG, ...(opts?.esplora ? { esplora: opts.esplora } : {}) });
 }
 
-export function bitcoinTestnetChainAdapter(): ChainAdapter {
-  return utxoChainAdapter({ chain: BITCOIN_TESTNET_CONFIG });
+export function bitcoinTestnetChainAdapter(opts?: { esplora?: EsploraClient }): ChainAdapter {
+  return utxoChainAdapter({ chain: BITCOIN_TESTNET_CONFIG, ...(opts?.esplora ? { esplora: opts.esplora } : {}) });
 }
 
-export function litecoinTestnetChainAdapter(): ChainAdapter {
-  return utxoChainAdapter({ chain: LITECOIN_TESTNET_CONFIG });
+export function litecoinTestnetChainAdapter(opts?: { esplora?: EsploraClient }): ChainAdapter {
+  return utxoChainAdapter({ chain: LITECOIN_TESTNET_CONFIG, ...(opts?.esplora ? { esplora: opts.esplora } : {}) });
 }
 
 // ---- Internal helpers ----
+
+// Run a single Esplora address query, swallowing ONLY the two "definitively
+// nothing to detect" outcomes:
+//   - EsploraNotFoundError (404): the address has no on-chain history.
+//   - EsploraBadRequestError (400): the address isn't valid for this chain.
+//     Detection polls the whole UTXO-family address set against every UTXO
+//     chain, so a bitcoin `bc1q…` address is queried against the litecoin
+//     backend, which answers 400 "Invalid Litecoin address". Benign.
+// Any other failure (5xx, 520, network timeout, all-backends-down) is rethrown
+// so the caller's poll loop does NOT advance its checkpoint and re-scans the
+// window once the backend recovers. See the call site in scanIncoming.
+async function scanAddressTxsOrThrow(
+  fn: () => Promise<readonly EsploraTx[]>
+): Promise<readonly EsploraTx[]> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof EsploraNotFoundError) return [];
+    if (err instanceof EsploraBadRequestError) return [];
+    throw err;
+  }
+}
 
 function hexToBytes(hex: string): Uint8Array {
   const out = new Uint8Array(hex.length / 2);

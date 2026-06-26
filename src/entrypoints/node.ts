@@ -23,6 +23,7 @@ import {
   bitcoinChainAdapter,
   litecoinChainAdapter
 } from "../adapters/chains/utxo/utxo-chain.adapter.js";
+import { utxoEsploraClientFor } from "../adapters/chains/utxo/alchemy-utxo-client.js";
 import {
   BITCOIN_CONFIG,
   LITECOIN_CONFIG,
@@ -215,18 +216,24 @@ async function main(): Promise<void> {
     activeAlchemyChainIds.push(solanaWiring.chainId);
   }
 
-  // UTXO wiring (Bitcoin + Litecoin). No API creds needed — Esplora's public
-  // endpoints (mempool.space + Blockstream) handle detection and broadcast
-  // without keys. Wired unconditionally; operators who don't accept BTC/LTC
-  // simply never create invoices on chains 800/801, and the adapters sit
-  // idle. Detection runs through the same `rpcPollDetection` path EVM uses
-  // when it's Alchemy-RPC-only (no webhook source).
-  chains.push(bitcoinChainAdapter());
+  // UTXO wiring (Bitcoin + Litecoin). Detection + broadcast go through an
+  // EsploraClient. When ALCHEMY_API_KEY is set we front the public Esplora
+  // endpoints (mempool.space + Blockstream / litecoinspace) with Alchemy's
+  // more reliable Blockbook backend and fall back to Esplora on an Alchemy
+  // outage; without the key it's Esplora-only, as before. Wired
+  // unconditionally; operators who don't accept BTC/LTC never create invoices
+  // on chains 800/801 and the adapters sit idle.
+  const utxoBackendOpts =
+    config.alchemyApiKey !== undefined && config.alchemyApiKey.length > 0
+      ? { alchemyApiKey: config.alchemyApiKey }
+      : {};
+  chains.push(bitcoinChainAdapter({ esplora: utxoEsploraClientFor(BITCOIN_CONFIG, utxoBackendOpts) }));
   detectionStrategies[BITCOIN_CONFIG.chainId] = rpcPollDetection();
-  chains.push(litecoinChainAdapter());
+  chains.push(litecoinChainAdapter({ esplora: utxoEsploraClientFor(LITECOIN_CONFIG, utxoBackendOpts) }));
   detectionStrategies[LITECOIN_CONFIG.chainId] = rpcPollDetection();
   logger.info("UTXO chains wired", {
-    chainIds: [BITCOIN_CONFIG.chainId, LITECOIN_CONFIG.chainId]
+    chainIds: [BITCOIN_CONFIG.chainId, LITECOIN_CONFIG.chainId],
+    detectionBackend: "alchemyApiKey" in utxoBackendOpts ? "alchemy+esplora-fallback" : "esplora"
   });
 
   // Monero (XMR) inbound wiring. Conditional: needs both MONERO_PRIMARY_ADDRESS
