@@ -525,24 +525,20 @@ export class UtxoNotImplementedError extends Error {
 // Convenience constructors so app-deps wires `utxoChainAdapter({ chain: BITCOIN_CONFIG })`
 // vs spelling out the import every time. Mirrors how evmChainAdapter / tronChainAdapter
 // are called from src/core/app-deps.ts.
-// Optional `esplora` override lets the entrypoint inject a more reliable
-// detection/broadcast backend (e.g. Alchemy's Blockbook with Esplora fallback,
-// via utxoEsploraClientFor) without the adapter knowing where the data comes
-// from. Omitted → the chain's default public Esplora endpoints.
-export function bitcoinChainAdapter(opts?: { esplora?: EsploraClient }): ChainAdapter {
-  return utxoChainAdapter({ chain: BITCOIN_CONFIG, ...(opts?.esplora ? { esplora: opts.esplora } : {}) });
+export function bitcoinChainAdapter(): ChainAdapter {
+  return utxoChainAdapter({ chain: BITCOIN_CONFIG });
 }
 
-export function litecoinChainAdapter(opts?: { esplora?: EsploraClient }): ChainAdapter {
-  return utxoChainAdapter({ chain: LITECOIN_CONFIG, ...(opts?.esplora ? { esplora: opts.esplora } : {}) });
+export function litecoinChainAdapter(): ChainAdapter {
+  return utxoChainAdapter({ chain: LITECOIN_CONFIG });
 }
 
-export function bitcoinTestnetChainAdapter(opts?: { esplora?: EsploraClient }): ChainAdapter {
-  return utxoChainAdapter({ chain: BITCOIN_TESTNET_CONFIG, ...(opts?.esplora ? { esplora: opts.esplora } : {}) });
+export function bitcoinTestnetChainAdapter(): ChainAdapter {
+  return utxoChainAdapter({ chain: BITCOIN_TESTNET_CONFIG });
 }
 
-export function litecoinTestnetChainAdapter(opts?: { esplora?: EsploraClient }): ChainAdapter {
-  return utxoChainAdapter({ chain: LITECOIN_TESTNET_CONFIG, ...(opts?.esplora ? { esplora: opts.esplora } : {}) });
+export function litecoinTestnetChainAdapter(): ChainAdapter {
+  return utxoChainAdapter({ chain: LITECOIN_TESTNET_CONFIG });
 }
 
 // ---- Internal helpers ----
