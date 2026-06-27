@@ -1,17 +1,27 @@
 import type { EventBus } from "../../core/events/event-bus.port.js";
 import type { Logger } from "../../core/ports/logger.port.js";
+import type { Invoice } from "../../core/types/invoice.js";
 import { utxoConfigForChainId } from "../chains/utxo/utxo-config.js";
 import type { BlockcypherSubscriptionStore } from "./blockcypher-subscription-store.js";
 
 // Event-bus subscriber that translates UTXO invoice lifecycle events into
 // per-address BlockCypher hook operations:
 //
-//   invoice.created           → 'subscribe' row (gateway gets push notifications
-//                                for this invoice's receive address)
-//   invoice.completed         → 'unsubscribe' row (free the hook quota slot;
-//                                BlockCypher's free tier caps at 200 hooks)
+//   invoice.created           → 'subscribe' row for EACH UTXO receive address on
+//                                the invoice (push notifications per address)
+//   invoice.completed         → 'unsubscribe' row per address (free the hook
+//                                quota slot; BlockCypher free tier caps ~200)
 //   invoice.expired           → 'unsubscribe'
 //   invoice.canceled          → 'unsubscribe'
+//
+// IMPORTANT: we walk `invoice.receiveAddresses[]`, not just the primary
+// `invoice.receiveAddress`. A multi-currency invoice carries one address per
+// accepted family, and the Litecoin (UTXO) leg is frequently a SECONDARY
+// family — the primary is whatever currency the invoice was created against
+// (e.g. an EVM stablecoin). Subscribing only the primary silently skipped LTC
+// hooks for those invoices, so BlockCypher never watched the LTC address and
+// push detection never fired. enqueueSubscribe/enqueueUnsubscribe filter out
+// non-UTXO and unconfigured chains, so passing the whole list is safe.
 //
 // Differs from the Alchemy tracker in two ways:
 //   1. Lifecycle is invoice-scoped, not pool-scoped (UTXO has no pool —
@@ -106,18 +116,40 @@ export function registerBlockcypherSubscriptionTracker(
     }
   };
 
+  // Every receive address on the invoice that BlockCypher should consider.
+  // Prefer the authoritative multi-family `receiveAddresses[]`; fall back to
+  // the primary denormalized fields only if it's absent (defensive — the
+  // Invoice type always populates receiveAddresses today).
+  const receiveTargets = (
+    invoice: Invoice
+  ): ReadonlyArray<{ chainId: number; address: string }> => {
+    const list = invoice.receiveAddresses;
+    if (Array.isArray(list) && list.length > 0) {
+      return list.map((rx) => ({ chainId: rx.chainId, address: rx.address }));
+    }
+    return [{ chainId: invoice.chainId, address: invoice.receiveAddress }];
+  };
+
   const unsubscribers = [
     events.subscribe("invoice.created", async (event) => {
-      await enqueueSubscribe(event.invoice.chainId, event.invoice.receiveAddress);
+      for (const t of receiveTargets(event.invoice)) {
+        await enqueueSubscribe(t.chainId, t.address);
+      }
     }),
     events.subscribe("invoice.completed", async (event) => {
-      await enqueueUnsubscribe(event.invoice.chainId, event.invoice.receiveAddress);
+      for (const t of receiveTargets(event.invoice)) {
+        await enqueueUnsubscribe(t.chainId, t.address);
+      }
     }),
     events.subscribe("invoice.expired", async (event) => {
-      await enqueueUnsubscribe(event.invoice.chainId, event.invoice.receiveAddress);
+      for (const t of receiveTargets(event.invoice)) {
+        await enqueueUnsubscribe(t.chainId, t.address);
+      }
     }),
     events.subscribe("invoice.canceled", async (event) => {
-      await enqueueUnsubscribe(event.invoice.chainId, event.invoice.receiveAddress);
+      for (const t of receiveTargets(event.invoice)) {
+        await enqueueUnsubscribe(t.chainId, t.address);
+      }
     })
   ];
 

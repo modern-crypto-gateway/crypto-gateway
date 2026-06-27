@@ -379,12 +379,20 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     };
     blockcypherPushStrategy = blockcypherNotifyDetection(
       async (innerDeps, chainId) => {
-        const { invoices } = await import("../db/schema.js");
+        // Owned addresses come from the per-family join table, NOT
+        // invoices.receiveAddress. On a multi-currency invoice the Litecoin leg
+        // is frequently a SECONDARY family: invoices.chainId/receiveAddress hold
+        // the PRIMARY (e.g. an EVM stablecoin), so a primary-only lookup would
+        // never contain the LTC address — the BlockCypher push arrives, matches
+        // nothing, and silently does nothing. invoice_receive_addresses carries
+        // one row per family keyed by the specific chainId (mirrors the
+        // subscription tracker, which subscribes every receive address).
+        const { invoiceReceiveAddresses } = await import("../db/schema.js");
         const { eq } = await import("drizzle-orm");
         const rows = await innerDeps.db
-          .select({ address: invoices.receiveAddress })
-          .from(invoices)
-          .where(eq(invoices.chainId, chainId));
+          .select({ address: invoiceReceiveAddresses.address })
+          .from(invoiceReceiveAddresses)
+          .where(eq(invoiceReceiveAddresses.chainId, chainId));
         const set = new Set<string>();
         for (const r of rows) set.add(r.address.toLowerCase());
         const cfg = utxoConfigForChainId(chainId);
