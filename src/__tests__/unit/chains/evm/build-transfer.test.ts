@@ -65,8 +65,51 @@ describe("evmChainAdapter.buildTransfer", () => {
     expect(raw.to.toLowerCase()).toBe("0x70997970c51812dc3a010c7d01b50e0d17dc79c8");
     expect(raw.data).toBe("0x");
     expect(raw.value).toBe(777n);
-    // Native transfer pre-bound to the 21_000 EVM floor.
+    // Native transfer: the noop transport makes the live estimate fail, so the
+    // gas floors to the 21_000 EVM minimum (plain-EOA cost).
     expect(raw.gas).toBe(21_000n);
+  });
+
+  it("keeps a plain-EOA native transfer at exactly 21_000 when the estimate returns 21_000", async () => {
+    // A non-contract destination estimates to exactly the EVM floor; no
+    // headroom is applied so reservations stay tight for the common case.
+    const eoaTransport = custom({
+      async request({ method }: { method: string }) {
+        if (method === "eth_estimateGas") return "0x5208"; // 21_000
+        throw new Error(`no ${method} in this test`);
+      }
+    });
+    const adapter = evmChainAdapter({ chainIds: [1], transports: { 1: eoaTransport } });
+    const unsigned = await adapter.buildTransfer({
+      chainId: 1,
+      fromAddress: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+      toAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      token: "ETH",
+      amountRaw: "1000"
+    });
+    expect((unsigned.raw as { gas?: bigint }).gas).toBe(21_000n);
+  });
+
+  it("sizes native gas above 21_000 for a contract / EIP-7702-delegated destination", async () => {
+    // Sending native value to an EIP-7702-delegated EOA (or a contract) runs
+    // its receive()/fallback(), which costs >21k. The old hardcoded 21k pin
+    // made exactly this transfer revert out-of-gas on BSC (gasUsed == 21000,
+    // status reverted). The bound limit must track the live estimate ×1.3.
+    const delegatedTransport = custom({
+      async request({ method }: { method: string }) {
+        if (method === "eth_estimateGas") return "0x7530"; // 30_000
+        throw new Error(`no ${method} in this test`);
+      }
+    });
+    const adapter = evmChainAdapter({ chainIds: [1], transports: { 1: delegatedTransport } });
+    const unsigned = await adapter.buildTransfer({
+      chainId: 1,
+      fromAddress: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+      toAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      token: "ETH",
+      amountRaw: "1000"
+    });
+    expect((unsigned.raw as { gas?: bigint }).gas).toBe((30_000n * 130n) / 100n);
   });
 
   it("binds the live estimate ×1.3 when eth_estimateGas answers (USDT0 cold-recipient regression)", async () => {

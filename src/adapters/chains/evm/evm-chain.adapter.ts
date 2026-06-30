@@ -58,6 +58,23 @@ const ERC20_GAS_HEADROOM = { num: 130n, den: 100n } as const;
 // would burn the bound gas for nothing. Bail loudly at build time instead.
 const MAX_ERC20_TRANSFER_GAS = 300_000n;
 
+// Native-transfer gas sizing. 21k is exact ONLY for a plain-EOA destination.
+// A destination can also be a deployed contract OR — since EIP-7702 (BSC
+// Pascal hardfork, Ethereum Pectra) — an EOA that has delegated its code to a
+// smart-contract wallet (its `eth_getCode` starts with the 0xef0100 delegation
+// designator). Sending native value to such a destination EXECUTES its
+// receive()/fallback(), which costs more than the 21k base; binding exactly
+// 21k makes the transfer revert out-of-gas, consuming the full 21k. Observed
+// on a BNB payout to a 7702-delegated wallet (gasUsed == gas limit == 21000,
+// status reverted). We therefore price native gas off a LIVE estimate against
+// the real to+value, floor it at 21k, and add the same ×1.3 drift headroom the
+// ERC-20 path uses. A plain EOA estimates to exactly 21k, so the common case
+// is unchanged (no over-binding, no extra reservation pressure).
+function nativeGasFromEstimate(estimated: bigint | null): bigint {
+  if (estimated === null || estimated <= NATIVE_TRANSFER_GAS) return NATIVE_TRANSFER_GAS;
+  return (estimated * ERC20_GAS_HEADROOM.num) / ERC20_GAS_HEADROOM.den;
+}
+
 // Per-chain gas floors. These encode network-level consensus rules (e.g.
 // Polygon's Heimdall v2 mandatory 25 gwei priority) and a small "panic
 // minimum" so a misbehaving RPC reporting 0 gwei doesn't produce a starved
@@ -581,7 +598,17 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       // pin (never let a vendor's estimator block a valid broadcast).
       let gas: bigint;
       if (isNative) {
-        gas = NATIVE_TRANSFER_GAS;
+        // 21k is correct for a plain-EOA destination, but a contract or an
+        // EIP-7702-delegated EOA (code prefix 0xef0100) runs receive()/
+        // fallback() on value receipt and needs more — exactly 21k reverts it
+        // out-of-gas. Estimate live against the real to+value (prices in the
+        // delegated/contract receive code), floor at 21k, ×1.3 drift headroom.
+        // Estimate failure (transport flap, unfunded-source simulation) degrades
+        // to the 21k floor, same as the ERC-20 fallback. See nativeGasFromEstimate.
+        const estimated = await getClient(args.chainId)
+          .estimateGas({ account: args.fromAddress as Hex, to, value })
+          .catch(() => null);
+        gas = nativeGasFromEstimate(estimated);
       } else {
         const estimated = await getClient(args.chainId)
           .estimateGas({ account: args.fromAddress as Hex, to, data })
@@ -870,7 +897,11 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
             to: args.toAddress as Hex,
             value: BigInt(args.amountRaw)
           });
-          return gas.toString() as AmountRaw;
+          // Mirror buildTransfer: a contract / EIP-7702-delegated destination
+          // receives via code that costs >21k, so the reservation sized off
+          // this quote must cover the floored+headroomed limit buildTransfer
+          // will bind. Plain EOAs estimate to 21k and pass through unchanged.
+          return nativeGasFromEstimate(gas).toString() as AmountRaw;
         }
         const data = encodeFunctionData({
           abi: ERC20_ABI,
