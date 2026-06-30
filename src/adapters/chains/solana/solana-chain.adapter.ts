@@ -289,7 +289,10 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
                   transfers.push({
                     chainId: chainId as ChainId,
                     txHash: sig.signature,
-                    logIndex: null,
+                    // One Solana signature can carry many credits; the credited
+                    // account's index in accountKeys disambiguates them and
+                    // dedupes consistently with the webhook path.
+                    logIndex: idx,
                     fromAddress,
                     toAddress: address,
                     token: nativeSymbol,
@@ -314,6 +317,10 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
             if (preTokens.length > 0 || postTokens.length > 0) {
               const preAmounts = new Map<string, bigint>();
               const postAmounts = new Map<string, bigint>();
+              // accountKeys index of the credited token account per mint —
+              // becomes the credit's logIndex so multiple SPL credits in one
+              // tx get distinct identities, matching the webhook path.
+              const postAccountIndexByMint = new Map<string, number>();
               for (const b of preTokens) {
                 if (!b.owner || b.owner !== address) continue;
                 if (!symbolByMint.has(b.mint)) continue;
@@ -327,6 +334,7 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
                 try {
                   postAmounts.set(b.mint, BigInt(b.uiTokenAmount.amount));
                 } catch { /* unparseable amount — treat as absent */ }
+                if (b.accountIndex !== undefined) postAccountIndexByMint.set(b.mint, b.accountIndex);
               }
               const mints = new Set<string>([...preAmounts.keys(), ...postAmounts.keys()]);
               for (const mint of mints) {
@@ -364,7 +372,7 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
                 transfers.push({
                   chainId: chainId as ChainId,
                   txHash: sig.signature,
-                  logIndex: null,
+                  logIndex: postAccountIndexByMint.get(mint) ?? null,
                   fromAddress,
                   toAddress: address,
                   token: symbolByMint.get(mint)!,

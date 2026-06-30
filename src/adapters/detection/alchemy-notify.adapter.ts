@@ -225,7 +225,13 @@ function parseSolanaEvent(
         transfers.push({
           chainId,
           txHash: rawTx.signature,
-          logIndex: null,
+          // Solana packs many transfers under one signature, so tx_hash alone
+          // can't be the identity — the credited account's index in
+          // accountKeys disambiguates the credits and dedupes consistently
+          // with the RPC poll path (which reads the same on-chain ordering).
+          // Token-account indices are excluded above, so native and SPL
+          // discriminators never collide within a tx.
+          logIndex: i,
           fromAddress,
           toAddress,
           token: nativeSymbol,
@@ -278,10 +284,15 @@ function parseSolanaEvent(
         // Try to find the sender: the (other-owner, same-mint) pair whose
         // amount dropped by -delta. Best-effort; falls back to account[0].
         const fromAddress = guessSplSender(preMap, postMap, owner, mint, delta) ?? accountKeys[0] ?? "unknown";
+        // Discriminate this credit by the credited token account's index, the
+        // same value the RPC poll path derives from postTokenBalances — keeps
+        // webhook/poll dedup aligned and lets multiple SPL credits in one tx
+        // each get a distinct (chain_id, tx_hash, log_index) identity.
+        const splLogIndex = post.accountIndex ?? pre.accountIndex ?? null;
         transfers.push({
           chainId,
           txHash: rawTx.signature,
-          logIndex: null,
+          logIndex: splLogIndex,
           fromAddress,
           toAddress: owner,
           token: symbol,
@@ -316,6 +327,9 @@ interface IndexedTokenBalance {
   owner: string;
   mint: string;
   amount: bigint;
+  // accountKeys index of this token account — used as the credit's logIndex
+  // discriminator so multiple SPL credits in one tx get distinct identities.
+  accountIndex?: number;
 }
 
 function indexTokenBalances(
@@ -334,7 +348,10 @@ function indexTokenBalances(
     } catch {
       continue;
     }
-    out.set(`${owner}|${mint}`, { owner, mint, amount });
+    const entry: IndexedTokenBalance = { owner, mint, amount };
+    const accountIndex = b.account_index ?? b.accountIndex;
+    if (accountIndex !== undefined) entry.accountIndex = accountIndex;
+    out.set(`${owner}|${mint}`, entry);
   }
   return out;
 }

@@ -179,7 +179,10 @@ describe("solanaChainAdapter.scanIncoming", () => {
     expect(transfers[0]).toMatchObject({
       chainId: SOLANA_MAINNET_CHAIN_ID,
       txHash: "5o1QwXtrHJfJTXr4k73nnwLFSplCreditExampleSignature",
-      logIndex: null,
+      // accountKeys index of the credited token account (recipientAta) — the
+      // per-credit discriminator that lets multiple SPL credits in one tx
+      // dedupe distinctly instead of collapsing on (chain_id, tx_hash).
+      logIndex: 2,
       fromAddress: sender,
       toAddress: owner,
       token: "USDC",
@@ -251,7 +254,9 @@ describe("solanaChainAdapter.scanIncoming", () => {
     expect(transfers[0]).toMatchObject({
       chainId: SOLANA_MAINNET_CHAIN_ID,
       txHash: "sig1".repeat(16),
-      logIndex: null,
+      // accountKeys index of the credited account (recipient) — disambiguates
+      // multiple native credits sharing one signature.
+      logIndex: 1,
       fromAddress: sender,
       toAddress: recipient,
       token: "SOL",

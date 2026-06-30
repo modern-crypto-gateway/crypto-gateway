@@ -16,6 +16,8 @@ const WATCHED_WALLET = "9JxSJR4bwp1gq48u8oKxkqxGCs4tGNnVzgS4sZ1kRoBX";
 const EXTERNAL_PAYER = "5auZoWJxJodSU8dwgKmAfmphv5Z9Su3HAzEdLz1EUZs7";
 const ATA_WATCHED = "3BzVyVXGeq4zE3qtFpXaXuvLLauzmF3q7yiACJHpJPST";
 const ATA_PAYER = "Fj5FZrS4HDRmU7aJgK8QZ8eYRPBEJ1YHEqRZK4kRb9cq";
+const RECIPIENT_B = "HqTynQ2bVbF4kqkqVqkqVqkqVqkqVqkqVqkqVqkqVqk";
+const RECIPIENT_C = "FNq7SVwBwBwBwBwBwBwBwBwBwBwBwBwBwBwBwBwBwBwB";
 
 // Solana chain adapter bound to a dummy RPC URL (never called in these tests).
 function solanaAdapterForTests() {
@@ -317,6 +319,65 @@ describe("alchemyNotifyDetection — Solana SPL payload", () => {
       expect(transfers[0]?.amountRaw).toBe("490000");
       // Defensive — make sure no row carries the rent magic number as SOL.
       expect(transfers.find((t) => t.token === "SOL" && t.amountRaw === "2039280")).toBeUndefined();
+    }
+  });
+
+  it("gives each native SOL credit in one tx a distinct logIndex (multi-credit dedup)", async () => {
+    const { deps } = minimalDepsForParser();
+    {
+      const strategy = alchemyNotifyDetection();
+      // Real-world shape (solscan tx 67QUM…Ghz5): one signature, three System
+      // Program transfers from the same payer to three different recipients.
+      // Before the fix every credit was emitted with logIndex=null, so all
+      // three collapsed onto the (chain_id, tx_hash) native-identity index and
+      // only the first survived the INSERT — the other two were silently
+      // swallowed as UNIQUE-violation "duplicates". The account-index
+      // discriminator must now make each credit a distinct identity.
+      const A = 26_246_580;   // 0.02624658 SOL
+      const B = 848_639_428;  // 0.848639428 SOL
+      const C = 3_523_607;    // 0.003523607 SOL
+      const fee = 5000;
+      const payerPre = 1_000_000_000;
+      const payerPost = payerPre - A - B - C - fee;
+      const payload = {
+        type: "ADDRESS_ACTIVITY",
+        event: {
+          network: "SOLANA_MAINNET",
+          transaction: [
+            {
+              signature: "multi_native_credit_tx",
+              slot: 429823567,
+              transaction: [{
+                signatures: ["multi_native_credit_tx"],
+                message: [{ account_keys: [EXTERNAL_PAYER, WATCHED_WALLET, RECIPIENT_B, RECIPIENT_C] }]
+              }],
+              meta: [
+                {
+                  err: null,
+                  fee,
+                  pre_balances:  [payerPre, 0, 0, 0],
+                  post_balances: [payerPost, A, B, C]
+                }
+              ]
+            }
+          ]
+        }
+      };
+      const transfers = await strategy.handlePush!(deps, payload);
+      const credits = transfers.filter((t) => t.token === "SOL");
+      // All three recipients credited — none dropped.
+      expect(credits).toHaveLength(3);
+      // Identity discriminator is the credited account's index in accountKeys.
+      const byTo = new Map(credits.map((t) => [t.toAddress, t.logIndex]));
+      expect(byTo.get(WATCHED_WALLET)).toBe(1);
+      expect(byTo.get(RECIPIENT_B)).toBe(2);
+      expect(byTo.get(RECIPIENT_C)).toBe(3);
+      // The whole point: distinct logIndex per credit ⇒ distinct DB identities,
+      // so none collide on uq_transactions_identity / _native.
+      expect(new Set(credits.map((t) => t.logIndex)).size).toBe(3);
+      expect(credits.find((t) => t.toAddress === WATCHED_WALLET)?.amountRaw).toBe(String(A));
+      expect(credits.find((t) => t.toAddress === RECIPIENT_B)?.amountRaw).toBe(String(B));
+      expect(credits.find((t) => t.toAddress === RECIPIENT_C)?.amountRaw).toBe(String(C));
     }
   });
 
