@@ -516,7 +516,16 @@ export function moneroChainAdapter(config: MoneroChainAdapterConfig): MoneroChai
               amountRaw: amountRaw.toString() as AmountRaw,
               blockNumber: blockHeight,
               confirmations: Math.max(0, tipHeight - blockHeight),
-              seenAt: new Date()
+              seenAt: new Date(),
+              // FOLLOW-UP: the scan fetches tx hashes by height but not the
+              // block header timestamp, so a true on-chain time would cost an
+              // extra get_block per height. Left null for now → Monero
+              // re-ingests fail-closed to orphan (admin attributes). The live
+              // path is unchanged (active-owner + cooldown + overshoot net),
+              // and the ownership-window history IS maintained, so threading
+              // block_header.timestamp here later turns reingest on with no
+              // other change.
+              onchainTime: null
             });
           }
         }

@@ -5,6 +5,11 @@ import type { ChainAdapter } from "../ports/chain.port.js";
 import type { ChainFamily } from "../types/chain.js";
 import type { PoolAddress, PoolFamilyStats } from "../types/pool.js";
 import { addressPool, invoices, merchants } from "../../db/schema.js";
+import {
+  closeAllocationsByInvoice,
+  closeAllocationsByPoolIds,
+  recordAllocationOpen
+} from "./address-allocation-history.js";
 
 // Address pool: shared-across-merchants, HD-derived, reused across invoices.
 //
@@ -160,6 +165,19 @@ export async function allocateForInvoice(
       .returning();
 
     if (claim) {
+      // Open an ownership-history window stamped with the SAME `now` written
+      // to address_pool.allocated_at above. This is the authoritative
+      // allocation instant the re-ingest matcher needs (NOT the earlier
+      // invoice_receive_addresses.created_at). Awaited so the window is
+      // durable before the invoice row references this address.
+      await recordAllocationOpen(deps, {
+        family,
+        address: claim.address,
+        chainId: null,
+        poolAddressId: claim.id,
+        invoiceId,
+        allocatedAt: now
+      });
       // Post-allocation: check the available count and schedule a refill
       // when below the trigger. This is what keeps the pool self-healing
       // without any cron support.
@@ -237,6 +255,14 @@ export async function allocateForInvoice(
       .returning();
 
     if (borrowed) {
+      await recordAllocationOpen(deps, {
+        family,
+        address: borrowed.address,
+        chainId: null,
+        poolAddressId: borrowed.id,
+        invoiceId,
+        allocatedAt: now
+      });
       deps.logger.info("pool.borrowed_disabled_under_pressure", {
         family,
         address: borrowed.address,
@@ -286,6 +312,11 @@ export async function releaseFromInvoice(
       lastReleasedByMerchantId: options.merchantId ?? null
     })
     .where(eq(addressPool.allocatedToInvoiceId, invoiceId));
+  // Close the ownership-history window(s) with the SAME `now` written to
+  // address_pool.last_released_at above. After this the address is owned by
+  // NO invoice until the next allocate — a transfer landing in that gap
+  // matches no window and correctly orphans.
+  await closeAllocationsByInvoice(deps, invoiceId, now);
 }
 
 // Lookup `merchant.address_cooldown_seconds` and project to an absolute
@@ -398,6 +429,9 @@ export async function reconcileOrphanedAllocations(
     .returning({ id: addressPool.id });
 
   if (updated.length > 0) {
+    // Close the leaked rows' ownership-history windows too. Keyed by pool row
+    // id because a leaked row may carry a NULL allocated_to_invoice_id.
+    await closeAllocationsByPoolIds(deps, updated.map((u) => u.id), now);
     deps.logger.warn("pool reconciled orphaned allocations", { released: updated.length });
   }
   return { released: updated.length };
@@ -435,9 +469,21 @@ export async function reacquireForInvoice(
         lastReleasedByMerchantId: null
       })
       .where(and(eq(addressPool.address, address), eq(addressPool.status, "available")))
-      .returning({ id: addressPool.id });
+      .returning({ id: addressPool.id, family: addressPool.family, address: addressPool.address });
     if (updated.length > 0) {
       reacquired += 1;
+      // Reorg re-claim re-opens ownership for this invoice: append a fresh
+      // window. The prior window was closed at the earlier release, so a
+      // transfer in the intervening gap still orphans correctly.
+      const row = updated[0]!;
+      await recordAllocationOpen(deps, {
+        family: row.family,
+        address: row.address,
+        chainId: null,
+        poolAddressId: row.id,
+        invoiceId,
+        allocatedAt: now
+      });
       continue;
     }
     // Nothing changed — either this invoice already holds the row (safe) or

@@ -328,6 +328,14 @@ export const transactions = sqliteTable(
     }).notNull(),
     detectedAt: integer("detected_at").notNull(),
     confirmedAt: integer("confirmed_at"),
+    // True on-chain block time of the transfer (epoch ms), distinct from
+    // detected_at/confirmed_at which are gateway WALL-CLOCK stamps. NULL when
+    // the detection source can't supply it (mempool/0-conf, webhook payloads
+    // that carry a slot/blockNum but no timestamp, or an EVM getBlock failure).
+    // Consumed ONLY by time-correct attribution on the re-ingest/relink path
+    // and by forensics — NEVER by the reorg-recheck window or confirm-sweep
+    // ordering, which deliberately stay on wall-clock. See ingestDetectedTransfer.
+    onchainTime: integer("onchain_time"),
     amountUsd: text("amount_usd"),
     usdRate: text("usd_rate"),
     // Admin-side dismissal of an orphaned transfer (invoice_id IS NULL row that
@@ -360,6 +368,11 @@ export const transactions = sqliteTable(
     index("idx_transactions_orphans_open")
       .on(t.chainId, t.detectedAt)
       .where(sql`${t.invoiceId} IS NULL AND ${t.dismissedAt} IS NULL`),
+    // Forensic lookups by on-chain time (e.g. "what landed on this chain in
+    // window [t0,t1)"). Partial — only rows that carry a block time.
+    index("idx_transactions_onchain_time")
+      .on(t.chainId, t.onchainTime)
+      .where(sql`${t.onchainTime} IS NOT NULL`),
     check(
       "transactions_status_check",
       sql`${t.status} IN ('detected','confirmed','reverted','orphaned')`
@@ -1093,6 +1106,70 @@ export const invoiceReceiveAddresses = sqliteTable(
   ]
 );
 
+// ---- address_allocations (append-only ownership-window history) ----
+//
+// Answers "which invoice OWNED receive address X at on-chain time T" — the
+// fact the time-blind matcher in ingestDetectedTransfer could not. One row per
+// (invoice, address) allocation, stamped with the AUTHORITATIVE allocate /
+// release clock reads (the same `now` written to address_pool.allocated_at /
+// last_released_at), NOT invoice_receive_addresses.created_at (which is
+// captured BEFORE pool allocation — see invoice.service create flow — and so
+// opens too early, over the prior owner's tail).
+//
+// Lifecycle:
+//   allocate → INSERT a row (allocated_at = now, released_at = NULL).
+//   release  → UPDATE the open row(s) SET released_at = now.
+// Append-only: rows are never deleted, so a reused address accrues one row per
+// owner across time. The post-release GAP (released_at set, no covering row
+// yet) is a first-class fact — a transfer landing there matches NO window and
+// correctly orphans instead of crediting the prior owner.
+//
+// Window query (re-ingest / relink path only):
+//   WHERE family=? AND address=? AND allocated_at <= :T
+//         AND (released_at IS NULL OR :T < released_at)
+//   ORDER BY allocated_at DESC LIMIT 1
+//
+// Families:
+//   - evm/tron/solana: pool_address_id FKs address_pool; chain_id NULL (the
+//     address is valid family-wide, so the window match is chain-agnostic).
+//   - utxo: single permanent owner (fresh-per-invoice, never pooled) →
+//     released_at stays NULL forever; pool_address_id NULL.
+//   - monero: pool_address_id NULL (its own subaddress pool), chain_id set.
+export const addressAllocations = sqliteTable(
+  "address_allocations",
+  {
+    id: text("id").primaryKey(),
+    family: text("family", { enum: ["evm", "tron", "solana", "utxo", "monero"] }).notNull(),
+    // Canonical address form (hex for EVM, base58 for Tron/Solana/Monero,
+    // bech32 for UTXO) — must match how detection canonicalizes `toAddress`.
+    address: text("address").notNull(),
+    // Informational/forensic only — the window match keys on (family,address).
+    // NULL for account families where one address spans every chain.
+    chainId: integer("chain_id"),
+    poolAddressId: text("pool_address_id").references(() => addressPool.id),
+    // NOT an FK on purpose: a window row is INSERTed during allocation, which
+    // runs BEFORE the invoice row is written (same ordering as
+    // address_pool.allocated_to_invoice_id, also intentionally FK-free). FK
+    // enforcement is on for some connections, so an invoice_id reference here
+    // would fail the pre-invoice insert. Referential integrity is app-side.
+    invoiceId: text("invoice_id").notNull(),
+    allocatedAt: integer("allocated_at").notNull(),
+    releasedAt: integer("released_at")
+  },
+  (t) => [
+    // Matcher index: (family, address) narrows to one address's history, then
+    // allocated_at orders the windows for the DESC-limit-1 pick.
+    index("idx_addr_alloc_lookup").on(t.family, t.address, t.allocatedAt),
+    // Close-by-invoice (release) and close-by-pool-row (reconcile sweeper).
+    index("idx_addr_alloc_invoice").on(t.invoiceId),
+    index("idx_addr_alloc_pool").on(t.poolAddressId),
+    check(
+      "addr_alloc_family_check",
+      sql`${t.family} IN ('evm','tron','solana','utxo','monero')`
+    )
+  ]
+);
+
 // ---- webhook_deliveries (outbox + dead-letter queue for merchant webhooks) ----
 
 export const webhookDeliveries = sqliteTable(
@@ -1243,6 +1320,7 @@ export const schema = {
   blockcypherSubscriptions,
   addressPool,
   invoiceReceiveAddresses,
+  addressAllocations,
   webhookDeliveries,
   autoConsolidationSchedules
 };

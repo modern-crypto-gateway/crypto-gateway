@@ -238,7 +238,10 @@ function parseSolanaEvent(
           amountRaw: delta.toString() as AmountRaw,
           blockNumber: rawTx.slot ?? null,
           confirmations: 1,
-          seenAt: now
+          seenAt: now,
+          // Webhook payload carries a slot but no block timestamp → null. Live
+          // push detection attributes to the active owner, which is correct.
+          onchainTime: null
         });
       }
     }
@@ -299,7 +302,8 @@ function parseSolanaEvent(
           amountRaw: delta.toString() as AmountRaw,
           blockNumber: rawTx.slot ?? null,
           confirmations: 1,
-          seenAt: now
+          seenAt: now,
+          onchainTime: null
         });
       }
       // Diagnostic: the tx carried token-balance entries but we emitted
@@ -484,6 +488,9 @@ function parseActivity(
     // Alchemy Notify fires on the first confirmation. Treat as 1 confirmation;
     // the sweeper will re-query `getConfirmationStatus` for the authoritative depth.
     confirmations: 1,
-    seenAt: new Date()
+    seenAt: new Date(),
+    // ADDRESS_ACTIVITY carries blockNum but no block timestamp → null. Live
+    // push detection uses the active-owner matcher, which is correct.
+    onchainTime: null
   };
 }

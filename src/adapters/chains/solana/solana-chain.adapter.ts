@@ -299,7 +299,10 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
                     amountRaw: delta.toString() as AmountRaw,
                     blockNumber: sig.slot,
                     confirmations: confirmationsFor(sig),
-                    seenAt: new Date()
+                    seenAt: new Date(),
+                    // Real on-chain time (blockTime already fetched, zero extra
+                    // RPC). null for not-yet-confirmed sigs lacking a blockTime.
+                    onchainTime: sig.blockTime !== null ? new Date(sig.blockTime * 1000) : null
                   });
                 }
               }
@@ -379,7 +382,8 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
                   amountRaw: delta.toString() as AmountRaw,
                   blockNumber: sig.slot,
                   confirmations: confirmationsFor(sig),
-                  seenAt: new Date()
+                  seenAt: new Date(),
+                  onchainTime: sig.blockTime !== null ? new Date(sig.blockTime * 1000) : null
                 });
               }
             }

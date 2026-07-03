@@ -441,7 +441,8 @@ describe("JIT gas top-up — token payout from a source that lacks native", () =
       amountRaw: "30",
       blockNumber: 123,
       confirmations: 2,
-      seenAt: new Date()
+      seenAt: new Date(),
+      onchainTime: null
     });
 
     const result = await reconcileUnknownBroadcastPayouts(booted.deps, { minAgeMs: 0 });
@@ -646,7 +647,7 @@ describe("JIT gas top-up — token payout from a source that lacks native", () =
     incoming.push({
       chainId: 999 as ChainId, txHash: realTxHash, logIndex: 0,
       fromAddress: sourceAddress, toAddress: destinationAddress,
-      token: "DEVT", amountRaw: "30", blockNumber: 100, confirmations: 30, seenAt: new Date()
+      token: "DEVT", amountRaw: "30", blockNumber: 100, confirmations: 30, seenAt: new Date(), onchainTime: null
     });
     wrappedAdapter.confirmationStatuses.set(realTxHash, { blockNumber: 100, confirmations: 30, reverted: false });
 

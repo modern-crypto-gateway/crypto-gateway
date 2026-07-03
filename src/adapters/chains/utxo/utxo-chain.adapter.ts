@@ -601,6 +601,12 @@ function projectTxOutputs(
     tx.status.confirmed && tx.status.block_height !== undefined
       ? Math.max(0, tipHeight - tx.status.block_height + 1)
       : 0;
+  // Esplora carries the block time on confirmed txs (zero extra RPC). Mempool
+  // txs have no block time → null. block_time is unix seconds.
+  const onchainTime =
+    tx.status.confirmed && tx.status.block_time != null
+      ? new Date(tx.status.block_time * 1000)
+      : null;
 
   for (let vout = 0; vout < tx.vout.length; vout += 1) {
     const o = tx.vout[vout]!;
@@ -622,7 +628,8 @@ function projectTxOutputs(
       amountRaw: o.value.toString() as DetectedTransfer["amountRaw"],
       blockNumber,
       confirmations,
-      seenAt
+      seenAt,
+      onchainTime
     });
   }
   return out;

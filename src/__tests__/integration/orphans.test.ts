@@ -604,6 +604,10 @@ describe("POST /admin/audit-address", () => {
     toAddress: string;
     amountRaw: string;
     logIndex?: number;
+    // audit-address runs the re-ingest matcher, which attributes by on-chain
+    // time. Provide one (inside the invoice's ownership window) to credit an
+    // invoice; leave null to exercise the fail-closed orphan path.
+    onchainTime?: Date | null;
   }): DetectedTransfer {
     return {
       chainId: 999 as ChainId,
@@ -615,7 +619,8 @@ describe("POST /admin/audit-address", () => {
       amountRaw: opts.amountRaw,
       blockNumber: 100,
       confirmations: 5,
-      seenAt: new Date()
+      seenAt: new Date(),
+      onchainTime: opts.onchainTime ?? null
     };
   }
 
@@ -655,35 +660,32 @@ describe("POST /admin/audit-address", () => {
     }
   });
 
-  it("attributes a missing transfer to an active invoice via the normal ingest path", async () => {
-    // Fresh boot without transfers — we create the invoice first to discover
-    // its receive address, then reboot with a pre-seeded transfer for that
-    // address. (Simpler than mutating the adapter mid-test.)
-    const discoverBooted = await bootTestApp({ secretsOverrides: { ADMIN_KEY } });
-    const invoice = await createInvoiceViaApi(discoverBooted, { amountRaw: "1000" });
-    const receiveAddress = invoice.receiveAddress;
-    await discoverBooted.close();
-
-    const transfer = makeTransfer({
-      txHash: "0xaudit-credit",
-      toAddress: receiveAddress,
-      amountRaw: "1000"
-    });
+  it("attributes a missing transfer to the invoice that owned the address at the transfer's time", async () => {
+    // Mutable incoming array so we can push the transfer AFTER the invoice is
+    // created — its on-chain time then falls inside the invoice's ownership
+    // window (allocated_at .. now), which is what the re-ingest matcher keys on.
+    const incoming: DetectedTransfer[] = [];
     const booted = await bootTestApp({
       secretsOverrides: { ADMIN_KEY },
-      chains: [devChainAdapter({ incomingTransfers: [transfer] })]
+      chains: [devChainAdapter({ incomingTransfers: incoming })]
     });
     try {
-      // Re-create the same invoice on the fresh app so the address mapping exists.
-      const newInvoice = await createInvoiceViaApi(booted, { amountRaw: "1000" });
-      // The pool is deterministic per seed so the same address comes back first.
-      expect(newInvoice.receiveAddress).toBe(receiveAddress);
+      const invoice = await createInvoiceViaApi(booted, { amountRaw: "1000" });
+      incoming.push(
+        makeTransfer({
+          txHash: "0xaudit-credit",
+          toAddress: invoice.receiveAddress,
+          amountRaw: "1000",
+          // Just after allocation → inside the ownership window, not stale.
+          onchainTime: new Date()
+        })
+      );
 
       const res = await booted.app.fetch(
         new Request("http://test.local/admin/audit-address", {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_KEY}` },
-          body: JSON.stringify({ chainId: 999, address: receiveAddress, sinceMs: 0 })
+          body: JSON.stringify({ chainId: 999, address: invoice.receiveAddress, sinceMs: 0 })
         })
       );
       expect(res.status).toBe(200);
@@ -694,7 +696,7 @@ describe("POST /admin/audit-address", () => {
       const [inv] = await booted.deps.db
         .select({ status: invoices.status })
         .from(invoices)
-        .where(eq(invoices.id, newInvoice.id))
+        .where(eq(invoices.id, invoice.id))
         .limit(1);
       expect(inv?.status).toBe("completed");
     } finally {

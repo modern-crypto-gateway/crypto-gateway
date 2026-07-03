@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
 import type { ChainFamily, ChainId } from "../types/chain.js";
@@ -21,9 +21,68 @@ import { findToken } from "../types/token-registry.js";
 import { reacquireForInvoice } from "./pool.service.js";
 import { getMoneroPoolAddress, isMoneroAddressInCooldown } from "./monero-pool.service.js";
 import { addUsd, applyBps, compareUsd, refreshIfExpired, subUsd, usdValueFor } from "./rate-window.js";
-import { addressPool, invoices, invoiceReceiveAddresses, payouts, transactions, utxos } from "../../db/schema.js";
+import { addressAllocations, addressPool, invoices, invoiceReceiveAddresses, payouts, transactions, utxos } from "../../db/schema.js";
 
 type InvoiceRow = typeof invoices.$inferSelect;
+
+// Re-ingest staleness ceiling. On the re-ingest path a transfer whose on-chain
+// time is older than this AND whose time-correct owner is a DEAD invoice
+// (expired/canceled) is orphaned for admin review rather than silently
+// crediting it (which would flip a long-dead invoice and fire its webhooks).
+// Still-active owners credit regardless of age. 30 days — generous for
+// forensic recovery of recent payments, short enough to keep ancient
+// re-ingests off the auto-credit path. (Operator policy: orphan-if-too-stale.)
+const STALE_REINGEST_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Time-correct attribution for the re-ingest path: find the invoice that
+// OWNED `address` (within `family`) at on-chain time `tMs`, via the append-only
+// address_allocations window history. Returns the owning invoice row plus the
+// matched receive-address's derivation index (for the UTXO ledger), or null
+// when no window covers `tMs` — i.e. the transfer predates any allocation, or
+// landed in a released-but-not-yet-reallocated GAP, or in a pre-fix window
+// that was never backfilled. A null result means orphan.
+async function findInvoiceOwningAddressAt(
+  deps: AppDeps,
+  family: ChainFamily,
+  address: string,
+  tMs: number
+): Promise<{ invoice: InvoiceRow; addressIndex: number | null } | null> {
+  const [row] = await deps.db
+    .select({
+      invoice: invoices,
+      rxAddressIndex: invoiceReceiveAddresses.addressIndex
+    })
+    .from(addressAllocations)
+    .innerJoin(invoices, eq(invoices.id, addressAllocations.invoiceId))
+    // Per-row derivation index lives on invoice_receive_addresses, keyed by
+    // (invoice, family, address). LEFT JOIN so a missing rx row (shouldn't
+    // happen) degrades to a null index rather than dropping the match.
+    .leftJoin(
+      invoiceReceiveAddresses,
+      and(
+        eq(invoiceReceiveAddresses.invoiceId, addressAllocations.invoiceId),
+        eq(invoiceReceiveAddresses.family, family),
+        eq(invoiceReceiveAddresses.address, address)
+      )
+    )
+    .where(
+      and(
+        eq(addressAllocations.family, family),
+        eq(addressAllocations.address, address),
+        // Half-open window [allocated_at, released_at): allocated_at <= T < released_at.
+        // No lower tolerance — with cooldown=0 a symmetric grace would overlap
+        // adjacent windows and silently credit the later owner.
+        lte(addressAllocations.allocatedAt, tMs),
+        or(isNull(addressAllocations.releasedAt), gt(addressAllocations.releasedAt, tMs))
+      )
+    )
+    // Most-recent covering window wins (defensive — windows for one address
+    // shouldn't overlap, but DESC makes the pick deterministic).
+    .orderBy(desc(addressAllocations.allocatedAt))
+    .limit(1);
+  if (!row) return null;
+  return { invoice: row.invoice, addressIndex: row.rxAddressIndex };
+}
 
 // Resolve the confirmation threshold to apply to a single transfer paying
 // `invoiceRow`. Precedence at evaluation time:
@@ -80,12 +139,25 @@ export interface IngestResult {
   invoiceStatusAfter?: InvoiceStatus;
 }
 
-export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Promise<IngestResult> {
+export async function ingestDetectedTransfer(
+  deps: AppDeps,
+  input: unknown,
+  opts: { source?: "live" | "reingest" } = {}
+): Promise<IngestResult> {
   const transfer = DetectedTransferSchema.parse(input);
+  // 'live' = webhook/poll detection of a FRESH transfer → attribute to the
+  // address's CURRENT owner (correct: a live payment belongs to whoever owns
+  // the address now; this is today's behavior, kept byte-identical).
+  // 'reingest' = audit-address / relink replaying a HISTORICAL transfer →
+  // attribute by who owned the address AT the transfer's on-chain time, and
+  // fail-closed to orphan when that can't be determined. Only the re-ingest
+  // path can mis-attribute against a reused pool address, so only it changes.
+  const source = opts.source ?? "live";
 
   const chainAdapter = findChainAdapter(deps, transfer.chainId);
   const canonicalTo = chainAdapter.canonicalizeAddress(transfer.toAddress);
   const canonicalFrom = chainAdapter.canonicalizeAddress(transfer.fromAddress);
+  const now = deps.clock.now().getTime();
 
   // Match to an invoice via the receive-addresses join table: family +
   // address pair resolves across all chains in the family. This is how
@@ -103,42 +175,80 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   // status='orphaned') so it doesn't auto-credit an expired invoice whose
   // merchant may no longer own the address.
   const family = chainAdapter.family;
-  const candidates = await deps.db
-    .select({
-      invoice: invoices,
-      // Per-(family, chainId, address) addressIndex from the matched receive
-      // address row. Critical for multi-family invoices where the primary
-      // family's index on `invoices.address_index` doesn't match a UTXO
-      // non-primary receive address — using the per-row value lets the
-      // utxos ledger insert the correct derivation index, which is what
-      // broadcastUtxoMain uses to recover the private key at sign time.
-      // Pre-migration-0006 rows have NULL here; the SELECT coalesces below.
-      rxAddressIndex: invoiceReceiveAddresses.addressIndex
-    })
-    .from(invoices)
-    .innerJoin(invoiceReceiveAddresses, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
-    .where(and(eq(invoiceReceiveAddresses.address, canonicalTo), eq(invoiceReceiveAddresses.family, family)))
-    .orderBy(
-      // Non-terminal invoices first. SQLite has no boolean sort so we materialize
-      // a CASE expression and ASC-sort it. Status taxonomy: pending/processing
-      // are pre-terminal active states; completed is positive terminal;
-      // expired/canceled are negative terminal. Active states win the sort.
-      sql`CASE WHEN ${invoices.status} IN ('pending','processing','completed') THEN 0 ELSE 1 END`,
-      desc(invoices.createdAt)
-    )
-    .limit(1);
-  const topCandidate: InvoiceRow | null = candidates[0] ? candidates[0].invoice : null;
-  const matchedAddressIndex: number | null =
-    candidates[0]?.rxAddressIndex ?? null;
 
-  // Cooldown-aware attribution: if the top candidate is a terminal invoice
-  // (expired / canceled), we only credit it when the pool row for this
-  // address is still inside its cooldown window. Otherwise the transfer
-  // records as an orphan for admin reconciliation.
-  let invoiceRow: InvoiceRow | null = topCandidate;
-  if (topCandidate !== null && ADMIN_TERMINAL_STATES.has(topCandidate.status as InvoiceStatus)) {
-    const inCooldown = await isAddressInCooldown(deps, family, canonicalTo, transfer.chainId);
-    if (!inCooldown) invoiceRow = null;
+  // Resolved by the matcher below. `matchedAddressIndex` is the per-row
+  // derivation index of the matched receive address (UTXO ledger needs it).
+  let invoiceRow: InvoiceRow | null = null;
+  let matchedAddressIndex: number | null = null;
+
+  if (source === "reingest") {
+    // TIME-CORRECT attribution. Bind the historical transfer to whoever OWNED
+    // the address at its ON-CHAIN time, via the address_allocations window
+    // history — NOT to whatever invoice happens to be active now (the bug:
+    // reused pool addresses mis-credited the current owner). Fail-closed:
+    // anything we can't time, or that lands in a released gap / pre-fix
+    // unbackfilled window, orphans to the admin queue.
+    const tMs = transfer.onchainTime?.getTime() ?? null;
+    if (tMs === null) {
+      // No on-chain time (adapter couldn't source it / EVM getBlock failed /
+      // mempool). Never guess the current owner on a re-ingest — orphan.
+      invoiceRow = null;
+    } else {
+      const owner = await findInvoiceOwningAddressAt(deps, family, canonicalTo, tMs);
+      if (owner === null) {
+        invoiceRow = null; // gap / pre-history / unbackfilled window → orphan
+      } else if (
+        ADMIN_TERMINAL_STATES.has(owner.invoice.status as InvoiceStatus) &&
+        now - tMs > STALE_REINGEST_MS
+      ) {
+        // Too-stale payment to a DEAD invoice → orphan for manual review
+        // instead of flipping a long-expired invoice and firing its webhooks.
+        invoiceRow = null;
+      } else {
+        invoiceRow = owner.invoice;
+        matchedAddressIndex = owner.addressIndex;
+      }
+    }
+  } else {
+    // LIVE detection — unchanged active-owner matcher. A fresh transfer to a
+    // watched address belongs to its current owner; the active-first ordering
+    // returns exactly that.
+    const candidates = await deps.db
+      .select({
+        invoice: invoices,
+        // Per-(family, chainId, address) addressIndex from the matched receive
+        // address row. Critical for multi-family invoices where the primary
+        // family's index on `invoices.address_index` doesn't match a UTXO
+        // non-primary receive address — using the per-row value lets the
+        // utxos ledger insert the correct derivation index, which is what
+        // broadcastUtxoMain uses to recover the private key at sign time.
+        // Pre-migration-0006 rows have NULL here; the SELECT coalesces below.
+        rxAddressIndex: invoiceReceiveAddresses.addressIndex
+      })
+      .from(invoices)
+      .innerJoin(invoiceReceiveAddresses, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
+      .where(and(eq(invoiceReceiveAddresses.address, canonicalTo), eq(invoiceReceiveAddresses.family, family)))
+      .orderBy(
+        // Non-terminal invoices first. SQLite has no boolean sort so we materialize
+        // a CASE expression and ASC-sort it. Status taxonomy: pending/processing
+        // are pre-terminal active states; completed is positive terminal;
+        // expired/canceled are negative terminal. Active states win the sort.
+        sql`CASE WHEN ${invoices.status} IN ('pending','processing','completed') THEN 0 ELSE 1 END`,
+        desc(invoices.createdAt)
+      )
+      .limit(1);
+    const topCandidate: InvoiceRow | null = candidates[0] ? candidates[0].invoice : null;
+    matchedAddressIndex = candidates[0]?.rxAddressIndex ?? null;
+
+    // Cooldown-aware attribution: if the top candidate is a terminal invoice
+    // (expired / canceled), we only credit it when the pool row for this
+    // address is still inside its cooldown window. Otherwise the transfer
+    // records as an orphan for admin reconciliation.
+    invoiceRow = topCandidate;
+    if (topCandidate !== null && ADMIN_TERMINAL_STATES.has(topCandidate.status as InvoiceStatus)) {
+      const inCooldown = await isAddressInCooldown(deps, family, canonicalTo, transfer.chainId);
+      if (!inCooldown) invoiceRow = null;
+    }
   }
 
   // Monero reused-subaddress safety net. Monero has no payment IDs, so a
@@ -260,7 +370,6 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
   const initialStatus: TxStatus = isOrphanRow
     ? "orphaned"
     : (transfer.confirmations >= threshold ? "confirmed" : "detected");
-  const now = deps.clock.now().getTime();
   const txId = globalThis.crypto.randomUUID();
 
   // USD conversion for USD-path invoices. We pin the rate on the transaction
@@ -325,8 +434,13 @@ export async function ingestDetectedTransfer(deps: AppDeps, input: unknown): Pro
     status: initialStatus,
     amountUsd,
     usdRate,
+    // Wall-clock stamps (NOT on-chain time) — keeps reorg-recheck windows and
+    // confirm-sweep ordering stable even when re-ingesting an old transfer.
     detectedAt: now,
-    confirmedAt: initialStatus === "confirmed" ? now : null
+    confirmedAt: initialStatus === "confirmed" ? now : null,
+    // True on-chain block time when the adapter could source it; null
+    // otherwise. Persisted for forensics + the relink window matcher.
+    onchainTime: transfer.onchainTime?.getTime() ?? null
   };
   let insertOk = true;
   try {
@@ -1444,17 +1558,28 @@ export async function relinkOrphanTransactions(
     }
 
     const family = chainAdapter.family;
-    const [matched] = await deps.db
-      .select({ invoice: invoices })
-      .from(invoices)
-      .innerJoin(invoiceReceiveAddresses, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
-      .where(and(eq(invoiceReceiveAddresses.address, canonicalTo), eq(invoiceReceiveAddresses.family, family)))
-      .limit(1);
-
-    if (!matched) {
-      skipped.push({ txId: row.id, chainId: row.chainId, toAddress: row.toAddress, reason: "no invoice for address" });
+    // Time-correct relink: attribute by who owned the address at the transfer's
+    // ON-CHAIN time, not the current owner (same fix as the re-ingest path).
+    // Fail-closed — orphans we can't time, or that no window covers, stay
+    // orphaned for admin attribution rather than being blind-linked.
+    const tMs = row.onchainTime;
+    if (tMs === null) {
+      skipped.push({ txId: row.id, chainId: row.chainId, toAddress: row.toAddress, reason: "no on-chain time to attribute by" });
       continue;
     }
+    const owner = await findInvoiceOwningAddressAt(deps, family, canonicalTo, tMs);
+    if (owner === null) {
+      skipped.push({ txId: row.id, chainId: row.chainId, toAddress: row.toAddress, reason: "no invoice owned address at transfer time" });
+      continue;
+    }
+    if (
+      ADMIN_TERMINAL_STATES.has(owner.invoice.status as InvoiceStatus) &&
+      now - tMs > STALE_REINGEST_MS
+    ) {
+      skipped.push({ txId: row.id, chainId: row.chainId, toAddress: row.toAddress, reason: "owner invoice dead and transfer too stale" });
+      continue;
+    }
+    const matched = { invoice: owner.invoice };
 
     if (apply) {
       // Lowercase the stored addresses while we're here — same canonicalization

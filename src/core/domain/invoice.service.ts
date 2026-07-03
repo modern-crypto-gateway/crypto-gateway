@@ -19,7 +19,7 @@ import { allocateUtxoAddress } from "./utxo-address-allocator.js";
 import { allocateMoneroFromPool, releaseMoneroFromInvoice } from "./monero-pool.service.js";
 import { addUsd, RateUnavailableError, snapshotRates, subUsd, tokenDecimalsFor, tokensForFamilies } from "./rate-window.js";
 import { resolveMerchantConfirmationThreshold } from "./payment-config.js";
-import { invoices, invoiceReceiveAddresses, merchants, transactions } from "../../db/schema.js";
+import { addressAllocations, invoices, invoiceReceiveAddresses, merchants, transactions } from "../../db/schema.js";
 
 // ---- Input validation ----
 
@@ -445,7 +445,27 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
         createdAt: now
       })
     );
-    await deps.db.batch([invoiceInsertStmt, ...rxInsertStmts] as [
+    // UTXO addresses are fresh-per-invoice (never pooled), so allocateForInvoice
+    // / allocateMoneroFromPool never ran for them and no ownership-history
+    // window exists yet. Open one here — UTXO has a single permanent owner, so
+    // released_at stays NULL forever (a late payment always credits this
+    // invoice). Account/Monero families already got their history row at
+    // allocation time. created_at IS the allocation instant for UTXO.
+    const utxoAllocStmts = receiveRows
+      .filter((rx) => rx.family === "utxo")
+      .map((rx) =>
+        deps.db.insert(addressAllocations).values({
+          id: globalThis.crypto.randomUUID(),
+          family: rx.family,
+          address: rx.address,
+          chainId: rx.chainId,
+          poolAddressId: null,
+          invoiceId,
+          allocatedAt: now,
+          releasedAt: null
+        })
+      );
+    await deps.db.batch([invoiceInsertStmt, ...rxInsertStmts, ...utxoAllocStmts] as [
       typeof invoiceInsertStmt,
       ...typeof rxInsertStmts
     ]);

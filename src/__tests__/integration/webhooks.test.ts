@@ -315,7 +315,8 @@ describe("pollPayments orchestrator", () => {
         amountRaw: "1000",
         blockNumber: 10,
         confirmations: 0,
-        seenAt: new Date()
+        seenAt: new Date(),
+        onchainTime: null
       });
 
       const result = await pollPayments(booted.deps);
@@ -372,7 +373,8 @@ describe("pollPayments orchestrator", () => {
         amountRaw: "1000",
         blockNumber: 10,
         confirmations: 0,
-        seenAt: new Date()
+        seenAt: new Date(),
+        onchainTime: null
       });
       const r1 = await pollPayments(booted.deps);
       expect(r1.transfersIngested).toBe(1);

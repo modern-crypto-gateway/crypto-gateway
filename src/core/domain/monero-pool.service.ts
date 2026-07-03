@@ -9,6 +9,11 @@ import {
 } from "../../adapters/chains/monero/monero-chain.adapter.js";
 import { deriveSubaddress } from "../../adapters/chains/monero/monero-crypto.js";
 import { invoices, merchants, moneroSubaddressCounters, moneroSubaddressPool } from "../../db/schema.js";
+import {
+  closeAllocationsByAddresses,
+  closeAllocationsByInvoice,
+  recordAllocationOpen
+} from "./address-allocation-history.js";
 
 // Reusable Monero subaddress pool. The Monero analogue of `pool.service.ts`,
 // kept entirely separate because Monero is inbound-only (the gateway holds the
@@ -124,6 +129,17 @@ export async function allocateMoneroFromPool(
       .returning();
 
     if (claim) {
+      // Ownership-history window, stamped with the SAME `now` as the pool
+      // allocated_at above. pool_address_id stays NULL — Monero lives in its
+      // own subaddress pool, not address_pool.
+      await recordAllocationOpen(deps, {
+        family: "monero",
+        address: claim.address,
+        chainId,
+        poolAddressId: null,
+        invoiceId,
+        allocatedAt: now
+      });
       // Detached self-healing refill check — kept off the invoice-create
       // critical path (mirrors allocateForInvoice).
       void (async () => {
@@ -170,6 +186,7 @@ export async function releaseMoneroFromInvoice(
       lastReleasedByMerchantId: options.merchantId ?? null
     })
     .where(eq(moneroSubaddressPool.allocatedToInvoiceId, invoiceId));
+  await closeAllocationsByInvoice(deps, invoiceId, now);
 }
 
 // Cooldown deadline for a release: the configured Monero floor, raised (never
@@ -375,9 +392,16 @@ export async function reconcileOrphanedMoneroAllocations(
         or(isNull(moneroSubaddressPool.allocatedToInvoiceId), orphanIdMatch)
       )
     )
-    .returning({ id: moneroSubaddressPool.id });
+    .returning({
+      id: moneroSubaddressPool.id,
+      address: moneroSubaddressPool.address
+    });
 
   if (updated.length > 0) {
+    // Close the leaked rows' ownership-history windows. Monero history rows
+    // carry no pool_address_id, and RETURNING yields the post-update (nulled)
+    // invoice_id — so key by the unchanged address.
+    await closeAllocationsByAddresses(deps, "monero", updated.map((u) => u.address), now);
     deps.logger.warn("monero pool reconciled orphaned allocations", { released: updated.length });
   }
   return { released: updated.length };

@@ -123,6 +123,7 @@ export function drizzleRowToTransaction(row: typeof transactions.$inferSelect): 
     status: row.status as TxStatus,
     detectedAt: new Date(row.detectedAt),
     confirmedAt: row.confirmedAt === null ? null : new Date(row.confirmedAt),
+    onchainTime: row.onchainTime === null ? null : new Date(row.onchainTime),
     amountUsd: row.amountUsd,
     usdRate: row.usdRate
   };

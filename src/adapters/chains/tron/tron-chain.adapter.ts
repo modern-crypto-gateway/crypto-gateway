@@ -449,7 +449,10 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
                     // We record what we can see and let the sweeper call `getConfirmationStatus`
                     // for authoritative depth on each tx.
                     confirmations: 0,
-                    seenAt: new Date(t.block_timestamp)
+                    seenAt: new Date(t.block_timestamp),
+                    // block_timestamp is the real on-chain block time; trust it
+                    // only once the tx is in a block (block present).
+                    onchainTime: t.block != null ? new Date(t.block_timestamp) : null
                   }))
               )
           );
@@ -496,7 +499,8 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
                     // to null so Zod accepts it; sweeper fills later.
                     blockNumber: t.blockNumber ?? null,
                     confirmations: 0,
-                    seenAt: new Date(t.blockTimestamp)
+                    seenAt: new Date(t.blockTimestamp),
+                    onchainTime: t.blockNumber != null ? new Date(t.blockTimestamp) : null
                   }
                 ];
               })

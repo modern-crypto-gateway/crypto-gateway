@@ -428,6 +428,26 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
       // but most providers return better results per-contract. The parallelism
       // is cheap on HTTP.
       const results: DetectedTransfer[] = [];
+      // eth_getLogs returns no block timestamp, so we fetch eth_getBlockByNumber
+      // once per distinct block and reuse it across all token loops. The cache
+      // stores the in-flight PROMISE (not the resolved value) so concurrent
+      // token queries hitting the same block coalesce into one RPC. A getBlock
+      // failure resolves to null → the re-ingest matcher fail-closes to orphan
+      // rather than mis-attributing on a degraded RPC.
+      const blockTimeCache = new Map<bigint, Promise<Date | null>>();
+      function blockTimeFor(blockNumber: bigint): Promise<Date | null> {
+        let pending = blockTimeCache.get(blockNumber);
+        if (pending === undefined) {
+          pending = client
+            .getBlock({ blockNumber })
+            .then((block) =>
+              block?.timestamp != null ? new Date(Number(block.timestamp) * 1000) : null
+            )
+            .catch(() => null);
+          blockTimeCache.set(blockNumber, pending);
+        }
+        return pending;
+      }
       await Promise.all(
         erc20Targets.map(async (token) => {
           const threshold = tokenDustThreshold(token);
@@ -461,6 +481,7 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
               // viem-decoded args: { from, to, value }
               const args = log.args as { from: Hex; to: Hex; value: bigint };
               if (threshold > 0n && args.value < threshold) continue;
+              const onchainTime = await blockTimeFor(log.blockNumber);
               results.push({
                 chainId: chainId as ChainId,
                 txHash: log.transactionHash,
@@ -471,7 +492,10 @@ export function evmChainAdapter(config: EvmChainConfig): ChainAdapter {
                 amountRaw: args.value.toString() as AmountRaw,
                 blockNumber: Number(log.blockNumber),
                 confirmations: Number(latest - log.blockNumber) + 1,
-                seenAt: new Date()
+                seenAt: new Date(),
+                // Real block time (cached getBlock). null on RPC failure →
+                // re-ingest fail-closes to orphan.
+                onchainTime
               });
             }
           }

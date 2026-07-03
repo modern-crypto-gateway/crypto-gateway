@@ -104,7 +104,10 @@ export function projectBlockcypherTx(
         amountRaw: out.value.toString() as AmountRaw,
         blockNumber,
         confirmations,
-        seenAt
+        seenAt,
+        // Push payload — no reliable block timestamp on the typed shape. Live
+        // detection uses the active-owner matcher (correct), so null is fine.
+        onchainTime: null
       });
       // Same address might appear twice in the `addresses` array on legacy
       // multi-sig outputs; we only want one DetectedTransfer per (vout)

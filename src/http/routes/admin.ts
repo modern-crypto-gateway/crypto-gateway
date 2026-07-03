@@ -2561,7 +2561,11 @@ const hasFeeWallet = adapterFamily !== undefined && adapterFamily !== "monero"
       let alreadyPresent = 0;
       const insertedTxIds: string[] = [];
       for (const transfer of transfers) {
-        const result = await ingestDetectedTransfer(deps, transfer);
+        // Re-ingest path: attribute each transfer to the invoice that owned
+        // the address at the transfer's ON-CHAIN time (time-correct), and
+        // fail-closed to orphan when that can't be determined — instead of
+        // crediting whatever invoice is currently active on a reused address.
+        const result = await ingestDetectedTransfer(deps, transfer, { source: "reingest" });
         if (result.inserted) {
           inserted += 1;
           if (result.transactionId !== undefined) insertedTxIds.push(result.transactionId);

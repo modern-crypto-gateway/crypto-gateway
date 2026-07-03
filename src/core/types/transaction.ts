@@ -38,6 +38,10 @@ export const TransactionSchema = z.object({
 
   detectedAt: z.date(),
   confirmedAt: z.date().nullable(),
+  // True on-chain block time (separate from detectedAt/confirmedAt wall-clock).
+  // NULL when the detection source can't supply it. Drives time-correct
+  // attribution on the re-ingest path; never used by reorg/sweep logic.
+  onchainTime: z.date().nullable(),
 
   // USD valuation captured when the payment was first priced (oracle quote at
   // detection time). Both null on legacy single-token invoices and on rows
@@ -63,6 +67,14 @@ export const DetectedTransferSchema = z.object({
   blockNumber: z.number().int().nonnegative().nullable(),
   // Adapters report as many confirmations as they can see; 0 is valid.
   confirmations: z.number().int().nonnegative(),
-  seenAt: z.date()
+  // Wall-clock observation time (when detection saw the transfer).
+  seenAt: z.date(),
+  // True on-chain block time of the transfer. Distinct from `seenAt`. Adapters
+  // that can source it (poll paths reading block/slot timestamps) populate it;
+  // webhook/push paths and mempool/0-conf transfers leave it null. Defaulted to
+  // null so any path or test that omits it stays valid. Consumed by the
+  // re-ingest matcher (ingestDetectedTransfer source='reingest') to attribute
+  // the transfer to the invoice that owned the address at this time.
+  onchainTime: z.date().nullable().default(null)
 });
 export type DetectedTransfer = z.infer<typeof DetectedTransferSchema>;
