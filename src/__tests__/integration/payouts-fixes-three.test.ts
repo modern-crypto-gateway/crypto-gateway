@@ -4,9 +4,10 @@ import { devChainAdapter } from "../../adapters/chains/dev/dev-chain.adapter.js"
 import {
   estimatePayoutFees,
   planPayout,
-  reconcileFailedPayoutGasBurns
+  reconcileFailedPayoutGasBurns,
+  sweepStuckPayoutReservations
 } from "../../core/domain/payout.service.js";
-import { payouts } from "../../db/schema.js";
+import { payoutReservations, payouts } from "../../db/schema.js";
 import { bootTestApp, type BootedTestApp } from "../helpers/boot.js";
 import { seedFundedPoolAddress } from "../helpers/seed-source.js";
 import type { ChainAdapter } from "../../core/ports/chain.port.js";
@@ -197,6 +198,170 @@ describe("Fix 1: reconcileFailedPayoutGasBurns", () => {
       .from(payouts)
       .where(and(eq(payouts.kind, "gas_burn"), eq(payouts.parentPayoutId, failedId)));
     expect(burns).toHaveLength(1); // not duplicated
+  });
+
+  it("tombstones a perma-deferred row past the abandon window and stops rescanning it", async () => {
+    const failedId = globalThis.crypto.randomUUID();
+    const failedTxHash = "0xabad1dea" + "0".repeat(56);
+    const now = booted.deps.clock.now().getTime();
+    const eightDaysAgo = now - 8 * 24 * 60 * 60 * 1000;
+    await booted.deps.db.insert(payouts).values({
+      id: failedId,
+      merchantId: MERCHANT_ID,
+      kind: "standard",
+      parentPayoutId: null,
+      status: "failed",
+      chainId: 999,
+      token: "DEVT",
+      amountRaw: "10",
+      destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      sourceAddress,
+      txHash: failedTxHash,
+      lastError: "Transaction reverted on-chain",
+      createdAt: eightDaysAgo,
+      submittedAt: eightDaysAgo,
+      updatedAt: eightDaysAgo
+    });
+    // Receipt never becomes available (consumedFeeByTxHash stays empty).
+
+    const result = await reconcileFailedPayoutGasBurns(booted.deps);
+    expect(result.scanned).toBe(1);
+    expect(result.recorded).toBe(0);
+    expect(result.stillDeferred).toBe(0);
+    expect(result.abandoned).toBe(1);
+
+    const burns = await booted.deps.db
+      .select()
+      .from(payouts)
+      .where(and(eq(payouts.kind, "gas_burn"), eq(payouts.parentPayoutId, failedId)));
+    expect(burns).toHaveLength(1);
+    expect(burns[0]!.amountRaw).toBe("0"); // ledger untouched
+    expect(burns[0]!.lastError).toContain("abandoned");
+
+    // Tombstone drops the parent out of the NOT EXISTS candidate set.
+    const again = await reconcileFailedPayoutGasBurns(booted.deps);
+    expect(again.scanned).toBe(0);
+  });
+
+  it("keeps retrying a deferred row still inside the abandon window", async () => {
+    const failedId = globalThis.crypto.randomUUID();
+    const failedTxHash = "0xcafebabe" + "0".repeat(56);
+    const now = booted.deps.clock.now().getTime();
+    await booted.deps.db.insert(payouts).values({
+      id: failedId,
+      merchantId: MERCHANT_ID,
+      kind: "standard",
+      parentPayoutId: null,
+      status: "failed",
+      chainId: 999,
+      token: "DEVT",
+      amountRaw: "10",
+      destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      sourceAddress,
+      txHash: failedTxHash,
+      createdAt: now,
+      submittedAt: now,
+      updatedAt: now
+    });
+
+    const result = await reconcileFailedPayoutGasBurns(booted.deps);
+    expect(result.stillDeferred).toBe(1);
+    expect(result.abandoned).toBe(0);
+
+    const burns = await booted.deps.db
+      .select()
+      .from(payouts)
+      .where(and(eq(payouts.kind, "gas_burn"), eq(payouts.parentPayoutId, failedId)));
+    expect(burns).toHaveLength(0); // no tombstone — still recoverable
+  });
+});
+
+describe("sweepStuckPayoutReservations (active-side probe)", () => {
+  let booted: BootedTestApp;
+
+  beforeEach(async () => {
+    booted = await bootTestApp({ chains: [makeTestAdapter({})] });
+  });
+
+  afterEach(async () => {
+    await booted.close();
+  });
+
+  function insertPayoutRow(status: "confirmed" | "reserved") {
+    const id = globalThis.crypto.randomUUID();
+    const now = booted.deps.clock.now().getTime();
+    return booted.deps.db
+      .insert(payouts)
+      .values({
+        id,
+        merchantId: MERCHANT_ID,
+        kind: "standard",
+        parentPayoutId: null,
+        status,
+        chainId: 999,
+        token: "DEVT",
+        amountRaw: "10",
+        destinationAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        sourceAddress: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        createdAt: now,
+        updatedAt: now
+      })
+      .then(() => id);
+  }
+
+  function insertReservation(payoutId: string, createdAt: number) {
+    const id = globalThis.crypto.randomUUID();
+    return booted.deps.db
+      .insert(payoutReservations)
+      .values({
+        id,
+        payoutId,
+        role: "source",
+        chainId: 999,
+        address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        token: "DEVT",
+        amountRaw: "10",
+        createdAt,
+        releasedAt: null
+      })
+      .then(() => id);
+  }
+
+  it("no active reservations → clean no-op", async () => {
+    const result = await sweepStuckPayoutReservations(booted.deps);
+    expect(result).toEqual({ releasedTerminal: 0, stuckPending: 0 });
+  });
+
+  it("releases active reservations whose payout is terminal", async () => {
+    const now = booted.deps.clock.now().getTime();
+    const payoutId = await insertPayoutRow("confirmed");
+    const reservationId = await insertReservation(payoutId, now);
+
+    const result = await sweepStuckPayoutReservations(booted.deps);
+    expect(result.releasedTerminal).toBe(1);
+    expect(result.stuckPending).toBe(0);
+
+    const [row] = await booted.deps.db
+      .select()
+      .from(payoutReservations)
+      .where(eq(payoutReservations.id, reservationId));
+    expect(row!.releasedAt).not.toBeNull();
+  });
+
+  it("flags (but does not release) an old reservation on an in-flight payout", async () => {
+    const now = booted.deps.clock.now().getTime();
+    const payoutId = await insertPayoutRow("reserved");
+    const reservationId = await insertReservation(payoutId, now - 31 * 60 * 1000);
+
+    const result = await sweepStuckPayoutReservations(booted.deps);
+    expect(result.releasedTerminal).toBe(0);
+    expect(result.stuckPending).toBe(1);
+
+    const [row] = await booted.deps.db
+      .select()
+      .from(payoutReservations)
+      .where(eq(payoutReservations.id, reservationId));
+    expect(row!.releasedAt).toBeNull(); // in-flight — watchdog only warns
   });
 });
 

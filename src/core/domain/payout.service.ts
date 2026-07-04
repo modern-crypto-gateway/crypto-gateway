@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lte, notInArray, sql, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainAdapter, GasPrepResult } from "../ports/chain.port.js";
 import { ChainIdSchema, type Address, type ChainFamily, type ChainId, type TxHash } from "../types/chain.js";
@@ -3380,6 +3380,157 @@ async function recordGasBurnDebit(
   }
 }
 
+// Zero-amount `gas_burn` sentinel for a parent whose real consumed fee is no
+// longer recoverable (receipt pruned by the RPC provider, chain adapter
+// unregistered). Amount 0 leaves the ledger exactly where the old
+// defer-forever behavior left it, but the child row's existence drops the
+// parent out of both reconcilers' NOT EXISTS candidate sets. Without it,
+// permanently-deferred rows are re-fetched and re-probed against the RPC on
+// every cron tick forever — and, worse, the oldest ones monopolize the
+// ORDER BY … LIMIT batch so younger, still-recoverable rows never get
+// reconciled at all. Correcting the ledger for the unrecovered fee itself is
+// reconcileLedgerToChain's job (balance_adjustments).
+async function insertGasBurnTombstone(
+  deps: AppDeps,
+  parent: typeof payouts.$inferSelect,
+  token: string,
+  reason: string
+): Promise<boolean> {
+  const now = deps.clock.now().getTime();
+  try {
+    await deps.db.insert(payouts).values({
+      id: globalThis.crypto.randomUUID(),
+      merchantId: parent.merchantId,
+      kind: "gas_burn",
+      parentPayoutId: parent.id,
+      status: "confirmed",
+      chainId: parent.chainId,
+      token,
+      amountRaw: "0",
+      quotedAmountUsd: null,
+      quotedRate: null,
+      feeTier: null,
+      feeQuotedNative: null,
+      batchId: null,
+      destinationAddress: "0x0", // matches recordGasBurnDebit's burned-no-recipient sentinel
+      sourceAddress: parent.sourceAddress,
+      txHash: parent.txHash,
+      feeEstimateNative: null,
+      topUpTxHash: null,
+      topUpSponsorAddress: null,
+      topUpAmountRaw: null,
+      lastError: reason,
+      createdAt: now,
+      submittedAt: now,
+      confirmedAt: now,
+      updatedAt: now,
+      broadcastAttemptedAt: null,
+      confirmationThreshold: parent.confirmationThreshold,
+      confirmationTiersJson: parent.confirmationTiersJson,
+      webhookUrl: null,
+      webhookSecretCiphertext: null
+    });
+    deps.logger.warn("payout.gas_burn.abandoned", {
+      parentPayoutId: parent.id,
+      chainId: parent.chainId,
+      txHash: parent.txHash,
+      reason
+    });
+    return true;
+  } catch (err) {
+    deps.logger.warn("payout.gas_burn.failed_to_record", {
+      payoutId: parent.id,
+      chainId: parent.chainId,
+      error: err instanceof Error ? err.message : String(err)
+    });
+    return false;
+  }
+}
+
+// Chains whose miner fee is already captured by the change-UTXO backfill on
+// confirmation — a gas_burn row must never be recorded for them, so the
+// reconcilers exclude them from the candidate query entirely. (The old
+// JS-side skip re-fetched every confirmed UTXO payout on every tick forever
+// and let them clog the ORDER BY … LIMIT candidate batch.)
+function utxoChainIdsOf(deps: AppDeps): number[] {
+  return deps.chains
+    .filter((a) => a.family === "utxo")
+    .flatMap((a) => [...a.supportedChainIds]);
+}
+
+// Shared per-candidate pass for both gas-burn reconcilers: try to record the
+// real burn; when the row stays deferred past `abandonAfterMs` (measured from
+// `ageBasis`), tombstone it so it stops re-entering the candidate set.
+async function runGasBurnPass(
+  deps: AppDeps,
+  candidates: readonly (typeof payouts.$inferSelect)[],
+  opts: {
+    readonly now: number;
+    readonly abandonAfterMs: number;
+    readonly ageBasis: (row: typeof payouts.$inferSelect) => number | null;
+    readonly noAdapterLogEvent: string;
+  }
+): Promise<ReconcileGasBurnsResult> {
+  let recorded = 0;
+  let stillDeferred = 0;
+  let abandoned = 0;
+
+  for (const row of candidates) {
+    let chainAdapter: ChainAdapter | null = null;
+    try {
+      chainAdapter = findChainAdapter(deps, row.chainId);
+    } catch (err) {
+      // Chain adapter went away (e.g. operator removed it from config). The
+      // burn is unrecoverable until the adapter is wired back; if that never
+      // happens, the age-out below tombstones the row so it stops clogging
+      // the candidate batch.
+      deps.logger.warn(opts.noAdapterLogEvent, {
+        payoutId: row.id,
+        chainId: row.chainId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+    // UTXO fee is captured by the change-UTXO backfill — excluded in SQL by
+    // the callers; this guard is defense-in-depth only.
+    if (chainAdapter !== null && chainAdapter.family === "utxo") continue;
+
+    if (chainAdapter !== null) {
+      await recordGasBurnDebit(deps, row, chainAdapter);
+    }
+
+    // Re-query to see if the child was created (recordGasBurnDebit is
+    // fire-and-forget over its own deferred / error paths).
+    const after = await deps.db
+      .select({ id: payouts.id })
+      .from(payouts)
+      .where(and(eq(payouts.kind, "gas_burn"), eq(payouts.parentPayoutId, row.id)))
+      .limit(1);
+    if (after.length > 0) {
+      recorded += 1;
+      continue;
+    }
+
+    const ageAnchor = opts.ageBasis(row) ?? row.createdAt;
+    if (opts.now - ageAnchor >= opts.abandonAfterMs) {
+      const token =
+        chainAdapter !== null ? chainAdapter.nativeSymbol(row.chainId as ChainId) : row.token;
+      const reason =
+        chainAdapter === null
+          ? "gas_burn abandoned: no chain adapter registered for this chainId"
+          : "gas_burn abandoned: consumed fee unavailable from RPC past abandon window";
+      if (await insertGasBurnTombstone(deps, row, token, reason)) {
+        abandoned += 1;
+      } else {
+        stillDeferred += 1;
+      }
+    } else {
+      stillDeferred += 1;
+    }
+  }
+
+  return { scanned: candidates.length, recorded, stillDeferred, abandoned };
+}
+
 // Cron-triggered reconciliation pass for gas_burn debits that were
 // DEFERRED on failPayout because the RPC didn't yet have the tx
 // receipt. Without this, a transient RPC lag at the moment of failure
@@ -3410,14 +3561,25 @@ async function recordGasBurnDebit(
 // `confirmPayouts`. A failed-and-burned-but-unreconciled population
 // shouldn't grow unbounded, but the cap keeps a one-time pile-up from
 // monopolizing a cron tick.
+// A candidate that stays deferred this long (receipt never became available,
+// or the chain adapter is gone) is tombstoned with a zero-amount gas_burn so
+// it stops re-entering the candidate query. Comfortably beyond any RPC
+// receipt-visibility lag; old-enough receipts pruned by the provider will
+// never appear anyway.
+const GAS_BURN_ABANDON_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
 export interface ReconcileGasBurnsOptions {
   readonly maxBatch?: number;
+  // Override for GAS_BURN_ABANDON_AFTER_MS (tests).
+  readonly abandonAfterMs?: number;
 }
 
 export interface ReconcileGasBurnsResult {
   readonly scanned: number;
   readonly recorded: number;
   readonly stillDeferred: number;
+  // Perma-deferred rows tombstoned out of the candidate set this pass.
+  readonly abandoned: number;
 }
 
 export interface ReconcileUnknownBroadcastsResult {
@@ -3449,88 +3611,58 @@ export async function reconcileFailedPayoutGasBurns(
   opts: ReconcileGasBurnsOptions = {}
 ): Promise<ReconcileGasBurnsResult> {
   const limit = opts.maxBatch ?? 200;
-  // Failed rows that broadcast (txHash present) and aren't themselves
-  // gas_burn synth rows. We further filter "no existing gas_burn child"
-  // in JavaScript because the LEFT-JOIN-style anti-join is awkward in
-  // drizzle's SQLite dialect; the row count is small in practice
-  // (failed-and-unreconciled is a recovery situation, not a steady
-  // state) so a follow-up query per candidate is fine.
+  const abandonAfterMs = opts.abandonAfterMs ?? GAS_BURN_ABANDON_AFTER_MS;
+  const now = deps.clock.now().getTime();
+
+  // Failed rows that broadcast (txHash present) and don't yet have a
+  // gas_burn child. Status/kind are inlined as SQL LITERALS, not
+  // drizzle-bound parameters: SQLite may only use a partial index when the
+  // query's WHERE provably implies the index's WHERE, and a bound parameter
+  // can never prove `status = 'failed'` — with `eq()` the purpose-built
+  // idx_payouts_failed_gas_reconcile was dead weight and this cron scanned
+  // the entire failed population every tick. The literal lists must stay
+  // textually identical to the index DDL in schema.ts for the implication
+  // proof to hold.
+  //
+  // The likelihood() wrapper matters too: Turso's API forbids ANALYZE, so
+  // sqlite_stat1 never exists and the unstat'd planner otherwise prefers a
+  // seek on idx_payouts_status (default guess: equality ≈ 10 rows) — which
+  // in reality re-reads the ENTIRE failed population every tick. The hint is
+  // transparent to the partial-index implication proof but tells the cost
+  // model the status term matches ~everything (true: most payouts end
+  // terminal), making the partial index win deterministically, stats or not.
+  //
+  // Same NOT EXISTS anti-join as the confirmed reconciler: reconciled (and
+  // tombstoned) rows drop out of the candidate set in SQL, which also
+  // replaces the old per-row "existing child?" pre-check queries.
+  //
+  // UTXO chains are excluded outright: a failed UTXO tx was never mined, so
+  // no fee was consumed and a gas_burn would be wrong — but its receipt also
+  // never appears, so it would otherwise sit in the candidate set forever.
+  const conditions = [
+    sql`likelihood(${payouts.status} = 'failed', 0.98)`,
+    sql`${payouts.txHash} IS NOT NULL`,
+    sql`${payouts.kind} IN ('standard','gas_top_up','consolidation_sweep')`,
+    sql`NOT EXISTS (SELECT 1 FROM payouts gb WHERE gb.kind = 'gas_burn' AND gb.parent_payout_id = ${payouts.id})`
+  ];
+  const utxoIds = utxoChainIdsOf(deps);
+  if (utxoIds.length > 0) conditions.push(notInArray(payouts.chainId, utxoIds));
+
   const candidates = await deps.db
     .select()
     .from(payouts)
-    .where(
-      and(
-        eq(payouts.status, "failed"),
-        inArray(payouts.kind, ["standard", "gas_top_up", "consolidation_sweep"]),
-        // No drizzle helper for "tx_hash IS NOT NULL"; emit raw SQL.
-        sql`${payouts.txHash} IS NOT NULL`
-      )
-    )
+    .where(and(...conditions))
     .orderBy(asc(payouts.updatedAt))
     .limit(limit);
 
-  let recorded = 0;
-  let stillDeferred = 0;
-
-  for (const row of candidates) {
-    // Skip if we already wrote a gas_burn for this parent.
-    const existing = await deps.db
-      .select({ id: payouts.id })
-      .from(payouts)
-      .where(
-        and(
-          eq(payouts.kind, "gas_burn"),
-          eq(payouts.parentPayoutId, row.id)
-        )
-      )
-      .limit(1);
-    if (existing.length > 0) continue;
-
-    // Reuse the same recorder used by failPayout. It logs both success
-    // (payout.gas_burn.recorded) and still-deferred (payout.gas_burn.deferred)
-    // outcomes — we observe via post-call payouts query rather than
-    // changing recordGasBurnDebit's signature.
-    let chainAdapter: ChainAdapter;
-    try {
-      chainAdapter = findChainAdapter(deps, row.chainId);
-    } catch (err) {
-      // Chain adapter went away (e.g. operator removed it from config).
-      // Nothing we can do — the burn is unrecoverable until the adapter
-      // is wired back. Log and skip; don't fail the whole batch.
-      deps.logger.warn("payout.gas_burn.reconcile.no_adapter", {
-        payoutId: row.id,
-        chainId: row.chainId,
-        error: err instanceof Error ? err.message : String(err)
-      });
-      continue;
-    }
-
-    await recordGasBurnDebit(deps, row, chainAdapter);
-
-    // Re-query to see if the row was created (recordGasBurnDebit is
-    // fire-and-forget over its own deferred / error paths).
-    const after = await deps.db
-      .select({ id: payouts.id })
-      .from(payouts)
-      .where(
-        and(
-          eq(payouts.kind, "gas_burn"),
-          eq(payouts.parentPayoutId, row.id)
-        )
-      )
-      .limit(1);
-    if (after.length > 0) {
-      recorded += 1;
-    } else {
-      stillDeferred += 1;
-    }
-  }
-
-  return {
-    scanned: candidates.length,
-    recorded,
-    stillDeferred
-  };
+  return runGasBurnPass(deps, candidates, {
+    now,
+    abandonAfterMs,
+    // Failed rows anchor the abandon window on updatedAt — the moment the
+    // row flipped to failed (when the receipt hunt started).
+    ageBasis: (row) => row.updatedAt,
+    noAdapterLogEvent: "payout.gas_burn.reconcile.no_adapter"
+  });
 }
 
 // Fix C — debit the ACTUAL native gas burned by a SUCCESSFUL account-model
@@ -3556,53 +3688,40 @@ export async function reconcileConfirmedPayoutGasBurns(
   opts: ReconcileGasBurnsOptions = {}
 ): Promise<ReconcileGasBurnsResult> {
   const limit = opts.maxBatch ?? 200;
+  const abandonAfterMs = opts.abandonAfterMs ?? GAS_BURN_ABANDON_AFTER_MS;
+  const now = deps.clock.now().getTime();
+
+  // Literal status/kind + likelihood() so idx_payouts_confirmed_gas_reconcile
+  // stays provable AND preferred even with no ANALYZE stats (impossible on
+  // Turso) — the candidate query is an ordered index walk instead of a
+  // scan+sort of the whole confirmed population (see the failed reconciler
+  // above for the full explanation). UTXO chains are excluded in SQL — the
+  // old JS-side skip left every confirmed UTXO payout in the candidate set
+  // forever, permanently occupying the LIMIT batch.
+  const conditions = [
+    sql`likelihood(${payouts.status} = 'confirmed', 0.98)`,
+    sql`${payouts.txHash} IS NOT NULL`,
+    sql`${payouts.kind} IN ('standard','gas_top_up','consolidation_sweep')`,
+    // Anti-join: only rows without an existing gas_burn child. Keeps the
+    // candidate window advancing as rows get reconciled.
+    sql`NOT EXISTS (SELECT 1 FROM payouts gb WHERE gb.kind = 'gas_burn' AND gb.parent_payout_id = ${payouts.id})`
+  ];
+  const utxoIds = utxoChainIdsOf(deps);
+  if (utxoIds.length > 0) conditions.push(notInArray(payouts.chainId, utxoIds));
+
   const candidates = await deps.db
     .select()
     .from(payouts)
-    .where(
-      and(
-        eq(payouts.status, "confirmed"),
-        inArray(payouts.kind, ["standard", "gas_top_up", "consolidation_sweep"]),
-        sql`${payouts.txHash} IS NOT NULL`,
-        // Anti-join: only rows without an existing gas_burn child. Keeps the
-        // candidate window advancing as rows get reconciled.
-        sql`NOT EXISTS (SELECT 1 FROM payouts gb WHERE gb.kind = 'gas_burn' AND gb.parent_payout_id = ${payouts.id})`
-      )
-    )
+    .where(and(...conditions))
     .orderBy(asc(payouts.confirmedAt))
     .limit(limit);
 
-  let recorded = 0;
-  let stillDeferred = 0;
-
-  for (const row of candidates) {
-    let chainAdapter: ChainAdapter;
-    try {
-      chainAdapter = findChainAdapter(deps, row.chainId);
-    } catch (err) {
-      deps.logger.warn("payout.gas_burn.reconcile_confirmed.no_adapter", {
-        payoutId: row.id,
-        chainId: row.chainId,
-        error: err instanceof Error ? err.message : String(err)
-      });
-      continue;
-    }
-    // UTXO fee is already captured by the change-UTXO backfill — skip to avoid
-    // double-counting the miner fee.
-    if (chainAdapter.family === "utxo") continue;
-
-    await recordGasBurnDebit(deps, row, chainAdapter);
-
-    const after = await deps.db
-      .select({ id: payouts.id })
-      .from(payouts)
-      .where(and(eq(payouts.kind, "gas_burn"), eq(payouts.parentPayoutId, row.id)))
-      .limit(1);
-    if (after.length > 0) recorded += 1;
-    else stillDeferred += 1;
-  }
-
-  return { scanned: candidates.length, recorded, stillDeferred };
+  return runGasBurnPass(deps, candidates, {
+    now,
+    abandonAfterMs,
+    ageBasis: (row) => row.confirmedAt,
+    noAdapterLogEvent: "payout.gas_burn.reconcile_confirmed.no_adapter"
+  });
 }
 
 const UNKNOWN_BROADCAST_RECONCILE_GRACE_MS = 30_000;
@@ -3640,13 +3759,18 @@ export async function reconcileUnknownBroadcastPayouts(
   const scanPaddingMs = opts.scanPaddingMs ?? UNKNOWN_BROADCAST_SCAN_PADDING_MS;
   const maxDeepScanWindowMs = opts.maxDeepScanWindowMs ?? UNKNOWN_BROADCAST_MAX_DEEP_SCAN_MS;
   const rebroadcastAfterMs = opts.rebroadcastAfterMs ?? UNKNOWN_BROADCAST_REBROADCAST_AFTER_MS;
+  // Status/kind as SQL literals (not bound parameters) so the WHERE provably
+  // implies idx_payouts_unknown_broadcast_reconcile's partial predicate —
+  // lists must stay textually identical to the index DDL in schema.ts. The
+  // likelihood() wrapper keeps the partial index preferred with no ANALYZE
+  // stats (impossible on Turso); see reconcileFailedPayoutGasBurns.
   const candidates = await deps.db
     .select()
     .from(payouts)
     .where(
       and(
-        inArray(payouts.status, ["reserved", "topping-up"]),
-        inArray(payouts.kind, ["standard", "consolidation_sweep"]),
+        sql`likelihood(${payouts.status} IN ('reserved','topping-up'), 0.98)`,
+        sql`${payouts.kind} IN ('standard','consolidation_sweep')`,
         isNull(payouts.txHash),
         isNotNull(payouts.sourceAddress),
         isNotNull(payouts.broadcastAttemptedAt),
@@ -4637,6 +4761,14 @@ export interface SweepStuckPayoutReservationsOptions {
 // confirmPayouts/failPayout makes this normally a no-op), and logs WARN for
 // reservations older than `stuckThresholdMs` whose payout is still in a
 // non-terminal in-flight state.
+//
+// Shape matters here because this runs every cron tick against a table that
+// only ever grows (released rows are audit trail, never deleted). The
+// previous version ran one UPDATE whose WHERE joined the full reservation
+// history against a payouts-status subquery — ~25k rows read per tick on
+// Turso to release nothing. Probing the ACTIVE side first (partial-index
+// scan, normally zero rows) makes the no-op tick cost O(active rows) and
+// lets us skip the payouts lookup entirely when nothing is held.
 export async function sweepStuckPayoutReservations(
   deps: AppDeps,
   opts: SweepStuckPayoutReservationsOptions = {}
@@ -4644,53 +4776,76 @@ export async function sweepStuckPayoutReservations(
   const stuckThresholdMs = opts.stuckThresholdMs ?? 30 * 60 * 1000;
   const now = deps.clock.now().getTime();
 
-  const terminalRelease = await deps.db
-    .update(payoutReservations)
-    .set({ releasedAt: now })
-    .where(
-      and(
-        isNull(payoutReservations.releasedAt),
-        inArray(
-          payoutReservations.payoutId,
-          deps.db
-            .select({ id: payouts.id })
-            .from(payouts)
-            .where(inArray(payouts.status, ["confirmed", "failed", "canceled"]))
-        )
-      )
-    )
-    .returning({ id: payoutReservations.id });
-
-  const stuck = await deps.db
+  const active = await deps.db
     .select({
-      reservationId: payoutReservations.id,
-      address: payoutReservations.address,
+      id: payoutReservations.id,
       payoutId: payoutReservations.payoutId,
-      createdAt: payoutReservations.createdAt,
-      payoutStatus: payouts.status
+      address: payoutReservations.address,
+      createdAt: payoutReservations.createdAt
     })
     .from(payoutReservations)
-    .innerJoin(payouts, eq(payouts.id, payoutReservations.payoutId))
-    .where(
-      and(
-        isNull(payoutReservations.releasedAt),
-        lt(payoutReservations.createdAt, now - stuckThresholdMs),
-        inArray(payouts.status, ["reserved", "topping-up", "submitted"])
+    .where(isNull(payoutReservations.releasedAt));
+
+  if (active.length === 0) {
+    return { releasedTerminal: 0, stuckPending: 0 };
+  }
+
+  const payoutIds = Array.from(new Set(active.map((r) => r.payoutId)));
+  const payoutRows = await deps.db
+    .select({ id: payouts.id, status: payouts.status })
+    .from(payouts)
+    .where(inArray(payouts.id, payoutIds));
+  const statusById = new Map(payoutRows.map((p) => [p.id, p.status]));
+
+  const terminalStatuses = new Set(["confirmed", "failed", "canceled"]);
+  const toRelease = active.filter((r) => {
+    const status = statusById.get(r.payoutId);
+    return status !== undefined && terminalStatuses.has(status);
+  });
+
+  let releasedTerminal = 0;
+  if (toRelease.length > 0) {
+    const released = await deps.db
+      .update(payoutReservations)
+      .set({ releasedAt: now })
+      .where(
+        and(
+          inArray(
+            payoutReservations.id,
+            toRelease.map((r) => r.id)
+          ),
+          // Re-check under the write: a concurrent confirmPayouts/failPayout
+          // batch may have released the row between our SELECT and this
+          // UPDATE — don't re-stamp its released_at.
+          isNull(payoutReservations.releasedAt)
+        )
       )
+      .returning({ id: payoutReservations.id });
+    releasedTerminal = released.length;
+  }
+
+  const inFlightStatuses = new Set(["reserved", "topping-up", "submitted"]);
+  const stuck = active.filter((r) => {
+    const status = statusById.get(r.payoutId);
+    return (
+      r.createdAt < now - stuckThresholdMs &&
+      status !== undefined &&
+      inFlightStatuses.has(status)
     );
+  });
 
   for (const row of stuck) {
     deps.logger.warn("payout reservation stuck mid-flight; operator review required", {
-      reservationId: row.reservationId,
+      reservationId: row.id,
       address: row.address,
       payoutId: row.payoutId,
-      payoutStatus: row.payoutStatus,
+      payoutStatus: statusById.get(row.payoutId),
       heldMinutes: Math.round((now - row.createdAt) / 60_000)
     });
   }
 
   return {
-    releasedTerminal: terminalRelease.length,
+    releasedTerminal,
     stuckPending: stuck.length
   };
 }

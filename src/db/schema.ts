@@ -360,6 +360,10 @@ export const transactions = sqliteTable(
       .where(sql`${t.logIndex} IS NULL`),
     index("idx_transactions_invoice").on(t.invoiceId),
     index("idx_transactions_status").on(t.status, t.chainId),
+    // tx_hash-only lookups (merchant invoice list filtered by ?txHash=). The
+    // two identity unique indexes lead with chain_id and are partial on
+    // log_index, so neither can serve a bare tx_hash seek.
+    index("idx_transactions_tx_hash").on(t.txHash),
     index("idx_transactions_confirmed_to_balance")
       .on(t.chainId, t.token, t.toAddress)
       .where(sql`${t.status} = 'confirmed'`),
@@ -493,6 +497,12 @@ export const payoutReservations = sqliteTable(
   (t) => [
     index("idx_reservations_active")
       .on(t.chainId, t.address, t.token)
+      .where(sql`${t.releasedAt} IS NULL`),
+    // Covering index for the per-tick stuck-reservation watchdog: "give me
+    // the payout_id of every ACTIVE reservation" as a partial-index scan
+    // whose cost is O(active rows) — normally zero — instead of a table scan.
+    index("idx_reservations_active_payout")
+      .on(t.payoutId)
       .where(sql`${t.releasedAt} IS NULL`),
     index("idx_reservations_payout").on(t.payoutId),
     check("reservations_role_check", sql`${t.role} IN ('source','top_up_sponsor')`)
@@ -675,6 +685,11 @@ export const payouts = sqliteTable(
   (t) => [
     index("idx_payouts_merchant").on(t.merchantId, sql`${t.createdAt} DESC`),
     index("idx_payouts_status").on(t.status, t.chainId),
+    // tx_hash probes: payout self-detect on every ingested transfer and the
+    // recovery-tx dupe check. Partial on IS NOT NULL stays usable from
+    // parameterized queries (`tx_hash = ?` proves the predicate) while
+    // keeping never-broadcast rows out of the index.
+    index("idx_payouts_tx_hash").on(t.txHash).where(sql`${t.txHash} IS NOT NULL`),
     // Partial index on batch_id: most rows have batch_id=NULL (only set by
     // POST /payouts/batch), so a partial index keeps storage minimal while
     // making ?batchId=<uuid> list filters O(log n) instead of full-scan.
