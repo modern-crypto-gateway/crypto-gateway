@@ -1730,22 +1730,29 @@ for an interactive client.
 A full-coverage Postman setup lives in [`postman/`](postman/):
 
 - [`crypto-gateway.postman_collection.json`](postman/crypto-gateway.postman_collection.json)
-  — every route (admin bootstrap, merchant API, public checkout, Alchemy
-  webhook ingest simulator, internal cron) grouped into folders. Per-chain
-  quick-start requests under `Invoices / Quick starts` for Ethereum, OP,
-  Polygon, Base, Arbitrum, Avalanche, BSC, Tron, Solana, and the local dev
-  chain. Chained flow: the merchant-create test script writes `apiKey`,
-  `merchantId`, `webhookSecret` into the environment; create-invoice writes
-  `invoiceId` + `invoiceReceiveAddress`; bootstrap writes per-chain signing keys.
+  — every route (admin bootstrap, merchant API, public checkout, Alchemy +
+  BlockCypher webhook ingest simulators, internal cron) grouped into folders.
+  Per-chain quick-start requests under `Invoices / Quick starts` for Ethereum,
+  OP, Polygon, Base, Arbitrum, Avalanche, BSC, Tron, Solana, Bitcoin, Litecoin,
+  both UTXO testnets, and the local dev chain — plus multi-family, universal-USD,
+  and fiat-quoted variants. Chained flow: the merchant-create test script writes
+  `merchantApiKey`, `merchantId`, `webhookSecret` into the environment;
+  create-invoice writes `invoiceId` + `invoiceReceiveAddress`; bootstrap writes
+  per-chain signing keys.
 - [`crypto-gateway.local.postman_environment.json`](postman/crypto-gateway.local.postman_environment.json)
   — import as an environment. Pre-declares every variable the collection
-  reads and writes. Only `adminKey` needs to be filled by hand; everything
-  else populates as you run the setup folder.
+  reads and writes. `adminKey` must be filled by hand; a few others are
+  manual only if you use their requests: `cronSecret` (Internal cron tick),
+  `blockcypherIngestToken` (BlockCypher webhook simulator), and the
+  operator-supplied `moneroTxHash`, `recoveredTxHash`, and `family` values
+  for the Monero-debug, payout-recovery, and fee-wallet admin folders.
+  Everything else populates as you run the setup folder.
 
-The `Webhooks (simulate)` folder fires synthetic Alchemy payloads (both EVM
-and Solana SPL shapes) at `/webhooks/alchemy` with a correct HMAC — useful
-for replaying the detection path locally without waiting for a real on-chain
-transfer.
+The `Webhooks (simulate provider)` folder fires synthetic provider payloads —
+Alchemy (both EVM and Solana SPL shapes) at `/webhooks/alchemy` with a correct
+HMAC, and a BlockCypher UTXO tx-confirmation at `/webhooks/blockcypher/{chainId}`
+— useful for replaying the detection path locally without waiting for a real
+on-chain transfer.
 
 ### Listing & filtering invoices / payouts
 
