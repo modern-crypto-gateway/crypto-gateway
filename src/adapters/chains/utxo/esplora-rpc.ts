@@ -130,6 +130,41 @@ export interface EsploraClient {
   getAddressBalanceSats(address: string): Promise<bigint>;
 }
 
+// Compose clients speaking DIFFERENT API shapes (Esplora, Blockbook) into
+// one failover chain. The inner esploraClient already fails over across
+// same-shape backends; this layer fails over across shapes — e.g. LTC:
+// litecoinspace.org (Esplora) → GetBlock/NOWNodes (Blockbook). Semantics
+// mirror withFailover: 404/400 are properties of the request (definitive
+// "nothing here") and short-circuit; anything else moves to the next client.
+export function compositeEsploraClient(clients: readonly EsploraClient[]): EsploraClient {
+  if (clients.length === 0) throw new Error("compositeEsploraClient: at least one client required");
+  if (clients.length === 1) return clients[0]!;
+
+  async function firstSuccess<T>(op: (client: EsploraClient) => Promise<T>): Promise<T> {
+    const errors: string[] = [];
+    for (const client of clients) {
+      try {
+        return await op(client);
+      } catch (err) {
+        if (err instanceof EsploraNotFoundError) throw err;
+        if (err instanceof EsploraBadRequestError) throw err;
+        errors.push(err instanceof Error ? err.message : String(err));
+      }
+    }
+    throw new Error(`esplora composite: all ${clients.length} providers failed: ${errors.join("; ")}`);
+  }
+
+  return {
+    getAddressTxs: (address) => firstSuccess((c) => c.getAddressTxs(address)),
+    getAddressMempoolTxs: (address) => firstSuccess((c) => c.getAddressMempoolTxs(address)),
+    getTx: (txid) => firstSuccess((c) => c.getTx(txid)),
+    getTipHeight: () => firstSuccess((c) => c.getTipHeight()),
+    broadcastTx: (rawHex) => firstSuccess((c) => c.broadcastTx(rawHex)),
+    getFeeEstimates: () => firstSuccess((c) => c.getFeeEstimates()),
+    getAddressBalanceSats: (address) => firstSuccess((c) => c.getAddressBalanceSats(address))
+  };
+}
+
 export interface EsploraClientConfig {
   readonly backends: readonly EsploraBackend[];
   // Optional: inject fetch (tests). Defaults to globalThis.fetch.

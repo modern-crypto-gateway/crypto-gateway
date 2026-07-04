@@ -1,15 +1,21 @@
-import type { ExecutionContext, KVNamespace, RateLimit, ScheduledController } from "@cloudflare/workers-types";
+import type {
+  DurableObjectNamespace,
+  ExecutionContext,
+  KVNamespace,
+  RateLimit,
+  ScheduledController
+} from "@cloudflare/workers-types";
 import { buildApp, registerEventSubscribers } from "../app.js";
 import { cfKvAdapter } from "../adapters/cache/cf-kv.adapter.js";
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import {
   bitcoinChainAdapter,
-  litecoinChainAdapter
+  litecoinChainAdapter,
+  parseEsploraUrlsEnv
 } from "../adapters/chains/utxo/utxo-chain.adapter.js";
 import {
   BITCOIN_CONFIG,
-  LITECOIN_CONFIG,
-  utxoConfigForChainId
+  LITECOIN_CONFIG
 } from "../adapters/chains/utxo/utxo-config.js";
 import { moneroChainAdapter } from "../adapters/chains/monero/monero-chain.adapter.js";
 import {
@@ -23,10 +29,6 @@ import {
   parseMoneroRpcUrlsEnv,
   parseMoneroRpcHeadersEnv
 } from "../adapters/chains/monero/monero-rpc.js";
-import { loadBlockcypherChainConfigs } from "../adapters/detection/blockcypher-config.js";
-import { dbBlockcypherSubscriptionStore } from "../adapters/detection/blockcypher-subscription-store.js";
-import { makeBlockcypherSyncSweep } from "../adapters/detection/blockcypher-sync-sweep.js";
-import { blockcypherNotifyDetection } from "../adapters/detection/blockcypher-notify.adapter.js";
 import { alchemyRpcUrls, parseAlchemyChainsEnv } from "../adapters/chains/evm/alchemy-rpc.js";
 import { wireSolana } from "../adapters/chains/solana/wire.js";
 import { wireTron } from "../adapters/chains/tron/wire.js";
@@ -84,6 +86,10 @@ export interface WorkerEnv {
   RATE_LIMIT_CHECKOUT?: RateLimit;
   RATE_LIMIT_WEBHOOK_INGEST?: RateLimit;
   RATE_LIMIT_MERCHANT_API?: RateLimit;
+  // Durable Object hosting the UTXO WebSocket push watcher (instant BTC/LTC
+  // mempool detection). Optional: without the binding (or with UTXO_WS=off)
+  // the gateway is poll-only via the 1-minute cron, exactly as before.
+  UTXO_WS_DO?: DurableObjectNamespace;
 
   // Secrets (set via `wrangler secret put`)
   MASTER_SEED: string;
@@ -95,7 +101,16 @@ export interface WorkerEnv {
   [key: string]: unknown;
 }
 
-async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> {
+// off/0/false disable the UTXO WebSocket watcher (same spellings as the
+// Node entrypoint's kill switch).
+function utxoWsEnabled(env: WorkerEnv): boolean {
+  const knob = String(env["UTXO_WS"] ?? "").toLowerCase();
+  return knob !== "off" && knob !== "0" && knob !== "false";
+}
+
+// Exported for the UtxoWsWatcherDO — the Durable Object builds the same full
+// AppDeps (Turso, KV, event bus, chain adapters) as the request path.
+export async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> {
   const alertWebhookUrl = typeof env["ALERT_WEBHOOK_URL"] === "string" && env["ALERT_WEBHOOK_URL"].length > 0
     ? env["ALERT_WEBHOOK_URL"]
     : undefined;
@@ -224,14 +239,33 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
   // UTXO wiring (Bitcoin + Litecoin). No API creds — Esplora's public
   // endpoints handle detection + broadcast. Wired unconditionally; idle
   // when no merchant invoices on these chains. See node.ts for matching
-  // rationale.
-  chains.push(bitcoinChainAdapter());
+  // rationale. ESPLORA_URLS_<SLUG> env override mirrors node.ts.
+  const envString = (key: string): string | undefined =>
+    typeof env[key] === "string" ? (env[key] as string) : undefined;
+  chains.push(bitcoinChainAdapter(
+    parseEsploraUrlsEnv(envString("ESPLORA_URLS_BITCOIN")),
+    parseEsploraUrlsEnv(envString("BLOCKBOOK_URLS_BITCOIN"))
+  ));
   detectionStrategies[BITCOIN_CONFIG.chainId] = rpcPollDetection();
-  chains.push(litecoinChainAdapter());
+  chains.push(litecoinChainAdapter(
+    parseEsploraUrlsEnv(envString("ESPLORA_URLS_LITECOIN")),
+    parseEsploraUrlsEnv(envString("BLOCKBOOK_URLS_LITECOIN"))
+  ));
   detectionStrategies[LITECOIN_CONFIG.chainId] = rpcPollDetection();
   logger.info("UTXO chains wired", {
     chainIds: [BITCOIN_CONFIG.chainId, LITECOIN_CONFIG.chainId]
   });
+  // BlockCypher support was removed (2026-07) — warn loudly if a deployment
+  // still carries its env vars expecting push detection that no longer exists.
+  const staleBlockcypherVars = Object.keys(env as Record<string, unknown>).filter((k) =>
+    k.startsWith("BLOCKCYPHER")
+  );
+  if (staleBlockcypherVars.length > 0) {
+    logger.warn(
+      "BLOCKCYPHER_* env vars are set but BlockCypher support has been removed — vars are ignored.",
+      { vars: staleBlockcypherVars }
+    );
+  }
 
   // Monero (XMR) inbound wiring. Conditional on MONERO_PRIMARY_ADDRESS +
   // MONERO_VIEW_KEY both being set. See node.ts for the full rationale.
@@ -352,58 +386,31 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     alchemy = { syncAddresses: sweep };
   }
 
-  // BlockCypher push-detection accelerator (mirror of node.ts wiring).
-  // Per-chain config: each UTXO chain registered in `chains` reads its own
-  //   BLOCKCYPHER_TOKEN_<SLUG> + BLOCKCYPHER_CALLBACK_URL_<SLUG>
-  // env-var pair (e.g. BLOCKCYPHER_TOKEN_BITCOIN, _LITECOIN, _BITCOIN_TESTNET).
-  // Setting only one of the pair is a hard boot error. Chains BlockCypher
-  // doesn't cover (LTC testnet, blockcypherCoinPath=null) are skipped silently.
-  let blockcypher: AppDeps["blockcypher"];
-  let blockcypherPushStrategy: ReturnType<typeof blockcypherNotifyDetection> | undefined;
   const workerSecrets = workersEnvSecrets(env as unknown as Record<string, unknown>);
-  const blockcypherConfigs = loadBlockcypherChainConfigs({
-    secrets: workerSecrets,
-    chains,
-    logger
-  });
-  if (blockcypherConfigs.size > 0) {
-    const sweep = makeBlockcypherSyncSweep({
-      store: dbBlockcypherSubscriptionStore(db),
-      configByChainId: blockcypherConfigs,
-      logger,
-      clock: { now: () => new Date() }
-    });
-    blockcypher = {
-      syncSubscriptions: sweep,
-      configuredChainIds: new Set(blockcypherConfigs.keys())
-    };
-    blockcypherPushStrategy = blockcypherNotifyDetection(
-      async (innerDeps, chainId) => {
-        // Owned addresses come from the per-family join table, NOT
-        // invoices.receiveAddress. On a multi-currency invoice the Litecoin leg
-        // is frequently a SECONDARY family: invoices.chainId/receiveAddress hold
-        // the PRIMARY (e.g. an EVM stablecoin), so a primary-only lookup would
-        // never contain the LTC address — the BlockCypher push arrives, matches
-        // nothing, and silently does nothing. invoice_receive_addresses carries
-        // one row per family keyed by the specific chainId (mirrors the
-        // subscription tracker, which subscribes every receive address).
-        const { invoiceReceiveAddresses } = await import("../db/schema.js");
-        const { eq } = await import("drizzle-orm");
-        const rows = await innerDeps.db
-          .select({ address: invoiceReceiveAddresses.address })
-          .from(invoiceReceiveAddresses)
-          .where(eq(invoiceReceiveAddresses.chainId, chainId));
-        const set = new Set<string>();
-        for (const r of rows) set.add(r.address.toLowerCase());
-        const cfg = utxoConfigForChainId(chainId);
-        const native = cfg?.nativeSymbol ?? "BTC";
-        return { chainId, nativeSymbol: native as "BTC" | "LTC", ourAddresses: set };
-      }
-    );
-    const enabledSlugs = Array.from(blockcypherConfigs.values()).map((c) => c.slug);
-    logger.info("BlockCypher accelerator wired (per-chain)", {
-      chains: enabledSlugs,
-      chainCount: blockcypherConfigs.size
+
+  // Event bus is hoisted (not inlined in the literal) so the UTXO WS
+  // Durable Object poke below can subscribe before deps are returned. The
+  // bus is per-invocation: events published during THIS request reach THIS
+  // subscription only, which is exactly the semantics the poke needs.
+  const events = createInMemoryEventBus();
+  // Instant tracking for new UTXO invoices: the watcher lives in a Durable
+  // Object with its own isolate + bus, so the in-process invoice.created
+  // subscription that works on Node can't reach it — poke it over the DO
+  // stub instead. Fire-and-forget via waitUntil; the DO's cron ping and
+  // watchdog alarm are the reliability net if a poke is lost.
+  if (env.UTXO_WS_DO !== undefined && utxoWsEnabled(env)) {
+    const namespace = env.UTXO_WS_DO;
+    events.subscribe("invoice.created", async (event) => {
+      if (!event.invoice.receiveAddresses.some((a) => a.family === "utxo")) return;
+      const stub = namespace.get(namespace.idFromName("global"));
+      ctx.waitUntil(
+        stub.fetch("https://utxo-ws-do/ensure").then(
+          () => undefined,
+          (err: unknown) => logger.warn("utxo-ws-do poke failed (cron ping will cover)", {
+            error: err instanceof Error ? err.message : String(err)
+          })
+        )
+      );
     });
   }
 
@@ -444,7 +451,7 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
       allowHttp: env["NODE_ENV"] === "development" || env["NODE_ENV"] === "test"
     }),
     webhookDeliveryStore: dbWebhookDeliveryStore(db),
-    events: createInMemoryEventBus(),
+    events,
     logger,
     rateLimiter,
     rateLimits: {
@@ -457,14 +464,10 @@ async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<AppDeps> 
     chains,
     detectionStrategies,
     pushStrategies: {
-      "alchemy-notify": alchemyNotifyDetection(),
-      ...(blockcypherPushStrategy !== undefined
-        ? { "blockcypher-notify": blockcypherPushStrategy }
-        : {})
+      "alchemy-notify": alchemyNotifyDetection()
     },
     clock: { now: () => new Date() },
     ...(alchemy !== undefined ? { alchemy } : {}),
-    ...(blockcypher !== undefined ? { blockcypher } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
     confirmationThresholds: parseFinalityOverridesEnv(
       typeof env["FINALITY_OVERRIDES"] === "string" ? env["FINALITY_OVERRIDES"] : undefined
@@ -603,6 +606,20 @@ export default {
     // (invoice.completed, invoice.payment_confirmed, payout.*) reach an
     // empty bus and never insert into webhook_deliveries.
     registerEventSubscribers(deps);
+    // Keep the UTXO WS watcher Durable Object alive: first start, revive
+    // after deploys/evictions. Fire-and-forget in parallel with the job run
+    // — the DO ping must not delay (or be delayed by) the sweeps.
+    if (env.UTXO_WS_DO !== undefined && utxoWsEnabled(env)) {
+      const stub = env.UTXO_WS_DO.get(env.UTXO_WS_DO.idFromName("global"));
+      ctx.waitUntil(
+        stub.fetch("https://utxo-ws-do/ensure").then(
+          () => undefined,
+          (err: unknown) => deps.logger.warn("utxo-ws-do ensure failed (next tick retries)", {
+            error: err instanceof Error ? err.message : String(err)
+          })
+        )
+      );
+    }
     const result = await runScheduledJobs(deps);
     for (const [name, outcome] of Object.entries(result)) {
       if (outcome && !outcome.ok) {
@@ -611,6 +628,10 @@ export default {
     }
   }
 };
+
+// Durable Object class — must be exported from the Worker's main module so
+// the runtime can bind it (wrangler.jsonc `durable_objects` + `migrations`).
+export { UtxoWsWatcherDO } from "./utxo-ws-do.js";
 
 // Decode a 64-hex-char string into 32 bytes. Throws with a stable error
 // shape if the env var is the wrong length or has non-hex characters —

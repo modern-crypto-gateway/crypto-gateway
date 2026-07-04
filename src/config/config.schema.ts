@@ -34,18 +34,6 @@ export const AppConfigSchema = z
     // fall back to a fixed dev key; prod/staging require a real one.
     secretsEncryptionKey: z.string().optional(),
 
-    // Shared secret for the /webhooks/blockcypher/:chainId ingest route — a
-    // `?token=` query param BlockCypher echoes back on every push. The route
-    // is fail-closed: without this token it rejects all pushes, so the
-    // refine below requires it in production/staging whenever BlockCypher
-    // push detection is enabled.
-    blockcypherIngestToken: z.string().optional(),
-    // Derived in loadConfig (not a real env var): true when any per-chain
-    // `BLOCKCYPHER_TOKEN_<SLUG>` / `BLOCKCYPHER_CALLBACK_URL_<SLUG>` pair
-    // member is set, i.e. the operator intends to run BlockCypher push
-    // detection on this deployment.
-    blockcypherIngestEnabled: z.boolean().default(false),
-
     // Provider secrets.
     alchemyApiKey: z.string().optional(),
     // CoinGecko API key. Optional — the free tier is keyless but heavily
@@ -206,6 +194,20 @@ export const AppConfigSchema = z
     // ADMIN_KEY redirect Alchemy traffic to attacker-controlled hosts.
     gatewayPublicUrl: z.string().url().optional(),
 
+    // In-process scheduler (Node entrypoint only). The scheduled-jobs loop
+    // (payment polling, confirmation sweeps, invoice expiry, payouts) MUST
+    // tick for the gateway to function; on Workers/Deno/Vercel the platform
+    // cron drives it, but plain Node has no host cron — so node.ts runs its
+    // own setInterval by default. Set INTERNAL_CRON=off only when an external
+    // scheduler POSTs /internal/cron/tick (k8s CronJob, QStash, systemd timer)
+    // to avoid double-ticking. Interval floor 5s: sub-second ticks would
+    // hammer public Esplora backends for no detection benefit.
+    internalCronEnabled: z
+      .string()
+      .optional()
+      .transform((v) => v !== "off" && v !== "0" && v !== "false"),
+    internalCronIntervalMs: z.coerce.number().int().min(5_000).max(600_000).default(60_000),
+
     // Rate limits. Defaults are generous enough that dev + integration tests
     // don't trip them; tune down in production via env vars.
     rateLimitMerchantPerMinute: z.coerce.number().int().min(1).default(1000),
@@ -291,22 +293,6 @@ export const AppConfigSchema = z
       path: ["secretsEncryptionKey"]
     }
   )
-  // The /webhooks/blockcypher route is fail-closed on BLOCKCYPHER_INGEST_TOKEN:
-  // without it every push is rejected, so a live deployment that enabled
-  // BlockCypher detection (per-chain BLOCKCYPHER_TOKEN_<SLUG> vars) but forgot
-  // the ingest token would silently lose all push notifications. Require the
-  // token at boot instead. Deployments not using BlockCypher are unaffected.
-  .refine(
-    (c) =>
-      isRelaxedEnvironment(c.environment) ||
-      !c.blockcypherIngestEnabled ||
-      (c.blockcypherIngestToken !== undefined && c.blockcypherIngestToken.length > 0),
-    {
-      message:
-        "BLOCKCYPHER_INGEST_TOKEN is required in production/staging when BlockCypher push detection is enabled (BLOCKCYPHER_TOKEN_<SLUG>/BLOCKCYPHER_CALLBACK_URL_<SLUG> set) — the /webhooks/blockcypher route rejects all pushes without it",
-      path: ["blockcypherIngestToken"]
-    }
-  )
   .refine(
     (c) => c.dbAdapter !== "libsql" || c.databaseUrl !== undefined,
     { message: "DATABASE_URL is required when DB_ADAPTER=libsql", path: ["databaseUrl"] }
@@ -327,24 +313,6 @@ export type AppConfig = z.infer<typeof AppConfigSchema>;
 // default "production" — is treated as a live environment.
 function isRelaxedEnvironment(env: string): boolean {
   return env === "development" || env === "test";
-}
-
-// BlockCypher push detection is enabled per chain via
-// `BLOCKCYPHER_TOKEN_<SLUG>` + `BLOCKCYPHER_CALLBACK_URL_<SLUG>` pairs (see
-// adapters/detection/blockcypher-config.ts). For the ingest-token refine we
-// only need intent, not full validity: if EITHER member of any per-chain pair
-// is set non-empty, the operator means to run BlockCypher and must also set
-// BLOCKCYPHER_INGEST_TOKEN in production/staging. The legacy single-form
-// `BLOCKCYPHER_TOKEN` / `BLOCKCYPHER_CALLBACK_URL` (no suffix) are no longer
-// recognized anywhere and deliberately do NOT count.
-function hasBlockcypherChainConfig(env: Readonly<Record<string, string | undefined>>): boolean {
-  for (const [key, value] of Object.entries(env)) {
-    if (value === undefined || value === "") continue;
-    if (key.startsWith("BLOCKCYPHER_TOKEN_") || key.startsWith("BLOCKCYPHER_CALLBACK_URL_")) {
-      return true;
-    }
-  }
-  return false;
 }
 
 // Typed error class so entrypoints can differentiate misconfiguration from
@@ -372,8 +340,6 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     sweepMasterKey: env["SWEEP_MASTER_KEY"],
     cronSecret: env["CRON_SECRET"],
     secretsEncryptionKey: env["SECRETS_ENCRYPTION_KEY"],
-    blockcypherIngestToken: env["BLOCKCYPHER_INGEST_TOKEN"],
-    blockcypherIngestEnabled: hasBlockcypherChainConfig(env),
     alchemyApiKey: env["ALCHEMY_API_KEY"],
     alchemyChains: env["ALCHEMY_CHAINS"],
     coingeckoApiKey: env["COINGECKO_API_KEY"],
@@ -410,6 +376,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     databaseUrl: env["TURSO_URL"] ?? env["DATABASE_URL"],
     databaseToken: env["TURSO_AUTH_TOKEN"] ?? env["DATABASE_TOKEN"],
     redisUrl: env["REDIS_URL"],
+    internalCronEnabled: env["INTERNAL_CRON"],
+    internalCronIntervalMs: env["INTERNAL_CRON_INTERVAL_MS"],
     rateLimitMerchantPerMinute: env["RATE_LIMIT_MERCHANT_PER_MINUTE"],
     rateLimitCheckoutPerMinute: env["RATE_LIMIT_CHECKOUT_PER_MINUTE"],
     rateLimitWebhookIngestPerMinute: env["RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE"],

@@ -1124,8 +1124,7 @@ paths:
         constraint.
 
         Rate limited per client IP — default 300/min
-        (`RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE`), shared scope with
-        `/webhooks/blockcypher/{chainId}`.
+        (`RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE`).
       security:
         - AlchemySignature: []
       requestBody:
@@ -1272,182 +1271,6 @@ paths:
         "413":
           description: |
             `PAYLOAD_TOO_LARGE` — body exceeds the 64 KB cap.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-        "429": { $ref: "#/components/responses/RateLimited" }
-
-  /webhooks/blockcypher/{chainId}:
-    parameters:
-      - name: chainId
-        in: path
-        required: true
-        schema: { type: integer, minimum: 1 }
-        description: |
-          Gateway synthetic UTXO chain id — `800` Bitcoin, `801` Litecoin,
-          `802` Bitcoin Testnet3, `803` Litecoin Testnet. The URL — not
-          the payload — decides which chain's watched-address set the tx
-          is matched against (payload coin fields are deliberately
-          ignored, defense-in-depth against a spoofed or misconfigured
-          callback), so each chain's hooks must be registered with its own
-          URL. Segments whose leading digits don't form a positive
-          integer → 400 `BAD_CHAIN_ID`; the segment is parsed with
-          `parseInt`, so trailing non-digit characters are ignored
-          (`801abc` is treated as chain 801, `1.9` as chain 1).
-    post:
-      tags: [webhooks]
-      summary: Ingest BlockCypher tx-confirmation webhooks (BTC / LTC)
-      description: |
-        Inbound push from BlockCypher for watched UTXO addresses. The
-        gateway registers one BlockCypher hook per active invoice receive
-        address (event `tx-confirmation` — fires on mempool entry and
-        again at each confirmation depth up to 6) through the
-        `blockcypher_subscriptions` queue, drained by the scheduled-jobs
-        `blockcypherSyncSubscriptions` step. Push is purely a
-        sub-30-second accelerator: the Esplora poll path keeps detecting
-        even when pushes are lost, and a tx caught by both never
-        double-credits.
-
-        **Auth model — URL token, not HMAC.** BlockCypher does not sign
-        payloads; the callback URL itself is the secret. Generate one
-        random token, set it as `BLOCKCYPHER_INGEST_TOKEN` on the gateway,
-        and bake it into the callback URL registered with BlockCypher
-        (`BLOCKCYPHER_CALLBACK_URL_<SLUG>`), e.g.
-        `https://gw.example.com/webhooks/blockcypher/801?token=<random>`.
-        The comparison is constant-time, and the check is **fail-closed**:
-        with the env var unset or empty, every caller gets 404
-        `NOT_CONFIGURED` — the route never falls back to accepting
-        unauthenticated payloads (an attacker could otherwise forge
-        `outputs[].value` / `confirmations` and mint confirmed payments).
-        Config validation refuses to boot production/staging with
-        BlockCypher push detection enabled (`BLOCKCYPHER_TOKEN_<SLUG>` or
-        `BLOCKCYPHER_CALLBACK_URL_<SLUG>` set) but no ingest token.
-
-        The body is BlockCypher's standard **TX object**. Each
-        `outputs[]` entry paying a watched receive address is projected
-        into one transfer whose `log_index` is the output's vout; the
-        first input address is the best-effort sender attribution.
-        Because BlockCypher re-fires the same tx at each confirmation
-        depth, downstream ingest dedupes on the UNIQUE
-        `(chain_id, tx_hash, log_index)` constraint — repeats are no-ops.
-        The route ACKs **200 immediately** and processes in the background
-        (BlockCypher retries on non-2xx), so a 200 never confirms a
-        credit: payloads without a string `hash` or an `outputs` array,
-        and txs paying no watched address, are silently dropped with the
-        same 200.
-
-        Rate limited per client IP — default 300/min
-        (`RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE`), shared scope with
-        `/webhooks/alchemy`.
-      security:
-        - BlockCypherIngestToken: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              description: |
-                BlockCypher TX object (the `tx-confirmation` /
-                `unconfirmed-tx` event body). Extra fields BlockCypher
-                sends (`total`, `fees`, `preference`, `double_spend`,
-                `script_type`, `spent_by`, ...) are tolerated and ignored.
-                A payload without a string `hash` or an `outputs` array is
-                accepted (200) but produces no transfers.
-              properties:
-                hash:
-                  type: string
-                  description: Transaction hash (hex, no 0x prefix).
-                block_height:
-                  type: integer
-                  description: |
-                    Containing block height; `-1` while the tx is still in
-                    the mempool (stored as a null block number).
-                confirmations:
-                  type: integer
-                  description: |
-                    Confirmation depth at fire time (0 = mempool).
-                    Negative values are clamped to 0. The confirmation
-                    sweeper re-checks authoritative depth via RPC
-                    afterward — this value only seeds the initial row.
-                addresses:
-                  type: array
-                  items: { type: string }
-                  description: |
-                    Every address the tx touches — informational only, NOT
-                    used for matching (matching walks `outputs[]`).
-                inputs:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      prev_hash: { type: string }
-                      output_index: { type: integer }
-                      output_value: { type: integer }
-                      addresses:
-                        type: array
-                        items: { type: string }
-                        description: |
-                          Spending addresses. The first non-empty input
-                          address becomes the transfer's `fromAddress`
-                          (best-effort display attribution).
-                outputs:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      value:
-                        type: integer
-                        description: |
-                          Output amount in base units (satoshis /
-                          litoshis).
-                      addresses:
-                        type: array
-                        items: { type: string }
-                        description: |
-                          Paid addresses (lowercased before matching
-                          against watched invoice receive addresses). A
-                          matching output becomes one transfer; its array
-                          index (vout) is the `log_index` dedup
-                          discriminator.
-                      script: { type: string }
-      responses:
-        "200":
-          description: |
-            Acknowledged — ingest happens in the background, so 200 does
-            NOT mean a transfer was credited (unwatched outputs, missing
-            `hash`/`outputs`, and repeat deliveries of the same tx all
-            still 200).
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [received]
-                properties:
-                  received: { type: boolean, const: true }
-        "400":
-          description: |
-            `BAD_CHAIN_ID` — the path segment's leading digits don't form
-            a positive integer (checked before the token, so reachable
-            unauthenticated) — or
-            `BAD_JSON` — the body is not valid JSON (only after a valid
-            token).
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-        "401":
-          description: |
-            `UNAUTHORIZED` — `?token=` missing or not equal to
-            `BLOCKCYPHER_INGEST_TOKEN`.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-        "404":
-          description: |
-            `NOT_CONFIGURED` — `BLOCKCYPHER_INGEST_TOKEN` unset/empty
-            (fail-closed), or BlockCypher push detection not wired on this
-            deployment (no `BLOCKCYPHER_TOKEN_<SLUG>` +
-            `BLOCKCYPHER_CALLBACK_URL_<SLUG>` pair for any UTXO chain).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -5572,10 +5395,8 @@ paths:
         sweepStuckPayoutReservations → sweepExpiredInvoices →
         reconcileOrphanedAllocations → reconcileOrphanedMoneroAllocations
         → sweepWebhookDeliveries → runAutoConsolidations`, plus
-        `alchemySyncAddresses` (only when Alchemy Notify is configured)
-        and `blockcypherSyncSubscriptions` (only when BlockCypher is
-        configured). A missing optional key means "provider not wired",
-        not failure.
+        `alchemySyncAddresses` (only when Alchemy Notify is configured).
+        A missing optional key means "provider not wired", not failure.
 
         Every job is individually try/caught: one slow or failing provider
         can't mask the others, and the endpoint still returns **200** with
@@ -5607,9 +5428,8 @@ paths:
                     type: object
                     description: |
                       One key per job, in the run order listed in the
-                      endpoint description. `alchemySyncAddresses` /
-                      `blockcypherSyncSubscriptions` are present only when
-                      the corresponding provider is configured.
+                      endpoint description. `alchemySyncAddresses` is
+                      present only when Alchemy Notify is configured.
                     additionalProperties:
                       type: object
                       required: [ok]
@@ -5655,16 +5475,6 @@ components:
       type: http
       scheme: bearer
       description: Shared secret from `CRON_SECRET` env.
-    BlockCypherIngestToken:
-      type: apiKey
-      in: query
-      name: token
-      description: |
-        Shared ingest secret for `POST /webhooks/blockcypher/{chainId}` —
-        the `?token=` query value must equal `BLOCKCYPHER_INGEST_TOKEN`
-        (compared in constant time). Bake it into the callback URL
-        registered with BlockCypher. Wrong or missing token → 401;
-        env var unset/empty → fail-closed 404 `NOT_CONFIGURED`.
 
   headers:
     X-Request-Id:

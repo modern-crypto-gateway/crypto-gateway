@@ -60,9 +60,6 @@ export interface ScheduledJobsResult {
   // (`deps.alchemy` set). Absent otherwise — callers should not treat the
   // missing key as a failure.
   alchemySyncAddresses?: JobOutcome;
-  // Present only when BlockCypher is configured (`deps.blockcypher` set).
-  // Drains the `blockcypher_subscriptions` queue per tick.
-  blockcypherSyncSubscriptions?: JobOutcome;
 }
 
 export type JobOutcome = { ok: true; value: unknown } | { ok: false; error: string };
@@ -70,7 +67,26 @@ export type JobOutcome = { ok: true; value: unknown } | { ok: false; error: stri
 const CONFIRMED_GAS_BURN_RECONCILE_CRON_BATCH = 20;
 const UNKNOWN_BROADCAST_RECONCILE_CRON_BATCH = 10;
 
+// Single-flight per deps instance. Two tick drivers can coexist in one Node
+// process — the entrypoint's built-in interval AND an external scheduler
+// POSTing /internal/cron/tick — and the jobs assume one runner: overlapping
+// sweeps double-select the same rows before either updates them. A caller
+// arriving while a run is in flight JOINS that run (gets its result) instead
+// of starting a second one. Keyed by deps so independent app instances
+// (tests) never serialize against each other.
+const inFlightByDeps = new WeakMap<AppDeps, Promise<ScheduledJobsResult>>();
+
 export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResult> {
+  const inFlight = inFlightByDeps.get(deps);
+  if (inFlight !== undefined) return inFlight;
+  const run = runScheduledJobsOnce(deps).finally(() => {
+    inFlightByDeps.delete(deps);
+  });
+  inFlightByDeps.set(deps, run);
+  return run;
+}
+
+async function runScheduledJobsOnce(deps: AppDeps): Promise<ScheduledJobsResult> {
   const result: ScheduledJobsResult = {
     // Pre-warm the price-oracle cache so USD-pegged invoice creation in the
     // next minute reads warm cache instead of paying upstream latency on
@@ -135,9 +151,6 @@ export async function runScheduledJobs(deps: AppDeps): Promise<ScheduledJobsResu
   };
   if (deps.alchemy !== undefined) {
     result.alchemySyncAddresses = await run(() => deps.alchemy!.syncAddresses());
-  }
-  if (deps.blockcypher !== undefined) {
-    result.blockcypherSyncSubscriptions = await run(() => deps.blockcypher!.syncSubscriptions());
   }
   return result;
 }

@@ -1,10 +1,11 @@
-import { and, eq, gt, inArray } from "drizzle-orm";
+import { and, eq, gt, inArray, or } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainFamily, ChainId } from "../types/chain.js";
 import type { TokenSymbol } from "../types/token.js";
 import type { DetectedTransfer } from "../types/transaction.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { ingestDetectedTransfer } from "./payment.service.js";
+import { LATE_PAYMENT_WATCH_MS, PROCESSING_EXPIRY_GRACE_MS } from "./payment-config.js";
 import { invoices, invoiceReceiveAddresses } from "../../db/schema.js";
 
 // Cron-triggered orchestrator:
@@ -41,12 +42,31 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
     .from(invoices)
     .innerJoin(invoiceReceiveAddresses, eq(invoiceReceiveAddresses.invoiceId, invoices.id))
     .where(
-      and(
-        // Active invoices for the poll loop. Includes `completed` because
-        // a reorg-recheck can demote a completed invoice and we still want
-        // to poll its addresses for any incoming top-ups during the window.
-        inArray(invoices.status, ["pending", "processing", "completed"]),
-        gt(invoices.expiresAt, deps.clock.now().getTime())
+      or(
+        and(
+          // Active invoices for the poll loop. Includes `completed` because
+          // a reorg-recheck can demote a completed invoice and we still want
+          // to poll its addresses for any incoming top-ups during the window.
+          inArray(invoices.status, ["pending", "completed"]),
+          gt(invoices.expiresAt, deps.clock.now().getTime())
+        ),
+        // `processing` = payment detected inside the window, confirmations
+        // pending. Keep watching through the grace window (mirrors
+        // sweepExpiredInvoices) — otherwise slow-confirming chains (BTC 6
+        // confs ≈ 60 min vs 30-min default expiry) lose detection coverage
+        // exactly when the crediting tx is about to confirm.
+        and(
+          eq(invoices.status, "processing"),
+          gt(invoices.expiresAt, deps.clock.now().getTime() - PROCESSING_EXPIRY_GRACE_MS)
+        ),
+        // Recently-expired invoices stay watched briefly so a payment
+        // broadcast around/after expiry is still ingested — it records as
+        // an orphaned transaction (or cooldown-credits on pooled families)
+        // instead of landing invisibly on a gateway-controlled address.
+        and(
+          eq(invoices.status, "expired"),
+          gt(invoices.expiresAt, deps.clock.now().getTime() - LATE_PAYMENT_WATCH_MS)
+        )
       )
     );
 

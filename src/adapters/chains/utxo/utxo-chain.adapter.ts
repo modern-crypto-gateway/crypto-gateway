@@ -18,6 +18,7 @@ import {
   decodeUtxoDestination
 } from "./destination-script.js";
 import {
+  compositeEsploraClient,
   esploraClient,
   EsploraBadRequestError,
   EsploraNotFoundError,
@@ -25,6 +26,7 @@ import {
   type EsploraClient,
   type EsploraTx
 } from "./esplora-rpc.js";
+import { blockbookClient } from "./blockbook-rpc.js";
 import {
   signSegwitTx,
   type InputSigningKey,
@@ -45,7 +47,7 @@ import {
 // URLs — all carried by `UtxoChainConfig`. One adapter, two registered chains.
 //
 // Phase 1 scope: address derivation + canonicalization. Detection and payout
-// methods are stubbed (throw) and filled in Phase 2 (Esplora + BlockCypher) and
+// methods are stubbed (throw) and filled in Phase 2 (Esplora) and
 // Phase 3 (coin selection + signing + broadcast).
 
 const DEFAULT_ACCOUNT_INDEX = 0;
@@ -64,6 +66,12 @@ export interface UtxoChainAdapterConfig {
   // Override the Esplora backend list (production knob — point at a
   // self-hosted Electrs/Esplora deployment). Ignored when `esplora` is set.
   readonly esploraBackends?: readonly EsploraBackend[];
+  // Blockbook-v2 failover providers (GetBlock, NOWNodes, self-hosted
+  // Blockbook), tried AFTER every Esplora backend fails. A second API
+  // shape means a litecoinspace.org outage degrades to a keyed provider
+  // instead of stalling LTC detection. API key rides as URL userinfo
+  // (https://KEY@host → `api-key` header). Ignored when `esplora` is set.
+  readonly blockbookUrls?: readonly string[];
   // Inject fetch (Workers + tests). Forwarded to esploraClient.
   readonly fetch?: typeof globalThis.fetch;
 }
@@ -73,10 +81,15 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
   const accountIndex = cfg.accountIndex ?? DEFAULT_ACCOUNT_INDEX;
   const esplora =
     cfg.esplora ??
-    esploraClient({
-      backends: (cfg.esploraBackends ?? chain.defaultEsploraUrls.map((url) => ({ baseUrl: url }))),
-      ...(cfg.fetch !== undefined ? { fetch: cfg.fetch } : {})
-    });
+    compositeEsploraClient([
+      esploraClient({
+        backends: (cfg.esploraBackends ?? chain.defaultEsploraUrls.map((url) => ({ baseUrl: url }))),
+        ...(cfg.fetch !== undefined ? { fetch: cfg.fetch } : {})
+      }),
+      ...(cfg.blockbookUrls ?? []).map((baseUrl) =>
+        blockbookClient({ baseUrl, ...(cfg.fetch !== undefined ? { fetch: cfg.fetch } : {}) })
+      )
+    ]);
 
   return {
     family: "utxo",
@@ -183,15 +196,27 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
       const wantsNative = tokens.some((t) => t === chain.nativeSymbol);
       if (!wantsNative || addresses.length === 0) return [];
 
+      // The poll loop passes the whole UTXO-FAMILY address set to every UTXO
+      // chain (BTC and LTC addresses arrive intermixed). Filter to addresses
+      // that decode as valid for THIS chain instead of burning 2 HTTP calls
+      // per wrong-chain address per tick on a guaranteed 400. Decoding (not
+      // an HRP-prefix check) keeps legacy base58 P2PKH/P2SH addresses
+      // scannable — receive addresses are always our own BIP84 bech32, but
+      // payout-recovery and audit scans pass merchant-supplied destinations
+      // that can be legacy-format. (The 400-swallow below stays as
+      // belt-and-braces for chain-ambiguous base58 that slips through.)
+      const chainAddresses = addresses.filter((a) => decodeUtxoDestination(a, chain) !== null);
+      if (chainAddresses.length === 0) return [];
+
       const tip = await esplora.getTipHeight().catch(() => 0);
       const now = new Date();
-      const ourAddresses = new Set<string>(addresses.map((a) => a.toLowerCase()));
+      const ourAddresses = new Set<string>(chainAddresses.map((a) => a.toLowerCase()));
 
       // Each address gets two queries: confirmed history + mempool. Both feed
       // the same DetectedTransfer projection. Order across addresses doesn't
       // matter — the ingest path dedupes on (chainId, txHash, vout).
       const results: DetectedTransfer[] = [];
-      for (const address of addresses) {
+      for (const address of chainAddresses) {
         const lc = address.toLowerCase();
         // sinceMs filter: confirmed txs carry block_time (seconds); mempool
         // txs have no time so we always include them. The poll cadence is
@@ -206,9 +231,15 @@ export function utxoChainAdapter(cfg: UtxoChainAdapterConfig): ChainAdapter {
         // outage into a permanent miss: the scan returned [] as if success,
         // the checkpoint advanced past the payment's block_time, and no later
         // tick ever looked back far enough to detect it.
+        //
+        // Query with the ORIGINAL casing: bech32 is lowercase anyway, but
+        // base58 (legacy P2PKH/P2SH from payout-recovery/audit scans) is
+        // case-sensitive — a lowercased base58 address fails its checksum
+        // and Esplora answers 400. The lowercased form is only for local
+        // set-membership comparison in projectTxOutputs.
         const [confirmed, mempool] = await Promise.all([
-          scanAddressTxsOrThrow(() => esplora.getAddressTxs(lc)),
-          scanAddressTxsOrThrow(() => esplora.getAddressMempoolTxs(lc))
+          scanAddressTxsOrThrow(() => esplora.getAddressTxs(address)),
+          scanAddressTxsOrThrow(() => esplora.getAddressMempoolTxs(address))
         ]);
         for (const tx of confirmed) {
           if (
@@ -525,20 +556,59 @@ export class UtxoNotImplementedError extends Error {
 // Convenience constructors so app-deps wires `utxoChainAdapter({ chain: BITCOIN_CONFIG })`
 // vs spelling out the import every time. Mirrors how evmChainAdapter / tronChainAdapter
 // are called from src/core/app-deps.ts.
-export function bitcoinChainAdapter(): ChainAdapter {
-  return utxoChainAdapter({ chain: BITCOIN_CONFIG });
+//
+// `esploraUrls` (optional) overrides the default public backends — wired by
+// the entrypoints from `ESPLORA_URLS_<SLUG>` (comma-separated base URLs) so
+// operators can point at a self-hosted electrs/mempool instance, or add
+// failover backends, without a code change. `blockbookUrls` (optional,
+// from `BLOCKBOOK_URLS_<SLUG>`) appends Blockbook-shape failover providers
+// after the Esplora chain.
+export function bitcoinChainAdapter(
+  esploraUrls?: readonly string[],
+  blockbookUrls?: readonly string[]
+): ChainAdapter {
+  return utxoChainAdapter({
+    chain: BITCOIN_CONFIG,
+    ...backendsFromUrls(esploraUrls),
+    ...(blockbookUrls !== undefined && blockbookUrls.length > 0 ? { blockbookUrls } : {})
+  });
 }
 
-export function litecoinChainAdapter(): ChainAdapter {
-  return utxoChainAdapter({ chain: LITECOIN_CONFIG });
+export function litecoinChainAdapter(
+  esploraUrls?: readonly string[],
+  blockbookUrls?: readonly string[]
+): ChainAdapter {
+  return utxoChainAdapter({
+    chain: LITECOIN_CONFIG,
+    ...backendsFromUrls(esploraUrls),
+    ...(blockbookUrls !== undefined && blockbookUrls.length > 0 ? { blockbookUrls } : {})
+  });
 }
 
-export function bitcoinTestnetChainAdapter(): ChainAdapter {
-  return utxoChainAdapter({ chain: BITCOIN_TESTNET_CONFIG });
+export function bitcoinTestnetChainAdapter(esploraUrls?: readonly string[]): ChainAdapter {
+  return utxoChainAdapter({ chain: BITCOIN_TESTNET_CONFIG, ...backendsFromUrls(esploraUrls) });
 }
 
-export function litecoinTestnetChainAdapter(): ChainAdapter {
-  return utxoChainAdapter({ chain: LITECOIN_TESTNET_CONFIG });
+export function litecoinTestnetChainAdapter(esploraUrls?: readonly string[]): ChainAdapter {
+  return utxoChainAdapter({ chain: LITECOIN_TESTNET_CONFIG, ...backendsFromUrls(esploraUrls) });
+}
+
+function backendsFromUrls(
+  urls?: readonly string[]
+): { esploraBackends: readonly EsploraBackend[] } | Record<string, never> {
+  if (urls === undefined || urls.length === 0) return {};
+  return { esploraBackends: urls.map((baseUrl) => ({ baseUrl })) };
+}
+
+// Parse `ESPLORA_URLS_<SLUG>`-style env values ("https://a/api,https://b/api")
+// into a URL list. Undefined/empty → undefined (use chain defaults).
+export function parseEsploraUrlsEnv(value: string | undefined): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  const urls = value
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return urls.length > 0 ? urls : undefined;
 }
 
 // ---- Internal helpers ----
@@ -581,9 +651,16 @@ function hexToBytes(hex: string): Uint8Array {
 //
 // `fromAddress` is best-effort — UTXO inputs can come from many addresses,
 // none of them necessarily owned by the sender's "main wallet." We pick the
-// first input with a known prevout address. Falls back to the empty string
-// when no input prevout addresses are available (rare).
-function projectTxOutputs(
+// first input with a known prevout address. Falls back to "unknown" when no
+// input prevout address exists (coinbase / P2PK / nonstandard inputs) —
+// NEVER the empty string: DetectedTransferSchema requires min(1), so ""
+// made Zod reject the whole transfer and the payment was silently dropped
+// on every subsequent tick.
+//
+// Exported for the WS push watcher (utxo-mempool-ws.ts), which receives the
+// same Esplora-format tx objects over the socket and must project them
+// identically to the poll path.
+export function projectTxOutputs(
   tx: EsploraTx,
   watchedAddress: string,
   ourAddresses: ReadonlySet<string>,
@@ -595,7 +672,8 @@ function projectTxOutputs(
   const out: DetectedTransfer[] = [];
   // Best-effort sender attribution — first input with a known address.
   const fromAddress =
-    tx.vin.find((vin) => vin.prevout?.scriptpubkey_address)?.prevout?.scriptpubkey_address ?? "";
+    tx.vin.find((vin) => vin.prevout?.scriptpubkey_address)?.prevout?.scriptpubkey_address ??
+    "unknown";
   const blockNumber = tx.status.confirmed ? (tx.status.block_height ?? null) : null;
   const confirmations =
     tx.status.confirmed && tx.status.block_height !== undefined

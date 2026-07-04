@@ -13,8 +13,6 @@ import { registerMoneroPoolReleaseHandler } from "./core/domain/monero-pool.serv
 import { registerWebhookSubscriber } from "./core/domain/webhook-subscriber.js";
 import { dbAlchemySubscriptionStore } from "./adapters/detection/alchemy-subscription-store.js";
 import { registerAlchemySubscriptionTracker } from "./adapters/detection/alchemy-subscription-tracker.js";
-import { registerBlockcypherSubscriptionTracker } from "./adapters/detection/blockcypher-subscription-tracker.js";
-import { dbBlockcypherSubscriptionStore } from "./adapters/detection/blockcypher-subscription-store.js";
 import { renderError } from "./http/middleware/error-handler.js";
 import { requestIdMiddleware, type RequestIdVariables } from "./http/middleware/request-id.js";
 import { securityHeaders } from "./http/middleware/security-headers.js";
@@ -59,24 +57,6 @@ export function registerEventSubscribers(deps: AppDeps): void {
       logger: deps.logger,
       clock: deps.clock,
       alchemyChainsByFamily: deps.alchemySubscribableChainsByFamily ?? {}
-    });
-  }
-  // BlockCypher subscription tracker — translates UTXO invoice lifecycle
-  // events into per-address subscribe/unsubscribe rows for the
-  // `blockcypher_subscriptions` queue. Registered only when the deployment
-  // has BlockCypher configured for at least one UTXO chain
-  // (BLOCKCYPHER_TOKEN_<SLUG> + BLOCKCYPHER_CALLBACK_URL_<SLUG> for that
-  // chain), surfaced via `deps.blockcypher.configuredChainIds`. Events for
-  // chains NOT in `configuredChainIds` are dropped at enqueue time. Esplora
-  // poll keeps detecting even without BlockCypher; this is purely a
-  // sub-30s push accelerator.
-  if (deps.blockcypher !== undefined) {
-    registerBlockcypherSubscriptionTracker({
-      events: deps.events,
-      store: dbBlockcypherSubscriptionStore(deps.db),
-      logger: deps.logger,
-      clock: deps.clock,
-      configuredChainIds: deps.blockcypher.configuredChainIds
     });
   }
 }

@@ -4,6 +4,7 @@ import { serve } from "@hono/node-server";
 import "dotenv/config";
 import { migrate } from "drizzle-orm/libsql/migrator";
 import { buildApp } from "../app.js";
+import { runScheduledJobs } from "../core/domain/scheduled-jobs.js";
 import { initializeMoneroPool } from "../core/domain/monero-pool.service.js";
 import { createDb, createLibsqlClient } from "../db/client.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
@@ -21,12 +22,12 @@ import { dbWebhookDeliveryStore } from "../adapters/webhook-delivery/db-delivery
 import { evmChainAdapter } from "../adapters/chains/evm/evm-chain.adapter.js";
 import {
   bitcoinChainAdapter,
-  litecoinChainAdapter
+  litecoinChainAdapter,
+  parseEsploraUrlsEnv
 } from "../adapters/chains/utxo/utxo-chain.adapter.js";
 import {
   BITCOIN_CONFIG,
-  LITECOIN_CONFIG,
-  utxoConfigForChainId
+  LITECOIN_CONFIG
 } from "../adapters/chains/utxo/utxo-config.js";
 import { moneroChainAdapter } from "../adapters/chains/monero/monero-chain.adapter.js";
 import {
@@ -51,10 +52,7 @@ import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-s
 import { readAlchemyNotifyToken } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
-import { dbBlockcypherSubscriptionStore } from "../adapters/detection/blockcypher-subscription-store.js";
-import { makeBlockcypherSyncSweep } from "../adapters/detection/blockcypher-sync-sweep.js";
-import { blockcypherNotifyDetection } from "../adapters/detection/blockcypher-notify.adapter.js";
-import { loadBlockcypherChainConfigs } from "../adapters/detection/blockcypher-config.js";
+import { utxoMempoolWsWatcher } from "../adapters/detection/utxo-mempool-ws.js";
 import { merchants } from "../db/schema.js";
 import { loadConfig, ConfigValidationError } from "../config/config.schema.js";
 import type { ChainAdapter } from "../core/ports/chain.port.js";
@@ -216,18 +214,39 @@ async function main(): Promise<void> {
   }
 
   // UTXO wiring (Bitcoin + Litecoin). No API creds needed — Esplora's public
-  // endpoints (mempool.space + Blockstream) handle detection and broadcast
-  // without keys. Wired unconditionally; operators who don't accept BTC/LTC
-  // simply never create invoices on chains 800/801, and the adapters sit
-  // idle. Detection runs through the same `rpcPollDetection` path EVM uses
-  // when it's Alchemy-RPC-only (no webhook source).
-  chains.push(bitcoinChainAdapter());
+  // endpoints (mempool.space / blockstream.info for BTC, litecoinspace.org
+  // for LTC) handle detection and broadcast without keys. Wired
+  // unconditionally; operators who don't accept BTC/LTC simply never create
+  // invoices on chains 800/801, and the adapters sit idle. Detection runs
+  // through the same `rpcPollDetection` path EVM uses when it's
+  // Alchemy-RPC-only (no webhook source), plus the mempool WebSocket push
+  // watcher started after boot (see below). ESPLORA_URLS_BITCOIN /
+  // ESPLORA_URLS_LITECOIN (comma-separated) override the default backends —
+  // point them at a self-hosted electrs/mempool instance for unmetered scale.
+  chains.push(bitcoinChainAdapter(
+    parseEsploraUrlsEnv(process.env["ESPLORA_URLS_BITCOIN"]),
+    parseEsploraUrlsEnv(process.env["BLOCKBOOK_URLS_BITCOIN"])
+  ));
   detectionStrategies[BITCOIN_CONFIG.chainId] = rpcPollDetection();
-  chains.push(litecoinChainAdapter());
+  chains.push(litecoinChainAdapter(
+    parseEsploraUrlsEnv(process.env["ESPLORA_URLS_LITECOIN"]),
+    parseEsploraUrlsEnv(process.env["BLOCKBOOK_URLS_LITECOIN"])
+  ));
   detectionStrategies[LITECOIN_CONFIG.chainId] = rpcPollDetection();
   logger.info("UTXO chains wired", {
     chainIds: [BITCOIN_CONFIG.chainId, LITECOIN_CONFIG.chainId]
   });
+  // BlockCypher support was removed (2026-07). A deployment still carrying
+  // its env vars almost certainly expects push detection that no longer
+  // exists — surface that loudly instead of silently ignoring the config.
+  const staleBlockcypherVars = Object.keys(process.env).filter((k) => k.startsWith("BLOCKCYPHER"));
+  if (staleBlockcypherVars.length > 0) {
+    logger.warn(
+      "BLOCKCYPHER_* env vars are set but BlockCypher support has been removed — vars are ignored. " +
+        "UTXO push detection now uses the mempool.space/litecoinspace WebSocket watcher (UTXO_WS).",
+      { vars: staleBlockcypherVars }
+    );
+  }
 
   // Monero (XMR) inbound wiring. Conditional: needs both MONERO_PRIMARY_ADDRESS
   // and MONERO_VIEW_KEY. Without them the adapter is simply not registered
@@ -298,63 +317,6 @@ async function main(): Promise<void> {
     alchemy = { syncAddresses: sweep };
   }
 
-  // BlockCypher push-detection accelerator. Per-chain config: each UTXO
-  // chain registered in `chains` reads its own
-  //   BLOCKCYPHER_TOKEN_<SLUG> + BLOCKCYPHER_CALLBACK_URL_<SLUG>
-  // env-var pair (e.g. BLOCKCYPHER_TOKEN_BITCOIN, _LITECOIN, _BITCOIN_TESTNET).
-  // A chain is BlockCypher-enabled iff BOTH vars are set non-empty for it.
-  // Setting only one is a hard boot error (the operator clearly intended to
-  // turn it on but only set half). Chains BlockCypher doesn't cover (e.g.
-  // LTC testnet, blockcypherCoinPath=null) are skipped silently.
-  let blockcypher: AppDeps["blockcypher"];
-  let blockcypherPushStrategy: ReturnType<typeof blockcypherNotifyDetection> | undefined;
-  const blockcypherConfigs = loadBlockcypherChainConfigs({ secrets, chains, logger });
-  if (blockcypherConfigs.size > 0) {
-    const sweep = makeBlockcypherSyncSweep({
-      store: dbBlockcypherSubscriptionStore(db),
-      configByChainId: blockcypherConfigs,
-      logger,
-      clock: { now: () => new Date() }
-    });
-    blockcypher = {
-      syncSubscriptions: sweep,
-      configuredChainIds: new Set(blockcypherConfigs.keys())
-    };
-    // The notify strategy is a thin wrapper around projectBlockcypherTx.
-    // It needs to know "what addresses do we own on this chainId" — we
-    // compute the set fresh per push by querying invoices.receive_address
-    // for utxo-family invoices. (Most paths are sub-millisecond DB reads;
-    // BlockCypher's worst-case fan-out is one push per active invoice.)
-    blockcypherPushStrategy = blockcypherNotifyDetection(
-      async (innerDeps, chainId) => {
-        // Owned addresses come from the per-family join table, NOT
-        // invoices.receiveAddress. On a multi-currency invoice the Litecoin leg
-        // is frequently a SECONDARY family: invoices.chainId/receiveAddress hold
-        // the PRIMARY (e.g. an EVM stablecoin), so a primary-only lookup would
-        // never contain the LTC address — the BlockCypher push arrives, matches
-        // nothing, and silently does nothing. invoice_receive_addresses carries
-        // one row per family keyed by the specific chainId (mirrors the
-        // subscription tracker, which subscribes every receive address).
-        const { invoiceReceiveAddresses } = await import("../db/schema.js");
-        const { eq } = await import("drizzle-orm");
-        const rows = await innerDeps.db
-          .select({ address: invoiceReceiveAddresses.address })
-          .from(invoiceReceiveAddresses)
-          .where(eq(invoiceReceiveAddresses.chainId, chainId));
-        const set = new Set<string>();
-        for (const r of rows) set.add(r.address.toLowerCase());
-        const cfg = utxoConfigForChainId(chainId);
-        const native = cfg?.nativeSymbol ?? "BTC";
-        return { chainId, nativeSymbol: native as "BTC" | "LTC", ourAddresses: set };
-      }
-    );
-    const enabledSlugs = Array.from(blockcypherConfigs.values()).map((c) => c.slug);
-    logger.info("BlockCypher accelerator wired (per-chain)", {
-      chains: enabledSlugs,
-      chainCount: blockcypherConfigs.size
-    });
-  }
-
   const clock = { now: () => new Date() };
   const feeWalletStore = dbFeeWalletStore({ db, secretsCipher, clock });
   const deps: AppDeps = {
@@ -410,18 +372,10 @@ async function main(): Promise<void> {
     // have to run the admin bootstrap (or manual signing-key register) to
     // enable /webhooks/alchemy end-to-end without touching this file.
     pushStrategies: {
-      "alchemy-notify": alchemyNotifyDetection(),
-      // BlockCypher strategy is registered conditionally — present only when
-      // the deployment's env vars are set. The /webhooks/blockcypher route
-      // returns 404 NOT_CONFIGURED when this key is absent, so a misrouted
-      // BlockCypher webhook never reaches an inert handler.
-      ...(blockcypherPushStrategy !== undefined
-        ? { "blockcypher-notify": blockcypherPushStrategy }
-        : {})
+      "alchemy-notify": alchemyNotifyDetection()
     },
     clock,
     ...(alchemy !== undefined ? { alchemy } : {}),
-    ...(blockcypher !== undefined ? { blockcypher } : {}),
     alchemySubscribableChainsByFamily: alchemyChainsByFamily(activeAlchemyChainIds),
     migrationsFolder,
     confirmationThresholds: parseFinalityOverridesEnv(secrets.getOptional("FINALITY_OVERRIDES")),
@@ -469,8 +423,82 @@ async function main(): Promise<void> {
     }
   );
 
+  // In-process scheduler. Workers/Deno/Vercel get ticks from platform cron;
+  // plain Node has no host cron, and without ticks NOTHING runs — no payment
+  // polling, no confirmation sweeps, no invoice expiry, no payout execution.
+  // Historically this entrypoint relied on an external scheduler hitting
+  // POST /internal/cron/tick, which silently never happened on most deploys
+  // (the root cause of "UTXO deposits never detected"). Default ON; opt out
+  // with INTERNAL_CRON=off when an external scheduler owns the tick.
+  let cronTimer: ReturnType<typeof setInterval> | undefined;
+  if (config.internalCronEnabled) {
+    let tickRunning = false;
+    const tick = async (): Promise<void> => {
+      // Overlap guard: a slow tick (RPC outage → timeouts) must not stack a
+      // second run on top of itself — jobs assume one runner per process.
+      if (tickRunning) {
+        logger.warn("internal cron: previous tick still running, skipping");
+        return;
+      }
+      tickRunning = true;
+      try {
+        const result = await runScheduledJobs(deps);
+        const failed = Object.entries(result).filter(([, o]) => o !== undefined && !o.ok);
+        if (failed.length > 0) {
+          logger.warn("internal cron: tick completed with job failures", {
+            failed: failed.map(([name, o]) => ({ name, error: (o as { error: string }).error }))
+          });
+        }
+      } catch (err) {
+        logger.error("internal cron: tick crashed", {
+          error: err instanceof Error ? err.message : String(err)
+        });
+      } finally {
+        tickRunning = false;
+      }
+    };
+    cronTimer = setInterval(() => void tick(), config.internalCronIntervalMs);
+    logger.info("internal cron scheduler started", {
+      intervalMs: config.internalCronIntervalMs
+    });
+    // First tick immediately (don't wait a full interval after boot).
+    void tick();
+  } else {
+    logger.info("internal cron disabled (INTERNAL_CRON=off) — expecting external POST /internal/cron/tick");
+  }
+
+  // Instant UTXO detection: mempool.space (BTC) / litecoinspace.org (LTC)
+  // WebSocket push. Long-lived sockets are a Node-runtime capability — the
+  // Workers/Deno deployments stay poll-only on their platform cron. The
+  // watcher is an accelerator: detection correctness is carried by the
+  // Esplora poll above; killing it (UTXO_WS=off) only costs latency.
+  let utxoWs: ReturnType<typeof utxoMempoolWsWatcher> | undefined;
+  const utxoWsKnob = (process.env["UTXO_WS"] ?? "").toLowerCase();
+  // Same off-spellings as INTERNAL_CRON so the two sibling knobs behave alike.
+  if (utxoWsKnob !== "off" && utxoWsKnob !== "0" && utxoWsKnob !== "false") {
+    const wsUrlByChainId: Record<number, string> = {};
+    const btcWsUrl = process.env["UTXO_WS_URL_BITCOIN"];
+    if (btcWsUrl !== undefined && btcWsUrl.length > 0) {
+      wsUrlByChainId[BITCOIN_CONFIG.chainId] = btcWsUrl;
+    }
+    const ltcWsUrl = process.env["UTXO_WS_URL_LITECOIN"];
+    if (ltcWsUrl !== undefined && ltcWsUrl.length > 0) {
+      wsUrlByChainId[LITECOIN_CONFIG.chainId] = ltcWsUrl;
+    }
+    utxoWs = utxoMempoolWsWatcher({
+      deps,
+      chains: [BITCOIN_CONFIG, LITECOIN_CONFIG],
+      wsUrlByChainId
+    });
+    utxoWs.start();
+  } else {
+    logger.info("UTXO WebSocket watcher disabled (UTXO_WS=off) — poll-only detection");
+  }
+
   process.on("SIGTERM", async () => {
     logger.info("SIGTERM received; draining jobs");
+    if (cronTimer !== undefined) clearInterval(cronTimer);
+    utxoWs?.stop();
     await deps.jobs.drain(10_000);
     server.close();
     process.exit(0);

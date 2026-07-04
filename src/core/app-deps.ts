@@ -81,22 +81,6 @@ export interface AppDeps {
     syncAddresses: () => Promise<unknown>;
   };
 
-  // Optional BlockCypher sync surface. Populated only when AT LEAST ONE
-  // UTXO chain has both `BLOCKCYPHER_TOKEN_<SLUG>` and
-  // `BLOCKCYPHER_CALLBACK_URL_<SLUG>` env vars set. The scheduled-jobs
-  // sweep invokes `syncSubscriptions` if present, which drains the
-  // `blockcypher_subscriptions` queue against BlockCypher's
-  // `/v1/.../hooks` API on a per-chain token + callback basis.
-  //
-  // `configuredChainIds` exposes which chains are currently BlockCypher-
-  // enabled — consumed by the subscription tracker (skips events for
-  // un-configured chains so rows don't pile up unsynced) and by ops/admin
-  // surfaces wanting to render per-chain status.
-  readonly blockcypher?: {
-    readonly syncSubscriptions: () => Promise<unknown>;
-    readonly configuredChainIds: ReadonlySet<number>;
-  };
-
   // Per-family list of chainIds to subscribe on when a new pool address is
   // created. Consumed by `registerAlchemySubscriptionTracker`. The entrypoint
   // derives this from its Alchemy chain configuration (ALCHEMY_CHAINS env).

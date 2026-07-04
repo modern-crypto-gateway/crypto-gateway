@@ -90,53 +90,18 @@ describe("loadConfig", () => {
       ).not.toThrow();
     });
 
-    it("requires BLOCKCYPHER_INGEST_TOKEN in production when BlockCypher push detection is enabled", () => {
-      const baseline = {
-        NODE_ENV: "production",
-        MASTER_SEED: "cat ".repeat(11) + "ranch",
-        ADMIN_KEY: "x".repeat(32),
-        SECRETS_ENCRYPTION_KEY: "a".repeat(64)
-      };
-      // BlockCypher enabled (per-chain token var set) but no ingest token → boot error.
-      expect(() =>
-        loadConfig({ ...baseline, BLOCKCYPHER_TOKEN_BITCOIN: "bc-account-token" })
-      ).toThrow(/BLOCKCYPHER_INGEST_TOKEN/);
-      // Half-pair detection: a callback URL alone also signals intent.
-      expect(() =>
-        loadConfig({ ...baseline, BLOCKCYPHER_CALLBACK_URL_BITCOIN: "https://gw/webhooks/blockcypher/800" })
-      ).toThrow(/BLOCKCYPHER_INGEST_TOKEN/);
-      // Token present → passes.
-      expect(() =>
-        loadConfig({
-          ...baseline,
-          BLOCKCYPHER_TOKEN_BITCOIN: "bc-account-token",
-          BLOCKCYPHER_INGEST_TOKEN: "ingest-token"
-        })
-      ).not.toThrow();
-    });
-
-    it("does not require BLOCKCYPHER_INGEST_TOKEN when BlockCypher is not enabled", () => {
-      const baseline = {
-        NODE_ENV: "production",
-        MASTER_SEED: "cat ".repeat(11) + "ranch",
-        ADMIN_KEY: "x".repeat(32),
-        SECRETS_ENCRYPTION_KEY: "a".repeat(64)
-      };
-      // No BLOCKCYPHER_* vars at all → no ingest-token requirement.
-      expect(() => loadConfig(baseline)).not.toThrow();
-      // Legacy single-form vars are no longer recognized and don't count as "enabled".
-      expect(() =>
-        loadConfig({ ...baseline, BLOCKCYPHER_TOKEN: "legacy-ignored" })
-      ).not.toThrow();
-    });
-
-    it("allows BlockCypher without an ingest token in development/test (relaxed envs)", () => {
-      expect(() =>
-        loadConfig({ NODE_ENV: "development", BLOCKCYPHER_TOKEN_BITCOIN: "bc-account-token" })
-      ).not.toThrow();
-      expect(() =>
-        loadConfig({ NODE_ENV: "test", BLOCKCYPHER_TOKEN_BITCOIN: "bc-account-token" })
-      ).not.toThrow();
+    it("parses the in-process scheduler knobs (INTERNAL_CRON / INTERNAL_CRON_INTERVAL_MS)", () => {
+      // Default ON — the Node entrypoint must tick without extra setup.
+      expect(loadConfig({ NODE_ENV: "test" }).internalCronEnabled).toBe(true);
+      expect(loadConfig({ NODE_ENV: "test", INTERNAL_CRON: "off" }).internalCronEnabled).toBe(false);
+      expect(loadConfig({ NODE_ENV: "test", INTERNAL_CRON: "0" }).internalCronEnabled).toBe(false);
+      expect(loadConfig({ NODE_ENV: "test", INTERNAL_CRON: "on" }).internalCronEnabled).toBe(true);
+      expect(loadConfig({ NODE_ENV: "test" }).internalCronIntervalMs).toBe(60_000);
+      expect(
+        loadConfig({ NODE_ENV: "test", INTERNAL_CRON_INTERVAL_MS: "15000" }).internalCronIntervalMs
+      ).toBe(15_000);
+      // Sub-5s ticks would hammer public Esplora backends — boot error.
+      expect(() => loadConfig({ NODE_ENV: "test", INTERNAL_CRON_INTERVAL_MS: "100" })).toThrow();
     });
 
     it("applies production guards to NODE_ENV=staging (prevents pre-prod with placeholder secrets)", () => {

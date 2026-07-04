@@ -494,41 +494,68 @@ add inputs from the spendable pool. Each attempt is journaled in
 `payout_broadcasts` (txid, fee, vsize, inputs, change). The cap is 10 bumps
 per payout.
 
-**BlockCypher push detection (optional, per-chain).** Configure per-chain
-to subscribe to invoice-scoped hooks via BlockCypher's `/v1/{coin}/{net}/hooks`
-API. Sub-5s detection latency vs Esplora's 30s poll. The system works
-correctly with or without BlockCypher — push is purely a latency accelerator.
+**Detection stack (poll + push).** Inbound BTC/LTC payments are detected
+through two complementary paths. Both feed the same ingest pipeline and
+dedupe on the UNIQUE `(chain_id, tx_hash, log_index)` constraint, so a tx
+caught by both never double-credits:
 
-Each UTXO chain reads its own env var pair, keyed by the chain `slug`:
+- **Esplora REST poll** (every runtime). Each scheduled-jobs tick checks
+  every active receive address against the chain's Esplora backends —
+  mempool.space + blockstream.info for Bitcoin, litecoinspace.org for
+  Litecoin (testnet default: `https://litecoinspace.org/testnet/api`).
+  Override the backend list with comma-separated base URLs in
+  `ESPLORA_URLS_BITCOIN` / `ESPLORA_URLS_LITECOIN` — point them at a
+  self-hosted electrs/mempool instance for unmetered scale.
 
-| Chain | Token env | Callback URL env |
-| --- | --- | --- |
-| Bitcoin (chainId 800) | `BLOCKCYPHER_TOKEN_BITCOIN` | `BLOCKCYPHER_CALLBACK_URL_BITCOIN` |
-| Litecoin (chainId 801) | `BLOCKCYPHER_TOKEN_LITECOIN` | `BLOCKCYPHER_CALLBACK_URL_LITECOIN` |
-| Bitcoin testnet3 (chainId 802) | `BLOCKCYPHER_TOKEN_BITCOIN_TESTNET` | `BLOCKCYPHER_CALLBACK_URL_BITCOIN_TESTNET` |
-| Litecoin testnet (chainId 803) | — | — (BlockCypher has no LTC testnet endpoint) |
+  **Blockbook failover (recommended for Litecoin).** Public Esplora
+  coverage for LTC is effectively one instance, and outages happen. Set
+  `BLOCKBOOK_URLS_LITECOIN` (and/or `_BITCOIN`) to comma-separated
+  Blockbook-v2 provider URLs — tried only after every Esplora backend
+  fails, so a litecoinspace.org outage degrades to the keyed provider
+  instead of stalling detection. Free options: GetBlock
+  (`https://go.getblock.io/<ACCESS_TOKEN>`, 5k req/day free) or NOWNodes
+  (`https://<API_KEY>@ltcbook.nownodes.io` — key in the URL userinfo is
+  sent as the `api-key` header, never logged in the URL). Failure
+  semantics are unchanged either way: if *all* providers are down the
+  scan checkpoint does not advance, so payments are delayed, never lost.
+- **WebSocket push** (Node + Cloudflare Workers). A persistent connection
+  per chain to a mempool.space-protocol WS endpoint (defaults
+  `wss://mempool.space/api/v1/ws` for Bitcoin and
+  `wss://litecoinspace.org/api/v1/ws` for Litecoin; override via
+  `UTXO_WS_URL_BITCOIN` / `UTXO_WS_URL_LITECOIN`) tracks active receive
+  addresses. Mempool sightings are ingested the instant they arrive —
+  no waiting for the next poll tick — and every new-block push triggers
+  an immediate confirmation sweep. Free, no API key. Public instances cap
+  tracked addresses per connection (~10 on mempool.space, ~100 on
+  litecoinspace.org); overflow addresses simply stay on poll detection.
+  Set `UTXO_WS=off` to disable — detection still works end-to-end via
+  the poll, just at one-tick latency.
 
-A chain is BlockCypher-enabled when **both** envs are non-empty. Setting
-only one is a hard boot error. Skipping a chain entirely keeps it on
-Esplora-poll detection. Inbound webhook auth uses a single shared
-`BLOCKCYPHER_INGEST_TOKEN` validated as a `?token=` query param at
-`/webhooks/blockcypher/:chainId`.
+  *On Node* the watcher runs in-process. *On Cloudflare Workers* — where a
+  request-scoped isolate cannot hold a socket — it runs inside the
+  `UtxoWsWatcherDO` Durable Object (see `durable_objects` + `migrations` in
+  `wrangler.jsonc`; SQLite-backed class, so it works on the Workers Free
+  plan). The 1-minute cron pings it alive, a 30s storage alarm is the
+  eviction-proof heartbeat/reconnector, and invoice creation pokes it so
+  new addresses are tracked within ~1s. Cost note: while ≥1 UTXO invoice
+  is open the DO stays resident — roughly 10,800 GB-s/day, which is ~83%
+  of the Free plan's 13,000 GB-s daily Durable Object budget (hard-fails
+  until midnight UTC if exceeded). The $5/mo Workers Paid plan includes
+  400k GB-s/month and removes that cliff — recommended for production.
+  With zero open UTXO invoices the DO holds no sockets and idles out, so
+  an idle gateway costs (almost) nothing.
 
-Per-chain config has three operational benefits:
-- **Independent free-tier quotas**: BlockCypher's free tier caps at 200
-  active hooks per account. Separate accounts per chain = separate caps.
-- **Independent failure domains**: a stuck BTC subscription doesn't
-  starve LTC's hook quota.
-- **Plug-and-play for future chains** (DASH, DOGE, BCH): add the chain
-  config to `utxo-config.ts` + a `<CHAIN_SLUG>_BIP84_*` factory and set
-  `BLOCKCYPHER_TOKEN_<SLUG>` / `BLOCKCYPHER_CALLBACK_URL_<SLUG>` in env;
-  no entrypoint or sweep code changes.
+**In-process scheduler (Node entrypoint).** The Node entrypoint runs the
+scheduled-jobs sweep on a built-in interval loop, so a bare node/container
+deployment needs no external cron. Set `INTERNAL_CRON=off` to disable it —
+only do this when an external scheduler POSTs `/internal/cron/tick` with
+`CRON_SECRET`. `INTERNAL_CRON_INTERVAL_MS` tunes the cadence (default
+`60000`; clamped to 5000–600000).
 
-> **Breaking change:** the legacy single-form `BLOCKCYPHER_TOKEN` and
-> `BLOCKCYPHER_CALLBACK_URL` env vars are no longer recognized. Existing
-> deployments must migrate to the per-chain names before redeploy. The
-> gateway logs a WARN at startup if legacy vars are detected and treats
-> BlockCypher as disabled until per-chain config is provided.
+**Slow-confirmation grace.** Invoices in `processing` (payment detected,
+awaiting confirmations) get a 24-hour grace window before the expiry sweep
+touches them, so a payment stuck behind slow Bitcoin blocks completes
+instead of freezing when `expiresAt` passes.
 
 **Out of scope for v1** (deferred to follow-ups):
 
@@ -1730,8 +1757,8 @@ for an interactive client.
 A full-coverage Postman setup lives in [`postman/`](postman/):
 
 - [`crypto-gateway.postman_collection.json`](postman/crypto-gateway.postman_collection.json)
-  — every route (admin bootstrap, merchant API, public checkout, Alchemy +
-  BlockCypher webhook ingest simulators, internal cron) grouped into folders.
+  — every route (admin bootstrap, merchant API, public checkout, Alchemy
+  webhook ingest simulators, internal cron) grouped into folders.
   Per-chain quick-start requests under `Invoices / Quick starts` for Ethereum,
   OP, Polygon, Base, Arbitrum, Avalanche, BSC, Tron, Solana, Bitcoin, Litecoin,
   both UTXO testnets, and the local dev chain — plus multi-family, universal-USD,
@@ -1742,17 +1769,16 @@ A full-coverage Postman setup lives in [`postman/`](postman/):
 - [`crypto-gateway.local.postman_environment.json`](postman/crypto-gateway.local.postman_environment.json)
   — import as an environment. Pre-declares every variable the collection
   reads and writes. `adminKey` must be filled by hand; a few others are
-  manual only if you use their requests: `cronSecret` (Internal cron tick),
-  `blockcypherIngestToken` (BlockCypher webhook simulator), and the
-  operator-supplied `moneroTxHash`, `recoveredTxHash`, and `family` values
-  for the Monero-debug, payout-recovery, and fee-wallet admin folders.
+  manual only if you use their requests: `cronSecret` (Internal cron tick)
+  and the operator-supplied `moneroTxHash`, `recoveredTxHash`, and
+  `family` values for the Monero-debug, payout-recovery, and fee-wallet
+  admin folders.
   Everything else populates as you run the setup folder.
 
 The `Webhooks (simulate provider)` folder fires synthetic provider payloads —
 Alchemy (both EVM and Solana SPL shapes) at `/webhooks/alchemy` with a correct
-HMAC, and a BlockCypher UTXO tx-confirmation at `/webhooks/blockcypher/{chainId}`
-— useful for replaying the detection path locally without waiting for a real
-on-chain transfer.
+HMAC — useful for replaying the detection path locally without waiting for a
+real on-chain transfer.
 
 ### Listing & filtering invoices / payouts
 

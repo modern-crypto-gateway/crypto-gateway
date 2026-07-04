@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "crypto-gateway",
-    "description": "Complete flow coverage for crypto-gateway: admin bootstrap, merchant API (invoices + payouts), public checkout, provider webhook ingest, admin operations (recovery, maintenance, forensics), and internal cron.\n\n## Quick start\n1. Import this collection AND `crypto-gateway.local.postman_environment.json` (Environments tab).\n2. Select the `crypto-gateway (local)` environment.\n3. Fill in `adminKey` in the environment. Most other values are auto-populated by test scripts as you run requests — see 'Manual variables' below for the handful that are not.\n4. Run `_Setup` → `1. Health` to confirm connectivity.\n5. Run `_Setup` → `2. Create merchant` — its test script saves `merchantApiKey`, `merchantId`, `webhookSecret` into the environment for subsequent merchant API calls.\n6. Use the per-chain quick-starts under `Invoices / Quick starts` to create sample invoices on each supported chain.\n\n## Manual variables\nNo test script fills these — set them in the environment yourself when the corresponding requests are on your path:\n- `adminKey` — bearer for every `/admin/*` request (must match `ADMIN_KEY` on the gateway)\n- `cronSecret` — bearer for `Internal / Cron tick` (must match `CRON_SECRET`)\n- `blockcypherIngestToken` — `?token=` auth for the BlockCypher simulate request (must match `BLOCKCYPHER_INGEST_TOKEN`)\n- `moneroTxHash` — 64-hex tx hash consumed by `Admin / Debug (Monero)` inspect / force-ingest\n- `recoveredTxHash` — explorer-verified on-chain tx hash consumed by `Admin / Payout recovery / Recover held payout`\n- `family` — ships with default `solana`; switch to `tron`/`evm`/`utxo` for the `_Setup` fee-wallet requests as needed\n\n## Chaining\nTest scripts write `merchantId`, `merchantApiKey`, `webhookSecret`, `invoiceId`, `invoiceReceiveAddress`, `payoutId`, `poolAddress`/`poolAddressFamily`, `lastConsolidationId`/`lastScheduleId`, `heldPayoutId`, `batchId`, `deadDeliveryId`, `orphanTxId`, and per-chain `alchemySigningKey_<chainId>` / `alchemyWebhookId_<chainId>` into the environment so later requests can consume them without copy-paste.\n\n## Webhook simulation\nThe `Webhooks (simulate provider)` folder fires synthetic provider payloads at the real ingest routes. The two Alchemy items substitute the registered `alchemyWebhookId_<chainId>` into the body and HMAC-sign the exact final bytes into `X-Alchemy-Signature` using `alchemySigningKey[_<chainId>]` — after `_Setup / 4. Bootstrap Alchemy webhooks`, the ingest route accepts them as if from Alchemy. The BlockCypher UTXO item is not signed at all: it authenticates via the `?token={{blockcypherIngestToken}}` URL secret (fill that variable by hand).\n\n## Admin operations folders\n- `Admin / Payout recovery` — held (broadcast-outcome-unknown) payout legs: list the queue, attach an explorer-verified `recoveredTxHash`.\n- `Admin / UTXO maintenance` — one-shot, idempotent `address_index` repair for the pre-migration-0006 multi-family UTXO bug.\n- `Admin / Debug (Monero)` — view-key forensics: per-output inspect-tx, cron scan-state, force-ingest for late payments.\n\n## Server-side config (not used by Postman — reference only)\nThese env vars affect the gateway's behavior but aren't exercised by any request in this collection. Documented here so operators testing against a deployed gateway know what knobs exist.\n\n**Price oracle fallback chain.** Invoice quoting walks a chained list of providers. Each link tries itself first; on error/timeout/unmapped symbol it delegates. The terminal `noop` link fails explicitly — a full oracle outage surfaces as an error rather than a silently mis-priced invoice; hardcoded rates are never substituted in production. Default ordering with `ALCHEMY_API_KEY` set: `CoinGecko → Alchemy → CoinCap → Binance → noop (explicit failure)`.\n- `PRICE_ADAPTER` — `coingecko` (default), `alchemy` (Alchemy-first), or `static-peg` (skip all live sources and serve hardcoded peg values — explicit opt-in for dev/tests only; static-peg is never part of the default chain)\n- `COINGECKO_API_KEY`, `COINGECKO_PLAN=demo|pro`, `COINCAP_API_KEY` — optional, raise the per-provider rate budget\n- `DISABLE_COINGECKO=1`, `DISABLE_COINCAP=1`, `DISABLE_BINANCE=1`, `DISABLE_ALCHEMY=1` — drop individual providers from the chain\n\n**Log shipping + alerting.**\n- `ALERT_WEBHOOK_URL` — `error`/`fatal` logs are POSTed here as JSON. Sliding-window rate-limited to 30/min, with `droppedSinceLast` reported on the next delivery\n- `ALERT_WEBHOOK_AUTH_HEADER` — value for the `Authorization` header (e.g. `Bearer xyz`)\n\nSee the repository README for the full env-var table.",
+    "description": "Complete flow coverage for crypto-gateway: admin bootstrap, merchant API (invoices + payouts), public checkout, provider webhook ingest, admin operations (recovery, maintenance, forensics), and internal cron.\n\n## Quick start\n1. Import this collection AND `crypto-gateway.local.postman_environment.json` (Environments tab).\n2. Select the `crypto-gateway (local)` environment.\n3. Fill in `adminKey` in the environment. Most other values are auto-populated by test scripts as you run requests — see 'Manual variables' below for the handful that are not.\n4. Run `_Setup` → `1. Health` to confirm connectivity.\n5. Run `_Setup` → `2. Create merchant` — its test script saves `merchantApiKey`, `merchantId`, `webhookSecret` into the environment for subsequent merchant API calls.\n6. Use the per-chain quick-starts under `Invoices / Quick starts` to create sample invoices on each supported chain.\n\n## Manual variables\nNo test script fills these — set them in the environment yourself when the corresponding requests are on your path:\n- `adminKey` — bearer for every `/admin/*` request (must match `ADMIN_KEY` on the gateway)\n- `cronSecret` — bearer for `Internal / Cron tick` (must match `CRON_SECRET`)\n- `moneroTxHash` — 64-hex tx hash consumed by `Admin / Debug (Monero)` inspect / force-ingest\n- `recoveredTxHash` — explorer-verified on-chain tx hash consumed by `Admin / Payout recovery / Recover held payout`\n- `family` — ships with default `solana`; switch to `tron`/`evm`/`utxo` for the `_Setup` fee-wallet requests as needed\n\n## Chaining\nTest scripts write `merchantId`, `merchantApiKey`, `webhookSecret`, `invoiceId`, `invoiceReceiveAddress`, `payoutId`, `poolAddress`/`poolAddressFamily`, `lastConsolidationId`/`lastScheduleId`, `heldPayoutId`, `batchId`, `deadDeliveryId`, `orphanTxId`, and per-chain `alchemySigningKey_<chainId>` / `alchemyWebhookId_<chainId>` into the environment so later requests can consume them without copy-paste.\n\n## Webhook simulation\nThe `Webhooks (simulate provider)` folder fires synthetic provider payloads at the real ingest routes. The two Alchemy items substitute the registered `alchemyWebhookId_<chainId>` into the body and HMAC-sign the exact final bytes into `X-Alchemy-Signature` using `alchemySigningKey[_<chainId>]` — after `_Setup / 4. Bootstrap Alchemy webhooks`, the ingest route accepts them as if from Alchemy.\n\n## Admin operations folders\n- `Admin / Payout recovery` — held (broadcast-outcome-unknown) payout legs: list the queue, attach an explorer-verified `recoveredTxHash`.\n- `Admin / UTXO maintenance` — one-shot, idempotent `address_index` repair for the pre-migration-0006 multi-family UTXO bug.\n- `Admin / Debug (Monero)` — view-key forensics: per-output inspect-tx, cron scan-state, force-ingest for late payments.\n\n## Server-side config (not used by Postman — reference only)\nThese env vars affect the gateway's behavior but aren't exercised by any request in this collection. Documented here so operators testing against a deployed gateway know what knobs exist.\n\n**Price oracle fallback chain.** Invoice quoting walks a chained list of providers. Each link tries itself first; on error/timeout/unmapped symbol it delegates. The terminal `noop` link fails explicitly — a full oracle outage surfaces as an error rather than a silently mis-priced invoice; hardcoded rates are never substituted in production. Default ordering with `ALCHEMY_API_KEY` set: `CoinGecko → Alchemy → CoinCap → Binance → noop (explicit failure)`.\n- `PRICE_ADAPTER` — `coingecko` (default), `alchemy` (Alchemy-first), or `static-peg` (skip all live sources and serve hardcoded peg values — explicit opt-in for dev/tests only; static-peg is never part of the default chain)\n- `COINGECKO_API_KEY`, `COINGECKO_PLAN=demo|pro`, `COINCAP_API_KEY` — optional, raise the per-provider rate budget\n- `DISABLE_COINGECKO=1`, `DISABLE_COINCAP=1`, `DISABLE_BINANCE=1`, `DISABLE_ALCHEMY=1` — drop individual providers from the chain\n\n**Log shipping + alerting.**\n- `ALERT_WEBHOOK_URL` — `error`/`fatal` logs are POSTed here as JSON. Sliding-window rate-limited to 30/min, with `droppedSinceLast` reported on the next delivery\n- `ALERT_WEBHOOK_AUTH_HEADER` — value for the `Authorization` header (e.g. `Bearer xyz`)\n\nSee the repository README for the full env-var table.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "crypto-gateway-v2"
   },
@@ -2513,7 +2513,7 @@
                   "mode": "raw",
                   "raw": "{\n  \"chainId\": 802,\n  \"token\": \"BTC\",\n  \"amountRaw\": \"10000\",\n  \"externalId\": \"{{runExternalId}}\"\n}"
                 },
-                "description": "Bitcoin testnet3 (chainId 802). BIP84 m/84'/1'/0'/0/N → tb1q… addresses. coin_type=1 per slip-0044 (shared testnet). Esplora at mempool.space/testnet + blockstream.info/testnet. 1-confirmation finality. BlockCypher push detection available via btc/test3 path."
+                "description": "Bitcoin testnet3 (chainId 802). BIP84 m/84'/1'/0'/0/N → tb1q… addresses. coin_type=1 per slip-0044 (shared testnet). Esplora at mempool.space/testnet + blockstream.info/testnet. 1-confirmation finality."
               },
               "event": [
                 {
@@ -2556,7 +2556,7 @@
                   "mode": "raw",
                   "raw": "{\n  \"chainId\": 803,\n  \"token\": \"LTC\",\n  \"amountRaw\": \"100000\",\n  \"externalId\": \"{{runExternalId}}\"\n}"
                 },
-                "description": "Litecoin testnet (chainId 803). BIP84 m/84'/1'/0'/0/N → tltc1q… addresses. Esplora coverage is thinner; deployments typically self-host Electrs/Esplora. BlockCypher has no LTC testnet endpoint, so push detection is unavailable here — Esplora poll only."
+                "description": "Litecoin testnet (chainId 803). BIP84 m/84'/1'/0'/0/N → tltc1q… addresses. litecoinspace.org hosts a free LTC testnet Esplora + WebSocket instance — the default Esplora base is https://litecoinspace.org/testnet/api; self-host electrs for heavier use."
               },
               "event": [
                 {
@@ -3544,7 +3544,7 @@
     },
     {
       "name": "Webhooks (simulate provider)",
-      "description": "Fake provider webhook payloads sent through the real ingest routes — two Alchemy simulators and one BlockCypher simulator, each authenticating exactly the way the real provider does.\n\n**Alchemy items** (EVM + Solana): the pre-request script substitutes the registered `alchemyWebhookId_<chainId>` into the body (the ingest route resolves the HMAC key by the payload's `webhookId` from the DB registry — an unregistered id 404s), then computes `HMAC-SHA256(body, signingKey)` hex into `X-Alchemy-Signature` — same flow the real Alchemy service uses. Both values are saved by `_Setup / 4. Bootstrap Alchemy webhooks`; without bootstrap, register the placeholder webhookId + a signing key of your choosing via `_Setup / 4b (POST /admin/alchemy-webhooks/signing-keys)` and set `alchemySigningKey` manually.\n\n**BlockCypher item** (UTXO/LTC): NOT HMAC-signed — BlockCypher doesn't sign payloads. It authenticates via the `?token={{blockcypherIngestToken}}` URL secret instead (must match `BLOCKCYPHER_INGEST_TOKEN` on the gateway); its pre-request only randomizes the tx hash.",
+      "description": "Fake provider webhook payloads sent through the real ingest routes — two Alchemy simulators, both authenticating exactly the way the real provider does.\n\n**Alchemy items** (EVM + Solana): the pre-request script substitutes the registered `alchemyWebhookId_<chainId>` into the body (the ingest route resolves the HMAC key by the payload's `webhookId` from the DB registry — an unregistered id 404s), then computes `HMAC-SHA256(body, signingKey)` hex into `X-Alchemy-Signature` — same flow the real Alchemy service uses. Both values are saved by `_Setup / 4. Bootstrap Alchemy webhooks`; without bootstrap, register the placeholder webhookId + a signing key of your choosing via `_Setup / 4b (POST /admin/alchemy-webhooks/signing-keys)` and set `alchemySigningKey` manually.",
       "item": [
         {
           "name": "Alchemy EVM — incoming USDC (Ethereum)",
@@ -3694,66 +3694,6 @@
                   "const body = pm.response.json();",
                   "pm.test('acknowledged (received: true)', () => pm.expect(body.received).to.equal(true));",
                   "pm.test('not a dedup skip', () => pm.expect(body.deduped).to.be.undefined);"
-                ]
-              }
-            }
-          ]
-        },
-        {
-          "name": "BlockCypher UTXO — incoming LTC (tx-confirmation)",
-          "request": {
-            "method": "POST",
-            "url": {
-              "raw": "{{baseUrl}}/webhooks/blockcypher/801?token={{blockcypherIngestToken}}",
-              "host": [
-                "{{baseUrl}}"
-              ],
-              "path": [
-                "webhooks",
-                "blockcypher",
-                "801"
-              ],
-              "query": [
-                {
-                  "key": "token",
-                  "value": "{{blockcypherIngestToken}}",
-                  "description": "Must equal BLOCKCYPHER_INGEST_TOKEN on the gateway. The URL token IS the auth — BlockCypher doesn't HMAC-sign payloads. Wrong token → 401; token unset server-side → 404 (fail-closed)."
-                }
-              ]
-            },
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"hash\": \"b6f6991d03df0e2e04dafffcd6bc418aac66049e2cd74b80f14ac86db1e3f0da\",\n  \"block_height\": -1,\n  \"block_index\": -1,\n  \"double_spend\": false,\n  \"total\": 149997800,\n  \"fees\": 2200,\n  \"confirmations\": 0,\n  \"preference\": \"high\",\n  \"addresses\": [\n    \"ltc1q5s258mmzl9wrp5cwspkmxjyu2f9cxr50m8ycpu\",\n    \"{{invoiceReceiveAddress}}\"\n  ],\n  \"inputs\": [\n    {\n      \"prev_hash\": \"5a0c6a9f3d84b6a1e7f2c4d8b9e0a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8\",\n      \"output_index\": 1,\n      \"output_value\": 150000000,\n      \"addresses\": [\"ltc1q5s258mmzl9wrp5cwspkmxjyu2f9cxr50m8ycpu\"],\n      \"script_type\": \"pay-to-witness-pubkey-hash\"\n    }\n  ],\n  \"outputs\": [\n    {\n      \"value\": 100000000,\n      \"addresses\": [\"{{invoiceReceiveAddress}}\"],\n      \"script_type\": \"pay-to-witness-pubkey-hash\"\n    },\n    {\n      \"value\": 49997800,\n      \"addresses\": [\"ltc1q5s258mmzl9wrp5cwspkmxjyu2f9cxr50m8ycpu\"],\n      \"script_type\": \"pay-to-witness-pubkey-hash\"\n    }\n  ]\n}"
-            },
-            "description": "Simulates a BlockCypher `tx-confirmation` push for a watched Litecoin address — the exact TX-object body BlockCypher POSTs when a subscribed address receives a transaction.\n\nSetup: create an invoice whose Litecoin leg is active first (`invoiceReceiveAddress` must hold the LTC receive address — chainId 801), and set `blockcypherIngestToken` to the gateway's `BLOCKCYPHER_INGEST_TOKEN`.\n\nKey fields:\n- **URL chainId segment** (`801` = Litecoin; `800` BTC, `802` BTC-testnet3, `803` LTC-testnet) — the URL, not the payload, decides the chain; the payload's coin identity is deliberately ignored.\n- **`outputs[].value`** — litoshis (100000000 = 1 LTC). Only outputs paying a watched receive address are credited; the output's vout index becomes `log_index`.\n- **`block_height: -1` + `confirmations: 0`** = mempool sighting → `invoice:payment_detected`. BlockCypher re-fires the same tx at each depth: re-send with a positive `block_height` and higher `confirmations` to simulate depth — dedup on `(chain_id, tx_hash, vout)` prevents double-credits, and the confirmation sweeper re-checks depth via RPC anyway.\n\nGotchas: the route ACKs 200 and processes in the background — 200 never proves a credit landed (check the invoice after an `Internal / Cron tick`). The pre-request script mints a fresh `hash` each send so every run is a NEW payment; comment it out to test idempotent re-delivery instead."
-          },
-          "event": [
-            {
-              "listen": "prerequest",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "// Fresh tx hash each send — repeats of the same (chain_id, tx_hash, vout) are idempotent no-ops downstream.",
-                  "let body = pm.request.body.raw;",
-                  "body = body.replace(/\"hash\":\\s*\"[0-9a-f]{64}\"/, '\"hash\": \"' + CryptoJS.lib.WordArray.random(32).toString(CryptoJS.enc.Hex) + '\"');",
-                  "pm.request.body.update({ mode: 'raw', raw: body });"
-                ]
-              }
-            },
-            {
-              "listen": "test",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.test('200 acknowledged', () => pm.response.to.have.status(200));",
-                  "const body = pm.response.json();",
-                  "pm.test('received flag', () => pm.expect(body.received).to.equal(true));"
                 ]
               }
             }
@@ -4892,7 +4832,7 @@
                 "value": "Bearer {{cronSecret}}"
               }
             ],
-            "description": "Runs the full scheduled-jobs sweep out of band — the exact sequence the Workers `scheduled` handler runs, in order:\n\n`warmRateCache → pollPayments → confirmTransactions → recheckConfirmedForReorg → executeReservedPayouts → reconcileUnknownBroadcastPayouts → confirmPayouts → reconcileFailedPayoutGasBurns → reconcileConfirmedPayoutGasBurns → sweepStuckPayoutReservations → sweepExpiredInvoices → reconcileOrphanedAllocations → reconcileOrphanedMoneroAllocations → sweepWebhookDeliveries → runAutoConsolidations` — plus `alchemySyncAddresses` (only when Alchemy Notify is configured) and `blockcypherSyncSubscriptions` (only when BlockCypher is configured; drains the per-address subscribe/unsubscribe queue).\n\nOutside Cloudflare Workers / Deno Deploy (native cron), this is the only way to advance state between invoices — Vercel Cron hits it on a schedule; for local Node runs invoke it manually after creating an invoice and simulating a webhook.\n\nReturns `{ ok: true, result: { <job>: { ok, value | error } } }`. **Per-job failures still return HTTP 200** — check each job's `ok` flag (the test script warns on any `ok: false`). No request body. 401 = wrong `cronSecret`; 404 = `CRON_SECRET` not set on the gateway."
+            "description": "Runs the full scheduled-jobs sweep out of band — the exact sequence the Workers `scheduled` handler runs, in order:\n\n`warmRateCache → pollPayments → confirmTransactions → recheckConfirmedForReorg → executeReservedPayouts → reconcileUnknownBroadcastPayouts → confirmPayouts → reconcileFailedPayoutGasBurns → reconcileConfirmedPayoutGasBurns → sweepStuckPayoutReservations → sweepExpiredInvoices → reconcileOrphanedAllocations → reconcileOrphanedMoneroAllocations → sweepWebhookDeliveries → runAutoConsolidations` — plus `alchemySyncAddresses` (only when Alchemy Notify is configured).\n\nOutside Cloudflare Workers / Deno Deploy (native cron) and the Node entrypoint (built-in interval loop — `INTERNAL_CRON` / `INTERNAL_CRON_INTERVAL_MS`), this is how state advances between invoices — Vercel Cron hits it on a schedule; invoke it manually when the internal loop is disabled (`INTERNAL_CRON=off`) or you don't want to wait for the next tick after simulating a webhook.\n\nReturns `{ ok: true, result: { <job>: { ok, value | error } } }`. **Per-job failures still return HTTP 200** — check each job's `ok` flag (the test script warns on any `ok: false`). No request body. 401 = wrong `cronSecret`; 404 = `CRON_SECRET` not set on the gateway."
           },
           "event": [
             {

@@ -95,6 +95,24 @@
     }
   ],
 
+  // UTXO WebSocket push watcher. A plain Worker can't hold a socket across
+  // invocations, so the mempool.space / litecoinspace.org `track-addresses`
+  // connections live in ONE singleton Durable Object ("global"), giving
+  // instant BTC/LTC mempool detection + block-triggered confirmation sweeps
+  // on the Workers deployment. The 1-minute cron pings it alive; with zero
+  // open UTXO invoices it holds no sockets and idles out (cost scales with
+  // traffic). Disable with UTXO_WS=off in [vars] — detection then falls
+  // back to the 1-minute Esplora poll only. SQLite-backed class so it works
+  // on the Workers Free plan.
+  "durable_objects": {
+    "bindings": [
+      { "name": "UTXO_WS_DO", "class_name": "UtxoWsWatcherDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["UtxoWsWatcherDO"] }
+  ],
+
   // Cloudflare built-in rate-limit bindings. One entry per scope — each
   // binding is ONE (limit, period) pair enforced atomically at the edge,
   // free, with no invocation cost on our side. Scopes map to the prefix

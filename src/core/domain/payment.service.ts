@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { DomainEvent } from "../events/event-bus.port.js";
-import type { ChainFamily, ChainId } from "../types/chain.js";
+import type { Address, ChainFamily, ChainId } from "../types/chain.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
 import type { Invoice, InvoiceExtraStatus, InvoiceId, InvoiceStatus } from "../types/invoice.js";
 import { DetectedTransferSchema, type TransactionId, type TxStatus } from "../types/transaction.js";
@@ -156,7 +156,17 @@ export async function ingestDetectedTransfer(
 
   const chainAdapter = findChainAdapter(deps, transfer.chainId);
   const canonicalTo = chainAdapter.canonicalizeAddress(transfer.toAddress);
-  const canonicalFrom = chainAdapter.canonicalizeAddress(transfer.fromAddress);
+  // `fromAddress` is informational (sender attribution / analytics) — a
+  // sender the adapter can't canonicalize (UTXO coinbase/P2PK inputs emit
+  // the "unknown" sentinel; exotic formats) must not drop a real payment
+  // to OUR address. Keep the raw string instead. `toAddress` stays strict:
+  // it's the load-bearing invoice-matching key.
+  let canonicalFrom: Address;
+  try {
+    canonicalFrom = chainAdapter.canonicalizeAddress(transfer.fromAddress);
+  } catch {
+    canonicalFrom = transfer.fromAddress;
+  }
   const now = deps.clock.now().getTime();
 
   // Match to an invoice via the receive-addresses join table: family +
@@ -848,7 +858,15 @@ export async function confirmTransactions(
       // Orphans stay orphaned — we only backfill confirmedAt/block/confs so
       // the admin queue shows "this is finalized, here's when and where".
       const newStatus = isOrphanRow ? ("orphaned" as const) : ("confirmed" as const);
-      await deps.db
+      // Compare-and-set on the status we SELECTed: this sweep can run from
+      // two drivers in the same process (the scheduled-jobs tick and the
+      // UTXO WS watcher's block-push trigger). Both may select the same
+      // 'detected' row before either promotes it; without the status
+      // predicate both would "promote" and both would publish tx.confirmed
+      // + invoice.payment_confirmed — duplicate merchant webhooks, possible
+      // double-fulfillment. With the CAS, exactly one driver wins the flip
+      // and only the winner publishes / recomputes.
+      const won = await deps.db
         .update(transactions)
         .set({
           status: newStatus,
@@ -856,7 +874,9 @@ export async function confirmTransactions(
           blockNumber: live.blockNumber,
           confirmedAt: now
         })
-        .where(eq(transactions.id, row.id));
+        .where(and(eq(transactions.id, row.id), eq(transactions.status, row.status)))
+        .returning({ id: transactions.id });
+      if (won.length === 0) continue; // another driver promoted it first
       if (!isOrphanRow) {
         confirmed += 1;
         const tx = drizzleRowToTransaction({

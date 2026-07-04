@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { and, asc, desc, eq, gte, inArray, isNotNull, lte, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, lte, or, sql, type SQL } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainFamilySchema, ChainIdSchema, type ChainFamily, type ChainId } from "../types/chain.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
@@ -18,7 +18,7 @@ import { allocateForInvoice, releaseFromInvoice } from "./pool.service.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
 import { allocateMoneroFromPool, releaseMoneroFromInvoice } from "./monero-pool.service.js";
 import { addUsd, RateUnavailableError, snapshotRates, subUsd, tokenDecimalsFor, tokensForFamilies } from "./rate-window.js";
-import { resolveMerchantConfirmationThreshold } from "./payment-config.js";
+import { PROCESSING_EXPIRY_GRACE_MS, resolveMerchantConfirmationThreshold } from "./payment-config.js";
 import { addressAllocations, invoices, invoiceReceiveAddresses, merchants, transactions } from "../../db/schema.js";
 
 // ---- Input validation ----
@@ -1004,12 +1004,25 @@ export interface SweepExpiredInvoicesResult {
 // skips them (poll-payments.ts gates on expiresAt > now), but their pool
 // addresses never return to rotation and the merchant never receives the
 // lifecycle webhook.
+//
+// `pending` expires at expiresAt (the customer never paid — the payment
+// window is the contract). `processing` means payment WAS detected inside
+// the window and is accumulating confirmations — expiring it now would
+// freeze the invoice (recomputeInvoiceFromTransactions skips expired rows)
+// so the tx confirms but the invoice never completes. Those rows get
+// PROCESSING_EXPIRY_GRACE_MS; only stuck partials/never-confirming txs
+// fall to expired at the end of the grace window.
 export async function sweepExpiredInvoices(deps: AppDeps): Promise<SweepExpiredInvoicesResult> {
   const now = deps.clock.now().getTime();
   const updated = await deps.db
     .update(invoices)
     .set({ status: "expired", updatedAt: now })
-    .where(and(inArray(invoices.status, ["pending", "processing"]), lte(invoices.expiresAt, now)))
+    .where(
+      or(
+        and(eq(invoices.status, "pending"), lte(invoices.expiresAt, now)),
+        and(eq(invoices.status, "processing"), lte(invoices.expiresAt, now - PROCESSING_EXPIRY_GRACE_MS))
+      )
+    )
     .returning();
   if (updated.length === 0) return { expired: 0 };
 

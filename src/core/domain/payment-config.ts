@@ -28,6 +28,30 @@ export const DEFAULT_CONFIRMATION_THRESHOLDS: Readonly<Record<number, number>> =
 // safe for any EVM chain, and non-EVM adapters should set their own.
 export const FALLBACK_CONFIRMATION_THRESHOLD = 12;
 
+// Grace window for invoices that received payment before expiry but are
+// still accumulating confirmations ('processing'). Without it, an invoice
+// whose expiry (default 30 min) is shorter than its chain's confirmation
+// time (BTC: 6 confs ≈ 60 min) is GUARANTEED to expire mid-confirmation —
+// the tx confirms later, but expired invoices are frozen by
+// recomputeInvoiceFromTransactions, so the payment is never credited and
+// the merchant never sees invoice.completed. Industry practice (BTCPay,
+// exchanges) is: expiry applies to the *payment window* (did the customer
+// broadcast in time?), not the *confirmation window* (did miners include
+// it fast enough?). 24h comfortably covers worst-case mempool congestion
+// on BTC/LTC while still closing abandoned partials eventually.
+export const PROCESSING_EXPIRY_GRACE_MS = 24 * 60 * 60 * 1000;
+
+// How long detection keeps watching a receive address AFTER its invoice
+// expires. A customer who broadcasts moments after (or straddling) expiry
+// still pays a gateway-controlled address; without a post-expiry watch
+// window the transfer would land with zero transaction rows — invisible to
+// merchant, admin, and reconciliation until a manual address audit. Within
+// this window the transfer is ingested and (for terminal invoices) recorded
+// as an orphan for the admin relink/refund queue. One hour covers the
+// realistic "paid too late" spread without meaningfully inflating the
+// public-Esplora scan set.
+export const LATE_PAYMENT_WATCH_MS = 60 * 60 * 1000;
+
 // `overrides` takes precedence over the shipped defaults so operators can
 // tune per-chain finality without a code change — e.g. raise chain 1 to 20
 // after a governance-risk event, or drop chain 137 to 64 once the Polygon

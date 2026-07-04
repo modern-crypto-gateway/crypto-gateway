@@ -18,13 +18,19 @@ export interface UtxoChainConfig {
   readonly bech32Hrp: string;
   readonly nativeSymbol: "BTC" | "LTC";
   readonly defaultEsploraUrls: readonly string[];
-  // BlockCypher coin slug for /v1/{coin}/{net}/hooks. BTC mainnet = "btc/main",
-  // BTC testnet3 = "btc/test3", LTC mainnet = "ltc/main", LTC testnet =
-  // not supported by BlockCypher (operators relying on testnet LTC fall
-  // back to Esplora poll only).
-  readonly blockcypherCoinPath: string | null;
+  // mempool.space-style WebSocket endpoint for push detection
+  // (`track-addresses` + `want blocks`). Served by mempool.space (BTC) and
+  // litecoinspace.org (LTC — the Litecoin Foundation's mempool fork).
+  // blockstream.info does NOT serve this API, so the WS URL is a separate
+  // field rather than derived from `defaultEsploraUrls`.
+  readonly defaultMempoolWsUrl: string;
+  // Server-enforced cap on addresses per `track-addresses` subscription on
+  // the public instance (probed live 2026-07: mempool.space = 10,
+  // litecoinspace.org = 100). The watcher shards addresses across
+  // connections in groups of this size.
+  readonly wsMaxTrackedAddressesPerConnection: number;
   // When true, this chain is a testnet — used by callers that want to
-  // suppress side-effects (BlockCypher, alerting) for non-production chains.
+  // suppress side-effects (alerting) for non-production chains.
   readonly testnet: boolean;
 }
 
@@ -38,7 +44,8 @@ export const BITCOIN_CONFIG: UtxoChainConfig = {
     "https://mempool.space/api",
     "https://blockstream.info/api"
   ],
-  blockcypherCoinPath: "btc/main",
+  defaultMempoolWsUrl: "wss://mempool.space/api/v1/ws",
+  wsMaxTrackedAddressesPerConnection: 10,
   testnet: false
 };
 
@@ -51,15 +58,14 @@ export const LITECOIN_CONFIG: UtxoChainConfig = {
   defaultEsploraUrls: [
     "https://litecoinspace.org/api"
   ],
-  blockcypherCoinPath: "ltc/main",
+  defaultMempoolWsUrl: "wss://litecoinspace.org/api/v1/ws",
+  wsMaxTrackedAddressesPerConnection: 100,
   testnet: false
 };
 
 // Bitcoin testnet3 (chainId 802). HRP "tb" per BIP173. coin_type 1 per
 // slip-0044 ("All test-nets share coin_type 1"). Esplora endpoints:
-// mempool.space/testnet and blockstream.info/testnet. BlockCypher's path
-// is "btc/test3" (their Wallet API names testnet3 explicitly because BCY
-// also has a "bcy/test" sandbox chain that's separate).
+// mempool.space/testnet and blockstream.info/testnet.
 export const BITCOIN_TESTNET_CONFIG: UtxoChainConfig = {
   chainId: 802 as ChainId,
   slug: "bitcoin-testnet",
@@ -70,16 +76,15 @@ export const BITCOIN_TESTNET_CONFIG: UtxoChainConfig = {
     "https://mempool.space/testnet/api",
     "https://blockstream.info/testnet/api"
   ],
-  blockcypherCoinPath: "btc/test3",
+  defaultMempoolWsUrl: "wss://mempool.space/testnet/api/v1/ws",
+  wsMaxTrackedAddressesPerConnection: 10,
   testnet: true
 };
 
 // Litecoin testnet (chainId 803). HRP "tltc" per the litecoin-project
-// BIP173 reference. coin_type 1 (shared testnet). Esplora coverage is
-// thinner — litecoinspace.org doesn't host testnet — so we fall back to
-// blockstream-style endpoints if/when operators self-host. BlockCypher
-// doesn't have an LTC testnet endpoint, so push detection is unavailable
-// here (`blockcypherCoinPath: null` → tracker skips enqueue).
+// BIP173 reference. coin_type 1 (shared testnet). litecoinspace.org hosts a
+// live Litecoin testnet4 instance under /testnet (REST + WebSocket) —
+// verified 2026-07.
 export const LITECOIN_TESTNET_CONFIG: UtxoChainConfig = {
   chainId: 803 as ChainId,
   slug: "litecoin-testnet",
@@ -87,12 +92,10 @@ export const LITECOIN_TESTNET_CONFIG: UtxoChainConfig = {
   bech32Hrp: "tltc",
   nativeSymbol: "LTC",
   defaultEsploraUrls: [
-    // No widely-available public Esplora testnet for LTC. Operators who
-    // need LTC testnet host their own Electrs/Esplora and override this
-    // via the chain adapter's `esploraBackends` config.
-    "https://litecoin-testnet.example/api"
+    "https://litecoinspace.org/testnet/api"
   ],
-  blockcypherCoinPath: null,
+  defaultMempoolWsUrl: "wss://litecoinspace.org/testnet/api/v1/ws",
+  wsMaxTrackedAddressesPerConnection: 100,
   testnet: true
 };
 

@@ -6,9 +6,8 @@ import { addressIndexCounters } from "../../db/schema.js";
 
 // UTXO families don't use the address_pool. Each invoice gets a brand-new
 // HD-derived address from a per-chain monotonic counter. Privacy preserved
-// (no reuse), schema simple (no pool reconciliation), BlockCypher hook
-// lifecycle aligns 1:1 with the invoice. No cooldown, no quarantine, no
-// reservation.
+// (no reuse), schema simple (no pool reconciliation). No cooldown, no
+// quarantine, no reservation.
 //
 // Concurrency: the `INSERT ... ON CONFLICT DO UPDATE ... RETURNING` is one
 // atomic statement. Two concurrent invoice creates serialize through it and

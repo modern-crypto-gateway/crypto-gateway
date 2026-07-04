@@ -297,6 +297,123 @@ describe("utxoChainAdapter.scanIncoming", () => {
     });
     expect(transfers).toEqual([]);
   });
+
+  it("skips sibling-chain addresses by bech32 HRP instead of querying them", async () => {
+    // pollPayments passes the whole utxo-family set to every UTXO chain —
+    // an ltc1 address handed to the BTC adapter must be filtered locally,
+    // not burned as 2 guaranteed-400 HTTP calls per tick.
+    const queried: string[] = [];
+    const adapter = utxoChainAdapter({
+      chain: BITCOIN_CONFIG,
+      esplora: fakeClient({
+        async getAddressTxs(addr) {
+          queried.push(addr);
+          return [];
+        },
+        async getAddressMempoolTxs(addr) {
+          queried.push(addr);
+          return [];
+        },
+        async getTipHeight() {
+          return 100;
+        }
+      })
+    });
+    const ltcAddress = "ltc1qq5m9zy96f2wm5cnjva06lqzr373lqhajkhy4mw";
+    const transfers = await adapter.scanIncoming({
+      chainId: 800 as never,
+      addresses: [WATCHED, ltcAddress] as never,
+      tokens: ["BTC"] as never,
+      sinceMs: 0
+    });
+    expect(transfers).toEqual([]);
+    expect(queried).toContain(WATCHED);
+    expect(queried).not.toContain(ltcAddress);
+  });
+
+  it("returns empty without any backend call when no address matches this chain's HRP", async () => {
+    const adapter = utxoChainAdapter({
+      chain: BITCOIN_CONFIG,
+      esplora: fakeClient({
+        async getAddressTxs() {
+          throw new Error("must not query when nothing matches the chain HRP");
+        },
+        async getTipHeight() {
+          throw new Error("must not fetch tip when nothing matches the chain HRP");
+        }
+      })
+    });
+    const transfers = await adapter.scanIncoming({
+      chainId: 800 as never,
+      addresses: ["ltc1qq5m9zy96f2wm5cnjva06lqzr373lqhajkhy4mw"] as never,
+      tokens: ["BTC"] as never,
+      sinceMs: 0
+    });
+    expect(transfers).toEqual([]);
+  });
+
+  it("still scans legacy base58 (P2PKH) addresses — the chain filter decodes, it doesn't just prefix-match", async () => {
+    // Payout-recovery and audit scans pass merchant-supplied destinations,
+    // which can be legacy base58. A bech32-HRP prefix filter would silently
+    // drop them and break those scans.
+    const queried: string[] = [];
+    const adapter = utxoChainAdapter({
+      chain: BITCOIN_CONFIG,
+      esplora: fakeClient({
+        async getAddressTxs(addr) {
+          queried.push(addr);
+          return [];
+        },
+        async getAddressMempoolTxs(addr) {
+          queried.push(addr);
+          return [];
+        },
+        async getTipHeight() {
+          return 100;
+        }
+      })
+    });
+    const genesisP2pkh = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa";
+    await adapter.scanIncoming({
+      chainId: 800 as never,
+      addresses: [genesisP2pkh] as never,
+      tokens: ["BTC"] as never,
+      sinceMs: 0
+    });
+    // Original casing preserved on the wire — base58 is case-sensitive and a
+    // lowercased query fails its checksum server-side (400).
+    expect(queried).toContain(genesisP2pkh);
+  });
+
+  it("falls back to fromAddress='unknown' when no input has a prevout address (coinbase/P2PK)", async () => {
+    // Regression: the previous fallback was "" which fails
+    // DetectedTransferSchema (min(1)) inside ingest — the transfer was
+    // rejected on every tick and the payment permanently missed.
+    const adapter = utxoChainAdapter({
+      chain: BITCOIN_CONFIG,
+      esplora: fakeClient({
+        async getAddressTxs() {
+          return [
+            tx({
+              txid: "coinbase-ish",
+              vin: [{ txid: "0".repeat(64), vout: 0, prevout: null }]
+            })
+          ];
+        },
+        async getTipHeight() {
+          return 100;
+        }
+      })
+    });
+    const transfers = await adapter.scanIncoming({
+      chainId: 800 as never,
+      addresses: [WATCHED] as never,
+      tokens: ["BTC"] as never,
+      sinceMs: 0
+    });
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]?.fromAddress).toBe("unknown");
+  });
 });
 
 describe("utxoChainAdapter.getConfirmationStatus", () => {

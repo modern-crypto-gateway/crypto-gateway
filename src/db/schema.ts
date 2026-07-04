@@ -860,64 +860,6 @@ export const alchemyAddressSubscriptions = sqliteTable(
   ]
 );
 
-// ---- blockcypher_subscriptions (UTXO push-detection accelerator) ----
-//
-// BlockCypher's `/v1/{coin}/{net}/hooks` lets us subscribe per-address for
-// `tx-confirmation` events — push notifications that fire as soon as a tx
-// touching a watched address hits the mempool (and again per confirmation
-// up to 6). This shaves detection latency from the Esplora poll's ~30s
-// down to sub-5s for active invoices.
-//
-// Lifecycle is invoice-scoped (UTXO has no pool; addresses don't get reused
-// across invoices, so subscriptions don't either):
-//   invoice.created           -> 'subscribe' row
-//   invoice.completed/expired/canceled -> 'unsubscribe' row (frees BlockCypher
-//                                         hook quota — free tier caps at 200
-//                                         active hooks)
-//
-// `hookId` is set when a 'subscribe' op succeeds (BlockCypher returns it on
-// hook creation; we'll need it later for DELETE). For 'unsubscribe' rows it
-// carries the hookId we're trying to free.
-//
-// `coinPath` is BlockCypher's coin/net slug ("btc/main" or "ltc/main").
-// Stored on the row so the sweeper doesn't need a chainId-to-path map at
-// query time and so a future testnet add (chainId 802 → "btc/test3") slots
-// in cleanly.
-export const blockcypherSubscriptions = sqliteTable(
-  "blockcypher_subscriptions",
-  {
-    id: text("id").primaryKey(),
-    chainId: integer("chain_id").notNull(),
-    coinPath: text("coin_path").notNull(),
-    address: text("address").notNull(),
-    action: text("action", { enum: ["subscribe", "unsubscribe"] }).notNull(),
-    // BlockCypher's hook id. Set when a subscribe succeeds. Pre-populated
-    // on unsubscribe rows so the sweeper knows which hook to DELETE.
-    hookId: text("hook_id"),
-    status: text("status", { enum: ["pending", "synced", "failed"] }).notNull(),
-    attempts: integer("attempts").notNull().default(0),
-    lastAttemptAt: integer("last_attempt_at"),
-    lastError: text("last_error"),
-    createdAt: integer("created_at").notNull(),
-    updatedAt: integer("updated_at").notNull()
-  },
-  (t) => [
-    index("idx_blockcypher_subs_pending").on(t.status, t.chainId, t.lastAttemptAt),
-    // Reverse lookup: "what's the hookId for address X?" — used by the
-    // tracker when enqueueing an unsubscribe to find the prior subscribe's
-    // hookId without scanning.
-    index("idx_blockcypher_subs_by_address").on(t.chainId, t.address),
-    check(
-      "blockcypher_subs_action_check",
-      sql`${t.action} IN ('subscribe','unsubscribe')`
-    ),
-    check(
-      "blockcypher_subs_status_check",
-      sql`${t.status} IN ('pending','synced','failed')`
-    )
-  ]
-);
-
 // ---- address_pool (reusable HD-derived receive addresses, per family) ----
 
 export const addressPool = sqliteTable(
@@ -1317,7 +1259,6 @@ export const schema = {
   payouts,
   alchemyWebhookRegistry,
   alchemyAddressSubscriptions,
-  blockcypherSubscriptions,
   addressPool,
   invoiceReceiveAddresses,
   addressAllocations,
