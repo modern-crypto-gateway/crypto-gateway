@@ -801,7 +801,22 @@ export async function confirmTransactions(
 
   for (const row of pending) {
     const chainAdapter = findChainAdapter(deps, row.chainId);
-    const live = await chainAdapter.getConfirmationStatus(row.chainId, row.txHash);
+    // Per-row error isolation: adapters THROW on RPC failure (they must —
+    // mapping errors to an "absent" result shape is what let transient
+    // outages demote confirmed rows). One unreachable chain must not stall
+    // promotion for every other row in the sweep; skip and retry next tick.
+    let live: Awaited<ReturnType<ChainAdapter["getConfirmationStatus"]>>;
+    try {
+      live = await chainAdapter.getConfirmationStatus(row.chainId, row.txHash);
+    } catch (err) {
+      deps.logger.warn("confirmTransactions: getConfirmationStatus failed; skipping row this tick", {
+        txId: row.id,
+        chainId: row.chainId,
+        txHash: row.txHash,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      continue;
+    }
     const now = deps.clock.now().getTime();
     // Threshold resolution per row: (1) tier match on this transfer's
     // amount + (chainId, token), (2) invoice's flat snapshot, (3) gateway

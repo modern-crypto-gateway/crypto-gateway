@@ -596,7 +596,12 @@ unset means the adapter is not registered and merchants can't accept XMR.
 | `MONERO_VIEW_KEY` | Yes | 64 hex chars = 32-byte secret view key. Validated at boot — must derive back to the public view key embedded in the primary address, otherwise the gateway refuses to start. |
 | `MONERO_NETWORK` | No (default `mainnet`) | `mainnet` / `stagenet` / `testnet`. |
 | `MONERO_RESTORE_HEIGHT` | No (default `0`) | Block to start scanning from. Set this to your wallet's birthday block — otherwise the first detection tick after deploy backfills years of pre-creation history. |
-| `MONERO_RPC_URLS` | No | Comma-separated daemon RPC URLs. Defaults to a curated public-node list (`node.community.rino.io`, `xmr-node.cakewallet.com`, `node.sethforprivacy.com`, `node.monero.net`). Override for self-hosted `monerod` or paid mirror. |
+| `MONERO_RPC_URLS` | No | Comma-separated daemon RPC URLs. Defaults to a curated public-node list (see `DEFAULT_MAINNET_BACKENDS` in `monero-rpc.ts` — every default was live-verified for CA-valid TLS on port 443, `get_block_count`, `/get_transaction_pool_hashes`, and `decode_as_json`, the exact set of endpoints Workers `fetch` can actually reach). Override for self-hosted `monerod` or a paid mirror. |
+| `MONERO_RPC_FALLBACK_URL` | No | Keyed fallback RPC (e.g. `https://xmr.nownodes.io`), tried only after every primary backend failed. |
+| `MONERO_RPC_FALLBACK_HEADERS_JSON` | No | Headers for the fallback only (e.g. `{"api-key":"…"}`) — kept separate from `MONERO_RPC_HEADERS_JSON` so the key never reaches public nodes. |
+| `MONERO_TXPOOL` | No (default on) | `off` disables the instant txpool watcher; detection falls back to cron block scanning (minutes of latency, still zero-miss). |
+| `MONERO_TXPOOL_POLL_MS` | No (default `10000`) | Txpool poll cadence while live XMR invoices exist. Floor 5000 (public-node etiquette). |
+| `MONERO_BLOCK_SCAN_MS` | No (default `60000`) | Block-walk settlement pass cadence inside the watcher. |
 
 **Spend key never reaches the gateway.** Detection only needs the view key
 + primary address. Operators settle funds via `monero-wallet-cli` or any
@@ -628,30 +633,53 @@ own wallet.
 
 ### Detection model
 
-The detection cron (default 1-minute tick) calls the Monero adapter's
-`scanIncoming` which:
+Two layers, sharing one pure view-key matcher (`matchMoneroTxOutputs`) so
+they can never drift apart cryptographically:
 
-1. Reads the last-scanned block height from cache (cold cache →
-   `MONERO_RESTORE_HEIGHT`).
-2. Fetches blocks from the public daemon RPC (failover across the
-   configured backends).
-3. For each tx output, locally derives the shared secret with the view
-   key and checks whether the output goes to one of the gateway's live
-   subaddresses.
-4. On match, unblinds the RingCT-encrypted amount and emits a
-   `DetectedTransfer` to the standard ingest path. The invoice flips to
-   `processing`, then `completed` after `confirmation_threshold` blocks
-   (default 10 for Monero mainnet, configurable via `FINALITY_OVERRIDES`
-   or per-merchant `confirmationThresholds`).
+**1. Instant layer — txpool watcher (seconds).** Monero has no
+address-watch push API anywhere (stealth addresses mean only the view-key
+holder can recognize an output), so the fastest primitive a public
+`monerod` exposes is `/get_transaction_pool_hashes`. The watcher polls it
+every `MONERO_TXPOOL_POLL_MS` (10 s) while live XMR invoices exist, diffs
+against a seen-set so only NEW hashes pay the fetch+scan cost, view-key
+scans the new txs (view-tag prefilter → one keccak skips ~255/256 foreign
+outputs before any EC math), and ingests hits at 0-conf. Broadcast →
+`invoice:payment_detected` webhook typically lands in **2–12 seconds**.
+On Cloudflare Workers this runs in the `MoneroWatcherDO` Durable Object
+(self-rescheduling alarm; cron `/ensure` ping is the dead-man's switch;
+invoice creation pokes it so a brand-new subaddress is watched within
+~1 s). On Node it's an in-process interval.
+
+**2. Settlement layer — block walk (zero-miss).** The watcher's block pass
+(every `MONERO_BLOCK_SCAN_MS`) walks every block from a cursor — never
+skipping heights while anything is watched — so a payment that eluded the
+pool pass (node omission, pool eviction + re-mine, watcher downtime) is
+still detected at most one pass after it's mined. The cursor advances
+only AFTER a block's transfers were handed to ingest; a crash re-scans
+(the `(chain_id, tx_hash, log_index)` unique constraint absorbs
+re-ingests) instead of losing payments. On match, the RingCT amount is
+unblinded and **verified against the output's Pedersen commitment**
+(fake-deposit defense), then flows to the standard ingest path: invoice →
+`processing`, then `completed` after `confirmation_threshold` blocks
+(default 10 for Monero mainnet — also the consensus spend-lock depth —
+configurable via `FINALITY_OVERRIDES` or per-merchant thresholds).
 
 A malicious public node could **omit** transactions but cannot **forge**
-credits — the cryptographic match would fail recipient-side. The failover
-list provides **liveness only** in v1: it returns the first backend that
-responds and does NOT cross-check responses across nodes. **A malicious
-primary node can silently drop incoming payments.** Operators concerned
-about omission should self-host `monerod` and set `MONERO_RPC_URLS=https://
-your-node.example`. v2 may add a consensus-of-N tip-and-block-hash
-pre-flight to mitigate single-node omission against community nodes.
+credits — the cryptographic match would fail recipient-side. Failover is
+sticky (keeps the last healthy backend, rotates on failure) and provides
+**liveness**; omission by the current backend delays detection until
+rotation, and the block walk bounds the damage to latency, never loss.
+Operators who want zero third-party trust should self-host `monerod` and
+set `MONERO_RPC_URLS=https://your-node.example` (CA-valid TLS required on
+Workers).
+
+**Fork readiness.** The FCMP++/Carrot hard fork (expected late 2026–2027)
+changes receive-side scanning (same view key + subaddresses; new ECDH,
+3-byte view tags, new amount encryption). The watcher polls
+`hard_fork_info` every 6 h and raises an **error-level alert** (→
+`ALERT_WEBHOOK_URL`) the moment the network reports a version above what
+the scanner supports, so the gateway alerts instead of going silently
+deaf on fork day.
 
 ### Operational hazards to know about
 
@@ -671,8 +699,8 @@ pre-flight to mitigate single-node omission against community nodes.
   public-node budget catching up from genesis. To backfill earlier
   history (e.g., a wallet with on-chain activity from before the gateway
   was wired up), set `MONERO_RESTORE_HEIGHT` to the wallet's birthday
-  block before first boot. The cron will chunk the catchup at
-  `maxBlocksPerTick=200` per tick.
+  block before first boot. Catch-up walks every block (never skips) at
+  `maxBlocksPerTick=40` per pass — ~40× chain production rate.
 - **Public-node trust is liveness-only in v1.** See the detection-model
   paragraph above. Operators concerned about omission should run their
   own `monerod` and set `MONERO_RPC_URLS`.

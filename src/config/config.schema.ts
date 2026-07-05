@@ -166,6 +166,12 @@ export const AppConfigSchema = z
     // providers (NOWNodes, Tatum). GetBlock-style URL-embedded keys do
     // not need this.
     moneroRpcHeadersJson: z.string().optional(),
+    // Optional keyed fallback RPC (e.g. https://xmr.nownodes.io), tried
+    // ONLY after every primary backend failed. Its headers are SEPARATE
+    // from moneroRpcHeadersJson so the API key is never sent to the public
+    // nodes in the primary rotation.
+    moneroRpcFallbackUrl: z.string().optional(),
+    moneroRpcFallbackHeadersJson: z.string().optional(),
     // Reusable Monero subaddress pool. Monero invoices allocate a subaddress
     // from a bounded pool and release it back on terminal for reuse (vs. the
     // legacy fresh-per-invoice counter). See monero-pool.service.ts.
@@ -367,6 +373,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     moneroRestoreHeight: env["MONERO_RESTORE_HEIGHT"],
     moneroRpcUrls: env["MONERO_RPC_URLS"],
     moneroRpcHeadersJson: env["MONERO_RPC_HEADERS_JSON"],
+    moneroRpcFallbackUrl: env["MONERO_RPC_FALLBACK_URL"],
+    moneroRpcFallbackHeadersJson: env["MONERO_RPC_FALLBACK_HEADERS_JSON"],
     moneroPoolInitialSize: env["MONERO_POOL_INITIAL_SIZE"],
     moneroPoolCooldownSeconds: env["MONERO_POOL_COOLDOWN_SECONDS"],
     gatewayPublicUrl: env["GATEWAY_PUBLIC_URL"],

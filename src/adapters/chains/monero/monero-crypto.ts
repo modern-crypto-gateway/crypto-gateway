@@ -216,34 +216,80 @@ export function viewKeyMatchesAddress(
   return constantTimeEqual(derived, parsed.publicViewKey);
 }
 
-// "Shared secret" — Monero's `derivation_to_scalar`. Two-stage:
-//   1. derivation D = 8 · viewSecret · txPubkey  (32-byte point encoding).
-//      The factor of 8 (cofactor) clears any small-subgroup component a
-//      hostile sender might have planted in `txPubkey`.
-//   2. scalar = Hs(D || varint(outputIndex))  (= keccak_256(...) mod ℓ).
-// We return the 32 bytes that encode the reduced scalar — same value
-// `expectedOutputPubkey` consumes (as a scalar to multiply G by) AND the
-// amount-decoding hash consumes (as bytes alongside the "amount" salt).
-// Bit-compatible with monero/src/crypto/crypto.cpp:hash_to_scalar.
+// Key derivation — Monero's `generate_key_derivation`:
+//   D = 8 · viewSecret · txPubkey  (32-byte compressed point).
+// The factor of 8 (cofactor) clears any small-subgroup component a hostile
+// sender might have planted in `txPubkey`. D depends only on (viewKey,
+// txPubkey) — NOT on the output index — so scanners compute it ONCE per tx
+// pubkey and reuse it across every output. This is the single expensive
+// ed25519 operation in the receive-side scan; everything downstream
+// (`derivationToScalar`, `deriveViewTag`) is a keccak hash.
+export function deriveKeyDerivation(args: {
+  viewKeySecret: Uint8Array;
+  txPubkey: Uint8Array; // 32-byte ed25519 point from the tx's `tx_pubkey`
+}): Uint8Array {
+  const viewScalar = leBytesToBigIntMod(args.viewKeySecret, ED25519_L);
+  if (viewScalar === 0n) {
+    throw new Error("deriveKeyDerivation: zero view scalar");
+  }
+  const txPub = ed25519.Point.fromBytes(args.txPubkey);
+  return txPub.multiply(viewScalar).multiply(8n).toBytes();
+}
+
+// Monero's `derivation_to_scalar`: Hs(D || varint(outputIndex)) — keccak of
+// the derivation + output index, reduced mod ℓ, re-encoded as 32 LE bytes.
+// Same value `expectedOutputPubkey` consumes (as a scalar to multiply G by)
+// AND the amount-decoding hash consumes (as bytes alongside the "amount"
+// salt). Bit-compatible with monero/src/crypto/crypto.cpp:hash_to_scalar.
+export function derivationToScalar(args: {
+  derivation: Uint8Array; // deriveKeyDerivation output
+  outputIndex: number; // 0-based index within the tx's output list
+}): Uint8Array {
+  const idx = encodeVarint(args.outputIndex);
+  const preimage = new Uint8Array(args.derivation.length + idx.length);
+  preimage.set(args.derivation, 0);
+  preimage.set(idx, args.derivation.length);
+  // sc_reduce32 — reduce the keccak output mod ℓ and re-encode as 32 LE bytes.
+  const reduced = leBytesToBigIntMod(keccak_256(preimage), ED25519_L);
+  return scalarToLEBytes32(reduced);
+}
+
+// View tag — Monero's `derive_view_tag` (crypto.cpp, mandatory on every
+// output since hard fork v15, Aug 2022):
+//   view_tag = keccak_256("view_tag" || derivation || varint(outputIndex))[0]
+// ("view_tag" is the 8-byte ASCII salt, NO null terminator.)
+// The sender computes the same byte from the same derivation, so a genuine
+// output to us ALWAYS matches — using it as a prefilter has zero false
+// negatives. ~1/256 foreign outputs false-positive through to the full
+// (expensive) subaddress check, which rejects them. Outputs from pre-v15
+// txs carry no tag; callers must bypass the prefilter for those.
+const VIEW_TAG_SALT = new Uint8Array([0x76, 0x69, 0x65, 0x77, 0x5f, 0x74, 0x61, 0x67]); // "view_tag", 8 bytes, no NUL
+export function deriveViewTag(args: {
+  derivation: Uint8Array;
+  outputIndex: number;
+}): number {
+  const idx = encodeVarint(args.outputIndex);
+  const preimage = new Uint8Array(VIEW_TAG_SALT.length + args.derivation.length + idx.length);
+  preimage.set(VIEW_TAG_SALT, 0);
+  preimage.set(args.derivation, VIEW_TAG_SALT.length);
+  preimage.set(idx, VIEW_TAG_SALT.length + args.derivation.length);
+  return keccak_256(preimage)[0]!;
+}
+
+// Legacy convenience wrapper: derivation + hash-to-scalar in one call.
+// Kept for callers/tests that don't need the per-tx derivation reuse or
+// the view-tag prefilter; new scan paths should call `deriveKeyDerivation`
+// once per tx pubkey and `derivationToScalar` per output instead.
 export function deriveSharedSecret(args: {
   viewKeySecret: Uint8Array;
   txPubkey: Uint8Array; // 32-byte ed25519 point from the tx's `tx_pubkey`
   outputIndex: number; // 0-based index within the tx's output list
 }): Uint8Array {
-  const viewScalar = leBytesToBigIntMod(args.viewKeySecret, ED25519_L);
-  if (viewScalar === 0n) {
-    throw new Error("deriveSharedSecret: zero view scalar");
-  }
-  const txPub = ed25519.Point.fromBytes(args.txPubkey);
-  const Dpoint = txPub.multiply(viewScalar).multiply(8n);
-  const D = Dpoint.toBytes();
-  const idx = encodeVarint(args.outputIndex);
-  const preimage = new Uint8Array(D.length + idx.length);
-  preimage.set(D, 0);
-  preimage.set(idx, D.length);
-  // sc_reduce32 — reduce the keccak output mod ℓ and re-encode as 32 LE bytes.
-  const reduced = leBytesToBigIntMod(keccak_256(preimage), ED25519_L);
-  return scalarToLEBytes32(reduced);
+  const derivation = deriveKeyDerivation({
+    viewKeySecret: args.viewKeySecret,
+    txPubkey: args.txPubkey
+  });
+  return derivationToScalar({ derivation, outputIndex: args.outputIndex });
 }
 
 // For a given subaddress N owned by the merchant: compute the expected
@@ -254,6 +300,12 @@ export function deriveSharedSecret(args: {
 //
 // `sharedSecret` is already a scalar (`deriveSharedSecret` did the
 // hash-to-scalar reduction); we just decode the 32 LE bytes and multiply.
+//
+// NOTE: this is O(1) per (output, subaddress) pair — an O(N-subaddress)
+// scan loop. New scan paths invert the equation instead (see
+// `outputToSubaddressSpendPub`) for an O(1)-per-output map lookup, which is
+// also exactly how wallet2's `derive_subaddress_public_key` + hashtable
+// scanning works. Kept for tests and as the reference construction.
 export function expectedOutputPubkey(args: {
   sharedSecret: Uint8Array;
   subaddressSpendPub: Uint8Array;
@@ -263,6 +315,29 @@ export function expectedOutputPubkey(args: {
   const left = ed25519.Point.BASE.multiply(safe);
   const right = ed25519.Point.fromBytes(args.subaddressSpendPub);
   return left.add(right).toBytes();
+}
+
+// Invert the output-key equation to recover the candidate subaddress spend
+// pub for an output — Monero's `derive_subaddress_public_key`:
+//   D' = outputPubkey − Hs(derivation || i) · G
+// If the output pays one of our subaddresses, D' equals that subaddress's
+// public spend key; the scanner looks D' up in a precomputed map of watched
+// spend pubs (one EC subtract per output instead of one EC add per output
+// PER subaddress). Returns null when the output pubkey isn't a valid curve
+// point — foreign garbage, never ours.
+export function outputToSubaddressSpendPub(args: {
+  hsScalar: Uint8Array; // derivationToScalar output for this output index
+  outputPubkey: Uint8Array; // 32-byte output key from the tx vout
+}): Uint8Array | null {
+  let outPoint: ReturnType<typeof ed25519.Point.fromBytes>;
+  try {
+    outPoint = ed25519.Point.fromBytes(args.outputPubkey);
+  } catch {
+    return null;
+  }
+  const scalar = leBytesToBigIntMod(args.hsScalar, ED25519_L);
+  const hsG = scalar === 0n ? ed25519.Point.ZERO : ed25519.Point.BASE.multiply(scalar);
+  return outPoint.subtract(hsG).toBytes();
 }
 
 // Unblind a RingCT v2 (BulletproofPlus) output amount.

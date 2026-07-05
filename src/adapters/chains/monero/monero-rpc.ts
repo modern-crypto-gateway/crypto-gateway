@@ -20,29 +20,43 @@
 // omission against community-run nodes.
 
 // Default public mainnet backends. Public Monero nodes come and go (operators
-// retire them, domains lapse). The list is ordered by recent reliability and
-// failover walks it in order — first responder wins. Operators should set
-// `MONERO_RPC_URLS` (comma-separated) for production; the defaults exist so a
-// dev/local boot Just Works without env wiring.
+// retire them, domains lapse). The list is ordered by measured latency +
+// operator/geographic diversity; failover is sticky (keeps using the last
+// healthy backend, resumes from the NEXT index on failure). Operators should
+// set `MONERO_RPC_URLS` (comma-separated) for production; the defaults exist
+// so a dev/local boot Just Works without env wiring.
 //
-// **Cloudflare Workers + TLS constraint.** Workers `fetch` enforces full TLS
-// chain validation and offers no opt-out. The Monero community has many fast
-// public nodes (hashvault, monerodevs, stormycloud, ...) but most use
-// self-signed certs because the daemon's built-in HTTPS doesn't read CA
-// certs — those are unreachable from a Worker even though they work fine
-// from `curl -k` or a Node deployment. The defaults below are the subset
-// known to terminate TLS through a real CA-signed cert (typically by
-// fronting the daemon with nginx/Cloudflare on a `.com`/`.org` domain).
+// **Cloudflare Workers constraints.** Two hard requirements for a default
+// backend:
+//   1. CA-valid TLS — Workers `fetch` enforces full chain validation with no
+//      opt-out, so monerod's typical self-signed cert is unreachable.
+//   2. Port 443 — hosts behind Cloudflare's proxy only accept Cloudflare's
+//      reverse-proxy port set, and (pre-`allow_custom_ports` compat dates)
+//      custom ports were silently stripped. The classic `:18081`/`:18089`
+//      community nodes (hashvault, monerodevs, stormycloud, cakewallet, ...)
+//      are therefore NOT usable as defaults, however healthy they look from
+//      curl. Operators pointing MONERO_RPC_URLS at a self-hosted daemon on a
+//      custom port need compatibility_date >= 2024-09-02 (this repo qualifies)
+//      and a CA-valid cert on the daemon's reverse proxy.
 //
-// If you discover one is dead, drop it from the list. Fresh candidates can
-// be sourced from https://monero.fail/ — when picking, verify with
-// `curl https://<node>/json_rpc` (without `-k`) that the cert validates.
+// Every entry below was live-verified (2026-07-05) for: CA-valid TLS on
+// :443, `get_block_count`, `/get_transaction_pool_hashes` (the txpool
+// endpoint the instant-detection watcher polls), and `/get_transactions`
+// with `decode_as_json` populated. Max one tari host (the fleet resolved to
+// a single OVH IP at test time) and max two fiatfaucet hosts (shared
+// operator). Verified spares if one dies: kowalski.fiatfaucet.com (NL),
+// monero.econanon.com (CF-fronted), monero.openinternet.io (US-W),
+// xmr.ducks.party (DE), xmr.sy.st (SE). Fresh candidates:
+// https://monero.fail/ — verify with `curl https://<node>/json_rpc`
+// (WITHOUT `-k`) that the cert validates and the port is 443.
 export const DEFAULT_MAINNET_BACKENDS: readonly string[] = [
-  "https://xmr-node.cakewallet.com:18081",
-  "https://xmr-node-uk.cakewallet.com:18081",
-  "https://xmr-node-eu.cakewallet.com:18081",
-  "https://xmr-node-usa-east.cakewallet.com:18081",
-  "https://node.sethforprivacy.com"
+  "https://xmr-01.tari.com", //          Cloudflare-fronted; fastest from any Worker PoP
+  "https://rpc.monerosafe.com", //       OVH Frankfurt, DE
+  "https://xmr.0xrpc.io", //             commercial free endpoint, Warsaw, PL
+  "https://node.sethforprivacy.com", //  Toronto, CA — battle-tested community node
+  "https://chad.fiatfaucet.com", //      Los Angeles, US-West
+  "https://connect.xmr-node.org", //     Vienna, AT
+  "https://xmr-au-1.cryptovps.io" //     Sydney, AU (APAC coverage)
 ];
 
 // Stagenet/testnet defaults are best-effort — these networks have far fewer
@@ -95,6 +109,21 @@ export interface MoneroTxOutput {
   // scanner must verify any decoded amount against this commitment before
   // crediting, otherwise a malicious payer can fake deposit amounts.
   readonly commitment: string | null;
+  // View tag byte from `vout[i].target.tagged_key.view_tag` — present on
+  // every output since hard fork v15 (Aug 2022). Null on pre-v15 outputs
+  // (bare `key` target). The scanner uses it as a zero-false-negative
+  // prefilter: one keccak per output instead of the full EC check for the
+  // ~255/256 of foreign outputs whose tag doesn't match.
+  readonly viewTag: number | null;
+}
+
+// Block metadata + tx hashes from `get_block`. `timestampSec` is the miner-
+// declared block-header time (unix seconds) — threaded onto detected
+// transfers as `onchainTime` so the re-ingest attribution matcher works for
+// Monero (previously always null → re-ingests fail-closed to orphan).
+export interface MoneroBlock {
+  readonly txHashes: readonly string[];
+  readonly timestampSec: number | null;
 }
 
 export interface MoneroParsedTx {
@@ -126,19 +155,39 @@ export interface MoneroParsedTx {
 export interface MoneroDaemonRpcClient {
   // Current tip (chain length). One block beyond the highest mined block.
   getTipHeight(): Promise<number>;
-  // Block at the given height: returns the list of tx hashes (incl. miner tx).
-  getBlockTxHashesByHeight(height: number): Promise<readonly string[]>;
+  // Block at the given height: tx hashes (incl. miner tx) + header timestamp.
+  getBlockByHeight(height: number): Promise<MoneroBlock>;
   // Batch fetch parsed txs by hash. Tx hashes that the daemon doesn't know
   // about are silently dropped from the response (no per-hash error).
   getTransactions(txHashes: readonly string[]): Promise<readonly MoneroParsedTx[]>;
+  // Current txpool tx hashes (`/get_transaction_pool_hashes`, plain-JSON
+  // endpoint — live-verified available on every default backend). This is
+  // the instant-detection primitive: the watcher polls it every few seconds,
+  // diffs against its seen-set, and only pays the fetch+scan cost for NEW
+  // hashes. Empty pool → empty array.
+  getTxPoolHashes(): Promise<readonly string[]>;
+  // Network hard-fork version (`hard_fork_info`). The watcher polls this
+  // rarely (hours) as a fork canary: the FCMP++/Carrot fork will change the
+  // receive-side scanning algorithm, and we want a loud alert instead of a
+  // scanner that goes silently deaf on fork day. Optional so test stubs and
+  // narrow clients don't have to implement it.
+  getHardForkVersion?(): Promise<number | null>;
 }
 
 export interface MoneroDaemonRpcConfig {
   readonly backends: readonly MoneroBackend[];
   readonly fetch?: typeof globalThis.fetch;
-  // Per-request timeout. Default 15s — Monero blocks are larger and
-  // public nodes are slower than Esplora's mempool.space.
+  // Per-request timeout. Default 4s — every default backend answered in
+  // <2.5s (incl. TLS) during live verification; a node slower than that is
+  // not healthy enough to keep waiting on, and short timeouts keep the
+  // worst-case full-failover walk inside a single watcher tick.
   readonly timeoutMs?: number;
+  // Optional authenticated fallback (e.g. NOWNodes with an `api-key`
+  // header), tried ONLY after every primary backend failed. Carries its own
+  // headers so the API key is never sent to public nodes — do NOT put keyed
+  // providers in `backends` with global MONERO_RPC_HEADERS_JSON for that
+  // reason.
+  readonly fallbackBackend?: MoneroBackend;
   // Optional logger so the parser can warn when a backend returns a tx
   // without `as_json` populated, or with unparseable extra. Otherwise
   // these are silent drops that show up as "tx mysteriously not detected".
@@ -151,23 +200,35 @@ export function moneroDaemonRpcClient(config: MoneroDaemonRpcConfig): MoneroDaem
     throw new Error("moneroDaemonRpcClient: at least one backend required");
   }
   const fetchImpl = config.fetch ?? globalThis.fetch;
-  // 8s per backend keeps total cron-tick spend bounded when public nodes go
-  // flaky. Worst-case full-failover budget is ~40s for the 5 default mainnet
-  // backends — still inside a 1-minute cron interval. A real Monero node
-  // responds to `get_block_count` in < 200ms; if it doesn't, it's not healthy
-  // enough to keep waiting on.
-  const timeoutMs = config.timeoutMs ?? 8_000;
+  const timeoutMs = config.timeoutMs ?? 4_000;
 
-  // Try each backend in order on failure. Same shape as Esplora's withFailover.
+  // Sticky failover. `preferredIndex` remembers the last backend that
+  // answered successfully; every call starts there and walks the ring
+  // forward on failure. The win over the old always-start-at-index-0 walk:
+  // a dead backend at the head of the list no longer taxes EVERY call with a
+  // timeout before reaching a live node — once one fails, the preferred
+  // index moves off it. NOTE: this is stickiness, NOT load spreading — all
+  // traffic concentrates on the current preferred node until it fails, so a
+  // single node's latency/omission has outsized effect (the txpool watcher's
+  // per-tick wall-clock budget bounds the resulting latency, and the block
+  // walk bounds omission to added latency, never loss). The optional keyed
+  // `fallbackBackend` is appended after all primaries.
+  //
   // BEST-EFFORT LIVENESS ONLY — returns the first backend that responds.
   // Does NOT cross-check responses across backends; a malicious primary
-  // node can omit txs without us noticing. See the file header for the
-  // v1 trust model + v2 consensus-of-N follow-up note.
+  // node can omit txs without us noticing. The block-walk detection layer
+  // (which never skips heights) bounds the damage of pool-level omission
+  // to added latency. See the file header for the v1 trust model.
+  let preferredIndex = 0;
   async function withFailover<T>(op: (b: MoneroBackend) => Promise<T>): Promise<T> {
     const errors: MoneroBackendError[] = [];
-    for (const backend of backends) {
+    for (let step = 0; step < backends.length; step += 1) {
+      const idx = (preferredIndex + step) % backends.length;
+      const backend = backends[idx]!;
       try {
-        return await op(backend);
+        const result = await op(backend);
+        preferredIndex = idx;
+        return result;
       } catch (err) {
         if (err instanceof MoneroBackendError) {
           errors.push(err);
@@ -176,8 +237,23 @@ export function moneroDaemonRpcClient(config: MoneroDaemonRpcConfig): MoneroDaem
         throw err;
       }
     }
+    if (config.fallbackBackend) {
+      try {
+        // Deliberately does NOT update preferredIndex — the keyed fallback
+        // absorbs outage windows; traffic returns to public nodes as soon
+        // as one recovers.
+        return await op(config.fallbackBackend);
+      } catch (err) {
+        if (err instanceof MoneroBackendError) {
+          errors.push(err);
+        } else {
+          throw err;
+        }
+      }
+    }
     throw new Error(
-      `monero: all ${backends.length} backends failed: ${errors.map((e) => e.message).join("; ")}`
+      `monero: all ${backends.length + (config.fallbackBackend ? 1 : 0)} backends failed: ` +
+      errors.map((e) => e.message).join("; ")
     );
   }
 
@@ -247,20 +323,51 @@ export function moneroDaemonRpcClient(config: MoneroDaemonRpcConfig): MoneroDaem
       return Math.max(0, result.count - 1);
     },
 
-    async getBlockTxHashesByHeight(height: number) {
+    async getBlockByHeight(height: number) {
       const result = await withFailover((b) =>
-        jsonRpc<{ tx_hashes?: string[]; miner_tx_hash?: string }>(b, "get_block", { height })
+        jsonRpc<{
+          tx_hashes?: string[];
+          miner_tx_hash?: string;
+          block_header?: { timestamp?: number };
+        }>(b, "get_block", { height })
       );
       const hashes: string[] = [];
       if (result.miner_tx_hash) hashes.push(result.miner_tx_hash);
       if (Array.isArray(result.tx_hashes)) hashes.push(...result.tx_hashes);
-      return hashes;
+      const ts = result.block_header?.timestamp;
+      return {
+        txHashes: hashes,
+        timestampSec: typeof ts === "number" && ts > 0 ? ts : null
+      };
+    },
+
+    async getTxPoolHashes() {
+      const result = await withFailover((b) =>
+        rawPost<{ tx_hashes?: string[]; status?: string }>(
+          b,
+          "/get_transaction_pool_hashes",
+          {}
+        )
+      );
+      return Array.isArray(result.tx_hashes) ? result.tx_hashes : [];
+    },
+
+    async getHardForkVersion() {
+      try {
+        const result = await withFailover((b) =>
+          jsonRpc<{ version?: number }>(b, "hard_fork_info", {})
+        );
+        return typeof result.version === "number" ? result.version : null;
+      } catch {
+        // The canary is best-effort — never let it disturb detection.
+        return null;
+      }
     },
 
     async getTransactions(txHashes: readonly string[]) {
       if (txHashes.length === 0) return [];
-      const result = await withFailover((b) =>
-        rawPost<{
+      const result = await withFailover(async (b) => {
+        const res = await rawPost<{
           txs?: Array<{
             tx_hash: string;
             block_height?: number;
@@ -270,25 +377,29 @@ export function moneroDaemonRpcClient(config: MoneroDaemonRpcConfig): MoneroDaem
         }>(b, "/get_transactions", {
           txs_hashes: [...txHashes],
           decode_as_json: true
-        })
-      );
+        });
+        // A tx record without `as_json` (despite decode_as_json:true) means
+        // THIS backend can't decode — typically a restricted proxy that
+        // strips the field. The same tx fetched from a healthy backend
+        // decodes fine, so treat it as a backend failure and fail over
+        // instead of silently dropping the tx (the old behavior — every
+        // such drop was an undetectable missed payment on that tick).
+        // Absent tx RECORDS are different: the daemon legitimately omits
+        // hashes it doesn't know (evicted pool txs), which is not an error.
+        for (const t of res.txs ?? []) {
+          if (!t.as_json) {
+            throw new MoneroBackendError(
+              b.baseUrl,
+              null,
+              `tx ${t.tx_hash} returned without as_json despite decode_as_json:true`
+            );
+          }
+        }
+        return res;
+      });
       const out: MoneroParsedTx[] = [];
       for (const t of result.txs ?? []) {
-        if (!t.as_json) {
-          // Some restricted/proxy nodes return a tx record without a
-          // decoded JSON payload, even when we asked for decode_as_json.
-          // Without this log, every such tx is silently invisible — and
-          // the same tx fetched via a different backend would decode
-          // fine. Surface it so operators can swap backends or notice
-          // a regression in their RPC provider.
-          config.logger?.warn("monero rpc: tx has no as_json (cannot decode); skipping", {
-            txHash: t.tx_hash,
-            inPool: t.in_pool,
-            blockHeight: t.block_height,
-            backend: undefined
-          });
-          continue;
-        }
+        if (!t.as_json) continue; // unreachable — validated in the failover op
         let parsed: ParsedTxJson;
         try {
           parsed = JSON.parse(t.as_json) as ParsedTxJson;
@@ -318,7 +429,11 @@ export function moneroDaemonRpcClient(config: MoneroDaemonRpcConfig): MoneroDaem
           // outPk[i] is the output's Pedersen commitment for all RingCT
           // types; absent on coinbase / pre-RingCT (type 0) txs where the
           // amount is plaintext instead.
-          commitment: parsed.rct_signatures?.outPk?.[i] ?? null
+          commitment: parsed.rct_signatures?.outPk?.[i] ?? null,
+          // Post-v15 outputs use `tagged_key` with a 1-byte view tag (hex).
+          // Pre-v15 outputs (bare `key`) have none — the scanner bypasses
+          // the tag prefilter for those.
+          viewTag: parseViewTagByte(vout.target?.tagged_key?.view_tag)
         }));
         const blockHeight = t.in_pool ? null : (typeof t.block_height === "number" ? t.block_height : null);
         out.push({
@@ -375,6 +490,16 @@ export function parseMoneroRpcHeadersEnv(value: string | undefined): Readonly<Re
 
 // ---- Internal helpers ----
 
+// Parse the `view_tag` hex byte from a tagged_key target. Returns null for
+// anything that isn't exactly one hex byte — treated as "no tag" so the
+// scanner falls back to the full check (fail open on the prefilter, never
+// on the cryptographic match).
+function parseViewTagByte(hex: string | undefined): number | null {
+  if (typeof hex !== "string" || hex.length !== 2) return null;
+  const v = parseInt(hex, 16);
+  return Number.isInteger(v) && v >= 0 && v <= 0xff ? v : null;
+}
+
 // Shape of a tx's `as_json` decoded payload — only the fields we touch.
 interface ParsedTxJson {
   readonly extra?: readonly number[]; // bytes (uint8 array as JSON numbers)
@@ -386,7 +511,7 @@ interface ParsedTxJson {
   readonly vout?: ReadonlyArray<{
     readonly target?: {
       readonly key?: string;
-      readonly tagged_key?: { readonly key: string };
+      readonly tagged_key?: { readonly key: string; readonly view_tag?: string };
     };
   }>;
   readonly rct_signatures?: {

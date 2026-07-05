@@ -104,13 +104,26 @@
   // traffic). Disable with UTXO_WS=off in [vars] — detection then falls
   // back to the 1-minute Esplora poll only. SQLite-backed class so it works
   // on the Workers Free plan.
+  // Monero txpool watcher. Cron Triggers bottom out at 1 minute, so instant
+  // XMR detection needs a Durable Object whose alarm re-schedules itself
+  // every ~10s while live XMR invoices exist: each firing polls a public
+  // node's txpool hash list, view-key-scans NEW txs, and ingests hits at
+  // 0-conf (broadcast → payment_detected webhook in seconds). With zero
+  // live XMR invoices it degrades to a slow idle heartbeat — cost scales
+  // with traffic. The platform cron pings it alive as the dead-man's
+  // switch. Disable with MONERO_TXPOOL=off in [vars] — detection then falls
+  // back to cron-driven block scanning (minutes of latency, still
+  // zero-miss). Tune with MONERO_TXPOOL_POLL_MS (default 10000, floor 5000)
+  // and MONERO_BLOCK_SCAN_MS (default 60000).
   "durable_objects": {
     "bindings": [
-      { "name": "UTXO_WS_DO", "class_name": "UtxoWsWatcherDO" }
+      { "name": "UTXO_WS_DO", "class_name": "UtxoWsWatcherDO" },
+      { "name": "MONERO_WATCHER_DO", "class_name": "MoneroWatcherDO" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["UtxoWsWatcherDO"] }
+    { "tag": "v1", "new_sqlite_classes": ["UtxoWsWatcherDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["MoneroWatcherDO"] }
   ],
 
   // Cloudflare built-in rate-limit bindings. One entry per scope — each

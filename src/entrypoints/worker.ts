@@ -18,6 +18,7 @@ import {
   LITECOIN_CONFIG
 } from "../adapters/chains/utxo/utxo-config.js";
 import { moneroChainAdapter } from "../adapters/chains/monero/monero-chain.adapter.js";
+import { moneroBlockScanDetection } from "../adapters/detection/monero-block-scan.adapter.js";
 import {
   MONERO_MAINNET_CONFIG,
   MONERO_STAGENET_CONFIG,
@@ -90,6 +91,11 @@ export interface WorkerEnv {
   // mempool detection). Optional: without the binding (or with UTXO_WS=off)
   // the gateway is poll-only via the 1-minute cron, exactly as before.
   UTXO_WS_DO?: DurableObjectNamespace;
+  // Durable Object hosting the Monero txpool watcher (instant XMR mempool
+  // detection — alarm-driven ~10s polling; cron can't go sub-minute).
+  // Optional: without the binding (or with MONERO_TXPOOL=off) Monero falls
+  // back to cron-driven block scanning only (minutes of latency).
+  MONERO_WATCHER_DO?: DurableObjectNamespace;
 
   // Secrets (set via `wrangler secret put`)
   MASTER_SEED: string;
@@ -106,6 +112,20 @@ export interface WorkerEnv {
 function utxoWsEnabled(env: WorkerEnv): boolean {
   const knob = String(env["UTXO_WS"] ?? "").toLowerCase();
   return knob !== "off" && knob !== "0" && knob !== "false";
+}
+
+// off/0/false disable the Monero txpool watcher DO (same kill-switch
+// spellings as UTXO_WS). Detection then degrades to the cron block scan.
+function moneroTxpoolEnabled(env: WorkerEnv): boolean {
+  const knob = String(env["MONERO_TXPOOL"] ?? "").toLowerCase();
+  return knob !== "off" && knob !== "0" && knob !== "false";
+}
+
+// True when the Monero watcher DO will own detection for this deployment —
+// used to decide whether the cron-driven block-scan strategy registers
+// (running both would double-scan the public RPC fleet).
+function moneroWatcherActive(env: WorkerEnv): boolean {
+  return env.MONERO_WATCHER_DO !== undefined && moneroTxpoolEnabled(env);
 }
 
 // Exported for the UtxoWsWatcherDO — the Durable Object builds the same full
@@ -308,6 +328,15 @@ export async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<Ap
     // paid one will respond first.
     const rpcHeadersRaw = typeof env["MONERO_RPC_HEADERS_JSON"] === "string" ? env["MONERO_RPC_HEADERS_JSON"] : undefined;
     const rpcHeaders = parseMoneroRpcHeadersEnv(rpcHeadersRaw);
+    // Optional keyed fallback (e.g. NOWNodes), tried only after every
+    // primary backend failed. Separate headers env so the API key is never
+    // sent to public nodes.
+    const fallbackUrl = typeof env["MONERO_RPC_FALLBACK_URL"] === "string" && env["MONERO_RPC_FALLBACK_URL"].length > 0
+      ? env["MONERO_RPC_FALLBACK_URL"]
+      : undefined;
+    const fallbackHeaders = parseMoneroRpcHeadersEnv(
+      typeof env["MONERO_RPC_FALLBACK_HEADERS_JSON"] === "string" ? env["MONERO_RPC_FALLBACK_HEADERS_JSON"] : undefined
+    );
     const viewKeyBytes = hexToBytes32(moneroViewKeyHex, "MONERO_VIEW_KEY");
     chains.push(
       moneroChainAdapter({
@@ -317,18 +346,30 @@ export async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<Ap
         restoreHeight,
         daemonClient: moneroDaemonRpcClient({
           backends: rpcUrls.map((u) => rpcHeaders ? { baseUrl: u, headers: rpcHeaders } : { baseUrl: u }),
+          ...(fallbackUrl !== undefined
+            ? { fallbackBackend: fallbackHeaders ? { baseUrl: fallbackUrl, headers: fallbackHeaders } : { baseUrl: fallbackUrl } }
+            : {}),
           logger
         }),
         cache,
         logger
       })
     );
-    detectionStrategies[moneroChain.chainId] = rpcPollDetection();
+    // Detection ownership: when the Monero watcher DO is active it owns
+    // BOTH the txpool pass and the block walk (alarm-driven, ~10s). The
+    // cron-driven block-scan strategy registers only as the fallback —
+    // running both would double-scan the same heights against the public
+    // RPC fleet for zero correctness gain.
+    if (!moneroWatcherActive(env)) {
+      detectionStrategies[moneroChain.chainId] = moneroBlockScanDetection();
+    }
     logger.info("Monero adapter wired", {
       chainId: moneroChain.chainId,
       network: networkVal,
       restoreHeight,
       backendCount: rpcUrls.length,
+      fallbackBackend: fallbackUrl !== undefined,
+      detectionMode: moneroWatcherActive(env) ? "txpool-watcher-do" : "cron-block-scan",
       // Header NAMES only — never log values; they're auth secrets.
       authHeaderNames: rpcHeaders ? Object.keys(rpcHeaders) : []
     });
@@ -407,6 +448,25 @@ export async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<Ap
         stub.fetch("https://utxo-ws-do/ensure").then(
           () => undefined,
           (err: unknown) => logger.warn("utxo-ws-do poke failed (cron ping will cover)", {
+            error: err instanceof Error ? err.message : String(err)
+          })
+        )
+      );
+    });
+  }
+  // Same instant-tracking poke for new Monero invoices: /ensure refreshes
+  // the DO watcher's subaddress set AND runs an immediate txpool tick, so a
+  // customer who pays within seconds of invoice creation is still caught at
+  // 0-conf. Cron ping + watchdog alarm remain the reliability net.
+  if (moneroWatcherActive(env)) {
+    const namespace = env.MONERO_WATCHER_DO!;
+    events.subscribe("invoice.created", async (event) => {
+      if (!event.invoice.receiveAddresses.some((a) => a.family === "monero")) return;
+      const stub = namespace.get(namespace.idFromName("global"));
+      ctx.waitUntil(
+        stub.fetch("https://monero-watcher-do/ensure").then(
+          () => undefined,
+          (err: unknown) => logger.warn("monero-watcher-do poke failed (cron ping will cover)", {
             error: err instanceof Error ? err.message : String(err)
           })
         )
@@ -620,6 +680,21 @@ export default {
         )
       );
     }
+    // Same dead-man's switch for the Monero txpool watcher DO: first start,
+    // and revival if its self-rescheduling alarm chain is ever lost
+    // (deploy, eviction, tick crash before re-arm).
+    if (moneroWatcherActive(env)) {
+      const ns = env.MONERO_WATCHER_DO!;
+      const stub = ns.get(ns.idFromName("global"));
+      ctx.waitUntil(
+        stub.fetch("https://monero-watcher-do/ensure").then(
+          () => undefined,
+          (err: unknown) => deps.logger.warn("monero-watcher-do ensure failed (next tick retries)", {
+            error: err instanceof Error ? err.message : String(err)
+          })
+        )
+      );
+    }
     const result = await runScheduledJobs(deps);
     for (const [name, outcome] of Object.entries(result)) {
       if (outcome && !outcome.ok) {
@@ -629,9 +704,10 @@ export default {
   }
 };
 
-// Durable Object class — must be exported from the Worker's main module so
-// the runtime can bind it (wrangler.jsonc `durable_objects` + `migrations`).
+// Durable Object classes — must be exported from the Worker's main module so
+// the runtime can bind them (wrangler.jsonc `durable_objects` + `migrations`).
 export { UtxoWsWatcherDO } from "./utxo-ws-do.js";
+export { MoneroWatcherDO } from "./monero-watcher-do.js";
 
 // Decode a 64-hex-char string into 32 bytes. Throws with a stable error
 // shape if the env var is the wrong length or has non-hex characters —

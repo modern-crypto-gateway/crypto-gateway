@@ -99,8 +99,9 @@ function stubDaemonClient(): MoneroDaemonRpcClient {
   };
   return {
     getTipHeight: fail,
-    getBlockTxHashesByHeight: fail,
-    getTransactions: fail
+    getBlockByHeight: fail,
+    getTransactions: fail,
+    getTxPoolHashes: fail
   };
 }
 
@@ -316,12 +317,13 @@ describe("Monero detection — happy path", () => {
         async getTipHeight() {
           return stubTipHeight;
         },
-        async getBlockTxHashesByHeight(height) {
-          return stubBlockTxs.get(height) ?? [];
+        async getBlockByHeight(height) {
+          return { txHashes: stubBlockTxs.get(height) ?? [], timestampSec: null };
         },
         async getTransactions(hashes) {
           return hashes.map((h) => stubTxs.get(h)).filter((t): t is MoneroParsedTx => t !== undefined);
-        }
+        },
+        async getTxPoolHashes() { return []; }
       };
       const adapter = moneroChainAdapter({
         chain: MONERO_MAINNET_CONFIG,
@@ -421,7 +423,10 @@ describe("Monero detection — happy path", () => {
             // the decoded ecdhInfo amount.
             commitment: bytesToHex(
               computeRctCommitment({ sharedSecret: sharedScalarBytes, amount: realAmount })
-            )
+            ),
+            // null = pre-v15 form → the scanner bypasses the view-tag
+            // prefilter and always runs the full cryptographic check.
+            viewTag: null
           }
         ]
       });
@@ -500,10 +505,11 @@ describe("Monero detection — happy path", () => {
       const stubTxs = new Map<string, MoneroParsedTx>();
       const daemonClient: MoneroDaemonRpcClient = {
         async getTipHeight() { return stubTipHeight; },
-        async getBlockTxHashesByHeight(h) { return stubBlockTxs.get(h) ?? []; },
+        async getBlockByHeight(h) { return { txHashes: stubBlockTxs.get(h) ?? [], timestampSec: null }; },
         async getTransactions(hashes) {
           return hashes.map((h) => stubTxs.get(h)).filter((t): t is MoneroParsedTx => t !== undefined);
-        }
+        },
+        async getTxPoolHashes() { return []; }
       };
       const adapter = moneroChainAdapter({
         chain: MONERO_MAINNET_CONFIG,
@@ -589,7 +595,8 @@ describe("Monero detection — happy path", () => {
             encryptedAmount: bytesToHex(encrypted),
             commitment: bytesToHex(
               computeRctCommitment({ sharedSecret: sharedScalarBytes, amount: realAmount })
-            )
+            ),
+            viewTag: null
           }
         ]
       });
@@ -617,8 +624,8 @@ describe("Monero detection — happy path", () => {
     try {
       const daemonClient: MoneroDaemonRpcClient = {
         async getTipHeight() { return 105; },
-        async getBlockTxHashesByHeight(h) {
-          return h === 100 ? [`cd`.repeat(32)] : [];
+        async getBlockByHeight(h) {
+          return { txHashes: h === 100 ? [`cd`.repeat(32)] : [], timestampSec: null };
         },
         async getTransactions(hashes) {
           // Return a tx with random output keys — none should match our
@@ -634,11 +641,13 @@ describe("Monero detection — happy path", () => {
               {
                 publicKey: bytesToHex(keccak_256(new TextEncoder().encode("foreign-output"))),
                 encryptedAmount: "0102030405060708",
-                commitment: null
+                commitment: null,
+                viewTag: null
               }
             ]
           }));
-        }
+        },
+        async getTxPoolHashes() { return []; }
       };
       const adapter = moneroChainAdapter({
         chain: MONERO_MAINNET_CONFIG,
@@ -696,10 +705,11 @@ describe("Monero detection — happy path", () => {
       const stubTxs = new Map<string, MoneroParsedTx>();
       const daemonClient: MoneroDaemonRpcClient = {
         async getTipHeight() { return stubTipHeight; },
-        async getBlockTxHashesByHeight(h) { return stubBlockTxs.get(h) ?? []; },
+        async getBlockByHeight(h) { return { txHashes: stubBlockTxs.get(h) ?? [], timestampSec: null }; },
         async getTransactions(hashes) {
           return hashes.map((h) => stubTxs.get(h)).filter((t): t is MoneroParsedTx => t !== undefined);
-        }
+        },
+        async getTxPoolHashes() { return []; }
       };
       const adapter = moneroChainAdapter({
         chain: MONERO_MAINNET_CONFIG,
@@ -780,7 +790,8 @@ describe("Monero detection — happy path", () => {
                         sharedSecret: sharedScalarBytes,
                         amount: args.committedAmount
                       })
-                    )
+                    ),
+              viewTag: null
             }
           ]
         };
@@ -839,11 +850,12 @@ describe("Monero detection — happy path", () => {
       const fetchedHeights: number[] = [];
       const daemonClient: MoneroDaemonRpcClient = {
         async getTipHeight() { return 50; },
-        async getBlockTxHashesByHeight(h) {
+        async getBlockByHeight(h) {
           fetchedHeights.push(h);
-          return [];
+          return { txHashes: [], timestampSec: null };
         },
-        async getTransactions() { return []; }
+        async getTransactions() { return []; },
+        async getTxPoolHashes() { return []; }
       };
       const adapter = moneroChainAdapter({
         chain: MONERO_MAINNET_CONFIG,
@@ -885,20 +897,19 @@ describe("Monero detection — happy path", () => {
     }
   });
 
-  // Regression: when no live Monero invoices exist for an extended period
-  // (hours/days), pollPayments skips the Monero family entirely and the
-  // height checkpoint freezes. When a fresh invoice is created later, naive
-  // resume-from-(lastScanned+1) means walking thousands of stale blocks at
-  // 40 blocks/tick before reaching the customer's actual payment block —
-  // a 1+ hour silent gap from the merchant's perspective. Stale-checkpoint
-  // detection snaps forward when the gap exceeds STALE_GAP_BLOCKS (~12h).
-  it("scanIncoming snaps forward to a recent window when the cache is far behind tip", async () => {
+  // Regression (inverted from the original snap-forward behavior): a stale
+  // checkpoint MUST NOT cause the scanner to skip blocks. The old code
+  // snapped a >60-block gap forward to tip-100 — any payment mined inside
+  // the skipped gap was permanently missed, which is the #1 way real XMR
+  // payments were lost. The scanner now catches up WITHOUT skipping,
+  // bounded per tick by maxBlocksPerTick, and the txpool watcher's
+  // idle-fast-forward handles the no-live-invoices case safely (it only
+  // advances the cursor when the watched set is empty, i.e. when nothing
+  // in those blocks could match).
+  it("scanIncoming walks a large gap from lastScanned+1 without skipping blocks", async () => {
     const w = makeWallet("stale-checkpoint");
     const booted = await bootTestApp({ merchants: [{ id: MERCHANT_ID }] });
     try {
-      // Pre-seed the cache with a checkpoint 5,000 blocks behind tip — far
-      // beyond the 360-block stale threshold. Simulates ~7 days of quiet
-      // (no live invoices, cache frozen).
       const fetchedHeights: number[] = [];
       const TIP = 100_000;
       const STALE_LAST_SCANNED = 95_000; // 5,000 blocks behind tip
@@ -908,11 +919,12 @@ describe("Monero detection — happy path", () => {
       );
       const daemonClient: MoneroDaemonRpcClient = {
         async getTipHeight() { return TIP; },
-        async getBlockTxHashesByHeight(h) {
+        async getBlockByHeight(h) {
           fetchedHeights.push(h);
-          return [];
+          return { txHashes: [], timestampSec: null };
         },
-        async getTransactions() { return []; }
+        async getTransactions() { return []; },
+        async getTxPoolHashes() { return []; }
       };
       const adapter = moneroChainAdapter({
         chain: MONERO_MAINNET_CONFIG,
@@ -931,24 +943,36 @@ describe("Monero detection — happy path", () => {
         sinceMs: 0
       });
 
-      // The scanner MUST NOT walk from 95_001 forward (would take hours).
-      // It MUST snap forward to within SNAP_WINDOW (100) of tip.
+      // Resume EXACTLY at lastScanned+1 — no snap, no skipped heights —
+      // and walk a bounded batch (maxBlocksPerTick, default 40).
       expect(fetchedHeights.length).toBeGreaterThan(0);
-      expect(fetchedHeights[0]).toBeGreaterThanOrEqual(TIP - 100);
-      expect(fetchedHeights[fetchedHeights.length - 1]).toBeLessThanOrEqual(TIP);
-      // Sanity: never went anywhere near the stale checkpoint.
-      expect(fetchedHeights.every((h) => h > STALE_LAST_SCANNED + 1000)).toBe(true);
+      expect(fetchedHeights[0]).toBe(STALE_LAST_SCANNED + 1);
+      expect(fetchedHeights.length).toBeLessThanOrEqual(40);
+      // Contiguous walk — every height between first and last fetched.
+      for (let i = 1; i < fetchedHeights.length; i += 1) {
+        expect(fetchedHeights[i]).toBe(fetchedHeights[0]! + i);
+      }
+
+      // Second call resumes where the first left off — checkpoint advanced
+      // by the walk, still no skipping.
+      const firstPassEnd = fetchedHeights[fetchedHeights.length - 1]!;
+      fetchedHeights.length = 0;
+      await adapter.scanIncoming({
+        chainId: MONERO_CHAIN_ID,
+        addresses: [validAddress],
+        tokens: ["XMR" as never],
+        sinceMs: 0
+      });
+      expect(fetchedHeights[0]).toBe(firstPassEnd + 1);
     } finally {
       await booted.close();
     }
   });
 
-  // Counter-regression: a small gap (e.g. one tick missed because of a
-  // transient RPC failure) MUST NOT trigger snap-forward. The scanner
-  // should resume strictly from lastScanned+1 so we don't lose blocks.
-  // STALE_GAP_BLOCKS is currently 60 (~2h); use a 30-block gap to stay
-  // safely under it.
-  it("scanIncoming resumes strictly from lastScanned+1 when the gap is small (no snap)", async () => {
+  // Small-gap resume (e.g. one tick missed because of a transient RPC
+  // failure): the scanner resumes strictly from lastScanned+1 so no block
+  // is ever skipped.
+  it("scanIncoming resumes strictly from lastScanned+1 when the gap is small", async () => {
     const w = makeWallet("small-gap");
     const booted = await bootTestApp({ merchants: [{ id: MERCHANT_ID }] });
     try {
@@ -961,11 +985,12 @@ describe("Monero detection — happy path", () => {
       );
       const daemonClient: MoneroDaemonRpcClient = {
         async getTipHeight() { return TIP; },
-        async getBlockTxHashesByHeight(h) {
+        async getBlockByHeight(h) {
           fetchedHeights.push(h);
-          return [];
+          return { txHashes: [], timestampSec: null };
         },
-        async getTransactions() { return []; }
+        async getTransactions() { return []; },
+        async getTxPoolHashes() { return []; }
       };
       const adapter = moneroChainAdapter({
         chain: MONERO_MAINNET_CONFIG,

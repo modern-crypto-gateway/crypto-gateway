@@ -9,8 +9,10 @@ import type { Logger } from "../../../core/ports/logger.port.js";
 
 import {
   decodeRctAmount,
-  deriveSharedSecret,
-  expectedOutputPubkey,
+  deriveKeyDerivation,
+  derivationToScalar,
+  deriveViewTag,
+  outputToSubaddressSpendPub,
   parseAddress,
   verifyRctCommitment,
   viewKeyMatchesAddress
@@ -18,6 +20,15 @@ import {
 import { MONERO_MAINNET_CONFIG, type MoneroChainConfig } from "./monero-config.js";
 import type { MoneroDaemonRpcClient, MoneroParsedTx } from "./monero-rpc.js";
 import type { MoneroNetwork } from "./monero-crypto.js";
+
+// Result of a checkpoint-free block-range scan. `scannedTo` is the highest
+// height whose block was FULLY processed (fetch + match) — the caller
+// persists it as its cursor only after the returned transfers were ingested.
+export interface MoneroBlockRangeScan {
+  readonly transfers: readonly DetectedTransfer[];
+  readonly scannedTo: number;
+  readonly tipHeight: number;
+}
 
 // ChainAdapter extension exposing the gateway's Monero key material so the
 // subaddress allocator (domain code, no chain-adapter DB dep) can call
@@ -33,10 +44,278 @@ export interface MoneroChainAdapter extends ChainAdapter {
   // through the same RPC stack the cron uses, without instantiating a
   // second client.
   readonly moneroDaemonClient: MoneroDaemonRpcClient;
+  // Configured backfill start (0 = unset). The txpool watcher uses it to
+  // seed a cold checkpoint the same way scanIncoming's cold-start does.
+  readonly moneroRestoreHeight: number;
+  // Checkpoint-free block walk: scan [fromHeight, fromHeight+maxBlocks) up
+  // to the live tip, matching outputs against `addresses`. Owns NO cursor
+  // state — callers (the txpool watcher's block pass, the poll strategy)
+  // persist `scannedTo` in their own storage AFTER ingesting the transfers,
+  // so a crash between scan and ingest re-scans instead of losing payments.
+  scanBlockRange(args: {
+    readonly addresses: readonly Address[];
+    readonly fromHeight: number;
+    readonly maxBlocks?: number;
+  }): Promise<MoneroBlockRangeScan>;
+  // scanIncoming minus the checkpoint write: same cold-start/cursor
+  // resolution against the shared cache, but the caller decides when the
+  // cursor advances (see commitScanCheckpoint). Used by the Monero block-
+  // scan detection strategy to commit only after pollPayments ingested.
+  scanIncomingDetailed(args: {
+    readonly chainId: ChainId;
+    readonly addresses: readonly Address[];
+    readonly tokens: readonly TokenSymbol[];
+  }): Promise<{ readonly transfers: readonly DetectedTransfer[]; readonly scannedTo: number | null }>;
+  // Persist the block cursor for this chain. No-op for null.
+  commitScanCheckpoint(scannedTo: number | null): Promise<void>;
 }
 
 export function isMoneroChainAdapter(a: ChainAdapter): a is MoneroChainAdapter {
   return a.family === "monero";
+}
+
+// ---- Shared view-key matcher ----
+//
+// One pure function decides "does this tx pay any of our watched
+// subaddresses" for EVERY detection surface: the block walk (here and in
+// the txpool watcher's block pass), the txpool instant-detection pass, and
+// the admin force-ingest endpoint. Keeping it pure (no RPC, no DB) means
+// the mempool and block paths cannot drift apart cryptographically.
+//
+// Scanning algorithm (wallet2-equivalent):
+//   per candidate tx pubkey R: derivation D = 8·a·R  (ONE point mult —
+//     hoisted per tx for the primary key, per output for additional keys,
+//     never recomputed per watched subaddress)
+//   per output i:
+//     view-tag prefilter — keccak("view_tag"||D||varint(i))[0] vs the
+//       output's tag byte; mismatch skips the EC work below. Sender derives
+//       the tag from the same D, so a real payment to us never mismatches
+//       (zero false negatives); ~1/256 foreign outputs slip through and are
+//       rejected by the full check. Bypassed when the output has no tag
+//       (pre-v15 txs).
+//     Hs = Hs(D||i); candidate spend pub D' = P − Hs·G; O(1) lookup in the
+//       watched map (vs the old O(N-subaddresses) forward loop).
+//     on hit: decode the RingCT amount and verify it against the output's
+//       consensus-validated Pedersen commitment (fake-deposit defense).
+
+export interface MoneroScanContext {
+  readonly chainId: ChainId;
+  readonly viewKey: Uint8Array;
+  // hex(subaddress public spend key) → the encoded subaddress string that
+  // appeared on the invoice.
+  readonly spendPubToAddress: ReadonlyMap<string, Address>;
+  readonly logger?: Logger;
+}
+
+export function buildMoneroScanContext(args: {
+  readonly chainId: ChainId;
+  readonly viewKey: Uint8Array;
+  readonly addresses: readonly Address[];
+  readonly logger?: Logger;
+}): MoneroScanContext {
+  const spendPubToAddress = new Map<string, Address>();
+  for (const a of args.addresses) {
+    try {
+      const p = parseAddress(a);
+      spendPubToAddress.set(bytesToHex(p.publicSpendKey), a);
+    } catch {
+      // Malformed address in the join — log and skip. Shouldn't happen with
+      // addresses we minted ourselves, but defense in depth.
+      args.logger?.warn("monero scan: skip malformed watched address", { address: a });
+    }
+  }
+  return {
+    chainId: args.chainId,
+    viewKey: args.viewKey,
+    spendPubToAddress,
+    ...(args.logger !== undefined ? { logger: args.logger } : {})
+  };
+}
+
+export function matchMoneroTxOutputs(
+  ctx: MoneroScanContext,
+  tx: MoneroParsedTx,
+  args: {
+    // Height to stamp on the transfer when the tx record itself carries
+    // none. Pool txs pass null → blockNumber null, confirmations 0.
+    readonly fallbackBlockHeight: number | null;
+    readonly tipHeight: number | null;
+    // Block-header time (unix seconds) for mined txs; null for pool txs.
+    readonly blockTimestampSec?: number | null;
+    readonly seenAt: Date;
+  }
+): DetectedTransfer[] {
+  if (ctx.spendPubToAddress.size === 0) return [];
+  if (tx.isCoinbase) return []; // miner txs never credit a view-key holder
+  // unlock_time policy: skip ANY tx with a non-zero unlock_time.
+  // unlock_time delays spendability of every output in the tx — crediting a
+  // locked output would let a "payer" show a confirmed deposit the merchant
+  // cannot actually spend for years. Legitimate payers never set it, and
+  // the FCMP++ fork consensus-bans it outright; fail closed.
+  if (tx.unlockTime !== 0) {
+    ctx.logger?.warn(
+      "monero scan: tx has non-zero unlock_time; skipping all outputs (time-locked funds are not creditable)",
+      { chainId: ctx.chainId, txHash: tx.txHash, unlockTime: tx.unlockTime }
+    );
+    return [];
+  }
+
+  // Primary tx pubkey derivation (tx_extra tag 0x01) — one point mult,
+  // shared by every output. Additional pubkeys (tag 0x04) are per-output;
+  // their derivation is computed inside the loop only when needed.
+  let primaryDerivation: Uint8Array | null = null;
+  if (tx.txPubkey.length === 64) {
+    try {
+      primaryDerivation = deriveKeyDerivation({
+        viewKeySecret: ctx.viewKey,
+        txPubkey: hexToBytes(tx.txPubkey)
+      });
+    } catch {
+      primaryDerivation = null; // not a valid point — legacy/garbage extra
+    }
+  }
+
+  const transfers: DetectedTransfer[] = [];
+  for (let i = 0; i < tx.outputs.length; i += 1) {
+    const output = tx.outputs[i]!;
+    if (output.publicKey.length !== 64) continue;
+    let outputPubBytes: Uint8Array;
+    try {
+      outputPubBytes = hexToBytes(output.publicKey);
+    } catch {
+      continue;
+    }
+
+    // Candidate derivations for THIS output. Primary first (already
+    // computed, cheap rejection via view tag), then this output's
+    // additional pubkey — the dominant path in practice, since modern
+    // wallets emit tag 0x04 for every tx that pays a subaddress and our
+    // gateway always pays subaddresses.
+    const candidates: Uint8Array[] = [];
+    if (primaryDerivation !== null) candidates.push(primaryDerivation);
+    const addtl = tx.additionalPubkeys[i];
+    if (addtl !== undefined && addtl.length === 64) {
+      try {
+        candidates.push(
+          deriveKeyDerivation({ viewKeySecret: ctx.viewKey, txPubkey: hexToBytes(addtl) })
+        );
+      } catch {
+        // ignore — primary candidate may still match
+      }
+    }
+    if (candidates.length === 0) continue;
+
+    let matched: Address | null = null;
+    let matchedSharedSecret: Uint8Array | null = null;
+    for (const derivation of candidates) {
+      // View-tag prefilter: one keccak instead of the scalar-mult +
+      // point-subtract below. Skip only on a definite mismatch — outputs
+      // without a tag (pre-v15) always take the full check.
+      if (output.viewTag !== null &&
+          deriveViewTag({ derivation, outputIndex: i }) !== output.viewTag) {
+        continue;
+      }
+      const hs = derivationToScalar({ derivation, outputIndex: i });
+      const candidateSpendPub = outputToSubaddressSpendPub({
+        hsScalar: hs,
+        outputPubkey: outputPubBytes
+      });
+      if (candidateSpendPub === null) continue;
+      const hit = ctx.spendPubToAddress.get(bytesToHex(candidateSpendPub));
+      if (hit !== undefined) {
+        matched = hit;
+        matchedSharedSecret = hs;
+        break;
+      }
+    }
+    if (matched === null || matchedSharedSecret === null) continue;
+
+    // Decode the encrypted amount. Coinbase already filtered out.
+    // RingCT v2 uses 8-byte encryptedAmount; if missing, skip.
+    if (!output.encryptedAmount) continue;
+    let encrypted: Uint8Array;
+    try {
+      encrypted = hexToBytes(output.encryptedAmount);
+    } catch {
+      continue;
+    }
+    if (encrypted.length !== 8) continue;
+    let amountRaw: bigint;
+    try {
+      amountRaw = decodeRctAmount({ sharedSecret: matchedSharedSecret, encryptedAmount: encrypted });
+    } catch {
+      continue;
+    }
+    if (amountRaw <= 0n) continue;
+    // SECURITY: verify the decoded amount against the output's Pedersen
+    // commitment (rct_signatures.outPk[i]). ecdhInfo is NOT consensus-
+    // validated — a malicious payer who knows the tx secret can commit
+    // ~0 XMR while encoding the full invoice amount in ecdhInfo (fake
+    // deposit). The commitment IS consensus-validated; recomputing
+    // C' = Hs("commitment_mask"||ss)·G + amount·H and comparing byte-equal
+    // proves the amount is real. On mismatch, wallet2 treats the output as
+    // amount 0 — we skip it. Fail closed when the commitment is missing.
+    if (!output.commitment) {
+      ctx.logger?.warn(
+        "monero scan: output has no Pedersen commitment from RPC; skipping (fail closed, cannot verify amount)",
+        { chainId: ctx.chainId, txHash: tx.txHash, outputIndex: i }
+      );
+      continue;
+    }
+    let commitmentBytes: Uint8Array;
+    try {
+      commitmentBytes = hexToBytes(output.commitment);
+    } catch {
+      ctx.logger?.warn(
+        "monero scan: output commitment is not valid hex; skipping (fail closed)",
+        { chainId: ctx.chainId, txHash: tx.txHash, outputIndex: i }
+      );
+      continue;
+    }
+    if (!verifyRctCommitment({
+      sharedSecret: matchedSharedSecret,
+      amount: amountRaw,
+      commitment: commitmentBytes
+    })) {
+      ctx.logger?.warn(
+        "monero scan: decoded ecdhInfo amount does NOT match the output's Pedersen commitment; skipping (possible fake-deposit attempt)",
+        { chainId: ctx.chainId, txHash: tx.txHash, outputIndex: i }
+      );
+      continue;
+    }
+
+    const blockHeight = tx.blockHeight ?? args.fallbackBlockHeight;
+    transfers.push({
+      chainId: ctx.chainId,
+      txHash: tx.txHash,
+      // Monero outputs aren't EVM-style "log indices" but we use the same
+      // column to disambiguate multiple outputs from one tx to the same
+      // subaddress (rare but possible).
+      logIndex: i,
+      // Monero outputs don't expose the sender to a view-key holder
+      // (privacy by design — the only thing we can prove is "this shared
+      // secret + our subaddress reproduces this output"). See the sentinel
+      // note on MONERO_UNKNOWN_SENDER.
+      fromAddress: MONERO_UNKNOWN_SENDER as Address,
+      toAddress: matched,
+      token: "XMR" as TokenSymbol,
+      amountRaw: amountRaw.toString() as AmountRaw,
+      blockNumber: blockHeight,
+      confirmations:
+        blockHeight === null || args.tipHeight === null
+          ? 0
+          : Math.max(0, args.tipHeight - blockHeight),
+      seenAt: args.seenAt,
+      // Block-header time for mined txs — enables time-correct re-ingest
+      // attribution (previously always null → re-ingests fail-closed to
+      // orphan). Pool txs stay null until the block pass re-observes them.
+      onchainTime:
+        typeof args.blockTimestampSec === "number" && args.blockTimestampSec > 0
+          ? new Date(args.blockTimestampSec * 1000)
+          : null
+    });
+  }
+  return transfers;
 }
 
 // Monero chain adapter. v1 inbound-only — see plan
@@ -146,6 +425,7 @@ export function moneroChainAdapter(config: MoneroChainAdapterConfig): MoneroChai
     moneroPrimarySpendPub: primarySpendPub,
     moneroViewKey: viewKey,
     moneroDaemonClient: daemonClient,
+    moneroRestoreHeight: restoreHeight,
 
     // ---- Addresses ----
 
@@ -201,75 +481,113 @@ export function moneroChainAdapter(config: MoneroChainAdapterConfig): MoneroChai
 
     // ---- Detection ----
 
-    async scanIncoming({ chainId, addresses, tokens }) {
-      if (chainId !== chain.chainId) return [];
-      if (addresses.length === 0) return [];
-      // We only credit XMR — there are no SPL/ERC-20 equivalents on Monero
-      // in v1. If the caller didn't ask for XMR, nothing to do.
-      const wantsXmr = tokens.includes("XMR" as TokenSymbol);
-      if (!wantsXmr) return [];
-
-      const tipHeight = await daemonClient.getTipHeight().catch((err) => {
-        logger?.warn("monero scanIncoming: tip fetch failed", {
-          chainId, error: err instanceof Error ? err.message : String(err)
-        });
-        return null;
+    async scanBlockRange({ addresses, fromHeight, maxBlocks }) {
+      const cap = maxBlocks ?? maxBlocksPerTick;
+      const tipHeight = await daemonClient.getTipHeight();
+      const ctx = buildMoneroScanContext({
+        chainId: chain.chainId,
+        viewKey,
+        addresses,
+        ...(logger !== undefined ? { logger } : {})
       });
-      if (tipHeight === null) return [];
+      const transfers: DetectedTransfer[] = [];
+      let scannedTo = fromHeight - 1;
+      if (fromHeight > tipHeight) {
+        return { transfers, scannedTo, tipHeight };
+      }
+      const toHeight = Math.min(tipHeight, fromHeight + cap - 1);
+      for (let height = fromHeight; height <= toHeight; height += 1) {
+        let block;
+        try {
+          block = await daemonClient.getBlockByHeight(height);
+        } catch (err) {
+          // Don't advance past the failed block — the caller's cursor stops
+          // here and the next pass retries. Never skip a height.
+          logger?.warn("monero scanBlockRange: block fetch failed; halting walk", {
+            chainId: chain.chainId,
+            height,
+            error: err instanceof Error ? err.message : String(err)
+          });
+          break;
+        }
+        if (block.txHashes.length > 0) {
+          let txs: readonly MoneroParsedTx[];
+          try {
+            txs = await daemonClient.getTransactions(block.txHashes);
+          } catch (err) {
+            logger?.warn("monero scanBlockRange: tx batch fetch failed; halting walk", {
+              chainId: chain.chainId,
+              height,
+              error: err instanceof Error ? err.message : String(err)
+            });
+            break;
+          }
+          const seenAt = new Date();
+          for (const tx of txs) {
+            transfers.push(
+              ...matchMoneroTxOutputs(ctx, tx, {
+                fallbackBlockHeight: height,
+                tipHeight,
+                blockTimestampSec: block.timestampSec,
+                seenAt
+              })
+            );
+          }
+        }
+        scannedTo = height;
+      }
+      return { transfers, scannedTo, tipHeight };
+    },
 
-      // Resolve the from-height checkpoint. Cold cache (or fresh boot)
-      // starts from `restoreHeight`; otherwise resume from the persisted
-      // height + 1.
+    async scanIncomingDetailed({ chainId, addresses, tokens }) {
+      if (chainId !== chain.chainId) return { transfers: [], scannedTo: null };
+      if (addresses.length === 0) return { transfers: [], scannedTo: null };
+      // We only credit XMR — there are no SPL/ERC-20 equivalents on Monero.
+      // pollPayments force-includes XMR for monero-family addresses, so this
+      // gate only trips for callers that explicitly asked for other tokens.
+      if (!tokens.includes("XMR" as TokenSymbol)) return { transfers: [], scannedTo: null };
+
+      let tipHeight: number;
+      try {
+        tipHeight = await daemonClient.getTipHeight();
+      } catch (err) {
+        logger?.warn("monero scanIncoming: tip fetch failed", {
+          chainId,
+          error: err instanceof Error ? err.message : String(err)
+        });
+        return { transfers: [], scannedTo: null };
+      }
+
+      // Resolve the from-height cursor. Cold cache (or fresh boot) starts
+      // from `restoreHeight`; otherwise resume from the persisted height + 1.
       //
       // Default-zero footgun guard: if the operator left
       // MONERO_RESTORE_HEIGHT unset (default 0) AND we have no cached
-      // checkpoint, snap to `tipHeight - 100` (a few hours of grace).
-      // Otherwise the first detection tick attempts to scan from genesis
-      // and burns ~11 days of public-node budget catching up at
-      // maxBlocksPerTick=200 / minute. Operators who genuinely need to
-      // backfill from an older height set MONERO_RESTORE_HEIGHT
-      // explicitly to the wallet's birthday block.
+      // checkpoint, snap to `tipHeight - 100` (a few hours of grace) so the
+      // first detection tick doesn't attempt to scan from genesis.
       const lastScanned = (await cache.getJSON<{ h: number }>(heightCacheKey))?.h;
       let fromHeight: number;
-      // Stale-checkpoint guard. If the gateway had no live Monero invoices
-      // for a while (a quiet period), pollPayments skips the Monero chain
-      // entirely in its for loop — scanIncoming is never called and the
-      // cache `lastScanned` value freezes. When a fresh invoice is created
-      // later, naive resume-from-(lastScanned+1) means the scanner has to
-      // walk through the entire idle gap (potentially hundreds of blocks
-      // at 40 blocks/min) before reaching the customer's actual payment
-      // block. A 10h quiet gap = ~300 blocks = ~8 min of customer-facing
-      // detection lag. Bad UX.
-      //
-      // Fix: if the gap exceeds ~2h of Monero blocks (60 blocks at 2 min
-      // each), assume the gap is "no live invoices" and snap forward to
-      // within the recent window. Anything in the gap that we'd skip is
-      // safely either:
-      //   (a) a payment to an expired invoice's subaddress — already
-      //       excluded by the cron's live-invoice filter, so skipping
-      //       it changes nothing; or
-      //   (b) a payment to a never-issued address — cryptographically
-      //       impossible to land on one of our subaddresses by accident.
-      //
-      // The one risk this trades against: a multi-hour RPC outage where
-      // a live invoice WAS being paid during the gap, in which case the
-      // snap would skip those real payments. Operators who hit this can
-      // recover via POST /admin/debug/monero/force-ingest-tx with the
-      // missed txHash — every "block fetch failed" log line during the
-      // outage points to a window worth force-ingesting from the wallet
-      // history. That's a much better default than imposing 8+ minutes
-      // of detection lag on every merchant after every idle period.
-      const STALE_GAP_BLOCKS = 60;
-      const SNAP_WINDOW = 100;
-      if (lastScanned !== undefined && tipHeight - lastScanned > STALE_GAP_BLOCKS) {
-        const snappedFrom = Math.max(lastScanned + 1, tipHeight - SNAP_WINDOW);
-        logger?.warn(
-          "monero scanIncoming: stale checkpoint detected; snapping forward to recent window",
-          { chainId, lastScanned, tipHeight, gapBlocks: tipHeight - lastScanned, snappedFromHeight: snappedFrom }
-        );
-        fromHeight = snappedFrom;
-      } else if (lastScanned !== undefined) {
+      if (lastScanned !== undefined) {
         fromHeight = lastScanned + 1;
+        // NO stale-gap snap-forward (the old gap>60 → tip-100 jump). That
+        // snap silently skipped every block in the gap — a payment mined
+        // there was permanently missed (the #1 correctness bug of the old
+        // scanner). Catch-up now walks every block, maxBlocksPerTick per
+        // tick (~40x chain production rate), trading bounded extra latency
+        // for zero misses.
+        const gapBlocks = tipHeight - lastScanned;
+        if (gapBlocks > 200) {
+          logger?.warn(
+            "monero scanIncoming: checkpoint lagging tip; catching up WITHOUT skipping blocks",
+            {
+              chainId,
+              lastScanned,
+              tipHeight,
+              gapBlocks,
+              estCatchupTicks: Math.ceil(gapBlocks / maxBlocksPerTick)
+            }
+          );
+        }
       } else if (restoreHeight === 0) {
         fromHeight = Math.max(0, tipHeight - 100);
         logger?.warn(
@@ -279,289 +597,62 @@ export function moneroChainAdapter(config: MoneroChainAdapterConfig): MoneroChai
       } else {
         fromHeight = restoreHeight;
       }
-      if (fromHeight > tipHeight) return []; // already up to date
+      if (fromHeight > tipHeight) return { transfers: [], scannedTo: null }; // up to date
 
-      const toHeight = Math.min(tipHeight, fromHeight + maxBlocksPerTick - 1);
-
-      // Visibility for operators who can't easily grep logs: emit one
-      // info-level line per tick whenever there are Monero addresses to scan.
-      // Captures tip, scan window, and address count so a "nothing detected
-      // for 10 min" report can be diagnosed by tailing the gateway log.
+      // Visibility for operators who can't easily grep logs: one info line
+      // per tick whenever there are Monero addresses to scan.
       logger?.info("monero scanIncoming tick", {
         chainId,
         addressCount: addresses.length,
         tipHeight,
-        fromHeight,
-        toHeight
+        fromHeight
       });
 
-      // Build a map (subaddressBytes → subaddressString) so we can match
-      // incoming output pubkeys back to the receive address that originally
-      // appeared on the invoice. The `addresses` list comes from
-      // invoice_receive_addresses where family='monero' — the strings are
-      // the encoded subaddresses we minted at invoice-create time.
-      type AddressInfo = {
-        readonly addressStr: Address;
-        readonly spendPub: Uint8Array;
-      };
-      const subaddrInfos: AddressInfo[] = [];
-      for (const a of addresses) {
-        try {
-          const p = parseAddress(a);
-          subaddrInfos.push({ addressStr: a, spendPub: p.publicSpendKey });
-        } catch {
-          // Malformed address in the join — log and skip. Shouldn't happen
-          // with addresses we minted ourselves, but defense in depth.
-          logger?.warn("monero scanIncoming: skip malformed address", { address: a });
-        }
-      }
-      if (subaddrInfos.length === 0) return [];
+      const range = await this.scanBlockRange({ addresses, fromHeight });
+      const scannedTo = range.scannedTo >= fromHeight ? range.scannedTo : null;
 
-      const transfers: DetectedTransfer[] = [];
-
-      // Progressive checkpoint: walk one block at a time, persist height after
-      // each block so a CPU-limit kill mid-walk doesn't lose all progress.
-      // This matters on Workers where the scheduled handler has a hard
-      // ceiling — without per-block checkpointing, a long catch-up could
-      // re-do the same blocks forever (each tick walks 40 blocks, gets
-      // killed at block 25, never persists, next tick starts over from 0).
-      let lastSuccessfullyScanned = fromHeight - 1;
-      for (let height = fromHeight; height <= toHeight; height += 1) {
-        let txHashes: readonly string[];
-        try {
-          txHashes = await daemonClient.getBlockTxHashesByHeight(height);
-        } catch (err) {
-          logger?.warn("monero scanIncoming: block fetch failed; halting tick", {
-            chainId, height, error: err instanceof Error ? err.message : String(err)
-          });
-          // Don't advance the checkpoint past the failed block — next tick retries.
-          break;
-        }
-        if (txHashes.length === 0) {
-          // Empty block — still counts as fully scanned. Advance the
-          // checkpoint so the next tick doesn't re-fetch this block.
-          lastSuccessfullyScanned = height;
-          await cache.putJSON(heightCacheKey, { h: height }, { ttlSeconds: 60 * 60 * 24 * 30 });
-          continue;
-        }
-        let txs: readonly MoneroParsedTx[];
-        try {
-          txs = await daemonClient.getTransactions(txHashes);
-        } catch (err) {
-          logger?.warn("monero scanIncoming: tx batch fetch failed; halting tick", {
-            chainId, height, error: err instanceof Error ? err.message : String(err)
-          });
-          break;
-        }
-        for (const tx of txs) {
-          if (tx.isCoinbase) continue; // miner txs never credit a view-key holder
-          // unlock_time policy: skip ANY tx with a non-zero unlock_time.
-          // unlock_time delays spendability of every output in the tx —
-          // values below 500_000_000 are block heights, anything above is
-          // a unix timestamp. Legitimate payers never set it; crediting a
-          // locked output would let a "payer" show a confirmed deposit the
-          // merchant cannot actually spend for years. Distinguishing
-          // already-satisfied locks from future ones adds clock/height
-          // parsing risk for zero real-world benefit, so the gateway
-          // treats any non-zero value as suspicious and fails closed.
-          if (tx.unlockTime !== 0) {
-            logger?.warn(
-              "monero scanIncoming: tx has non-zero unlock_time; skipping all outputs (time-locked funds are not creditable)",
-              { chainId, txHash: tx.txHash, unlockTime: tx.unlockTime }
-            );
-            continue;
-          }
-          // Each output has up to TWO candidate tx pubkeys to try:
-          //   1. The primary R (tx_extra tag 0x01) — used when the sender
-          //      treats the recipient as a primary address.
-          //   2. additional_pubkeys[i] (tx_extra tag 0x04) — used when the
-          //      sender treats output i's recipient as a subaddress.
-          // Modern wallets emit (2) for every output that pays a subaddress,
-          // and our gateway always pays subaddresses, so the additional
-          // pubkey path is the dominant one in practice. We still try the
-          // primary first because some legacy senders skip 0x04 entirely.
-          let primaryTxPub: Uint8Array | null = null;
-          if (tx.txPubkey.length > 0) {
-            try {
-              primaryTxPub = hexToBytes(tx.txPubkey);
-            } catch {
-              primaryTxPub = null;
-            }
-          }
-          for (let i = 0; i < tx.outputs.length; i += 1) {
-            const output = tx.outputs[i]!;
-            let outputPubBytes: Uint8Array;
-            try {
-              outputPubBytes = hexToBytes(output.publicKey);
-            } catch {
-              continue;
-            }
-            // Build the candidate tx pubkey list for THIS output. Order:
-            // primary first (cheap rejection for legacy txs), then this
-            // output's additional pubkey if available.
-            const candidates: Uint8Array[] = [];
-            if (primaryTxPub !== null) candidates.push(primaryTxPub);
-            const addtl = tx.additionalPubkeys[i];
-            if (addtl !== undefined && addtl.length > 0) {
-              try {
-                candidates.push(hexToBytes(addtl));
-              } catch {
-                // ignore — primary candidate may still match
-              }
-            }
-            if (candidates.length === 0) continue;
-
-            let matched: AddressInfo | null = null;
-            let matchedSharedSecret: Uint8Array | null = null;
-            outer: for (const txPubBytes of candidates) {
-              let sharedSecret: Uint8Array;
-              try {
-                sharedSecret = deriveSharedSecret({
-                  viewKeySecret: viewKey,
-                  txPubkey: txPubBytes,
-                  outputIndex: i
-                });
-              } catch {
-                continue;
-              }
-              for (const info of subaddrInfos) {
-                const expected = expectedOutputPubkey({
-                  sharedSecret,
-                  subaddressSpendPub: info.spendPub
-                });
-                if (bytesEqual(expected, outputPubBytes)) {
-                  matched = info;
-                  matchedSharedSecret = sharedSecret;
-                  break outer;
-                }
-              }
-            }
-            if (!matched || !matchedSharedSecret) continue;
-            const sharedSecret = matchedSharedSecret;
-            // Decode the encrypted amount. Coinbase already filtered out.
-            // RingCT v2 uses 8-byte encryptedAmount; if missing, skip.
-            if (!output.encryptedAmount) continue;
-            let encrypted: Uint8Array;
-            try {
-              encrypted = hexToBytes(output.encryptedAmount);
-            } catch {
-              continue;
-            }
-            if (encrypted.length !== 8) continue;
-            let amountRaw: bigint;
-            try {
-              amountRaw = decodeRctAmount({ sharedSecret, encryptedAmount: encrypted });
-            } catch {
-              continue;
-            }
-            if (amountRaw <= 0n) continue;
-            // SECURITY: verify the decoded amount against the output's
-            // Pedersen commitment (rct_signatures.outPk[i]). The ecdhInfo
-            // field we just decoded is NOT consensus-validated — a
-            // malicious payer who knows the tx secret can commit ~0 XMR
-            // while encoding the full invoice amount in ecdhInfo (fake
-            // deposit). The commitment IS consensus-validated, so
-            // recomputing C' = Hs("commitment_mask"||ss)·G + amount·H and
-            // comparing byte-equal proves the amount is real. On mismatch,
-            // wallet2 treats the output as amount 0 — we skip it. This
-            // check only applies to RingCT outputs decoded via
-            // decodeRctAmount; coinbase/plaintext-amount txs never reach
-            // this branch (coinbase is filtered above, and pre-RingCT
-            // outputs carry no encryptedAmount so they're skipped earlier).
-            if (!output.commitment) {
-              // Fail closed: every RingCT output carries outPk. Missing
-              // here means the RPC layer couldn't surface it — never
-              // credit an amount we cannot verify.
-              logger?.warn(
-                "monero scanIncoming: output has no Pedersen commitment from RPC; skipping (fail closed, cannot verify amount)",
-                { chainId, txHash: tx.txHash, outputIndex: i }
-              );
-              continue;
-            }
-            let commitmentBytes: Uint8Array;
-            try {
-              commitmentBytes = hexToBytes(output.commitment);
-            } catch {
-              logger?.warn(
-                "monero scanIncoming: output commitment is not valid hex; skipping (fail closed)",
-                { chainId, txHash: tx.txHash, outputIndex: i }
-              );
-              continue;
-            }
-            if (!verifyRctCommitment({ sharedSecret, amount: amountRaw, commitment: commitmentBytes })) {
-              logger?.warn(
-                "monero scanIncoming: decoded ecdhInfo amount does NOT match the output's Pedersen commitment; skipping (possible fake-deposit attempt)",
-                { chainId, txHash: tx.txHash, outputIndex: i }
-              );
-              continue;
-            }
-            const blockHeight = tx.blockHeight ?? height;
-            transfers.push({
-              chainId: chain.chainId,
-              txHash: tx.txHash,
-              // Monero outputs aren't EVM-style "log indices" but we use
-              // the same column to disambiguate multiple outputs from one
-              // tx to the same subaddress (rare but possible).
-              logIndex: i,
-              // Monero outputs don't expose the sender to a view-key holder
-              // (privacy by design — the only thing we can prove is "this
-              // shared secret + our subaddress reproduces this output").
-              // Use the MONERO_UNKNOWN_SENDER sentinel rather than empty
-              // string because DetectedTransferSchema enforces min(1) on
-              // every address field. canonicalizeAddress short-circuits on
-              // this exact value so it round-trips through ingest unchanged.
-              fromAddress: MONERO_UNKNOWN_SENDER as Address,
-              toAddress: matched.addressStr,
-              token: "XMR" as TokenSymbol,
-              amountRaw: amountRaw.toString() as AmountRaw,
-              blockNumber: blockHeight,
-              confirmations: Math.max(0, tipHeight - blockHeight),
-              seenAt: new Date(),
-              // FOLLOW-UP: the scan fetches tx hashes by height but not the
-              // block header timestamp, so a true on-chain time would cost an
-              // extra get_block per height. Left null for now → Monero
-              // re-ingests fail-closed to orphan (admin attributes). The live
-              // path is unchanged (active-owner + cooldown + overshoot net),
-              // and the ownership-window history IS maintained, so threading
-              // block_header.timestamp here later turns reingest on with no
-              // other change.
-              onchainTime: null
-            });
-          }
-        }
-        // Block fully processed — persist progress before advancing.
-        // Crash/kill after this point loses at most the next block's work.
-        lastSuccessfullyScanned = height;
-        await cache.putJSON(heightCacheKey, { h: height }, { ttlSeconds: 60 * 60 * 24 * 30 });
-      }
-
-      // Final checkpoint write is technically redundant (the per-block
-      // write above already covers `toHeight` after a clean walk) but kept
-      // for clarity about the exit invariant: after scanIncoming returns,
-      // `lastSuccessfullyScanned` reflects the highest block we know is
-      // fully processed.
-      void lastSuccessfullyScanned;
-
-      // Tick-summary log — pairs with the `monero scanIncoming tick` line
-      // emitted at the start of the scan. Together they let an operator
-      // tail and answer: "did the cron walk the block I expected? did
-      // anything match? how many credits did it find?" without having to
-      // build a separate per-output debug stream. transfersFound stays at
-      // INFO when > 0 (rare event, worth surfacing); idle ticks log at
-      // DEBUG so they don't drown out the production log stream.
+      // Tick-summary log — pairs with the tick line above so an operator can
+      // answer "did the walk reach the block I expected? did anything match?"
       const summaryFields = {
         chainId,
         fromHeight,
-        toHeight,
+        scannedTo,
+        tipHeight: range.tipHeight,
         addressCount: addresses.length,
-        transfersFound: transfers.length
+        transfersFound: range.transfers.length
       };
-      if (transfers.length > 0) {
+      if (range.transfers.length > 0) {
         logger?.info("monero scanIncoming summary (matches found)", summaryFields);
       } else {
         logger?.debug("monero scanIncoming summary (no matches)", summaryFields);
       }
+      return { transfers: range.transfers, scannedTo };
+    },
 
+    async commitScanCheckpoint(scannedTo) {
+      if (scannedTo === null) return;
+      // ONE cache write per committed walk. The old scanner wrote KV once
+      // PER BLOCK mid-walk (up to 40 writes/tick against KV's 1 write/sec/
+      // key limit) and committed BEFORE the transfers were ingested — a
+      // crash between checkpoint and ingest lost the payment permanently.
+      // Callers now commit only after handing the walk's transfers to
+      // ingest. TTL is a year (was 30 days — long-idle deployments lost
+      // their cursor and cold-started at tip-100).
+      await cache.putJSON(heightCacheKey, { h: scannedTo }, { ttlSeconds: 60 * 60 * 24 * 365 });
+    },
+
+    async scanIncoming({ chainId, addresses, tokens }) {
+      // Legacy self-committing wrapper (generic DetectionStrategy shape).
+      // Production paths use scanIncomingDetailed + commitScanCheckpoint via
+      // the Monero block-scan strategy so the cursor advances only AFTER
+      // ingest; this wrapper keeps the generic port contract working for
+      // tests and ad-hoc callers.
+      const { transfers, scannedTo } = await this.scanIncomingDetailed({
+        chainId,
+        addresses,
+        tokens
+      });
+      await this.commitScanCheckpoint(scannedTo);
       return transfers;
     },
 
@@ -569,16 +660,23 @@ export function moneroChainAdapter(config: MoneroChainAdapterConfig): MoneroChai
       if (chainId !== chain.chainId) {
         return { blockNumber: null, confirmations: 0, reverted: false };
       }
+      // RPC failures THROW here — no .catch swallowing. The old code mapped
+      // ANY error to the "absent" shape ({blockNumber:null, confirmations:0}),
+      // which the reorg recheck reads as "tx vanished from the chain": a
+      // transient public-node outage could demote/orphan a CONFIRMED
+      // payment, and the detected→confirmed promotion sweep stalled on the
+      // same false zeros. Callers catch per-row and skip on error; genuine
+      // absence is only reported after a SUCCESSFUL lookup finds nothing.
       const [tipHeight, txs] = await Promise.all([
-        daemonClient.getTipHeight().catch(() => null),
-        daemonClient.getTransactions([String(txHash)]).catch(() => [])
+        daemonClient.getTipHeight(),
+        daemonClient.getTransactions([String(txHash)])
       ]);
       const tx = txs[0];
       if (!tx || tx.blockHeight === null) {
-        // Mempool only or unknown — caller treats as "still pending".
+        // Mempool only or genuinely unknown — caller treats as "still pending".
         return { blockNumber: null, confirmations: 0, reverted: false };
       }
-      const tip = tipHeight ?? tx.blockHeight;
+      const tip = tipHeight;
       return {
         blockNumber: tx.blockHeight,
         confirmations: Math.max(0, tip - tx.blockHeight),
@@ -675,10 +773,10 @@ function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i += 1) {
-    if (a[i] !== b[i]) return false;
+function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    out += bytes[i]!.toString(16).padStart(2, "0");
   }
-  return true;
+  return out;
 }

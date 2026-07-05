@@ -95,6 +95,11 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
       tokensByFamily.set(family, tokSet);
     }
     tokSet.add(row.token as TokenSymbol);
+    // Monero has exactly one creditable token. Force it into the set so an
+    // invoice whose `token`/`ratesJson` lost the XMR entry (oracle gap at
+    // create time) can't silently disable the entire Monero scan — the
+    // adapter early-returns [] when XMR isn't in the requested tokens.
+    if (family === "monero") tokSet.add("XMR" as TokenSymbol);
     if (row.ratesJson !== null) {
       try {
         const parsed = JSON.parse(row.ratesJson) as Record<string, string>;
@@ -163,6 +168,9 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
     }
     transfersFound += transfers.length;
 
+    // Transfers whose ingest THREW (caught below). A self-checkpointing
+    // strategy must not advance its cursor past these blocks — see commit().
+    const failedTransfers: DetectedTransfer[] = [];
     for (const transfer of transfers) {
       try {
         const result = await ingestDetectedTransfer(deps, transfer);
@@ -172,10 +180,28 @@ export async function pollPayments(deps: AppDeps): Promise<PollPaymentsResult> {
           duplicates += 1;
         }
       } catch (err) {
+        failedTransfers.push(transfer);
         deps.logger.warn("pollPayments: ingestDetectedTransfer failed; continuing with next transfer", {
           chainId: chainIdNumber,
           txHash: transfer.txHash,
           logIndex: transfer.logIndex,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+    }
+
+    // The ingest loop for this chain finished (per-transfer failures were
+    // logged above, not thrown) — let self-checkpointing strategies persist
+    // their cursor. Committing here rather than inside poll() is what makes
+    // a crash between poll and ingest re-scan instead of skip; passing the
+    // failed transfers lets the strategy clamp its cursor BELOW the lowest
+    // failed block so a caught ingest error re-scans instead of skipping.
+    if (strategy.commit) {
+      try {
+        await strategy.commit(deps, chainIdNumber as ChainId, failedTransfers);
+      } catch (err) {
+        deps.logger.warn("pollPayments: strategy commit failed; next tick re-scans", {
+          chainId: chainIdNumber,
           error: err instanceof Error ? err.message : String(err)
         });
       }

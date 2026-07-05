@@ -37,4 +37,23 @@ export interface DetectionStrategy {
   // Optional: push path. The HTTP webhook-ingest route calls this to translate
   // a raw provider payload into DetectedTransfers the domain can persist.
   handlePush?(deps: AppDeps, rawPayload: unknown): Promise<readonly DetectedTransfer[]>;
+
+  // Optional: called by pollPayments AFTER every transfer returned by
+  // poll() was handed to ingest. Strategies that maintain their own scan
+  // cursor persist it here instead of inside poll() — committing inside
+  // poll() means a crash between poll and ingest silently skips the polled
+  // range forever, losing any payment inside it.
+  //
+  // `failedTransfers` carries the transfers whose ingest THREW (a caught,
+  // logged per-transfer error — not a crash, so commit still runs). A
+  // self-checkpointing strategy MUST NOT advance its cursor past the block
+  // of any failed transfer, or that payment is skipped forever on the next
+  // resume. The block-walk detection surfaces (txpool watcher + cron
+  // fallback) both clamp the cursor below the lowest failed block so the
+  // next pass re-scans it; ingest dedup absorbs the successful siblings.
+  commit?(
+    deps: AppDeps,
+    chainId: ChainId,
+    failedTransfers?: readonly DetectedTransfer[]
+  ): Promise<void>;
 }

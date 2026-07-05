@@ -29,7 +29,7 @@ import {
   BITCOIN_CONFIG,
   LITECOIN_CONFIG
 } from "../adapters/chains/utxo/utxo-config.js";
-import { moneroChainAdapter } from "../adapters/chains/monero/monero-chain.adapter.js";
+import { isMoneroChainAdapter, moneroChainAdapter } from "../adapters/chains/monero/monero-chain.adapter.js";
 import {
   MONERO_MAINNET_CONFIG,
   MONERO_STAGENET_CONFIG,
@@ -53,6 +53,11 @@ import { readAlchemyNotifyToken } from "../adapters/detection/alchemy-token.js";
 import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { utxoMempoolWsWatcher } from "../adapters/detection/utxo-mempool-ws.js";
+import { moneroBlockScanDetection } from "../adapters/detection/monero-block-scan.adapter.js";
+import {
+  memoryCacheWatcherStorage,
+  moneroTxpoolWatcher
+} from "../adapters/detection/monero-txpool.js";
 import { merchants } from "../db/schema.js";
 import { loadConfig, ConfigValidationError } from "../config/config.schema.js";
 import type { ChainAdapter } from "../core/ports/chain.port.js";
@@ -60,6 +65,14 @@ import type { DetectionStrategy } from "../core/ports/detection.port.js";
 import type { AppDeps } from "../core/app-deps.js";
 import { createInMemoryEventBus } from "../core/events/in-memory-bus.js";
 import { parseFinalityOverridesEnv } from "../core/domain/payment-config.js";
+
+// off/0/false disable the in-process Monero txpool watcher (same spellings
+// as UTXO_WS / INTERNAL_CRON). Detection then falls back to the cron-driven
+// block-scan strategy.
+function moneroTxpoolKnobEnabled(): boolean {
+  const knob = (process.env["MONERO_TXPOOL"] ?? "").toLowerCase();
+  return knob !== "off" && knob !== "0" && knob !== "false";
+}
 
 async function main(): Promise<void> {
   // Boot-time config validation. loadConfig throws a ConfigValidationError
@@ -262,6 +275,7 @@ async function main(): Promise<void> {
           : MONERO_MAINNET_CONFIG;
     const rpcUrls = parseMoneroRpcUrlsEnv(config.moneroRpcUrls) ?? moneroChain.defaultRpcUrls;
     const rpcHeaders = parseMoneroRpcHeadersEnv(config.moneroRpcHeadersJson);
+    const fallbackHeaders = parseMoneroRpcHeadersEnv(config.moneroRpcFallbackHeadersJson);
     const viewKeyBytes = hexToBytes32(config.moneroViewKey, "MONERO_VIEW_KEY");
     chains.push(
       moneroChainAdapter({
@@ -271,18 +285,34 @@ async function main(): Promise<void> {
         restoreHeight: config.moneroRestoreHeight,
         daemonClient: moneroDaemonRpcClient({
           backends: rpcUrls.map((u) => rpcHeaders ? { baseUrl: u, headers: rpcHeaders } : { baseUrl: u }),
+          ...(config.moneroRpcFallbackUrl !== undefined && config.moneroRpcFallbackUrl.length > 0
+            ? {
+                fallbackBackend: fallbackHeaders
+                  ? { baseUrl: config.moneroRpcFallbackUrl, headers: fallbackHeaders }
+                  : { baseUrl: config.moneroRpcFallbackUrl }
+              }
+            : {}),
           logger
         }),
         cache,
         logger
       })
     );
-    detectionStrategies[moneroChain.chainId] = rpcPollDetection();
+    // Detection ownership mirrors the Workers deployment: when the
+    // in-process txpool watcher runs (default), it owns both the pool pass
+    // and the block walk — registering the cron strategy too would
+    // double-scan the same heights. MONERO_TXPOOL=off falls back to the
+    // cron-driven block scan (commit-after-ingest via pollPayments).
+    if (!moneroTxpoolKnobEnabled()) {
+      detectionStrategies[moneroChain.chainId] = moneroBlockScanDetection();
+    }
     logger.info("Monero adapter wired", {
       chainId: moneroChain.chainId,
       network: config.moneroNetwork,
       restoreHeight: config.moneroRestoreHeight,
       backendCount: rpcUrls.length,
+      fallbackBackend: config.moneroRpcFallbackUrl !== undefined && config.moneroRpcFallbackUrl.length > 0,
+      detectionMode: moneroTxpoolKnobEnabled() ? "txpool-watcher" : "cron-block-scan",
       // Header NAMES only — never log values; they're auth secrets.
       authHeaderNames: rpcHeaders ? Object.keys(rpcHeaders) : []
     });
@@ -495,9 +525,69 @@ async function main(): Promise<void> {
     logger.info("UTXO WebSocket watcher disabled (UTXO_WS=off) — poll-only detection");
   }
 
+  // Instant Monero detection: in-process txpool watcher (there is no push
+  // API anywhere for XMR — stealth addresses mean only the view-key holder
+  // can recognize an output, so the fastest primitive is polling the pool
+  // hash list and scanning NEW txs). Owns both the ~10s pool pass and the
+  // block-walk settlement pass; when disabled (MONERO_TXPOOL=off) the
+  // cron-driven block-scan strategy registered above covers detection at
+  // minutes of latency instead of seconds.
+  let moneroWatcherTimer: ReturnType<typeof setInterval> | undefined;
+  const moneroAdapterForWatcher = chains.find(isMoneroChainAdapter);
+  if (moneroAdapterForWatcher !== undefined && moneroTxpoolKnobEnabled()) {
+    const moneroChainId = moneroAdapterForWatcher.supportedChainIds[0]!;
+    const pollMsRaw = Number(process.env["MONERO_TXPOOL_POLL_MS"] ?? "");
+    // Floor 5s: public-node etiquette — pool relay itself takes seconds.
+    const pollMs = Number.isFinite(pollMsRaw) && pollMsRaw >= 5_000 ? pollMsRaw : 10_000;
+    const blockMsRaw = Number(process.env["MONERO_BLOCK_SCAN_MS"] ?? "");
+    const watcher = moneroTxpoolWatcher({
+      deps,
+      adapter: moneroAdapterForWatcher,
+      chainId: moneroChainId,
+      storage: memoryCacheWatcherStorage(cache, moneroChainId),
+      ...(Number.isFinite(blockMsRaw) && blockMsRaw >= 15_000
+        ? { blockPassIntervalMs: blockMsRaw }
+        : {})
+    });
+    // Refresh the watched set the instant an invoice is created — same
+    // in-process event the UTXO watcher uses on Node.
+    deps.events.subscribe("invoice.created", async (event) => {
+      if (!event.invoice.receiveAddresses.some((a) => a.family === "monero")) return;
+      try {
+        await watcher.refreshWatchedSet();
+        await watcher.tick();
+      } catch (err) {
+        logger.warn("monero txpool watcher: invoice-created tick failed", {
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+    });
+    let watcherTickRunning = false;
+    const watcherTick = async (): Promise<void> => {
+      // Overlap guard — a slow tick (RPC timeouts) must not stack.
+      if (watcherTickRunning) return;
+      watcherTickRunning = true;
+      try {
+        await watcher.tick();
+      } catch (err) {
+        logger.warn("monero txpool watcher: tick failed", {
+          error: err instanceof Error ? err.message : String(err)
+        });
+      } finally {
+        watcherTickRunning = false;
+      }
+    };
+    moneroWatcherTimer = setInterval(() => void watcherTick(), pollMs);
+    void watcherTick();
+    logger.info("Monero txpool watcher started", { chainId: moneroChainId, pollMs });
+  } else if (moneroAdapterForWatcher !== undefined) {
+    logger.info("Monero txpool watcher disabled (MONERO_TXPOOL=off) — cron block-scan detection only");
+  }
+
   process.on("SIGTERM", async () => {
     logger.info("SIGTERM received; draining jobs");
     if (cronTimer !== undefined) clearInterval(cronTimer);
+    if (moneroWatcherTimer !== undefined) clearInterval(moneroWatcherTimer);
     utxoWs?.stop();
     await deps.jobs.drain(10_000);
     server.close();
