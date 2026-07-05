@@ -54,9 +54,11 @@ describe("PaymentService.ingestDetectedTransfer", () => {
     // extra_status=null since the amount is fine, just awaiting confirmations).
     expect(result.invoiceStatusAfter).toBe("processing");
     expect(events).toContain("tx.detected");
-    // No invoice-lifecycle event for pending→processing — per-tx
-    // invoice.payment_detected carries the visibility instead.
+    // pending→processing publishes both the per-tx invoice.payment_detected
+    // and the whole-invoice invoice.processing lifecycle event (merchant-
+    // facing as invoice:processing, deduped per (status, extraStatus)).
     expect(events).toContain("invoice.payment_detected");
+    expect(events).toContain("invoice.processing");
 
     // Verify persisted row
     const [row] = await booted.deps.db

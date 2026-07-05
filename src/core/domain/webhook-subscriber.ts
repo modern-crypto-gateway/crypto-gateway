@@ -32,6 +32,7 @@ import { invoices, merchants, payouts } from "../../db/schema.js";
 // colons (`invoice:completed`). The composer maps between them.
 const OUTBOUND_EVENT_TYPES = [
   "invoice.completed",
+  "invoice.processing",
   "invoice.expired",
   "invoice.canceled",
   "invoice.demoted",

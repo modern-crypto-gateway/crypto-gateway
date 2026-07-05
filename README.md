@@ -1227,16 +1227,21 @@ collision).
 
 | Event                | Fires when                                                                                  | Idempotency key shape                              |
 | -------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| `invoice:processing` | Invoice flips into the in-flight state — full amount detected but unconfirmed, a partial payment landed (`extraStatus='partial'`), or the partial flag clears after a top-up. One delivery per distinct `(status, extraStatus)` flavor | `invoice:processing:{invoiceId}:processing:{extraStatus\|none}` |
 | `invoice:completed`  | Invoice transitions to `status='completed'`. Overpaid invoices fire this same event with `data.invoice.extraStatus='overpaid'` on the snapshot | `invoice:completed:{invoiceId}:completed`          |
 | `invoice:expired`    | `expiresAt` elapses (cron sweeper) or `POST /invoices/{id}/expire`                          | `invoice:expired:{invoiceId}:expired`              |
 | `invoice:canceled`   | Merchant cancels via API                                                                    | `invoice:canceled:{invoiceId}:canceled`            |
 | `invoice:demoted`    | Reorg un-confirms a previously-completed invoice; carries `previousStatus` + pool-recapture counts | `invoice:demoted:{invoiceId}:{prev}:{new}`  |
 
-There's no separate event for `pending → processing` — the per-tx
-`payment_detected` event already carries that visibility. A typical partial-
-payment scenario emits N pairs of `payment_detected` + `payment_confirmed`
-(per contributing tx, with `data.invoice.extraStatus='partial'`) and finally
-one `invoice:completed` once the threshold is crossed.
+`invoice:processing` gives merchant UIs a single "payment in flight" signal
+without subscribing to every per-transfer event. Its idempotency key encodes
+the `extraStatus` slug, so an invoice can deliver it at most twice: once for
+the `partial` flavor and once for the plain (`none`) flavor — repeats of the
+same flavor are deduped, and a reorg cycle reuses the earlier key (the reorg
+itself is signaled by `invoice:demoted`). A typical partial-payment scenario
+emits `payment_detected` + `invoice:processing(partial)`, then N further
+`payment_detected` / `payment_confirmed` pairs per contributing tx, and
+finally one `invoice:completed` once the threshold is crossed.
 
 ### Payload shape
 

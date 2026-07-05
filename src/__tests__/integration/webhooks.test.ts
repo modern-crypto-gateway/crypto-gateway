@@ -48,12 +48,16 @@ describe("end-to-end: invoice:payment_detected -> webhook dispatched", () => {
       // Dispatch is deferred via deps.jobs.defer; drain to flush.
       await booted.deps.jobs.drain(1_000);
 
-      // One webhook per unconfirmed ingest: invoice:payment_detected (per-tx).
-      // The lifecycle transition pending→processing has no separate event —
-      // per-tx events carry merchant visibility for that phase.
+      // Two webhooks per unconfirmed ingest: invoice:payment_detected
+      // (per-tx) and invoice:processing (whole-invoice lifecycle —
+      // pending→processing, deduped per (status, extraStatus) flavor).
+      // Dispatch runs on deferred jobs, so arrival order is not guaranteed.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
-      const transferCall = calls[0]!;
+      expect(calls).toHaveLength(2);
+      const transferCall = calls.find(
+        (c) => (c.payload as { event: string }).event === "invoice:payment_detected"
+      )!;
+      expect(transferCall).toBeDefined();
       expect(transferCall.url).toBe("https://merchant.example.com/hook");
       expect(transferCall.secret).toBe("b".repeat(64));
       const payload = transferCall.payload as {
@@ -65,6 +69,21 @@ describe("end-to-end: invoice:payment_detected -> webhook dispatched", () => {
       expect(payload.data.invoice.status).toBe("processing");
       expect(payload.data.triggerTxHash).toBe("0xhook1");
       expect(transferCall.idempotencyKey).toBe(`invoice:payment_detected:${invoice.id}:0xhook1`);
+
+      // Full amount detected in one tx → extraStatus is null → key slug "none".
+      const processingCall = calls.find(
+        (c) => (c.payload as { event: string }).event === "invoice:processing"
+      )!;
+      expect(processingCall).toBeDefined();
+      const processingPayload = processingCall.payload as {
+        event: string;
+        data: { invoice: { status: string; extraStatus: string | null }; triggerTxHash: string | null };
+      };
+      expect(processingPayload.event).toBe("invoice:processing");
+      expect(processingPayload.data.invoice.status).toBe("processing");
+      expect(processingPayload.data.invoice.extraStatus).toBeNull();
+      expect(processingPayload.data.triggerTxHash).toBeNull();
+      expect(processingCall.idempotencyKey).toBe(`invoice:processing:${invoice.id}:processing:none`);
     } finally {
       await booted.close();
     }
@@ -128,11 +147,11 @@ describe("end-to-end: invoice:payment_detected -> webhook dispatched", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
-      // One webhook per unconfirmed ingest (invoice:payment_detected); routed
+      // Both webhooks (invoice:payment_detected + invoice:processing) routed
       // to the per-invoice URL with the per-invoice secret — merchant default
       // ignored because the override took precedence.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(2);
       for (const c of calls) {
         expect(c.url).toBe("https://merchant.example.com/per-invoice");
         expect(c.secret).toBe("i".repeat(64));
@@ -171,10 +190,10 @@ describe("end-to-end: invoice:payment_detected -> webhook dispatched", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
-      // One webhook per unconfirmed ingest; falls back to the merchant default
-      // URL/secret since the invoice has no override.
+      // Both webhooks fall back to the merchant default URL/secret since the
+      // invoice has no override.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(2);
       for (const c of calls) {
         expect(c.url).toBe("https://merchant.example.com/default");
         expect(c.secret).toBe("m".repeat(64));
@@ -208,10 +227,10 @@ describe("end-to-end: invoice:payment_detected -> webhook dispatched", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
-      // One webhook per unconfirmed ingest; goes to the per-invoice URL since
-      // no merchant default exists.
+      // Both webhooks go to the per-invoice URL since no merchant default
+      // exists.
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(2);
       for (const c of calls) {
         expect(c.url).toBe("https://merchant.example.com/only-invoice");
         expect(c.secret).toBe("i".repeat(64));
@@ -264,9 +283,9 @@ describe("end-to-end: invoice:payment_detected -> webhook dispatched", () => {
       await booted.deps.jobs.drain(200);
       expect(booted.webhookDispatcher!.calls).toHaveLength(0);
 
-      // A partial-payment transfer (< requiredAmount) emits tx.detected and
-      // invoice.payment_detected internally. Only the latter is merchant-
-      // facing → exactly one webhook; tx.detected is internal-only.
+      // A partial-payment transfer (< requiredAmount) emits tx.detected,
+      // invoice.payment_detected, and invoice.processing internally. The
+      // latter two are merchant-facing; tx.detected is internal-only.
       await ingestDetectedTransfer(booted.deps, {
         chainId: 999,
         txHash: "0xhook3",
@@ -282,9 +301,14 @@ describe("end-to-end: invoice:payment_detected -> webhook dispatched", () => {
       await booted.deps.jobs.drain(1_000);
 
       const calls = booted.webhookDispatcher!.calls;
-      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(2);
       const events = calls.map((c) => (c.payload as { event: string }).event);
-      expect(events).toEqual(["invoice:payment_detected"]);
+      expect([...events].sort()).toEqual(["invoice:payment_detected", "invoice:processing"]);
+      // Underpaid → the processing flavor is `partial`, encoded in the key.
+      const processingCall = calls.find(
+        (c) => (c.payload as { event: string }).event === "invoice:processing"
+      )!;
+      expect(processingCall.idempotencyKey).toBe(`invoice:processing:${invoice.id}:processing:partial`);
     } finally {
       await booted.close();
     }
@@ -432,12 +456,13 @@ describe("pollPayments orchestrator", () => {
       });
       await booted.deps.jobs.drain(1_000);
 
-      // After ingest: only invoice:payment_detected (per-tx). The lifecycle
-      // pending→processing has no separate event in the new model.
+      // After ingest: invoice:payment_detected (per-tx) plus
+      // invoice:processing (lifecycle pending→processing). Deferred-job
+      // dispatch means arrival order is not guaranteed.
       const initialEvents = booted.webhookDispatcher!.calls.map(
         (c) => (c.payload as { event: string }).event
       );
-      expect(initialEvents).toEqual(["invoice:payment_detected"]);
+      expect([...initialEvents].sort()).toEqual(["invoice:payment_detected", "invoice:processing"]);
 
       // Now mark the tx confirmed on-chain and run the cron sweeper. THIS is
       // the path that was silently dropping events on Workers `scheduled`.

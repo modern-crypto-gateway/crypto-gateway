@@ -689,10 +689,11 @@ paths:
         (`confirmed`). Track progress via `payout.*` webhooks or by polling
         `GET /api/v1/payouts/{id}`.
 
-        A `payout.planned` webhook event fires on success (the event name
-        is backward-compat; the row's status is `reserved`). Cancel is
-        possible only while status is `reserved` — see
-        `POST /api/v1/payouts/{id}/cancel`.
+        No merchant webhook fires at plan time — the 201 response is the
+        planning confirmation (the internal `payout.planned` domain event
+        is not exposed to merchants); the first webhook a payout emits is
+        `payout.submitted`. Cancel is possible only while status is
+        `reserved` — see `POST /api/v1/payouts/{id}/cancel`.
       requestBody:
         required: true
         content:
@@ -3215,7 +3216,17 @@ paths:
             on partial-payment invoices that haven't completed yet — gives
             merchants per-payment running-total visibility.
 
-        Whole-invoice lifecycle (key `{event}:{invoiceId}:{status}`):
+        Whole-invoice lifecycle (key `{event}:{invoiceId}:{status}`,
+        except `invoice:processing` which appends the extra-status slug):
+          - `invoice:processing` — invoice flipped into the in-flight
+            state: full amount detected but unconfirmed, a partial
+            payment landed (`extraStatus='partial'`), or the partial
+            flag cleared after a top-up. Key is
+            `invoice:processing:{invoiceId}:processing:{extraStatus|none}`,
+            so each distinct (status, extraStatus) flavor delivers
+            exactly once — at most two deliveries per invoice (`partial`
+            then `none`). A reorg cycle reuses the earlier key; the
+            reorg itself is signaled by `invoice:demoted`.
           - `invoice:completed` — invoice transitioned to
             `status='completed'`. Overpaid invoices fire this same event
             with `data.invoice.extraStatus='overpaid'` on the snapshot —

@@ -1,0 +1,3864 @@
+openapi: 3.1.0
+info:
+  title: crypto-gateway — Merchant API
+  version: 1.0.0
+  license:
+    name: MIT
+    identifier: MIT
+  summary: >
+    Merchant-facing surface of the crypto-gateway: invoices (get paid),
+    payouts (send funds), the public checkout projection, and signed
+    webhooks for both.
+  description: |
+    This document covers ONLY what a merchant integration needs: the
+    `/api/v1/invoices*` and `/api/v1/payouts*` routes, the unauthenticated
+    `/checkout/{id}` projection for hosted payment pages, and the outbound
+    **webhooks** the gateway signs and POSTs to your server. Operator /
+    admin routes are deliberately excluded (see the full `openapi.yaml`
+    for those).
+
+    ---
+
+    ## Authentication
+
+    Every `/api/v1/*` request needs your merchant API key — issued once by
+    the gateway operator; if you lose it the operator must rotate it.
+
+    Either header form works:
+
+    ```
+    Authorization: Bearer <api-key>
+    X-API-Key: <api-key>
+    ```
+
+    Your merchant identity is ALWAYS derived from the key. A `merchantId`
+    supplied in any request body is ignored — you can never read or write
+    another merchant's data, and cross-merchant resource ids return `404`
+    (never `403`) so ids can't be enumerated.
+
+    ## Conventions
+
+    - **Money is decimal strings, never floats.** `"100.00"`, `"0.04"`.
+      Fields suffixed `Raw` are integer strings in the token's smallest
+      unit (wei, sun, lamports, sats, micro-USDC…).
+    - **Timestamps** are ISO-8601 `date-time` strings in responses.
+      Time-range query filters accept ISO-8601 or unix-milliseconds.
+    - **`X-Request-Id`** is echoed (or minted) on every response — quote
+      it when reporting an issue to the operator.
+    - **Rate limits**: `/api/v1/*` is limited per merchant (default
+      1000/min per surface — invoices and payouts count separately);
+      `/checkout/{id}` is limited per client IP (default 60/min). Watch
+      `X-RateLimit-Remaining` / `X-RateLimit-Reset`; a `429` carries
+      `Retry-After` seconds. `POST /api/v1/payouts/batch` consumes one
+      quota token PER ROW.
+    - **Pagination** is `limit` + `offset` with a `hasMore` flag (computed
+      via fetch-N+1; there is no total-count field) — page until `hasMore`
+      is `false`.
+
+    ## Idempotency
+
+    - `POST /api/v1/invoices` — pass `externalId` (your cart/order id). A
+      retry with the same `externalId` returns the ORIGINAL invoice with
+      HTTP 201 again instead of creating a duplicate. Safe to retry on
+      timeouts and 5xx.
+    - `POST /api/v1/payouts` has NO idempotency key in v1 — a blind retry
+      after a timeout can double-pay. Recommended pattern: set a unique
+      `batchId` per logical payment attempt, and on any ambiguous outcome
+      reconcile with `GET /api/v1/payouts?batchId=<id>` before retrying.
+    - Webhooks carry `X-Webhook-Idempotency-Key` — dedupe on it (see below).
+
+    ## Invoice lifecycle
+
+    ```
+    pending ──payment detected──▶ processing ──confirmed ≥ target──▶ completed
+       │                             │  ▲                                │
+       │                             │  └──(reorg: invoice:demoted)──────┘
+       └────────── expiresAt ────────┴──────▶ expired        canceled (operator)
+    ```
+
+    `status` answers "where is the invoice in its journey"; the orthogonal
+    `extraStatus` answers "did the customer pay the right amount":
+    `"partial"` (underpaid, with `status=processing`) or `"overpaid"`
+    (over the tolerance threshold, with `status=completed`).
+
+    ## Payout lifecycle
+
+    ```
+    reserved ──▶ (topping-up) ──▶ submitted ──▶ confirmed
+       │
+       ├──▶ canceled (only while reserved)
+       └──▶ failed (lastError set)
+    ```
+
+    The funding source is picked and reserved synchronously on
+    `POST /api/v1/payouts` — "not enough funds" errors surface on the POST
+    itself, never as a later `failed` webhook. Only the broadcast is
+    asynchronous. **No webhook fires at plan time** — the first event you
+    receive for a payout is `payout.submitted`.
+
+    ## Webhooks
+
+    Configured at two levels, per event, most specific wins:
+
+    1. **Per-resource override** — `webhookUrl` + `webhookSecret` on the
+       invoice/payout create call (must be supplied as a pair; the secret
+       is write-only, min 16 chars, encrypted at rest, never echoed).
+    2. **Merchant default** — the URL + secret registered on your merchant
+       account by the operator.
+
+    If neither level is configured the event is skipped (logged
+    server-side, not queued). URLs must be public HTTPS — loopback,
+    link-local and cloud-metadata targets are rejected at create time
+    (`INVALID_DESTINATION`) and again at dispatch time.
+
+    ### Events
+
+    | Event | Fires when |
+    |---|---|
+    | `invoice:payment_detected` | A transfer to the invoice's receive address is seen on-chain (per transaction) |
+    | `invoice:payment_confirmed` | That transfer reaches the invoice's confirmation threshold (per transaction) |
+    | `invoice:processing` | The invoice as a whole flips into the in-flight state (once per distinct `(status, extraStatus)` flavor — see the event's docs) |
+    | `invoice:completed` | Confirmed value reaches the invoice target (within tolerance) |
+    | `invoice:expired` | The invoice passes `expiresAt` unpaid/underpaid, or is force-expired via the API |
+    | `invoice:canceled` | The invoice is canceled by the gateway operator |
+    | `invoice:demoted` | A chain reorg un-confirms a completed/processing invoice |
+    | `payout.submitted` | The payout tx is broadcast (`txHash` now set) |
+    | `payout.confirmed` | The payout tx reaches its confirmation threshold |
+    | `payout.failed` | Broadcast/confirmation permanently failed (`lastError` set) |
+
+    Note the (historical, load-bearing) naming asymmetry: invoice events
+    use a **colon** (`invoice:completed`), payout events use a **dot**
+    (`payout.submitted`). Match on the exact strings above.
+
+    ### Delivery contract
+
+    Each delivery is an HTTP `POST` to your URL:
+
+    ```
+    Content-Type: application/json
+    X-Webhook-Signature:       <hex HMAC-SHA256 of the raw request body>
+    X-Webhook-Idempotency-Key: <stable per logical event>
+    X-Webhook-Timestamp:       <unix-milliseconds of this delivery cycle's first attempt>
+    X-Webhook-Attempt:         <1..4 within the current delivery cycle>
+    ```
+
+    Payload envelope (all events):
+
+    ```json
+    { "event": "<name>", "timestamp": "<ISO-8601>", "data": { ... } }
+    ```
+
+    - Invoice events: `data = { invoice, transactions, triggerTxHash }` —
+      `transactions` is EVERY transaction ever associated with the invoice
+      (including `reverted` / `orphaned`), so you always have the complete
+      picture without a follow-up GET. `triggerTxHash` is set on the
+      per-transaction `payment_*` events, `null` on lifecycle events.
+      `invoice:demoted` adds `previousStatus`, `poolReacquired`,
+      `poolCollided`.
+    - Payout events: `data` IS the payout object (no wrapper).
+
+    ### Verifying the signature
+
+    Compute HMAC-SHA256 over the **raw request body bytes** with your
+    webhook secret and compare (constant-time) to `X-Webhook-Signature`:
+
+    ```js
+    import { createHmac, timingSafeEqual } from "node:crypto";
+
+    function verify(rawBody, signatureHeader, secret) {
+      const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
+      const a = Buffer.from(expected, "hex");
+      const b = Buffer.from(signatureHeader ?? "", "hex");
+      return a.length === b.length && timingSafeEqual(a, b);
+    }
+    ```
+
+    Parse the JSON only AFTER verifying. Any re-serialization
+    (pretty-printing, key reordering) breaks the HMAC.
+
+    ### Retries, ordering, dedupe
+
+    - Respond `2xx` fast (< 10 s; do heavy work async). Anything else is a
+      failure for that attempt.
+    - Within a delivery cycle the gateway retries up to 4 HTTP attempts
+      (~250 ms / 500 ms / 1 s backoff) on 408/425/429/5xx/network errors.
+      Failed cycles are re-driven by a durable outbox up to 5 cycles total
+      with growing gaps (~5 min, 15 min, 1 h, 6 h) before the delivery is
+      marked dead — worst case ≈ 20 HTTP attempts over ~7 h. The operator
+      can replay dead deliveries.
+    - **Dedupe on `X-Webhook-Idempotency-Key`** — it is stable across every
+      retry of a logical event, and also across a reorg-then-reconfirm
+      cycle: a repeated transition to the same state reuses the same key
+      and is NOT re-delivered. Treat `invoice:demoted` as your signal to
+      re-check state (poll the GET) rather than waiting for a repeat event.
+    - **Do not assume ordering.** Retries and concurrent transitions can
+      arrive out of order; the embedded `invoice` / payout object is the
+      state AT EVENT TIME (later events carry newer state). When in doubt,
+      `GET` the resource for current truth.
+    - Webhooks stop entirely while your merchant account is deactivated.
+      Secret rotation takes effect on the next delivery attempt, including
+      retries of already-queued events.
+
+    ## Error envelope
+
+    Every non-2xx response is `{ "error": { "code", "message", "details?" } }`
+    with a stable machine-readable `code` (per-endpoint codes documented on
+    each operation). `VALIDATION` errors carry the Zod issue array in
+    `details`.
+
+servers:
+  - url: http://localhost:8787
+    description: Local dev
+  - url: https://crypto-gateway-dev.workers.dev
+    description: Dev Workers (placeholder — replace with your gateway's domain)
+
+tags:
+  - name: invoices
+    description: |
+      Invoice lifecycle — create a payment request, share the receive
+      address (or hosted checkout link), and track it to `completed`.
+  - name: payouts
+    description: |
+      Payout lifecycle — quote fees, plan (funds reserved synchronously),
+      then track broadcast → confirmation via webhooks or polling.
+  - name: checkout
+    description: |
+      Public, unauthenticated invoice projection for hosted checkout
+      pages. The high-entropy invoice UUID is the only credential.
+  - name: webhooks
+    description: |
+      Outbound signed events delivered to YOUR server (not routes on the
+      gateway). See the `webhooks` section of this document for the
+      payloads and the top-level description for the delivery contract.
+  - name: health
+    description: Unauthenticated liveness probe.
+
+security:
+  - MerchantApiKey: []
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      operationId: getHealth
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Service up
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, phase]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  phase: { type: integer }
+              examples:
+                ok:
+                  value: { status: ok, phase: 7 }
+
+  /api/v1/invoices:
+    get:
+      tags: [invoices]
+      operationId: listInvoices
+      summary: List invoices
+      description: |
+        Returns invoices created by the authenticated merchant, newest
+        first (`createdAt DESC`). All filters are optional and
+        AND-combined. Pagination uses `limit` + `offset`; the response's
+        `hasMore` tells you whether another page exists (no total count) —
+        page until it is `false`.
+
+        `status` is lifecycle ("where is the invoice in its journey");
+        the orthogonal `extraStatus` filter is payment fidelity ("did the
+        customer pay the right amount").
+      parameters:
+        - name: status
+          in: query
+          description: |
+            Comma-separated statuses, any of
+            `pending,processing,completed,expired,canceled`. Unknown
+            values yield 400 `BAD_STATUS` (typos are rejected rather than
+            silently ignored).
+          schema: { type: string }
+          example: processing,completed
+        - name: chainId
+          in: query
+          description: Narrow to one chain id. Non-numeric → 400 `BAD_CHAIN_ID`.
+          schema: { type: integer }
+        - name: extraStatus
+          in: query
+          description: |
+            Comma-separated payment-fidelity filter: `partial` (underpaid,
+            status=processing) and/or `overpaid` (over threshold,
+            status=completed). Invoices with no extra status are excluded
+            when this filter is set.
+          schema: { type: string }
+        - name: token
+          in: query
+          description: Comma-separated token symbols (OR match), e.g. `USDT,USDC`.
+          schema: { type: string }
+        - name: externalId
+          in: query
+          description: Your dedup key (exact match).
+          schema: { type: string }
+        - name: externalIdContains
+          in: query
+          description: |
+            Case-insensitive substring match on `externalId` (`%`/`_` in
+            the term are escaped and matched literally).
+          schema: { type: string }
+        - name: toAddress
+          in: query
+          description: |
+            Invoice receive address — what the payer saw on the checkout
+            page. Exact match; pass the canonicalized form.
+          schema: { type: string }
+        - name: addressContains
+          in: query
+          description: Case-insensitive substring match on the receive address (stored casing).
+          schema: { type: string }
+        - name: fromAddress
+          in: query
+          description: |
+            Payer address. Matches invoices with any detected or confirmed
+            transaction from this address (reverted / orphaned excluded).
+          schema: { type: string }
+        - name: txHash
+          in: query
+          description: On-chain tx hash — matches the invoice(s) credited by it.
+          schema: { type: string }
+        - name: amountUsdMin
+          in: query
+          description: |
+            Inclusive lower bound on `amountUsd`. Legacy token-amount
+            invoices (no USD amount) are excluded when set. Non-numeric →
+            400 `BAD_NUMBER`.
+          schema: { type: number }
+        - name: amountUsdMax
+          in: query
+          schema: { type: number }
+        - name: paidUsdMin
+          in: query
+          description: Inclusive lower bound on `paidUsd` (USD received so far).
+          schema: { type: number }
+        - name: paidUsdMax
+          in: query
+          schema: { type: number }
+        - name: hasPayments
+          in: query
+          description: |
+            `true` → only invoices with any payment recorded; `false` →
+            only untouched ones. Accepts `true|false|1|0`; anything else →
+            400 `BAD_BOOLEAN`.
+          schema: { type: boolean }
+        - name: createdFrom
+          in: query
+          description: Inclusive lower bound on `createdAt` — ISO-8601 or unix-ms (else 400 `BAD_TIMESTAMP`).
+          schema: { type: string }
+          example: "2026-07-01T00:00:00Z"
+        - name: createdTo
+          in: query
+          schema: { type: string }
+        - name: updatedFrom
+          in: query
+          schema: { type: string }
+        - name: updatedTo
+          in: query
+          schema: { type: string }
+        - name: confirmedFrom
+          in: query
+          schema: { type: string }
+        - name: confirmedTo
+          in: query
+          schema: { type: string }
+        - name: expiresFrom
+          in: query
+          schema: { type: string }
+        - name: expiresTo
+          in: query
+          schema: { type: string }
+        - name: sortBy
+          in: query
+          description: Sort column. `amountUsd` / `paidUsd` sort numerically.
+          schema:
+            type: string
+            enum: [createdAt, updatedAt, confirmedAt, expiresAt, amountUsd, paidUsd]
+            default: createdAt
+        - name: sortDir
+          in: query
+          schema: { type: string, enum: [asc, desc], default: desc }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Paginated list of invoices
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invoices, limit, offset, sortBy, sortDir, hasMore]
+                properties:
+                  invoices:
+                    type: array
+                    items: { $ref: "#/components/schemas/Invoice" }
+                  limit: { type: integer, description: Echo of the resolved page size. }
+                  offset: { type: integer }
+                  sortBy:
+                    type: string
+                    enum: [createdAt, updatedAt, confirmedAt, expiresAt, amountUsd, paidUsd]
+                  sortDir: { type: string, enum: [asc, desc] }
+                  hasMore:
+                    type: boolean
+                    description: True when another page exists past `offset + limit`.
+              examples:
+                page:
+                  summary: One completed USD-path invoice, more pages available
+                  value:
+                    invoices:
+                      - id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                        merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                        status: completed
+                        extraStatus: null
+                        chainId: 137
+                        token: USDC
+                        receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                        addressIndex: 42
+                        acceptedFamilies: [evm]
+                        receiveAddresses:
+                          - family: evm
+                            chainId: 137
+                            address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                            poolAddressId: "f31c2f4e-8a4e-4f6e-b2c7-9d1e5a7b3c9f"
+                        requiredAmountRaw: "0"
+                        receivedAmountRaw: "0"
+                        fiatAmount: null
+                        fiatCurrency: null
+                        quotedRate: null
+                        amountUsd: "100.00"
+                        paidUsd: "100.05"
+                        overpaidUsd: "0"
+                        rateWindowExpiresAt: "2026-07-04T10:10:00.000Z"
+                        rates: { USDC: "0.9998", POL: "0.41", ETH: "2450.12" }
+                        externalId: "order-10023"
+                        metadata: { cartId: "c_88112", customer: "cus_5521" }
+                        webhookUrl: null
+                        paymentToleranceUnderBps: 100
+                        paymentToleranceOverBps: 500
+                        confirmationThreshold: 12
+                        confirmationTiers: null
+                        createdAt: "2026-07-04T10:00:00.000Z"
+                        expiresAt: "2026-07-04T10:30:00.000Z"
+                        confirmedAt: "2026-07-04T10:07:41.000Z"
+                        updatedAt: "2026-07-04T10:07:41.000Z"
+                    limit: 25
+                    offset: 0
+                    sortBy: createdAt
+                    sortDir: desc
+                    hasMore: true
+        "400":
+          description: |
+            Bad filter value. Stable `error.code` values:
+              - `BAD_STATUS` — unknown `status` entry
+              - `BAD_CHAIN_ID` — non-numeric `chainId`
+              - `BAD_TIMESTAMP` — a `*From`/`*To` bound that is neither ISO-8601 nor unix-ms
+              - `BAD_NUMBER` — non-numeric `amountUsdMin/Max` or `paidUsdMin/Max`
+              - `BAD_BOOLEAN` — `hasPayments` not one of `true|false|1|0`
+              - `VALIDATION` — Zod rejection (limit outside 1..100, unknown
+                `sortBy`/`sortDir`, `*From` > `*To`, `*Min` > `*Max`, bad
+                `extraStatus`/`token` values); `details` carries the issues
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                badStatus:
+                  value:
+                    error:
+                      code: BAD_STATUS
+                      message: "Unknown status 'complete' (did you mean 'completed'?)"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [invoices]
+      operationId: createInvoice
+      summary: Create an invoice
+      description: |
+        Creates an invoice and allocates one gateway-owned receive address
+        per accepted family (UTXO families get a fresh address per chain —
+        BTC and LTC differ; other families draw from the gateway's
+        pre-minted pools).
+
+        **Pricing modes — provide EXACTLY ONE:**
+          - `amountUsd` — USD-pegged (recommended). Any registered token on
+            any accepted family converts at the 10-minute pinned rate
+            window and SUMS toward the USD target (e.g. $50 USDC + $50 ETH
+            settles a $100 invoice).
+          - `amountRaw` — legacy exact-token: payer must send exactly this
+            raw amount of `token` on `chainId`; other tokens are ignored.
+          - `fiatAmount` + `fiatCurrency` — legacy fiat-quoted; converted
+            once at creation (rate echoed as `quotedRate`).
+
+        **Idempotency.** Pass `externalId` to make the call retry-safe: a
+        second POST with the same `externalId` returns the existing
+        invoice (HTTP 201 again; body identical except the
+        fresh-create-only `receiveAddresses[].addressIndex` extra is
+        absent on replays) — even under a concurrent-create race.
+
+        Share `id` with your payer via your own UI, or link them to the
+        hosted-checkout projection `GET /checkout/{id}`.
+
+        Known edge: a `chainId` whose token is registered but whose chain
+        adapter is not wired in this deployment currently surfaces as 500
+        `INTERNAL` rather than a typed 400; same for a full price-oracle
+        outage on the legacy fiat-quoted path (the typed 503
+        `RATES_UNAVAILABLE` applies to the USD path only).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateInvoiceInput" }
+            examples:
+              usdMultiFamily:
+                summary: USD-pegged, payable on EVM + Tron + Solana + BTC/LTC (recommended)
+                value:
+                  chainId: 137
+                  token: USDC
+                  amountUsd: "100.00"
+                  acceptedFamilies: [evm, tron, solana, utxo]
+                  externalId: "order-10023"
+                  metadata: { cartId: "c_88112", customer: "cus_5521" }
+                  expiresInMinutes: 30
+              usdWithWebhookOverride:
+                summary: USD-pegged with a per-invoice webhook override
+                value:
+                  chainId: 1
+                  token: ETH
+                  amountUsd: "250.00"
+                  acceptedFamilies: [evm]
+                  externalId: "order-10024"
+                  webhookUrl: "https://shop.example.com/hooks/crypto/order-10024"
+                  webhookSecret: "whsec_9f27c1e4b6a84d0f"
+              legacyExactToken:
+                summary: Legacy single-token — exactly 25 USDT on Tron
+                value:
+                  chainId: 728126428
+                  token: USDT
+                  amountRaw: "25000000"
+                  externalId: "order-10025"
+              legacyFiatQuoted:
+                summary: Legacy fiat-quoted — €49.99 in SOL at today's rate
+                value:
+                  chainId: 900
+                  token: SOL
+                  fiatAmount: "49.99"
+                  fiatCurrency: EUR
+                  expiresInMinutes: 60
+      responses:
+        "201":
+          description: |
+            Invoice created — or idempotent replay (the existing invoice
+            for this `externalId` returned with 201 again).
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invoice]
+                properties:
+                  invoice: { $ref: "#/components/schemas/Invoice" }
+              examples:
+                usdMultiFamily:
+                  summary: Fresh create for the USD multi-family request
+                  value:
+                    invoice:
+                      id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                      merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                      status: pending
+                      extraStatus: null
+                      chainId: 137
+                      token: USDC
+                      receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      addressIndex: 42
+                      acceptedFamilies: [evm, solana, tron, utxo]
+                      receiveAddresses:
+                        - family: evm
+                          chainId: 137
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                          poolAddressId: "f31c2f4e-8a4e-4f6e-b2c7-9d1e5a7b3c9f"
+                          addressIndex: 42
+                        - family: solana
+                          chainId: 900
+                          address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
+                          poolAddressId: "a7c81d5b-6e2f-4b9a-8c3d-1f0e9b7a5c4d"
+                          addressIndex: 17
+                        - family: tron
+                          chainId: 728126428
+                          address: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE"
+                          poolAddressId: "c95e3a7f-2b8d-4e1c-9a6b-7d4f8e2c0b5a"
+                          addressIndex: 8
+                        - family: utxo
+                          chainId: 800
+                          address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+                          poolAddressId: null
+                          addressIndex: 1031
+                        - family: utxo
+                          chainId: 801
+                          address: "ltc1qfmv2xhdasgty87ss8rt4mtvule5uvcgwmzy0y8"
+                          poolAddressId: null
+                          addressIndex: 1031
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "100.00"
+                      paidUsd: "0"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T10:10:00.000Z"
+                      rates:
+                        USDC: "0.9998"
+                        USDT: "1.0001"
+                        POL: "0.41"
+                        ETH: "2450.12"
+                        TRX: "0.13"
+                        SOL: "148.55"
+                        BTC: "108211.00"
+                        LTC: "87.15"
+                      externalId: "order-10023"
+                      metadata: { cartId: "c_88112", customer: "cus_5521" }
+                      webhookUrl: null
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      confirmationThreshold: 12
+                      confirmationTiers: null
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T10:00:00.000Z"
+        "400":
+          description: |
+            Stable `error.code` values:
+              - `BAD_JSON` — request body is not valid JSON
+              - `VALIDATION` — schema violation (zero or multiple pricing
+                modes, `fiatAmount` without `fiatCurrency`, `webhookUrl` /
+                `webhookSecret` not supplied as a pair, out-of-range
+                `expiresInMinutes` / tolerance bps, …); `details` carries
+                the Zod issues
+              - `TOKEN_NOT_SUPPORTED` — `token` not registered on the
+                request's `chainId`; or (legacy single-token modes) not
+                registered on every accepted family; or (USD mode) not
+                registered on the primary chain's family; or an accepted
+                family has no wired chain adapter
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                validation:
+                  value:
+                    error:
+                      code: VALIDATION
+                      message: "Invalid request body"
+                      details:
+                        - path: ["amountUsd"]
+                          message: "Provide exactly one of amountUsd, amountRaw, or fiatAmount+fiatCurrency"
+                tokenNotSupported:
+                  value:
+                    error:
+                      code: TOKEN_NOT_SUPPORTED
+                      message: "Token DOGE is not registered on chain 137"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "404":
+          description: |
+            `MERCHANT_NOT_FOUND` — the authenticated merchant row
+            disappeared between auth and create (deletion race).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503":
+          description: |
+            Transient — retry after a short delay. Stable `error.code`
+            values:
+              - `RATES_UNAVAILABLE` — USD path only; the rate cache is
+                empty (gateway just booted or oracle outage outlasted the
+                cache). Succeeds once rates are re-warmed.
+              - `POOL_EXHAUSTED` — no available receive address for one of
+                the accepted families; `details.family` names it. The
+                gateway operator must extend the pool.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                poolExhausted:
+                  value:
+                    error:
+                      code: POOL_EXHAUSTED
+                      message: "No available pool address for family 'tron'"
+                      details: { family: tron, hint: "POST /admin/pool/initialize" }
+
+  /api/v1/invoices/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Invoice id returned at create time.
+    get:
+      tags: [invoices]
+      operationId: getInvoice
+      summary: Fetch an invoice with USD breakdown and per-transaction detail
+      description: |
+        Returns the invoice plus two blocks not present on POST responses:
+          - `amounts` — USD-axis recomputation (required / confirmed /
+            confirming / remaining / overpaid). All-null on legacy
+            single-token invoices.
+          - `transactions` — every on-chain row tied to this invoice (all
+            statuses, including `reverted` and `orphaned`, for debugging),
+            ordered by `detectedAt` ascending.
+
+        Ownership: an id that exists but belongs to another merchant
+        returns 404 (never 403). Malformed non-UUID ids also return 404 —
+        indistinguishable from "doesn't exist" by design.
+      responses:
+        "200":
+          description: Invoice found
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InvoiceDetails" }
+              examples:
+                partialThenPaid:
+                  summary: USD invoice mid-flight — one confirmed + one confirming payment
+                  value:
+                    invoice:
+                      id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                      merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                      status: processing
+                      extraStatus: partial
+                      chainId: 137
+                      token: USDC
+                      receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      addressIndex: 42
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          chainId: 137
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                          poolAddressId: "f31c2f4e-8a4e-4f6e-b2c7-9d1e5a7b3c9f"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "100.00"
+                      paidUsd: "40.00"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T10:20:00.000Z"
+                      rates: { USDC: "0.9998", POL: "0.41", ETH: "2450.12" }
+                      externalId: "order-10023"
+                      metadata: { cartId: "c_88112" }
+                      webhookUrl: null
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      confirmationThreshold: 12
+                      confirmationTiers: null
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T10:09:12.000Z"
+                    amounts:
+                      requiredUsd: "100.00"
+                      confirmedUsd: "40.00"
+                      confirmingUsd: "60.05"
+                      remainingUsd: "60.00"
+                      overpaidUsd: "0"
+                    transactions:
+                      - id: "3f8e1a2b-4c5d-6e7f-8a9b-0c1d2e3f4a5b"
+                        txHash: "0x9f2b7c1e83a4d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f"
+                        logIndex: 211
+                        chainId: 137
+                        chain: polygon
+                        token: USDC
+                        fromAddress: "0x1E2f3A4b5C6d7E8f9A0b1C2d3E4f5A6b7C8d9E0f"
+                        toAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                        amountRaw: "40000000"
+                        amount: "40"
+                        amountUsd: "40.00"
+                        usdRate: "0.9998"
+                        status: confirmed
+                        confirmations: 27
+                        blockNumber: 61233401
+                        detectedAt: "2026-07-04T10:04:03.000Z"
+                        confirmedAt: "2026-07-04T10:05:10.000Z"
+                      - id: "5a6b7c8d-9e0f-1a2b-3c4d-5e6f7a8b9c0d"
+                        txHash: "0x71c4d2e9b8a7f605142e3d4c5b6a798081726354a4b5c6d7e8f90a1b2c3d4e5"
+                        logIndex: 96
+                        chainId: 137
+                        chain: polygon
+                        token: USDC
+                        fromAddress: "0x1E2f3A4b5C6d7E8f9A0b1C2d3E4f5A6b7C8d9E0f"
+                        toAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                        amountRaw: "60062000"
+                        amount: "60.062"
+                        amountUsd: "60.05"
+                        usdRate: "0.9998"
+                        status: detected
+                        confirmations: 4
+                        blockNumber: 61233542
+                        detectedAt: "2026-07-04T10:09:12.000Z"
+                        confirmedAt: null
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/invoices/{id}/expire:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [invoices]
+      operationId: expireInvoice
+      summary: Force-expire an invoice before its expiry window elapses
+      description: |
+        Transitions a `pending` or `processing` invoice to `expired`
+        immediately — partial-paid invoices (`processing` +
+        `extraStatus='partial'`) are eligible too. On success the gateway
+        publishes **`invoice:expired`** to your webhook (or the
+        per-invoice `webhookUrl` override) and the invoice's pooled
+        receive addresses return to rotation after the cooldown.
+
+        NOT idempotent: repeating the call on an already-terminal invoice
+        (`completed`, `expired`, `canceled`) returns 409
+        `EXPIRE_NOT_ALLOWED`. The 200 body is `{ invoice }` only — no
+        `amounts` / `transactions` blocks (use the GET for those).
+      responses:
+        "200":
+          description: Invoice expired
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invoice]
+                properties:
+                  invoice: { $ref: "#/components/schemas/Invoice" }
+              examples:
+                expired:
+                  summary: Unpaid invoice force-expired
+                  value:
+                    invoice:
+                      id: "9d8c7b6a-5e4f-3a2b-1c0d-9e8f7a6b5c4d"
+                      merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                      status: expired
+                      extraStatus: null
+                      chainId: 1
+                      token: ETH
+                      receiveAddress: "0x4Bb2f019661cE532803012645Ac136ddd64DBA71"
+                      addressIndex: 15
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          chainId: 1
+                          address: "0x4Bb2f019661cE532803012645Ac136ddd64DBA71"
+                          poolAddressId: "b21a3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "250.00"
+                      paidUsd: "0"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T09:55:00.000Z"
+                      rates: { ETH: "2450.12", USDC: "0.9998", USDT: "1.0001" }
+                      externalId: "order-10024"
+                      metadata: null
+                      webhookUrl: "https://shop.example.com/hooks/crypto/order-10024"
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      confirmationThreshold: 12
+                      confirmationTiers: null
+                      createdAt: "2026-07-04T09:45:00.000Z"
+                      expiresAt: "2026-07-04T09:58:21.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T09:58:21.000Z"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            `EXPIRE_NOT_ALLOWED` — the invoice is already terminal
+            (`completed`, `expired`, or `canceled`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                alreadyTerminal:
+                  value:
+                    error:
+                      code: EXPIRE_NOT_ALLOWED
+                      message: "Invoice is already 'completed' and cannot be expired"
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/payouts:
+    get:
+      tags: [payouts]
+      operationId: listPayouts
+      summary: List payouts
+      description: |
+        Returns payouts planned by the authenticated merchant, newest
+        first (`createdAt DESC`). All filters optional, AND-combined.
+        Internal gateway bookkeeping rows never appear here — only your
+        `standard` payouts.
+
+        Pagination via `limit` + `offset`; the response includes `hasMore`
+        (no total count) — page until it is `false`.
+      parameters:
+        - name: status
+          in: query
+          description: |
+            Comma-separated statuses, any of
+            `planned,reserved,topping-up,submitted,confirmed,failed,canceled`.
+            Unknown values → 400 `BAD_STATUS`. New rows start at
+            `reserved` (the source is picked synchronously on POST);
+            `planned` matches only legacy rows. `topping-up` means the
+            source address lacked native gas and the executor is waiting
+            for a sponsor → source top-up tx to confirm first.
+          schema: { type: string }
+          example: submitted,confirmed
+        - name: chainId
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: token
+          in: query
+          description: |
+            Comma-separated token symbols (OR match). Each entry must
+            match `^[A-Z0-9]{1,16}$` — malformed entries fail 400
+            `VALIDATION`; unknown-but-well-formed symbols simply match
+            zero rows.
+          schema: { type: string }
+        - name: destinationAddress
+          in: query
+          description: Exact match on the canonicalized destination.
+          schema: { type: string }
+        - name: destinationAddressContains
+          in: query
+          description: Case-insensitive substring match on `destinationAddress`.
+          schema: { type: string }
+        - name: sourceAddress
+          in: query
+          description: |
+            Gateway address that funded the payout. Always NULL on
+            UTXO-family payouts (no single source), so this filter
+            implicitly excludes them.
+          schema: { type: string }
+        - name: sourceAddressContains
+          in: query
+          schema: { type: string }
+        - name: batchId
+          in: query
+          description: |
+            Only payouts belonging to a specific batch (the `batchId`
+            returned by `POST /api/v1/payouts/batch`, or one you supplied
+            on single-create).
+          schema: { type: string }
+        - name: txHash
+          in: query
+          description: |
+            Exact on-chain tx hash. NULL until the payout reaches
+            `submitted`, so this implicitly filters to broadcast payouts.
+          schema: { type: string }
+        - name: feeTier
+          in: query
+          description: |
+            Comma-separated fee tiers (`low`, `medium`, `high`). Payouts
+            with no tier recorded are excluded when set.
+          schema: { type: string }
+        - name: hasError
+          in: query
+          description: |
+            `true` → only payouts carrying a `lastError`; `false` → only
+            clean ones. Accepts `true|false|1|0`.
+          schema: { type: boolean }
+        - name: amountUsdMin
+          in: query
+          description: |
+            Inclusive lower bound on `quotedAmountUsd`. Raw-amount payouts
+            (no USD quote) are excluded when set.
+          schema: { type: number }
+        - name: amountUsdMax
+          in: query
+          schema: { type: number }
+        - name: createdFrom
+          in: query
+          description: Inclusive lower bound on `createdAt` — ISO-8601 or unix-ms.
+          schema: { type: string }
+        - name: createdTo
+          in: query
+          schema: { type: string }
+        - name: submittedFrom
+          in: query
+          schema: { type: string }
+        - name: submittedTo
+          in: query
+          schema: { type: string }
+        - name: confirmedFrom
+          in: query
+          schema: { type: string }
+        - name: confirmedTo
+          in: query
+          schema: { type: string }
+        - name: updatedFrom
+          in: query
+          schema: { type: string }
+        - name: updatedTo
+          in: query
+          schema: { type: string }
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [createdAt, updatedAt, submittedAt, confirmedAt, amountUsd]
+            default: createdAt
+        - name: sortDir
+          in: query
+          schema: { type: string, enum: [asc, desc], default: desc }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Paginated list of payouts
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payouts, limit, offset, sortBy, sortDir, hasMore]
+                properties:
+                  payouts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Payout" }
+                  limit: { type: integer }
+                  offset: { type: integer }
+                  sortBy: { type: string }
+                  sortDir: { type: string }
+                  hasMore: { type: boolean }
+              examples:
+                page:
+                  summary: One confirmed payout
+                  value:
+                    payouts:
+                      - id: "e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b"
+                        merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                        kind: standard
+                        parentPayoutId: null
+                        status: confirmed
+                        chainId: 137
+                        token: USDC
+                        amountRaw: "250000000"
+                        quotedAmountUsd: "250.00"
+                        quotedRate: "0.9998"
+                        feeTier: medium
+                        feeQuotedNative: "1950000000000000"
+                        batchId: null
+                        destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+                        sourceAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                        txHash: "0x54ab99c2d1e0f83b7a6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a"
+                        topUpTxHash: null
+                        topUpSponsorAddress: null
+                        topUpAmountRaw: null
+                        feeEstimateNative: "1950000000000000"
+                        lastError: null
+                        webhookUrl: null
+                        confirmationThreshold: 12
+                        confirmationTiers: null
+                        createdAt: "2026-07-04T11:00:00.000Z"
+                        submittedAt: "2026-07-04T11:00:09.000Z"
+                        confirmedAt: "2026-07-04T11:01:02.000Z"
+                        broadcastAttemptedAt: "2026-07-04T11:00:08.000Z"
+                        updatedAt: "2026-07-04T11:01:02.000Z"
+                    limit: 25
+                    offset: 0
+                    sortBy: createdAt
+                    sortDir: desc
+                    hasMore: false
+        "400":
+          description: |
+            Bad filter. Route-specific codes: `BAD_STATUS`, `BAD_CHAIN_ID`,
+            `BAD_TIMESTAMP`, `BAD_NUMBER`, `BAD_BOOLEAN`. Everything else
+            surfaces as `VALIDATION` with Zod issues in `details`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [payouts]
+      operationId: createPayout
+      summary: Plan a payout (funding source reserved synchronously)
+      description: |
+        Plans a payout and — in the same request — picks the gateway
+        funding source and writes balance reservations. The returned
+        payout is already `status: "reserved"`: `sourceAddress` is set on
+        account-model chains (EVM / Tron / Solana); on UTXO chains
+        (BTC / LTC) it stays null because coin selection runs across every
+        owned UTXO at broadcast time (feasibility is still verified with a
+        real coin-selection pass on this POST).
+
+        Because selection is synchronous, **"not enough funds" surfaces on
+        this POST** (see the 400/503 codes) — never as a later `failed`
+        webhook. Only the broadcast is asynchronous: the executor picks up
+        the reserved row, optionally routes a sponsor → source gas top-up
+        (status `topping-up`), then broadcasts (`submitted`) and confirms
+        (`confirmed`). Track progress via the `payout.submitted` /
+        `payout.confirmed` / `payout.failed` webhooks or by polling
+        `GET /api/v1/payouts/{id}`.
+
+        No webhook fires at plan time — the 201 response IS your
+        confirmation of planning. Cancel is possible only while status is
+        `reserved` (`POST /api/v1/payouts/{id}/cancel`).
+
+        **Amount — provide EXACTLY ONE of:**
+          - `amountRaw` — integer string, token's smallest unit
+          - `amount` — human decimal string (max the token's decimals)
+          - `amountUSD` — USD-pegged; converted via the price oracle at
+            plan time (rate snapshotted to `quotedRate`; for volatile
+            tokens the broadcast happens seconds-to-minutes later, so the
+            executed market value can drift — accepted v1 cost)
+
+        Retry-safety: there is no idempotency key on this route. If the
+        response is lost, reconcile via
+        `GET /api/v1/payouts?batchId=<yourBatchId>` before retrying.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlanPayoutInput" }
+            examples:
+              raw:
+                summary: 250 USDC on Polygon, raw units, medium tier
+                value:
+                  chainId: 137
+                  token: USDC
+                  amountRaw: "250000000"
+                  destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+                  feeTier: medium
+              humanDecimal:
+                summary: 0.75 SOL, human decimal
+                value:
+                  chainId: 900
+                  token: SOL
+                  amount: "0.75"
+                  destinationAddress: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
+              usdPegged:
+                summary: $500 of USDT on Tron with per-payout webhook + batch tag
+                value:
+                  chainId: 728126428
+                  token: USDT
+                  amountUSD: "500.00"
+                  destinationAddress: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE"
+                  batchId: "vendor-settlement-2026-07-04"
+                  webhookUrl: "https://ops.example.com/hooks/payouts"
+                  webhookSecret: "whsec_c1a7d94e2f8b6035"
+              utxo:
+                summary: 0.005 BTC to a bech32 address, high tier
+                value:
+                  chainId: 800
+                  token: BTC
+                  amount: "0.005"
+                  destinationAddress: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
+                  feeTier: high
+      responses:
+        "201":
+          description: Payout planned and reserved (`status` is `reserved`)
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payout]
+                properties:
+                  payout: { $ref: "#/components/schemas/Payout" }
+              examples:
+                reserved:
+                  summary: Fresh reservation for the 250 USDC request
+                  value:
+                    payout:
+                      id: "e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b"
+                      merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                      kind: standard
+                      parentPayoutId: null
+                      status: reserved
+                      chainId: 137
+                      token: USDC
+                      amountRaw: "250000000"
+                      quotedAmountUsd: null
+                      quotedRate: null
+                      feeTier: medium
+                      feeQuotedNative: "1950000000000000"
+                      batchId: null
+                      destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+                      sourceAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      txHash: null
+                      topUpTxHash: null
+                      topUpSponsorAddress: null
+                      topUpAmountRaw: null
+                      feeEstimateNative: "1950000000000000"
+                      lastError: null
+                      webhookUrl: null
+                      confirmationThreshold: 12
+                      confirmationTiers: null
+                      createdAt: "2026-07-04T11:00:00.000Z"
+                      submittedAt: null
+                      confirmedAt: null
+                      broadcastAttemptedAt: null
+                      updatedAt: "2026-07-04T11:00:00.000Z"
+        "400":
+          description: |
+            Stable `error.code` values:
+              - `BAD_JSON` — body not JSON
+              - `VALIDATION` — Zod issues in `details` (unknown keys — the
+                schema is strict —, none or more than one of
+                `amountRaw`/`amount`/`amountUSD`, `webhookUrl` without
+                `webhookSecret` or vice versa)
+              - `TOKEN_NOT_SUPPORTED` — symbol not registered on the chain
+              - `INVALID_DESTINATION` — address fails the chain family's
+                canonicalize/validate; also used for an SSRF-unsafe
+                `webhookUrl`
+              - `BAD_AMOUNT` — `amount` has more decimal places than the
+                token supports
+              - `PAYOUT_NOT_SUPPORTED_ON_FAMILY` — Monero is inbound-only
+              - `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` — amount + gas exceeds
+                the spendable balance; `details` carries
+                `suggestedAmountRaw` / `suggestedAmount` / best-effort
+                `suggestedAmountUsd` so you can retry with a fitting amount
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                exceedsSpendable:
+                  value:
+                    error:
+                      code: MAX_AMOUNT_EXCEEDS_NET_SPENDABLE
+                      message: "Amount plus gas exceeds spendable balance"
+                      details:
+                        suggestedAmountRaw: "29000000000000000"
+                        suggestedAmount: "0.029"
+                        suggestedAmountUsd: "71.05"
+                invalidDestination:
+                  value:
+                    error:
+                      code: INVALID_DESTINATION
+                      message: "Destination is not a valid address for family 'evm'"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503":
+          description: |
+            Transient / operator-actionable rejections — nothing was
+            reserved; safe to retry after the condition clears:
+              - `ORACLE_FAILED` — `amountUSD` given but the price oracle
+                is unreachable; a stale rate is never substituted.
+              - `FEE_ESTIMATE_FAILED` — the chain fee quote failed; retry
+                shortly.
+              - `INSUFFICIENT_BALANCE_ANY_SOURCE` — no single gateway
+                address covers the amount. The message distinguishes
+                "aggregate is enough but fragmented — the operator should
+                consolidate, or lower the amount" from "aggregate too low
+                — fund the gateway".
+              - `NO_GAS_SPONSOR_AVAILABLE` — a token holder exists but no
+                other address has enough native to top up its gas.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                fragmented:
+                  value:
+                    error:
+                      code: INSUFFICIENT_BALANCE_ANY_SOURCE
+                      message: "Aggregate balance covers the amount but no single source does — consolidate or lower the amount"
+
+  /api/v1/payouts/estimate:
+    post:
+      tags: [payouts]
+      operationId: estimatePayout
+      summary: Quote fee tiers + preview the source the planner would pick
+      description: |
+        Returns low/medium/high fee quotes AND the funding address the
+        planner would pick, WITHOUT planning anything or writing a
+        reservation. Use it to preview where a payout would come from,
+        whether a just-in-time gas top-up would be needed, and to pick a
+        tier before committing the real `POST /api/v1/payouts`. The
+        request body is the same strict `PlanPayoutInput`.
+
+        Source-selection preview:
+          1. Tier A — richest gateway address (by token balance) that ALSO
+             has enough native for gas → no `topUp` field.
+          2. Tier B — no address has both → richest token holder plus a
+             sponsor proposal; `topUp.required=true`, `topUp.sponsor` null
+             when no funded sponsor exists.
+          3. No holder has enough → `source: null` and `warnings` carries
+             `no_source_address_has_sufficient_token_balance` (plus
+             `single_source_insufficient_consolidate_required` when the
+             aggregate would cover it).
+
+        UTXO chains have no per-address picker — `source` is a synthetic
+        aggregate (`address: "<utxo-aggregate>"`, `derivationIndex: -1`)
+        and `alternatives` is always empty.
+
+        For native payouts (token == chain native) an amount that leaves
+        no gas headroom throws 400 `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` with
+        `suggestedAmount*` fields in `details` for programmatic pre-fill.
+
+        Tier semantics: **EVM** = 0.8× / 1.0× / 1.5× priority-fee
+        multipliers; **Solana** = 25th/50th/75th percentile of recent
+        prioritization fees (`tieringSupported=false` when no samples);
+        **Tron** = no tier concept, three identical quotes,
+        `tieringSupported=false`; **UTXO** = sat/vB tiers applied to a
+        typical transfer size. A fee-quote failure does NOT error — the
+        response degrades to `tieringSupported=false` with zeroed tiers
+        and the `fee_quote_unavailable` warning.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlanPayoutInput" }
+            examples:
+              usdc:
+                value:
+                  chainId: 137
+                  token: USDC
+                  amountRaw: "250000000"
+                  destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+      responses:
+        "200":
+          description: Fee-tier quote + source preview (nothing was reserved)
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PayoutFeeEstimate" }
+              examples:
+                directSource:
+                  summary: Tier-A pick — source has both token and gas
+                  value:
+                    amountRaw: "250000000"
+                    quotedAmountUsd: null
+                    quotedRate: null
+                    tiers:
+                      tieringSupported: true
+                      nativeSymbol: POL
+                      low:
+                        tier: low
+                        nativeAmountRaw: "1560000000000000"
+                        usdAmount: "0.00064"
+                      medium:
+                        tier: medium
+                        nativeAmountRaw: "1950000000000000"
+                        usdAmount: "0.00080"
+                      high:
+                        tier: high
+                        nativeAmountRaw: "2925000000000000"
+                        usdAmount: "0.00120"
+                    source:
+                      address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      derivationIndex: 42
+                      tokenBalance: "812440000"
+                      nativeBalance: "84000000000000000"
+                      feeCoveredByDelegatedEnergy: false
+                    alternatives:
+                      - address: "0x11f3B4c5D6e7F8a9B0c1D2e3F4A5b6C7d8E9f0A1"
+                        derivationIndex: 43
+                        tokenBalance: "310020000"
+                        nativeBalance: "12000000000000000"
+                        feeCoveredByDelegatedEnergy: false
+                    warnings: []
+                topUpNeeded:
+                  summary: Tier-B pick — token holder needs a gas top-up from a sponsor
+                  value:
+                    amountRaw: "250000000"
+                    quotedAmountUsd: null
+                    quotedRate: null
+                    tiers:
+                      tieringSupported: true
+                      nativeSymbol: POL
+                      low:
+                        tier: low
+                        nativeAmountRaw: "1560000000000000"
+                        usdAmount: "0.00064"
+                      medium:
+                        tier: medium
+                        nativeAmountRaw: "1950000000000000"
+                        usdAmount: "0.00080"
+                      high:
+                        tier: high
+                        nativeAmountRaw: "2925000000000000"
+                        usdAmount: "0.00120"
+                    source:
+                      address: "0x11f3B4c5D6e7F8a9B0c1D2e3F4A5b6C7d8E9f0A1"
+                      derivationIndex: 43
+                      tokenBalance: "612000000"
+                      nativeBalance: "0"
+                      feeCoveredByDelegatedEnergy: false
+                    topUp:
+                      required: true
+                      sponsor:
+                        address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                        nativeBalance: "84000000000000000"
+                      amountRaw: "2340000000000000"
+                    alternatives: []
+                    warnings: []
+        "400":
+          description: |
+            `BAD_JSON`, `VALIDATION`, `TOKEN_NOT_SUPPORTED`,
+            `INVALID_DESTINATION`, `BAD_AMOUNT`,
+            `PAYOUT_NOT_SUPPORTED_ON_FAMILY` (Monero), or
+            `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE` (with `suggestedAmount*`
+            in `details`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/MerchantInactive" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503":
+          description: |
+            `ORACLE_FAILED` — `amountUSD` was given but the price oracle
+            is unreachable. (Fee-quote failures do NOT 503 here — they
+            degrade to `tieringSupported=false` + `fee_quote_unavailable`.)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/payouts/batch:
+    post:
+      tags: [payouts]
+      operationId: createPayoutBatch
+      summary: Plan up to 100 payouts in one call
+      description: |
+        Mass-create endpoint. Each row runs through the same pipeline as
+        `POST /api/v1/payouts` (synchronous source reservation per row) —
+        **per-row errors do NOT abort the batch**. Every
+        successfully-planned row shares the same server-generated
+        `batchId` (echoed top-level) so you can track them together via
+        `GET /api/v1/payouts?batchId=<id>`. Rows are processed in order:
+        earlier rows' reservations reduce the balance available to later
+        rows, so a batch can partially fail on its tail with
+        `INSUFFICIENT_BALANCE_ANY_SOURCE`.
+
+        **Rate limit:** a batch of N rows consumes N tokens from your
+        per-minute quota. If the quota can't cover the batch, the WHOLE
+        call returns 429 with `Retry-After` and nothing is planned —
+        split into smaller batches or wait out the window.
+
+        **Atomicity:** per-row. HTTP 200 whenever the batch envelope was
+        well-formed — even if EVERY row failed; inspect `results[]` and
+        `summary`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PayoutBatchInput" }
+            examples:
+              vendorRun:
+                summary: Three rows — the third will fail on a malformed address
+                value:
+                  payouts:
+                    - chainId: 137
+                      token: USDC
+                      amountRaw: "250000000"
+                      destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+                      feeTier: medium
+                    - chainId: 137
+                      token: USDC
+                      amountUSD: "125.00"
+                      destinationAddress: "0x11f3B4c5D6e7F8a9B0c1D2e3F4A5b6C7d8E9f0A1"
+                    - chainId: 137
+                      token: USDC
+                      amountRaw: "1000000"
+                      destinationAddress: "not-an-address"
+      responses:
+        "200":
+          description: |
+            Batch processed — partial or even total per-row failure still
+            returns 200; inspect `results[]` + `summary`.
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PayoutBatchResponse" }
+              examples:
+                mixed:
+                  summary: 2 planned, 1 failed
+                  value:
+                    batchId: "b3d4e5f6-a7b8-49c0-91d2-e3f4a5b6c7d8"
+                    results:
+                      - index: 0
+                        status: planned
+                        payout:
+                          id: "e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b"
+                          merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                          kind: standard
+                          parentPayoutId: null
+                          status: reserved
+                          chainId: 137
+                          token: USDC
+                          amountRaw: "250000000"
+                          quotedAmountUsd: null
+                          quotedRate: null
+                          feeTier: medium
+                          feeQuotedNative: "1950000000000000"
+                          batchId: "b3d4e5f6-a7b8-49c0-91d2-e3f4a5b6c7d8"
+                          destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+                          sourceAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                          txHash: null
+                          topUpTxHash: null
+                          topUpSponsorAddress: null
+                          topUpAmountRaw: null
+                          feeEstimateNative: "1950000000000000"
+                          lastError: null
+                          webhookUrl: null
+                          confirmationThreshold: 12
+                          confirmationTiers: null
+                          createdAt: "2026-07-04T11:00:00.000Z"
+                          submittedAt: null
+                          confirmedAt: null
+                          broadcastAttemptedAt: null
+                          updatedAt: "2026-07-04T11:00:00.000Z"
+                      - index: 1
+                        status: planned
+                        payout:
+                          id: "f5a6b7c8-d9e0-1f2a-3b4c-5d6e7f8a9b0c"
+                          merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                          kind: standard
+                          parentPayoutId: null
+                          status: reserved
+                          chainId: 137
+                          token: USDC
+                          amountRaw: "125025005"
+                          quotedAmountUsd: "125.00"
+                          quotedRate: "0.9998"
+                          feeTier: null
+                          feeQuotedNative: null
+                          batchId: "b3d4e5f6-a7b8-49c0-91d2-e3f4a5b6c7d8"
+                          destinationAddress: "0x11f3B4c5D6e7F8a9B0c1D2e3F4A5b6C7d8E9f0A1"
+                          sourceAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                          txHash: null
+                          topUpTxHash: null
+                          topUpSponsorAddress: null
+                          topUpAmountRaw: null
+                          feeEstimateNative: "1950000000000000"
+                          lastError: null
+                          webhookUrl: null
+                          confirmationThreshold: 12
+                          confirmationTiers: null
+                          createdAt: "2026-07-04T11:00:00.000Z"
+                          submittedAt: null
+                          confirmedAt: null
+                          broadcastAttemptedAt: null
+                          updatedAt: "2026-07-04T11:00:00.000Z"
+                      - index: 2
+                        status: failed
+                        error:
+                          code: INVALID_DESTINATION
+                          message: "Destination is not a valid address for family 'evm'"
+                    summary: { planned: 2, failed: 1 }
+        "400":
+          description: |
+            Batch-level errors only: `BAD_JSON` (body not JSON or not
+            `{ payouts: [...] }`) or `BATCH_TOO_LARGE` (more than 100
+            rows). Per-row schema failures do NOT 400 — they come back
+            inside a 200 as `results[i].error.code = "VALIDATION_FAILED"`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429":
+          description: |
+            `RATE_LIMITED` — either the per-request limiter or the
+            proportional batch charge (batch size exceeds the remaining
+            per-minute quota). Nothing was planned.
+          headers:
+            Retry-After:
+              description: Seconds until the window rolls
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/payouts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [payouts]
+      operationId: getPayout
+      summary: Fetch a payout
+      description: |
+        Poll this after `POST /api/v1/payouts` to track the lifecycle:
+        `reserved` → (`topping-up` →) `submitted` → `confirmed`, or
+        `failed` / `canceled`. `txHash` (and `topUpTxHash` when a gas
+        top-up was needed) appear once broadcast; `lastError` carries the
+        merchant-safe failure reason after a failure.
+
+        404 semantics: a malformed (non-UUID) id, a nonexistent id, and a
+        payout belonging to another merchant all return the same
+        `NOT_FOUND`.
+      responses:
+        "200":
+          description: Payout found
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payout]
+                properties:
+                  payout: { $ref: "#/components/schemas/Payout" }
+              examples:
+                toppingUp:
+                  summary: Mid-flight — waiting for the gas top-up to confirm
+                  value:
+                    payout:
+                      id: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+                      merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                      kind: standard
+                      parentPayoutId: null
+                      status: topping-up
+                      chainId: 728126428
+                      token: USDT
+                      amountRaw: "500000000"
+                      quotedAmountUsd: "500.00"
+                      quotedRate: "1.0001"
+                      feeTier: null
+                      feeQuotedNative: null
+                      batchId: "vendor-settlement-2026-07-04"
+                      destinationAddress: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE"
+                      sourceAddress: "TVj7RNVHy6thbM7BWdSe9G6gXwKhjhdNZS"
+                      txHash: null
+                      topUpTxHash: "8f2a1b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8"
+                      topUpSponsorAddress: "TN3W4H6rK2ce4vX9YnFQHwKENnHjoxb3m9"
+                      topUpAmountRaw: "28000000"
+                      feeEstimateNative: "27000000"
+                      lastError: null
+                      webhookUrl: "https://ops.example.com/hooks/payouts"
+                      confirmationThreshold: 19
+                      confirmationTiers: null
+                      createdAt: "2026-07-04T11:10:00.000Z"
+                      submittedAt: null
+                      confirmedAt: null
+                      broadcastAttemptedAt: "2026-07-04T11:10:04.000Z"
+                      updatedAt: "2026-07-04T11:10:05.000Z"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/payouts/{id}/cancel:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [payouts]
+      operationId: cancelPayout
+      summary: Cancel a reserved payout
+      description: |
+        Cancels a payout that's still in `reserved` status — releases its
+        source (and sponsor, when present) reservations so the balance is
+        immediately available to a subsequent plan.
+
+        Once a broadcast has started (`topping-up`, `submitted`, or
+        terminal states) the gateway can't recall the on-chain tx; the
+        endpoint returns 409 `PAYOUT_NOT_CANCELABLE`. The cancel is
+        CAS-guarded against the executor: if the executor claims the row
+        between your read and the cancel, you get the same 409.
+        Idempotent on already-canceled rows (200 with the canceled row).
+
+        No `payout.canceled` webhook exists — the 200 response is the
+        signal. If you rely on webhooks, poll `GET /api/v1/payouts/{id}`
+        after issuing cancel until status is terminal.
+      responses:
+        "200":
+          description: Canceled (or idempotent re-cancel of an already-canceled row)
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payout]
+                properties:
+                  payout: { $ref: "#/components/schemas/Payout" }
+              examples:
+                canceled:
+                  value:
+                    payout:
+                      id: "e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b"
+                      merchantId: "7d9f6c1a-2b3e-4c5d-8e9f-0a1b2c3d4e5f"
+                      kind: standard
+                      parentPayoutId: null
+                      status: canceled
+                      chainId: 137
+                      token: USDC
+                      amountRaw: "250000000"
+                      quotedAmountUsd: null
+                      quotedRate: null
+                      feeTier: medium
+                      feeQuotedNative: "1950000000000000"
+                      batchId: null
+                      destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+                      sourceAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      txHash: null
+                      topUpTxHash: null
+                      topUpSponsorAddress: null
+                      topUpAmountRaw: null
+                      feeEstimateNative: "1950000000000000"
+                      lastError: null
+                      webhookUrl: null
+                      confirmationThreshold: 12
+                      confirmationTiers: null
+                      createdAt: "2026-07-04T11:00:00.000Z"
+                      submittedAt: null
+                      confirmedAt: null
+                      broadcastAttemptedAt: null
+                      updatedAt: "2026-07-04T11:02:30.000Z"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: |
+            `PAYOUT_NOT_FOUND` — nonexistent id or cross-merchant access.
+            Malformed (non-UUID) ids short-circuit before the lookup and
+            return the same 404 status but with code `NOT_FOUND` (and no
+            message) — switch on both codes.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: |
+            `PAYOUT_NOT_CANCELABLE` — the payout is in any status other
+            than `reserved` / `canceled`, or the executor claimed the row
+            for broadcast concurrently with the cancel attempt.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                inFlight:
+                  value:
+                    error:
+                      code: PAYOUT_NOT_CANCELABLE
+                      message: "Payout is 'submitted' — the on-chain transaction cannot be recalled"
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /checkout/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Invoice id — the high-entropy UUID is the only credential.
+    get:
+      tags: [checkout]
+      operationId: getCheckoutInvoice
+      summary: Public invoice snapshot (for checkout UIs)
+      description: |
+        Narrow, unauthenticated projection of an invoice — everything a
+        hosted checkout page needs to render "send N TOKEN to ADDRESS"
+        plus a QR code. No API key required; safe to call from the payer's
+        browser.
+
+        Deliberately narrower than the merchant view: `merchantId`,
+        `externalId`, `metadata`, `webhookUrl`, tolerance/confirmation
+        policy fields and `updatedAt` are all excluded.
+
+        Multi-family invoices: `receiveAddresses` carries one
+        `{ family, address }` entry per accepted family (UTXO: one per
+        chain) — render all of them so the payer picks their chain.
+        USD-path invoices additionally expose `payableTokens`: one
+        ready-to-render entry per (family, chainId, token) the deployment
+        can actually settle — the UI never needs to know token decimals or
+        do rate math. Poll this endpoint (respecting the per-IP rate
+        limit, default 60/min) to flip the page to "paid" when `status`
+        reaches `completed`.
+
+        Malformed and unknown ids both return 404 — indistinguishable by
+        design so bots can't probe the keyspace.
+      security: []
+      responses:
+        "200":
+          description: Invoice snapshot
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invoice]
+                properties:
+                  invoice: { $ref: "#/components/schemas/PublicInvoice" }
+              examples:
+                usdInvoice:
+                  summary: $100 USD-path invoice with a payment chooser
+                  value:
+                    invoice:
+                      id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                      status: pending
+                      extraStatus: null
+                      chainId: 137
+                      token: USDC
+                      receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      acceptedFamilies: [evm, solana]
+                      receiveAddresses:
+                        - family: evm
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                        - family: solana
+                          address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      amountUsd: "100.00"
+                      paidUsd: "0"
+                      overpaidUsd: "0"
+                      rates: { USDC: "0.9998", POL: "0.41", ETH: "2450.12", SOL: "148.55" }
+                      rateWindowExpiresAt: "2026-07-04T10:10:00.000Z"
+                      payableTokens:
+                        - family: evm
+                          chainId: 137
+                          token: USDC
+                          decimals: 6
+                          amountRawMinimum: "100020005"
+                          amountDisplay: "100.020005"
+                          rate: "0.9998"
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                        - family: evm
+                          chainId: 137
+                          token: POL
+                          decimals: 18
+                          amountRawMinimum: "243902439024390243903"
+                          amountDisplay: "243.902439024390243903"
+                          rate: "0.41"
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                        - family: solana
+                          chainId: 900
+                          token: SOL
+                          decimals: 9
+                          amountRawMinimum: "673174017"
+                          amountDisplay: "0.673174017"
+                          rate: "148.55"
+                          address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: null
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+# ---------------------------------------------------------------------------
+# Outbound webhooks — events the GATEWAY delivers to YOUR server.
+# Each entry describes the POST your endpoint must accept. Respond 2xx fast;
+# see the top-level description for signing, retries, and dedupe.
+# ---------------------------------------------------------------------------
+webhooks:
+  "invoice:payment_detected":
+    post:
+      tags: [webhooks]
+      operationId: onInvoicePaymentDetected
+      summary: A transfer to the invoice's receive address was seen on-chain
+      description: |
+        Fires once per contributing transaction the moment it is detected
+        (0+ confirmations). `data.triggerTxHash` names the transaction
+        that caused this event; `data.transactions` lists EVERY
+        transaction ever associated with the invoice. The embedded
+        invoice typically shows `status: "processing"` (with
+        `extraStatus: "partial"` when the detected+confirmed total is
+        still under the target).
+
+        Typical use: show "payment seen, awaiting confirmation" in your
+        order UI. Do NOT ship goods on this event — wait for
+        `invoice:completed`. The whole-invoice flip into the in-flight
+        state is also signaled once by `invoice:processing` (delivery
+        order between the two is not guaranteed).
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookInvoiceEvent" }
+            examples:
+              partialDetected:
+                summary: First (partial) payment of $40 on a $100 invoice detected
+                value:
+                  event: "invoice:payment_detected"
+                  timestamp: "2026-07-04T10:04:05.000Z"
+                  data:
+                    invoice:
+                      id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                      status: processing
+                      extraStatus: partial
+                      chainId: 137
+                      token: USDC
+                      receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      addressIndex: 42
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "100.00"
+                      paidUsd: "0"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T10:10:00.000Z"
+                      rates: { USDC: "0.9998", POL: "0.41", ETH: "2450.12" }
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      externalId: "order-10023"
+                      metadata: { cartId: "c_88112" }
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T10:04:03.000Z"
+                    transactions:
+                      - hash: "0x9f2b7c1e83a4d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f"
+                        chainId: 137
+                        chainName: polygon
+                        token: USDC
+                        isNative: false
+                        amount: "40"
+                        amountRaw: "40000000"
+                        amountUsd: "40.00"
+                        confirmations: 0
+                        status: detected
+                    triggerTxHash: "0x9f2b7c1e83a4d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f"
+      responses:
+        "2XX":
+          description: |
+            Acknowledge within 10 s. Any 2xx marks the delivery done; the
+            body is ignored. Non-2xx (or a timeout) triggers the retry
+            schedule.
+
+  "invoice:payment_confirmed":
+    post:
+      tags: [webhooks]
+      operationId: onInvoicePaymentConfirmed
+      summary: A contributing transaction reached its confirmation threshold
+      description: |
+        Fires once per contributing transaction when it crosses the
+        invoice's confirmation threshold. The same tx hash that fired
+        `invoice:payment_detected` fires this event too (two distinct
+        idempotency keys). The invoice's `paidUsd` now includes this
+        transaction.
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookInvoiceEvent" }
+            examples:
+              partialConfirmed:
+                summary: The $40 partial payment confirmed — invoice still short $60
+                value:
+                  event: "invoice:payment_confirmed"
+                  timestamp: "2026-07-04T10:05:11.000Z"
+                  data:
+                    invoice:
+                      id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                      status: processing
+                      extraStatus: partial
+                      chainId: 137
+                      token: USDC
+                      receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      addressIndex: 42
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "100.00"
+                      paidUsd: "40.00"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T10:15:00.000Z"
+                      rates: { USDC: "0.9998", POL: "0.41", ETH: "2450.12" }
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      externalId: "order-10023"
+                      metadata: { cartId: "c_88112" }
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T10:05:10.000Z"
+                    transactions:
+                      - hash: "0x9f2b7c1e83a4d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f"
+                        chainId: 137
+                        chainName: polygon
+                        token: USDC
+                        isNative: false
+                        amount: "40"
+                        amountRaw: "40000000"
+                        amountUsd: "40.00"
+                        confirmations: 14
+                        status: confirmed
+                    triggerTxHash: "0x9f2b7c1e83a4d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f"
+      responses:
+        "2XX":
+          description: Acknowledge within 10 s; body ignored.
+
+  "invoice:processing":
+    post:
+      tags: [webhooks]
+      operationId: onInvoiceProcessing
+      summary: The invoice flipped into the in-flight state
+      description: |
+        Whole-invoice companion to the per-transaction `payment_*`
+        events: one "payment in flight" signal so your UI can swap from
+        "waiting for payment" to "payment in progress" without tracking
+        individual transfers.
+
+        Fires once per distinct `(status, extraStatus)` flavor:
+          - full amount detected, awaiting confirmations
+            (`extraStatus: null`)
+          - a partial payment landed (`extraStatus: "partial"`)
+          - the partial flag cleared after a top-up payment
+            (`extraStatus: null` again — a distinct delivery from the
+            earlier partial one, so you see the upgrade)
+
+        Repeats of the same flavor are deduped via the idempotency key
+        (`invoice:processing:<invoiceId>:processing:<extraStatus|none>`),
+        so an invoice delivers this event at most twice. A reorg demotion
+        back to `processing` reuses the earlier key for any flavor
+        already delivered (no duplicate) — but if the demotion lands on a
+        flavor you never received (e.g. the invoice completed directly
+        without ever passing through `processing`), this event fires
+        then, alongside `invoice:demoted`.
+        `triggerTxHash` is always null (status-level event); the
+        transaction that caused the flip arrives separately as
+        `invoice:payment_detected`. Delivery order between the two is
+        not guaranteed.
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookInvoiceEvent" }
+            examples:
+              partialInFlight:
+                summary: First (partial) payment landed — invoice now processing/partial
+                value:
+                  event: "invoice:processing"
+                  timestamp: "2026-07-04T10:04:05.000Z"
+                  data:
+                    invoice:
+                      id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                      status: processing
+                      extraStatus: partial
+                      chainId: 137
+                      token: USDC
+                      receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      addressIndex: 42
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "100.00"
+                      paidUsd: "0"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T10:10:00.000Z"
+                      rates: { USDC: "0.9998", POL: "0.41", ETH: "2450.12" }
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      externalId: "order-10023"
+                      metadata: { cartId: "c_88112" }
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T10:04:03.000Z"
+                    transactions:
+                      - hash: "0x9f2b7c1e83a4d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f"
+                        chainId: 137
+                        chainName: polygon
+                        token: USDC
+                        isNative: false
+                        amount: "40"
+                        amountRaw: "40000000"
+                        amountUsd: "40.00"
+                        confirmations: 0
+                        status: detected
+                    triggerTxHash: null
+              fullAmountInFlight:
+                summary: Partial flag cleared — the top-up landed, full amount now in flight (extraStatus back to null)
+                value:
+                  event: "invoice:processing"
+                  timestamp: "2026-07-04T10:06:15.000Z"
+                  data:
+                    invoice:
+                      id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                      status: processing
+                      extraStatus: null
+                      chainId: 137
+                      token: USDC
+                      receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      addressIndex: 42
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "100.00"
+                      paidUsd: "40.00"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T10:15:00.000Z"
+                      rates: { USDC: "0.9998", POL: "0.41", ETH: "2450.12" }
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      externalId: "order-10023"
+                      metadata: { cartId: "c_88112" }
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T10:06:15.000Z"
+                    transactions:
+                      - hash: "0x9f2b7c1e83a4d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f"
+                        chainId: 137
+                        chainName: polygon
+                        token: USDC
+                        isNative: false
+                        amount: "40"
+                        amountRaw: "40000000"
+                        amountUsd: "40.00"
+                        confirmations: 14
+                        status: confirmed
+                      - hash: "0x71c4d2e9b8a7f605142e3d4c5b6a798081726354a4b5c6d7e8f90a1b2c3d4e5"
+                        chainId: 137
+                        chainName: polygon
+                        token: USDC
+                        isNative: false
+                        amount: "60.062"
+                        amountRaw: "60062000"
+                        amountUsd: "60.05"
+                        confirmations: 0
+                        status: detected
+                    triggerTxHash: null
+      responses:
+        "2XX":
+          description: Acknowledge within 10 s; body ignored.
+
+  "invoice:completed":
+    post:
+      tags: [webhooks]
+      operationId: onInvoiceCompleted
+      summary: Confirmed value reached the invoice target — safe to fulfill
+      description: |
+        **The event to fulfill orders on.** Fires once when confirmed
+        payments reach the target within tolerance. On USD-path invoices
+        any mix of tokens/chains can have contributed — `transactions`
+        shows the full composition. An overpaid completion arrives with
+        `extraStatus: "overpaid"` and the excess in `overpaidUsd`.
+
+        If a chain reorg later un-confirms the invoice you'll receive
+        `invoice:demoted` — but a subsequent re-confirmation does NOT
+        re-deliver `invoice:completed` (the idempotency key is unchanged,
+        so the outbox dedupes it). After a demotion, poll
+        `GET /api/v1/invoices/{id}` to observe recovery back to
+        `completed`.
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookInvoiceEvent" }
+            examples:
+              completedTwoPayments:
+                summary: $100 target settled by two USDC transfers
+                value:
+                  event: "invoice:completed"
+                  timestamp: "2026-07-04T10:07:41.000Z"
+                  data:
+                    invoice:
+                      id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                      status: completed
+                      extraStatus: null
+                      chainId: 137
+                      token: USDC
+                      receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      addressIndex: 42
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "100.00"
+                      paidUsd: "100.05"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T10:15:00.000Z"
+                      rates: { USDC: "0.9998", POL: "0.41", ETH: "2450.12" }
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      externalId: "order-10023"
+                      metadata: { cartId: "c_88112" }
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: "2026-07-04T10:07:41.000Z"
+                      updatedAt: "2026-07-04T10:07:41.000Z"
+                    transactions:
+                      - hash: "0x9f2b7c1e83a4d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f"
+                        chainId: 137
+                        chainName: polygon
+                        token: USDC
+                        isNative: false
+                        amount: "40"
+                        amountRaw: "40000000"
+                        amountUsd: "40.00"
+                        confirmations: 27
+                        status: confirmed
+                      - hash: "0x71c4d2e9b8a7f605142e3d4c5b6a798081726354a4b5c6d7e8f90a1b2c3d4e5"
+                        chainId: 137
+                        chainName: polygon
+                        token: USDC
+                        isNative: false
+                        amount: "60.062"
+                        amountRaw: "60062000"
+                        amountUsd: "60.05"
+                        confirmations: 13
+                        status: confirmed
+                    triggerTxHash: null
+      responses:
+        "2XX":
+          description: Acknowledge within 10 s; body ignored.
+
+  "invoice:expired":
+    post:
+      tags: [webhooks]
+      operationId: onInvoiceExpired
+      summary: The invoice expired unpaid or underpaid
+      description: |
+        Fires when the invoice passes `expiresAt` without completing, or
+        when you force-expire it via
+        `POST /api/v1/invoices/{id}/expire`. A partial-paid invoice
+        expires with its `transactions` intact — inspect them to decide
+        on refunds or manual settlement.
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookInvoiceEvent" }
+            examples:
+              expiredUnpaid:
+                summary: No payment ever arrived
+                value:
+                  event: "invoice:expired"
+                  timestamp: "2026-07-04T10:30:02.000Z"
+                  data:
+                    invoice:
+                      id: "9d8c7b6a-5e4f-3a2b-1c0d-9e8f7a6b5c4d"
+                      status: expired
+                      extraStatus: null
+                      chainId: 1
+                      token: ETH
+                      receiveAddress: "0x4Bb2f019661cE532803012645Ac136ddd64DBA71"
+                      addressIndex: 15
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          address: "0x4Bb2f019661cE532803012645Ac136ddd64DBA71"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "250.00"
+                      paidUsd: "0"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T10:25:00.000Z"
+                      rates: { ETH: "2450.12", USDC: "0.9998" }
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      externalId: "order-10024"
+                      metadata: null
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T10:30:02.000Z"
+                    transactions: []
+                    triggerTxHash: null
+      responses:
+        "2XX":
+          description: Acknowledge within 10 s; body ignored.
+
+  "invoice:canceled":
+    post:
+      tags: [webhooks]
+      operationId: onInvoiceCanceled
+      summary: The invoice was canceled by the gateway operator
+      description: |
+        Fires when the gateway operator cancels the invoice through the
+        admin surface. There is no merchant-API cancel for invoices —
+        use force-expire (`POST /api/v1/invoices/{id}/expire`, which
+        emits `invoice:expired`) when YOU want to close one early.
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookInvoiceEvent" }
+            examples:
+              canceled:
+                value:
+                  event: "invoice:canceled"
+                  timestamp: "2026-07-04T12:00:00.000Z"
+                  data:
+                    invoice:
+                      id: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+                      status: canceled
+                      extraStatus: null
+                      chainId: 137
+                      token: USDT
+                      receiveAddress: "0x77aB1109551bD432803012645Ac136ddd64DBA99"
+                      addressIndex: 51
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          address: "0x77aB1109551bD432803012645Ac136ddd64DBA99"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "75.00"
+                      paidUsd: "0"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T11:55:00.000Z"
+                      rates: { USDT: "1.0001", POL: "0.41" }
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      externalId: "order-10031"
+                      metadata: null
+                      createdAt: "2026-07-04T11:45:00.000Z"
+                      expiresAt: "2026-07-04T12:15:00.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T12:00:00.000Z"
+                    transactions: []
+                    triggerTxHash: null
+      responses:
+        "2XX":
+          description: Acknowledge within 10 s; body ignored.
+
+  "invoice:demoted":
+    post:
+      tags: [webhooks]
+      operationId: onInvoiceDemoted
+      summary: A chain reorg un-confirmed the invoice
+      description: |
+        Fires when a blockchain reorganization orphans transaction(s) that
+        had counted toward the invoice, dropping it from `completed` (or
+        `processing`) back to a less-settled state. The `data` block
+        carries the standard envelope PLUS:
+          - `previousStatus` — where the invoice was before the reorg
+          - `poolReacquired` — the gateway re-locked the receive address
+            to keep watching for a replacement payment
+          - `poolCollided` — the address had ALREADY been recycled to a
+            newer invoice when the reorg hit (rare; funds arriving now may
+            attribute to the newer invoice — coordinate with the operator)
+
+        **Act on this if you fulfilled on `invoice:completed`**: pause the
+        order, then poll `GET /api/v1/invoices/{id}` — if the payment
+        re-confirms the invoice returns to `completed`, but
+        `invoice:completed` is NOT re-delivered (same idempotency key,
+        already delivered once).
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookInvoiceDemotedEvent" }
+            examples:
+              reorg:
+                summary: Completed invoice knocked back to processing by a reorg
+                value:
+                  event: "invoice:demoted"
+                  timestamp: "2026-07-04T10:12:20.000Z"
+                  data:
+                    invoice:
+                      id: "0b9e4c7a-1d2f-4a3b-9c8d-5e6f7a8b9c0d"
+                      status: processing
+                      extraStatus: partial
+                      chainId: 137
+                      token: USDC
+                      receiveAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      addressIndex: 42
+                      acceptedFamilies: [evm]
+                      receiveAddresses:
+                        - family: evm
+                          address: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                      requiredAmountRaw: "0"
+                      receivedAmountRaw: "0"
+                      fiatAmount: null
+                      fiatCurrency: null
+                      quotedRate: null
+                      amountUsd: "100.00"
+                      paidUsd: "40.00"
+                      overpaidUsd: "0"
+                      rateWindowExpiresAt: "2026-07-04T10:15:00.000Z"
+                      rates: { USDC: "0.9998", POL: "0.41" }
+                      paymentToleranceUnderBps: 100
+                      paymentToleranceOverBps: 500
+                      externalId: "order-10023"
+                      metadata: { cartId: "c_88112" }
+                      createdAt: "2026-07-04T10:00:00.000Z"
+                      expiresAt: "2026-07-04T10:30:00.000Z"
+                      confirmedAt: null
+                      updatedAt: "2026-07-04T10:12:20.000Z"
+                    transactions:
+                      - hash: "0x9f2b7c1e83a4d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f"
+                        chainId: 137
+                        chainName: polygon
+                        token: USDC
+                        isNative: false
+                        amount: "40"
+                        amountRaw: "40000000"
+                        amountUsd: "40.00"
+                        confirmations: 27
+                        status: confirmed
+                      - hash: "0x71c4d2e9b8a7f605142e3d4c5b6a798081726354a4b5c6d7e8f90a1b2c3d4e5"
+                        chainId: 137
+                        chainName: polygon
+                        token: USDC
+                        isNative: false
+                        amount: "60.062"
+                        amountRaw: "60062000"
+                        amountUsd: "60.05"
+                        confirmations: 0
+                        status: orphaned
+                    triggerTxHash: null
+                    previousStatus: completed
+                    poolReacquired: true
+                    poolCollided: false
+      responses:
+        "2XX":
+          description: Acknowledge within 10 s; body ignored.
+
+  "payout.submitted":
+    post:
+      tags: [webhooks]
+      operationId: onPayoutSubmitted
+      summary: The payout transaction was broadcast
+      description: |
+        Fires when the executor broadcasts the payout — `data.txHash` is
+        now set (plus `topUpTxHash` / `topUpSponsorAddress` when a
+        just-in-time gas top-up preceded it). `data` is the payout object
+        directly (no wrapper). This is the FIRST webhook a payout emits —
+        planning (the 201 on POST) does not produce one.
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookPayoutEvent" }
+            examples:
+              submitted:
+                summary: 250 USDC broadcast on Polygon
+                value:
+                  event: "payout.submitted"
+                  timestamp: "2026-07-04T11:00:09.000Z"
+                  data:
+                    id: "e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b"
+                    kind: standard
+                    parentPayoutId: null
+                    status: submitted
+                    chainId: 137
+                    token: USDC
+                    amountRaw: "250000000"
+                    feeTier: medium
+                    feeQuotedNative: "1950000000000000"
+                    batchId: null
+                    destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+                    sourceAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                    txHash: "0x54ab99c2d1e0f83b7a6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a"
+                    topUpTxHash: null
+                    topUpSponsorAddress: null
+                    lastError: null
+                    submittedAt: "2026-07-04T11:00:09.000Z"
+                    confirmedAt: null
+              submittedAfterTopUp:
+                summary: USDT on Tron broadcast after a sponsor gas top-up
+                value:
+                  event: "payout.submitted"
+                  timestamp: "2026-07-04T11:11:32.000Z"
+                  data:
+                    id: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+                    kind: standard
+                    parentPayoutId: null
+                    status: submitted
+                    chainId: 728126428
+                    token: USDT
+                    amountRaw: "500000000"
+                    feeTier: null
+                    feeQuotedNative: null
+                    batchId: "vendor-settlement-2026-07-04"
+                    destinationAddress: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE"
+                    sourceAddress: "TVj7RNVHy6thbM7BWdSe9G6gXwKhjhdNZS"
+                    txHash: "d4e5f6a7b8c90112233445566778899aabbccddeeff00112233445566778899a"
+                    topUpTxHash: "8f2a1b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8"
+                    topUpSponsorAddress: "TN3W4H6rK2ce4vX9YnFQHwKENnHjoxb3m9"
+                    lastError: null
+                    submittedAt: "2026-07-04T11:11:32.000Z"
+                    confirmedAt: null
+      responses:
+        "2XX":
+          description: Acknowledge within 10 s; body ignored.
+
+  "payout.confirmed":
+    post:
+      tags: [webhooks]
+      operationId: onPayoutConfirmed
+      summary: The payout transaction reached its confirmation threshold
+      description: |
+        Terminal success. `data.confirmedAt` is set; the destination has
+        the funds at the recorded `txHash`.
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookPayoutEvent" }
+            examples:
+              confirmed:
+                value:
+                  event: "payout.confirmed"
+                  timestamp: "2026-07-04T11:01:02.000Z"
+                  data:
+                    id: "e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b"
+                    kind: standard
+                    parentPayoutId: null
+                    status: confirmed
+                    chainId: 137
+                    token: USDC
+                    amountRaw: "250000000"
+                    feeTier: medium
+                    feeQuotedNative: "1950000000000000"
+                    batchId: null
+                    destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+                    sourceAddress: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72"
+                    txHash: "0x54ab99c2d1e0f83b7a6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a"
+                    topUpTxHash: null
+                    topUpSponsorAddress: null
+                    lastError: null
+                    submittedAt: "2026-07-04T11:00:09.000Z"
+                    confirmedAt: "2026-07-04T11:01:02.000Z"
+      responses:
+        "2XX":
+          description: Acknowledge within 10 s; body ignored.
+
+  "payout.failed":
+    post:
+      tags: [webhooks]
+      operationId: onPayoutFailed
+      summary: The payout permanently failed
+      description: |
+        Terminal failure — the executor exhausted its options.
+        `data.lastError` carries a merchant-safe reason (RPC diagnostics
+        with URLs and foreign addresses redacted, or a stable canned
+        message). Reservations are released.
+
+        Note: `txHash` may be non-null on a failure that happened AFTER
+        broadcast (e.g. the chain reverted the tx). Treat `status`
+        as authoritative, not the presence of a hash. Plan a new payout
+        to retry — failed rows are never re-executed.
+      parameters:
+        - $ref: "#/components/parameters/WebhookSignature"
+        - $ref: "#/components/parameters/WebhookIdempotencyKey"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookAttempt"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookPayoutEvent" }
+            examples:
+              failed:
+                value:
+                  event: "payout.failed"
+                  timestamp: "2026-07-04T11:20:44.000Z"
+                  data:
+                    id: "c9d0e1f2-a3b4-4c5d-8e7f-6a5b4c3d2e1f"
+                    kind: standard
+                    parentPayoutId: null
+                    status: failed
+                    chainId: 1
+                    token: ETH
+                    amountRaw: "120000000000000000"
+                    feeTier: high
+                    feeQuotedNative: "630000000000000"
+                    batchId: null
+                    destinationAddress: "0xAb5801a7D398351b8bE11C439e05C5b3259aec9B"
+                    sourceAddress: "0x4Bb2f019661cE532803012645Ac136ddd64DBA71"
+                    txHash: null
+                    topUpTxHash: null
+                    topUpSponsorAddress: null
+                    lastError: "broadcast rejected by chain: replacement transaction underpriced (after 3 attempts)"
+                    submittedAt: null
+                    confirmedAt: null
+      responses:
+        "2XX":
+          description: Acknowledge within 10 s; body ignored.
+
+components:
+  securitySchemes:
+    MerchantApiKey:
+      type: http
+      scheme: bearer
+      description: |
+        Merchant API key issued by the gateway operator (shown once at
+        creation; rotation invalidates the old key immediately). Also
+        accepted as `X-API-Key: <key>`.
+
+  parameters:
+    WebhookSignature:
+      name: X-Webhook-Signature
+      in: header
+      required: true
+      description: |
+        Lowercase-hex HMAC-SHA256 of the raw request body, keyed with the
+        webhook secret in effect for this delivery (per-resource override
+        if one was set on the invoice/payout, otherwise your merchant
+        secret). Verify with a constant-time comparison BEFORE parsing
+        the JSON.
+      schema: { type: string, pattern: "^[0-9a-f]{64}$" }
+    WebhookIdempotencyKey:
+      name: X-Webhook-Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Stable key for the logical event — identical across every retry.
+        Dedupe on it. Formats (informative, subject to extension):
+        `invoice:completed:<invoiceId>:<status>`,
+        `invoice:processing:<invoiceId>:processing:<extraStatus|none>`,
+        `invoice:payment_detected:<invoiceId>:<txHash>`,
+        `invoice:demoted:<invoiceId>:<prevStatus>:<newStatus>`,
+        `payout.submitted:<payoutId>:<status>`, …
+      schema: { type: string }
+    WebhookTimestamp:
+      name: X-Webhook-Timestamp
+      in: header
+      required: true
+      description: |
+        Unix-milliseconds of the first HTTP attempt of the current
+        delivery cycle (stable across the up-to-4 in-cycle retries; a
+        later outbox re-drive gets a fresh value). Use it for staleness
+        checks, not for dedupe.
+      schema: { type: string, pattern: "^\\d+$" }
+    WebhookAttempt:
+      name: X-Webhook-Attempt
+      in: header
+      required: true
+      description: 1-based attempt counter WITHIN the current delivery cycle (1..4).
+      schema: { type: string, pattern: "^[1-4]$" }
+
+  headers:
+    X-Request-Id:
+      description: |
+        UUID correlation id. Accepts a caller-supplied value if it's a
+        valid UUID; otherwise minted. Quote it in support requests.
+      schema: { type: string, format: uuid }
+    X-RateLimit-Limit:
+      description: Window cap for this route's rate-limit scope.
+      schema: { type: integer }
+    X-RateLimit-Remaining:
+      description: Requests left in the current window after this one.
+      schema: { type: integer }
+    X-RateLimit-Reset:
+      description: Unix seconds when the window rolls.
+      schema: { type: integer }
+
+  responses:
+    Unauthorized:
+      description: |
+        Missing or invalid API key — also returned when the key is valid
+        but the merchant account has been deactivated.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            unauthorized:
+              value:
+                error: { code: UNAUTHORIZED, message: "Missing or invalid API key" }
+    MerchantInactive:
+      description: Merchant account is deactivated — contact the gateway operator.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: |
+        Entity not found. Deliberately covers three indistinguishable
+        cases: nonexistent id, malformed (non-UUID) id, and an id owned
+        by another merchant.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            notFound:
+              value:
+                error: { code: NOT_FOUND, message: "Not found" }
+    RateLimited:
+      description: Too many requests in the current window.
+      headers:
+        Retry-After:
+          description: Seconds until the window rolls.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            limited:
+              value:
+                error: { code: RATE_LIMITED, message: "Rate limit exceeded — retry after 12s" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code — switch on this, never on `message`.
+            message: { type: string }
+            details:
+              type: [object, array]
+              additionalProperties: true
+              description: |
+                Optional per-code payload. `VALIDATION` errors carry the
+                Zod issues ARRAY; other codes attach an object (e.g.
+                `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE`'s `suggestedAmount*`
+                trio, `POOL_EXHAUSTED`'s `{ family, hint }`).
+
+    CreateInvoiceInput:
+      type: object
+      description: |
+        Provide EXACTLY ONE pricing mode:
+          - `amountUsd` — USD-pegged (recommended). Pair with
+            `acceptedFamilies` to make the invoice payable from any
+            family/token the gateway supports. Rates are pinned for 10
+            minutes at creation (refreshed per detection window after).
+          - `amountRaw` — legacy single-token exact amount.
+          - `fiatAmount` + `fiatCurrency` — legacy fiat-quoted; the
+            applied rate is echoed on the invoice as `quotedRate`.
+
+        Zero or multiple pricing modes → 400 `VALIDATION`. A `merchantId`
+        key in the body is ignored — identity comes from the API key.
+      required: [chainId, token]
+      properties:
+        chainId:
+          type: integer
+          description: |
+            Primary chain. Must be wired in the deployment. Determines
+            the primary family and the legacy `chainId` +
+            `receiveAddress` denormalization on the response. Common ids:
+            1 Ethereum, 137 Polygon, 56 BNB, 728126428 Tron, 900 Solana,
+            800 Bitcoin, 801 Litecoin, 1000 Monero — ask your gateway
+            operator for the wired set.
+        token:
+          type: string
+          pattern: "^[A-Z0-9]+$"
+          maxLength: 16
+          description: |
+            Any symbol registered on this `chainId`, including native gas
+            tokens (ETH/POL/BNB/TRX/SOL/BTC/LTC/XMR) — natives are
+            first-class alongside USDC/USDT. Your gateway operator can
+            list the registered symbols per chain.
+        amountUsd:
+          type: string
+          pattern: "^\\d+(\\.\\d{1,8})?$"
+          description: |
+            USD-pegged target — settleable in ANY combination of
+            registered tokens at the receive addresses; each transfer
+            converts to USD at its detection-time rate snapshot and sums.
+            e.g. $50 USDC + $50 ETH satisfies a $100 invoice.
+          examples: ["100.00"]
+        acceptedFamilies:
+          type: array
+          items: { type: string, enum: [evm, tron, solana, utxo, monero] }
+          minItems: 1
+          description: |
+            Families the invoice will accept payment from — each gets its
+            own receive address (UTXO as non-primary yields one address
+            per wired UTXO chain; BTC and LTC formats differ). Omit for
+            single-family (derived from `chainId`). Every listed family
+            must be wired in the deployment or the request fails 400
+            `TOKEN_NOT_SUPPORTED`.
+
+            Token-availability rule: with `amountRaw` / `fiatAmount`
+            (legacy), `token` must be registered on EVERY accepted
+            family; with `amountUsd`, only on the primary chain's family.
+        amountRaw:
+          type: string
+          pattern: "^\\d+$"
+          description: |
+            Raw token amount in smallest units (wei, sun, lamports,
+            micro-units for 6-dec USDC/USDT). Single-token invoices: only
+            the quoted `token` credits toward this target — wrong-token
+            transfers are logged for audit but ignored.
+          examples: ["25000000"]
+        fiatAmount:
+          type: string
+          pattern: "^\\d+(\\.\\d+)?$"
+          description: Fiat amount as a decimal string (e.g. "49.99"). Requires `fiatCurrency`.
+        fiatCurrency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+          description: ISO-4217 currency code, uppercase (e.g. "USD", "EUR").
+        externalId:
+          type: string
+          maxLength: 256
+          description: |
+            Your opaque reference (cart/order id). Doubles as a
+            Stripe-style idempotency key: a second POST from the same
+            merchant with the same `externalId` returns the original
+            invoice (HTTP 201 again) instead of creating a duplicate.
+            Omit it and every POST creates a new invoice.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: |
+            Opaque JSON echoed on merchant reads and webhook payloads.
+            Never exposed on the public checkout view.
+        expiresInMinutes:
+          type: integer
+          minimum: 1
+          maximum: 1440
+          default: 30
+          description: Hard ceiling 24 h — the scheduler sweeps long-expired invoices.
+        webhookUrl:
+          type: string
+          format: uri
+          description: |
+            Per-invoice webhook destination override. When set, this
+            invoice's events go here instead of the merchant-account
+            webhook. Must be supplied together with `webhookSecret`
+            (passing one without the other is a 400). Public HTTPS only —
+            loopback / link-local / metadata targets are rejected.
+        webhookSecret:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: |
+            HMAC secret paired with `webhookUrl`. Encrypted at rest,
+            never echoed back.
+        paymentToleranceUnderBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Under-payment tolerance override in basis points — the
+            invoice completes when confirmed value ≥ target × (1 −
+            under/10000). Omit to inherit your merchant default
+            (snapshotted at create time).
+        paymentToleranceOverBps:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          description: |
+            Over-payment tolerance override in basis points — confirmed
+            value > target × (1 + over/10000) marks the completed invoice
+            `extraStatus: "overpaid"`. Omit to inherit the merchant
+            default.
+
+    Invoice:
+      type: object
+      description: |
+        Merchant view of an invoice, as serialized by every
+        `/api/v1/invoices*` response. All monetary fields are decimal
+        strings (never floats); timestamps are ISO-8601. Every field is
+        always present (null-capable ones carry `null`).
+      required:
+        [id, merchantId, status, extraStatus, chainId, token, receiveAddress,
+         addressIndex, acceptedFamilies, receiveAddresses, requiredAmountRaw,
+         receivedAmountRaw, fiatAmount, fiatCurrency, quotedRate, amountUsd,
+         paidUsd, overpaidUsd, rateWindowExpiresAt, rates, externalId,
+         metadata, webhookUrl, paymentToleranceUnderBps,
+         paymentToleranceOverBps, confirmationThreshold, confirmationTiers,
+         createdAt, expiresAt, confirmedAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        merchantId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [pending, processing, completed, expired, canceled]
+          description: |
+            Lifecycle stage:
+              - `pending`    — no on-chain activity yet
+              - `processing` — at least one tx seen; threshold not met OR
+                               met but unconfirmed
+              - `completed`  — confirmed payment ≥ threshold (within
+                               tolerance); overpaid completions carry
+                               `extraStatus='overpaid'`
+              - `expired`    — past `expiresAt` with no completion
+              - `canceled`   — canceled by the gateway operator
+        extraStatus:
+          type: [string, "null"]
+          enum: [partial, overpaid, null]
+          description: |
+            Payment-fidelity signal, orthogonal to `status`:
+            `"partial"` = 0 < paid < threshold (with status=processing);
+            `"overpaid"` = paid > threshold × (1 + over_bps/10000)
+            (with status=completed).
+        chainId:
+          type: integer
+          description: Primary chain (named at create time). Multi-family invoices carry the full set in `receiveAddresses`.
+        token: { type: string }
+        receiveAddress:
+          type: string
+          description: Primary family's receive address (denormalized for single-chain clients). Authoritative set = `receiveAddresses`.
+        addressIndex:
+          type: integer
+          description: HD derivation index of the primary receive address.
+        acceptedFamilies:
+          type: array
+          items: { type: string, enum: [evm, tron, solana, utxo, monero] }
+        receiveAddresses:
+          type: array
+          description: |
+            One entry per accepted family — except UTXO, which yields one
+            entry per wired UTXO chain (BTC and LTC addresses differ).
+            Sorted by family, then chainId.
+          items:
+            type: object
+            required: [family, chainId, address, poolAddressId]
+            properties:
+              family: { type: string, enum: [evm, tron, solana, utxo, monero] }
+              chainId:
+                type: integer
+                description: |
+                  Informational on EVM/Tron/Solana rows (the address is
+                  valid family-wide); authoritative on UTXO rows.
+              address: { type: string }
+              poolAddressId:
+                type: [string, "null"]
+                format: uuid
+                description: Backing pool row. Null on UTXO (fresh-per-invoice) and Monero rows.
+              addressIndex:
+                type: integer
+                description: |
+                  HD derivation index backing this entry. Present ONLY on
+                  the fresh-create `POST /api/v1/invoices` 201 response;
+                  GET / list / expire / idempotent-replay responses omit it.
+        requiredAmountRaw:
+          type: string
+          description: Legacy single-token target in smallest units. `"0"` on USD-path invoices.
+        receivedAmountRaw:
+          type: string
+          description: Sum of confirmed inbound raw-unit transfers (legacy single-token axis).
+        fiatAmount: { type: [string, "null"] }
+        fiatCurrency: { type: [string, "null"] }
+        quotedRate:
+          type: [string, "null"]
+          description: Token/fiat rate pinned at creation. Non-null only on fiat-quoted invoices.
+        amountUsd:
+          type: [string, "null"]
+          description: USD target. Non-null only on USD-path invoices.
+        paidUsd:
+          type: string
+          description: Sum of confirmed transactions' USD value. `"0"` on fresh and legacy invoices.
+        overpaidUsd:
+          type: string
+          description: max(paidUsd − amountUsd, 0). `"0"` unless overpaid.
+        rateWindowExpiresAt:
+          type: [string, "null"]
+          format: date-time
+          description: When the current 10-minute pinned-rate window closes. Null on legacy invoices.
+        rates:
+          type: [object, "null"]
+          additionalProperties: { type: string }
+          description: Pinned USD-per-token rates for this window (USD-path only), keyed by symbol.
+        externalId: { type: [string, "null"] }
+        metadata: { type: [object, "null"] }
+        webhookUrl:
+          type: [string, "null"]
+          format: uri
+          description: Per-invoice webhook override (echo-only; the secret is never returned).
+        paymentToleranceUnderBps: { type: integer, minimum: 0, maximum: 2000 }
+        paymentToleranceOverBps: { type: integer, minimum: 0, maximum: 2000 }
+        confirmationThreshold:
+          type: [integer, "null"]
+          minimum: 1
+          description: |
+            Confirmations required to flip a transfer `detected` →
+            `confirmed`. Snapshotted at create time and frozen; applies
+            to every accepted family. Null only on pre-migration rows.
+        confirmationTiers:
+          type: [object, "null"]
+          description: |
+            Snapshot of amount-tiered confirmation rules, keyed
+            `"{chainId}:{TOKEN}"`; first matching rule wins, else
+            `confirmationThreshold`. Null = no tiers.
+          additionalProperties:
+            type: array
+            items:
+              type: object
+              required: [confirmations]
+              properties:
+                amount: { type: string }
+                op: { type: string, enum: ["<", "<=", ">", ">=", "=", "<>"] }
+                confirmations: { type: integer, minimum: 1 }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    InvoiceAmountsBreakdown:
+      type: object
+      description: |
+        USD-axis breakdown of an invoice's progress. All fields null on
+        legacy single-token invoices (use `requiredAmountRaw` /
+        `receivedAmountRaw` there).
+      properties:
+        requiredUsd: { type: [string, "null"] }
+        confirmedUsd:
+          type: [string, "null"]
+          description: Sum of CONFIRMED contributing transactions' USD values.
+        confirmingUsd:
+          type: [string, "null"]
+          description: Sum of DETECTED-but-not-yet-confirmed transactions' USD values.
+        remainingUsd:
+          type: [string, "null"]
+          description: max(requiredUsd − confirmedUsd, 0).
+        overpaidUsd:
+          type: [string, "null"]
+          description: max(confirmedUsd − requiredUsd, 0).
+
+    InvoiceTransaction:
+      type: object
+      description: |
+        One on-chain payment tied to the invoice (REST shape — the
+        webhook payload uses the slimmer `WebhookTransaction`). All
+        statuses are returned, including `reverted` / `orphaned` rows
+        that no longer count toward the total.
+      properties:
+        id: { type: string, format: uuid }
+        txHash: { type: string }
+        logIndex: { type: [integer, "null"] }
+        chainId: { type: integer }
+        chain:
+          type: [string, "null"]
+          description: Short slug like `ethereum`, `polygon`, `tron`, `solana`. Null if unknown.
+        token: { type: string }
+        fromAddress: { type: string }
+        toAddress: { type: string }
+        amountRaw: { type: string, description: Integer string in the token's smallest units. }
+        amount: { type: string, description: Human-readable decimal (UI convenience). }
+        amountUsd:
+          type: [string, "null"]
+          description: USD valuation pinned at detection time.
+        usdRate: { type: [string, "null"] }
+        status: { type: string, enum: [detected, confirmed, reverted, orphaned] }
+        confirmations: { type: integer }
+        blockNumber: { type: [integer, "null"] }
+        detectedAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+
+    InvoiceDetails:
+      type: object
+      description: Hydrated GET response — invoice + USD breakdown + per-tx detail.
+      required: [invoice, amounts, transactions]
+      properties:
+        invoice: { $ref: "#/components/schemas/Invoice" }
+        amounts: { $ref: "#/components/schemas/InvoiceAmountsBreakdown" }
+        transactions:
+          type: array
+          items: { $ref: "#/components/schemas/InvoiceTransaction" }
+
+    PublicInvoice:
+      type: object
+      description: |
+        Public checkout projection — everything a hosted checkout page
+        needs and nothing merchant-private. Compared to `Invoice` this
+        EXCLUDES `merchantId`, `externalId`, `metadata`, `webhookUrl`,
+        tolerance/confirmation fields, `addressIndex`, `quotedRate` and
+        `updatedAt`; `receiveAddresses` entries carry only
+        `family` + `address`.
+      required:
+        [id, status, extraStatus, chainId, token, receiveAddress,
+         acceptedFamilies, receiveAddresses, requiredAmountRaw,
+         receivedAmountRaw, fiatAmount, fiatCurrency, amountUsd, paidUsd,
+         overpaidUsd, rates, rateWindowExpiresAt, payableTokens, createdAt,
+         expiresAt, confirmedAt]
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, processing, completed, expired, canceled] }
+        extraStatus:
+          type: [string, "null"]
+          enum: [partial, overpaid, null]
+        chainId: { type: integer, description: Primary chain id — a label for simple single-chain UIs. }
+        token: { type: string }
+        receiveAddress:
+          type: string
+          description: Primary family's address. Multi-family UIs should render `receiveAddresses`.
+        acceptedFamilies:
+          type: array
+          items: { type: string, enum: [evm, tron, solana, utxo, monero] }
+        receiveAddresses:
+          type: array
+          description: "One gateway-owned address per accepted family (UTXO: per chain). Render all."
+          items:
+            type: object
+            required: [family, address]
+            properties:
+              family: { type: string, enum: [evm, tron, solana, utxo, monero] }
+              address: { type: string }
+        requiredAmountRaw: { type: string, description: "Legacy single-token target. `\"0\"` on USD-path invoices." }
+        receivedAmountRaw: { type: string }
+        fiatAmount: { type: [string, "null"] }
+        fiatCurrency: { type: [string, "null"] }
+        amountUsd: { type: [string, "null"] }
+        paidUsd: { type: string }
+        overpaidUsd: { type: string }
+        rates:
+          type: [object, "null"]
+          additionalProperties: { type: string }
+        rateWindowExpiresAt:
+          type: [string, "null"]
+          format: date-time
+          description: When the pinned rates (and `payableTokens` amounts) expire.
+        payableTokens:
+          type: [array, "null"]
+          items: { $ref: "#/components/schemas/PayableToken" }
+          description: |
+            USD-path only (null otherwise): every "pay with TOKEN on
+            CHAIN" option the deployment can settle for this invoice,
+            priced at the pinned rates. Sorted family → chainId → token.
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+
+    PayableToken:
+      type: object
+      description: |
+        One payment option for a USD-path invoice on the public checkout
+        view — a (family, chainId, token) combination the gateway can
+        accept, priced at the invoice's pinned rate window.
+      required: [family, chainId, token, decimals, amountRawMinimum, amountDisplay, rate, address]
+      properties:
+        family: { type: string, enum: [evm, tron, solana, utxo, monero] }
+        chainId: { type: integer }
+        token: { type: string }
+        decimals: { type: integer }
+        amountRawMinimum:
+          type: string
+          description: |
+            Minimum raw-units amount that satisfies the full invoice at
+            the pinned rate. Ceiling-rounded (over-send ≤ 1 raw unit).
+        amountDisplay:
+          type: string
+          description: Human-readable token amount — render directly, no math needed.
+        rate: { type: string, description: "USD per whole token, as pinned." }
+        address:
+          type: string
+          description: Gateway-owned receive address on this family (identical across same-family rows).
+
+    PlanPayoutInput:
+      type: object
+      required: [chainId, token, destinationAddress]
+      description: |
+        Shared request body for `POST /api/v1/payouts` and
+        `POST /api/v1/payouts/estimate`. The server rejects unknown keys
+        with 400 `VALIDATION`. (Two additional reserved keys —
+        `forceSourceAddress`, `internalKind` — are tolerated for the
+        gateway's internal machinery; merchants MUST NOT set them.)
+
+        Provide **exactly one** of `amountRaw`, `amount`, `amountUSD`.
+      properties:
+        chainId:
+          type: integer
+          minimum: 1
+        token:
+          type: string
+          minLength: 1
+          maxLength: 16
+          pattern: "^[A-Z0-9]+$"
+          description: |
+            Any symbol registered on this `chainId`, including natives
+            (ETH/POL/BNB/TRX/SOL/BTC/LTC). Malformed symbols fail 400
+            `VALIDATION`; well-formed unknown symbols fail 400
+            `TOKEN_NOT_SUPPORTED`.
+        amountRaw:
+          type: string
+          pattern: "^\\d+$"
+          description: Smallest-unit integer string (e.g. `"1000000"` = 1 USDC).
+        amount:
+          type: string
+          pattern: "^(0|[1-9]\\d*)(\\.\\d+)?$"
+          description: |
+            Human decimal (e.g. `"1.5"`). Must not exceed the token's
+            decimal places — else 400 `BAD_AMOUNT`.
+        amountUSD:
+          type: string
+          pattern: "^(0|[1-9]\\d*)(\\.\\d+)?$"
+          description: |
+            USD-pegged decimal (e.g. `"10.00"`), converted via the price
+            oracle at plan time; rate snapshotted to `quotedRate` /
+            `quotedAmountUsd`. Oracle down → 503 `ORACLE_FAILED` (a stale
+            rate is never substituted).
+        destinationAddress:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Canonicalized and validated per chain family before the plan
+            is accepted (400 `INVALID_DESTINATION` on failure). EVM
+            0x-hex; Tron base58; Solana base58; UTXO native-segwit bech32
+            only (`bc1q…` / `ltc1q…`). Monero rejects with 400
+            `PAYOUT_NOT_SUPPORTED_ON_FAMILY` (inbound-only in v1).
+        feeTier:
+          type: string
+          enum: [low, medium, high]
+          description: |
+            Optional fee tier for the broadcast tx. Meaningful where
+            `tieringSupported=true` (see estimate): EVM binds
+            maxFee/maxPriorityFee multipliers (0.8×/1.0×/1.5×); Solana
+            binds a compute-unit price percentile; UTXO picks the tier's
+            sat/vB. Tron accepts but ignores it. Omitted → the planner
+            budgets at `medium` and the broadcast uses chain defaults.
+        batchId:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            Optional grouping id, persisted verbatim and filterable via
+            `GET /api/v1/payouts?batchId=<id>`. Set automatically by
+            `POST /api/v1/payouts/batch`. Also your best retry-safety
+            lever on single-create: tag each logical payment attempt
+            uniquely and reconcile before retrying.
+        webhookUrl:
+          type: string
+          format: uri
+          description: |
+            Per-payout webhook destination override. Pair with
+            `webhookSecret`. Public HTTPS only (SSRF-guarded; loopback /
+            link-local / metadata targets → 400 `INVALID_DESTINATION`).
+        webhookSecret:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: HMAC secret paired with `webhookUrl`. Encrypted at rest, never echoed.
+
+    Payout:
+      type: object
+      description: |
+        Merchant view of a payout as serialized by every `/api/v1/payouts*`
+        response. Monetary fields are decimal/integer strings; timestamps
+        ISO-8601. (The webhook payload uses the slimmer
+        `WebhookPayoutObject`.)
+      required:
+        [id, merchantId, kind, parentPayoutId, status, chainId, token,
+         amountRaw, quotedAmountUsd, quotedRate, feeTier, feeQuotedNative,
+         batchId, destinationAddress, sourceAddress, txHash, topUpTxHash,
+         topUpSponsorAddress, topUpAmountRaw, feeEstimateNative, lastError,
+         webhookUrl, confirmationThreshold, confirmationTiers, createdAt,
+         submittedAt, confirmedAt, broadcastAttemptedAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        merchantId: { type: string, format: uuid }
+        kind:
+          type: string
+          enum: [standard]
+          description: |
+            Always `standard` on merchant-facing responses — the
+            gateway's internal kinds (gas top-ups, consolidation sweeps,
+            gas-burn tombstones) are filtered out of this API.
+        parentPayoutId:
+          type: [string, "null"]
+          format: uuid
+          description: Always null on standard rows (used by internal kinds).
+        status:
+          type: string
+          enum: [planned, reserved, topping-up, submitted, confirmed, failed, canceled]
+          description: |
+            New rows are inserted directly at `reserved` (the funding
+            source is picked synchronously on POST; `planned` matches
+            only legacy rows). `topping-up` = waiting for a sponsor →
+            source gas top-up tx to confirm before the main broadcast.
+            Only `reserved` rows can be canceled.
+        chainId: { type: integer }
+        token: { type: string }
+        amountRaw: { type: string, description: Integer string in the token's smallest unit. }
+        quotedAmountUsd:
+          type: [string, "null"]
+          description: Original USD input when the create used `amountUSD`; null otherwise.
+        quotedRate:
+          type: [string, "null"]
+          description: |
+            Oracle rate (USD per whole token) snapshotted at create time
+            (`amountUSD` path only). Create-time rate, not executed-time.
+        feeTier:
+          type: [string, "null"]
+          enum: [low, medium, high, null]
+          description: |
+            Fee tier bound at create time. Null when unspecified — EXCEPT
+            UTXO-family payouts, which record `medium` (the planner's
+            budgeting default).
+        feeQuotedNative:
+          type: [string, "null"]
+          description: |
+            Native-unit fee quoted at plan time for the chosen tier (for
+            quoted-vs-actual drift analysis). Null when no tier was
+            requested — except UTXO, where it always carries coinselect's
+            plan-time fee.
+        batchId: { type: [string, "null"] }
+        destinationAddress: { type: string }
+        sourceAddress:
+          type: [string, "null"]
+          description: |
+            Gateway address funding the payout, picked at plan time on
+            account-model chains. ALWAYS null on UTXO-family payouts
+            (coin selection spans every owned UTXO at broadcast).
+        txHash: { type: [string, "null"] }
+        topUpTxHash:
+          type: [string, "null"]
+          description: |
+            Hash of the sponsor → source gas top-up tx when one was
+            needed; stays set after the main tx confirms (audit trail).
+        topUpSponsorAddress: { type: [string, "null"] }
+        topUpAmountRaw:
+          type: [string, "null"]
+          description: Native amount the sponsor sends (gas gap + cushion), fixed at plan time.
+        feeEstimateNative: { type: [string, "null"] }
+        lastError:
+          type: [string, "null"]
+          description: |
+            Merchant-safe failure reason after a `failed` transition
+            (RPC diagnostics redacted of URLs / foreign addresses).
+        webhookUrl:
+          type: [string, "null"]
+          format: uri
+          description: Per-payout webhook override (echo-only; secret never returned).
+        confirmationThreshold:
+          type: [integer, "null"]
+          description: |
+            Confirmations required to flip `submitted` → `confirmed`.
+            Snapshotted at plan time and frozen — later policy edits
+            don't reshape in-flight payouts.
+        confirmationTiers:
+          type: [object, "null"]
+          description: |
+            Snapshot of amount-tiered confirmation rules keyed
+            `"{chainId}:{token}"`; no match falls back to
+            `confirmationThreshold`. Null when none.
+          additionalProperties:
+            type: array
+            items:
+              type: object
+              required: [confirmations]
+              properties:
+                amount: { type: string }
+                op: { type: string, enum: ["<", "<=", ">", ">=", "=", "<>"] }
+                confirmations: { type: integer, minimum: 1 }
+        createdAt: { type: string, format: date-time }
+        submittedAt: { type: [string, "null"], format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+        broadcastAttemptedAt:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            First time the executor tried to broadcast — distinguishes
+            "never attempted" from "attempted at least once".
+        updatedAt: { type: string, format: date-time }
+
+    PayoutFeeEstimate:
+      type: object
+      description: |
+        Fee-tier quote + source preview for a hypothetical payout
+        (`POST /api/v1/payouts/estimate`). The planner's source selection
+        runs in dry-run mode — the response shows exactly what a real
+        plan would do. Nothing is reserved.
+      required: [amountRaw, quotedAmountUsd, quotedRate, tiers, source, alternatives, warnings]
+      properties:
+        amountRaw:
+          type: string
+          description: Resolved raw amount, token's smallest unit.
+        quotedAmountUsd: { type: [string, "null"] }
+        quotedRate: { type: [string, "null"] }
+        tiers:
+          type: object
+          required: [tieringSupported, nativeSymbol, low, medium, high]
+          properties:
+            tieringSupported:
+              type: boolean
+              description: |
+                False on chains without a fee-priority concept (Tron), on
+                Solana with no recent samples, and whenever the fee quote
+                failed (then all tiers are `"0"` and `warnings` carries
+                `fee_quote_unavailable`).
+            nativeSymbol: { type: string }
+            low: { $ref: "#/components/schemas/PayoutFeeQuoteTier" }
+            medium: { $ref: "#/components/schemas/PayoutFeeQuoteTier" }
+            high: { $ref: "#/components/schemas/PayoutFeeQuoteTier" }
+        source:
+          type: [object, "null"]
+          description: |
+            Gateway address the planner would pick. Null when no
+            candidate has enough token balance (see `warnings`). On UTXO
+            chains: a synthetic aggregate with
+            `address: "<utxo-aggregate>"` and `derivationIndex: -1`.
+          required: [address, derivationIndex, tokenBalance, nativeBalance, feeCoveredByDelegatedEnergy]
+          properties:
+            address: { type: string }
+            derivationIndex: { type: integer, description: "-1 on the synthetic UTXO aggregate." }
+            tokenBalance: { type: string, description: Spendable token balance (smallest units). }
+            nativeBalance: { type: string }
+            feeCoveredByDelegatedEnergy:
+              type: boolean
+              description: |
+                True when this source can broadcast WITHOUT burning
+                native gas (Tron delegated-energy model) — the `tiers`
+                quote then does not apply to this source (~$0 real cost).
+                Always false on non-Tron chains and native payouts.
+        topUp:
+          type: object
+          description: |
+            Present ONLY when the chosen source lacks native gas and a
+            sponsor must top it up first. `sponsor: null` = a token
+            holder exists but no funded sponsor (a real plan would 503
+            `NO_GAS_SPONSOR_AVAILABLE`).
+          required: [required, sponsor, amountRaw]
+          properties:
+            required: { type: boolean, enum: [true] }
+            sponsor:
+              type: [object, "null"]
+              required: [address, nativeBalance]
+              properties:
+                address: { type: string }
+                nativeBalance: { type: string }
+            amountRaw:
+              type: string
+              description: Native amount the sponsor would send (gas gap + 20% cushion when a sponsor exists).
+        alternatives:
+          type: array
+          maxItems: 4
+          description: Next-best source candidates by token balance descending. Always empty on UTXO.
+          items:
+            type: object
+            required: [address, derivationIndex, tokenBalance, nativeBalance, feeCoveredByDelegatedEnergy]
+            properties:
+              address: { type: string }
+              derivationIndex: { type: integer }
+              tokenBalance: { type: string }
+              nativeBalance: { type: string }
+              feeCoveredByDelegatedEnergy: { type: boolean }
+        warnings:
+          type: array
+          items: { type: string }
+          description: |
+            Non-fatal notices. Known codes:
+              - `no_source_address_has_sufficient_token_balance` — `source: null`
+              - `single_source_insufficient_consolidate_required` — the
+                AGGREGATE balance is sufficient but fragmented across
+                addresses; the gateway operator should consolidate
+              - `no_gas_sponsor_available` — `topUp.sponsor: null`
+              - `fee_quote_unavailable` — RPC failed during tier quoting;
+                `tieringSupported=false`, zeroed tiers (a real plan would
+                503 `FEE_ESTIMATE_FAILED`)
+              - `fee_quote_degraded` — conservative hardcoded rates were
+                served; broadcast works but tiers aren't market-fresh
+              - `fee_market_uniform` — low == medium == high right now
+              - `insufficient_utxo_balance` — UTXO only; confirmed
+                spendable can't cover amount + fee; `source: null`
+              - `max_amount_exceeds_net_spendable` — companion to the 400
+
+    PayoutFeeQuoteTier:
+      type: object
+      required: [tier, nativeAmountRaw, usdAmount]
+      properties:
+        tier: { type: string, enum: [low, medium, high] }
+        nativeAmountRaw:
+          type: string
+          description: Total fee in native smallest units (wei / sun / lamports / sats).
+        usdAmount:
+          type: [string, "null"]
+          description: USD value via the price oracle; null when the oracle is unavailable.
+
+    PayoutBatchInput:
+      type: object
+      required: [payouts]
+      description: |
+        Up to 100 `PlanPayoutInput` rows, validated and planned
+        independently in order. An empty array is accepted (200 with
+        `batchId: ""`). More than 100 rows → 400 `BATCH_TOO_LARGE`. The
+        request consumes N rate-limit tokens.
+      properties:
+        payouts:
+          type: array
+          minItems: 0
+          maxItems: 100
+          items: { $ref: "#/components/schemas/PlanPayoutInput" }
+
+    PayoutBatchResponse:
+      type: object
+      description: |
+        HTTP 200 whenever the batch envelope was well-formed — even when
+        every row failed. Inspect `results[]` per row and `summary`.
+      required: [batchId, results, summary]
+      properties:
+        batchId:
+          type: string
+          description: |
+            UUID shared across every successfully-planned row. Filter
+            with `GET /api/v1/payouts?batchId=<id>`. Empty string for the
+            degenerate empty batch.
+        results:
+          type: array
+          description: One entry per input row, in request order; `index` echoes the input position.
+          items:
+            oneOf:
+              - type: object
+                required: [index, status, payout]
+                properties:
+                  index: { type: integer }
+                  status: { type: string, enum: [planned] }
+                  payout: { $ref: "#/components/schemas/Payout" }
+              - type: object
+                required: [index, status, error]
+                properties:
+                  index: { type: integer }
+                  status: { type: string, enum: [failed] }
+                  error:
+                    type: object
+                    required: [code, message]
+                    properties:
+                      code:
+                        type: string
+                        description: |
+                          Any single-create error code
+                          (`TOKEN_NOT_SUPPORTED`, `INVALID_DESTINATION`,
+                          `BAD_AMOUNT`,
+                          `MAX_AMOUNT_EXCEEDS_NET_SPENDABLE`,
+                          `INSUFFICIENT_BALANCE_ANY_SOURCE`,
+                          `NO_GAS_SPONSOR_AVAILABLE`, `ORACLE_FAILED`,
+                          `FEE_ESTIMATE_FAILED`,
+                          `PAYOUT_NOT_SUPPORTED_ON_FAMILY`, …), plus
+                          `VALIDATION_FAILED` (row failed schema
+                          validation) and `INTERNAL`.
+                      message: { type: string }
+        summary:
+          type: object
+          required: [planned, failed]
+          properties:
+            planned: { type: integer }
+            failed: { type: integer }
+
+    # ------------------------------------------------------------------
+    # Webhook payload schemas. The invoice/payout objects inside webhook
+    # payloads are SLIMMER than their REST counterparts — do not assume
+    # field parity. Always GET the resource when you need the full view.
+    # ------------------------------------------------------------------
+
+    WebhookInvoiceObject:
+      type: object
+      description: |
+        Invoice snapshot embedded in invoice webhook payloads. Compared
+        to the REST `Invoice`: no `merchantId`, no `webhookUrl`, no
+        `confirmationThreshold` / `confirmationTiers`; `receiveAddresses`
+        entries carry only `family` + `address`.
+      required:
+        [id, status, extraStatus, chainId, token, receiveAddress,
+         addressIndex, acceptedFamilies, receiveAddresses,
+         requiredAmountRaw, receivedAmountRaw, fiatAmount, fiatCurrency,
+         quotedRate, amountUsd, paidUsd, overpaidUsd, rateWindowExpiresAt,
+         rates, paymentToleranceUnderBps, paymentToleranceOverBps,
+         externalId, metadata, createdAt, expiresAt, confirmedAt,
+         updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, processing, completed, expired, canceled] }
+        extraStatus:
+          type: [string, "null"]
+          enum: [partial, overpaid, null]
+        chainId: { type: integer }
+        token: { type: string }
+        receiveAddress: { type: string }
+        addressIndex: { type: integer }
+        acceptedFamilies:
+          type: array
+          items: { type: string, enum: [evm, tron, solana, utxo, monero] }
+        receiveAddresses:
+          type: array
+          items:
+            type: object
+            required: [family, address]
+            properties:
+              family: { type: string, enum: [evm, tron, solana, utxo, monero] }
+              address: { type: string }
+        requiredAmountRaw: { type: string }
+        receivedAmountRaw: { type: string }
+        fiatAmount: { type: [string, "null"] }
+        fiatCurrency: { type: [string, "null"] }
+        quotedRate: { type: [string, "null"] }
+        amountUsd: { type: [string, "null"] }
+        paidUsd: { type: string }
+        overpaidUsd: { type: string }
+        rateWindowExpiresAt: { type: [string, "null"], format: date-time }
+        rates:
+          type: [object, "null"]
+          additionalProperties: { type: string }
+        paymentToleranceUnderBps: { type: integer }
+        paymentToleranceOverBps: { type: integer }
+        externalId: { type: [string, "null"] }
+        metadata: { type: [object, "null"] }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    WebhookTransaction:
+      type: object
+      description: |
+        Transaction entry inside invoice webhook payloads (slimmer than
+        the REST `InvoiceTransaction` — no addresses / block / ids).
+      required: [hash, chainId, chainName, token, isNative, amount, amountRaw, amountUsd, confirmations, status]
+      properties:
+        hash: { type: string }
+        chainId: { type: integer }
+        chainName:
+          type: [string, "null"]
+          description: Short slug (`polygon`, `tron`, …). Null if the chain is unknown to the registry.
+        token: { type: string }
+        isNative: { type: boolean }
+        amount:
+          type: [string, "null"]
+          description: |
+            Human-decimal form (`amountRaw / 10^decimals`) as a string.
+            Null when the token's decimals can't be resolved (e.g. token
+            later removed from the registry).
+        amountRaw: { type: string }
+        amountUsd: { type: [string, "null"] }
+        confirmations: { type: integer }
+        status: { type: string, enum: [detected, confirmed, reverted, orphaned] }
+
+    WebhookInvoiceEvent:
+      type: object
+      description: |
+        Envelope for all invoice webhook events except `invoice:demoted`
+        (which extends `data` — see `WebhookInvoiceDemotedEvent`).
+      required: [event, timestamp, data]
+      properties:
+        event:
+          type: string
+          enum:
+            - "invoice:payment_detected"
+            - "invoice:payment_confirmed"
+            - "invoice:completed"
+            - "invoice:expired"
+            - "invoice:canceled"
+            - "invoice:processing"
+          description: |
+            Colon-separated wire name. All six values are live events —
+            see the `webhooks` section for when each fires.
+        timestamp:
+          type: string
+          format: date-time
+          description: When the state transition happened (event time, not delivery time).
+        data:
+          type: object
+          required: [invoice, transactions, triggerTxHash]
+          properties:
+            invoice: { $ref: "#/components/schemas/WebhookInvoiceObject" }
+            transactions:
+              type: array
+              items: { $ref: "#/components/schemas/WebhookTransaction" }
+              description: |
+                EVERY transaction ever associated with the invoice
+                (including reverted / orphaned), ordered by detection
+                time — the complete picture on every event, no follow-up
+                GET needed.
+            triggerTxHash:
+              type: [string, "null"]
+              description: |
+                The transaction that caused this event, for the per-tx
+                `payment_*` events; null on whole-invoice lifecycle
+                events.
+
+    WebhookInvoiceDemotedEvent:
+      type: object
+      description: Envelope for `invoice:demoted` — the standard invoice envelope plus reorg extras.
+      required: [event, timestamp, data]
+      properties:
+        event:
+          type: string
+          enum: ["invoice:demoted"]
+        timestamp: { type: string, format: date-time }
+        data:
+          type: object
+          required: [invoice, transactions, triggerTxHash, previousStatus, poolReacquired, poolCollided]
+          properties:
+            invoice: { $ref: "#/components/schemas/WebhookInvoiceObject" }
+            transactions:
+              type: array
+              items: { $ref: "#/components/schemas/WebhookTransaction" }
+            triggerTxHash: { type: [string, "null"] }
+            previousStatus:
+              type: string
+              enum: [pending, processing, completed, expired, canceled]
+              description: Status before the reorg demotion.
+            poolReacquired:
+              type: boolean
+              description: The gateway re-locked the receive address to keep watching for a replacement payment.
+            poolCollided:
+              type: boolean
+              description: |
+                The address had already been recycled to a newer invoice
+                when the reorg hit — funds arriving now may attribute to
+                that newer invoice. Rare; coordinate with the operator.
+
+    WebhookPayoutObject:
+      type: object
+      description: |
+        Payout snapshot embedded in payout webhook payloads (the `data`
+        block IS this object — no wrapper). Slimmer than the REST
+        `Payout`: no `merchantId`, `quotedAmountUsd`, `quotedRate`,
+        `topUpAmountRaw`, `feeEstimateNative`, `webhookUrl`,
+        confirmation-policy fields, `createdAt`, `broadcastAttemptedAt`
+        or `updatedAt`. GET the payout for the full view.
+      required:
+        [id, kind, parentPayoutId, status, chainId, token, amountRaw,
+         feeTier, feeQuotedNative, batchId, destinationAddress,
+         sourceAddress, txHash, topUpTxHash, topUpSponsorAddress,
+         lastError, submittedAt, confirmedAt]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [standard] }
+        parentPayoutId: { type: [string, "null"], format: uuid }
+        status:
+          type: string
+          enum: [planned, reserved, topping-up, submitted, confirmed, failed, canceled]
+          description: Status at event time — `submitted` / `confirmed` / `failed` for the three payout events.
+        chainId: { type: integer }
+        token: { type: string }
+        amountRaw: { type: string }
+        feeTier:
+          type: [string, "null"]
+          enum: [low, medium, high, null]
+        feeQuotedNative: { type: [string, "null"] }
+        batchId: { type: [string, "null"] }
+        destinationAddress: { type: string }
+        sourceAddress: { type: [string, "null"] }
+        txHash: { type: [string, "null"] }
+        topUpTxHash: { type: [string, "null"] }
+        topUpSponsorAddress: { type: [string, "null"] }
+        lastError: { type: [string, "null"] }
+        submittedAt: { type: [string, "null"], format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+
+    WebhookPayoutEvent:
+      type: object
+      description: Envelope for the three payout webhook events.
+      required: [event, timestamp, data]
+      properties:
+        event:
+          type: string
+          enum: ["payout.submitted", "payout.confirmed", "payout.failed"]
+          description: Dot-separated wire name (unlike invoice events, which use colons).
+        timestamp: { type: string, format: date-time }
+        data: { $ref: "#/components/schemas/WebhookPayoutObject" }
