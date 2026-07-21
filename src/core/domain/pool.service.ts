@@ -2,14 +2,16 @@ import { and, asc, count, eq, inArray, isNotNull, isNull, lt, lte, max, notInArr
 import type { AppDeps } from "../app-deps.js";
 import { PoolExhaustedError } from "../errors.js";
 import type { ChainAdapter } from "../ports/chain.port.js";
-import type { ChainFamily } from "../types/chain.js";
+import type { Address, ChainFamily, ChainId } from "../types/chain.js";
 import type { PoolAddress, PoolFamilyStats } from "../types/pool.js";
-import { addressPool, invoices, merchants } from "../../db/schema.js";
+import { TOKEN_REGISTRY } from "../types/token-registry.js";
+import { addressPool, invoices, merchants, payoutReservations, transactions } from "../../db/schema.js";
 import {
   closeAllocationsByInvoice,
   closeAllocationsByPoolIds,
   recordAllocationOpen
 } from "./address-allocation-history.js";
+import { computeSpendable, computeSpendableBatch } from "./balance-snapshot.service.js";
 
 // Address pool: shared-across-merchants, HD-derived, reused across invoices.
 //
@@ -21,8 +23,18 @@ import {
 //              then lowest address_index) to 'allocated', tie to invoiceId.
 //   release  → on invoice terminal, flip back to 'available' and bump
 //              total_allocations. The same row can now serve the next invoice.
-//   quarantine → ops action, pull a row out of rotation (not wired in A1.a
-//              but the status exists so the table schema doesn't churn later).
+//   quarantine → two flavors sharing status='quarantined':
+//              - operator disable (disabled_at set) — manual park intent.
+//              - auto-retire (retired_at set, disabled_at NULL) — the hourly
+//                shrinkIdlePools sweep parks idle zero-balance rows so a
+//                demand spike doesn't permanently inflate the watched set.
+//   retire/dereg → retired_at is the watcher-deregistration marker:
+//              set ⟺ a pool.address.quarantined event was published (Alchemy
+//              tracker enqueues per-chain `remove` rows) and no re-add has
+//              been published since. EVERY path returning a row to service
+//              (refill reactivation, under-pressure borrow, operator enable,
+//              stray-funds rescan) clears retired_at and re-publishes
+//              pool.address.created so the watchers re-register.
 //
 // Concurrency:
 //   - allocate uses a RETURNING-style CAS on a single row; retries on miss
@@ -51,6 +63,58 @@ const ALLOCATE_RETRY_LIMIT = 5;
 // HD derivation + DB round-trip (<5s on any runtime). Short enough that a
 // dead process releases the lock reasonably fast.
 const REFILL_LOCK_TTL_SECONDS = 60;
+
+// ---- Auto-shrink defaults (see shrinkIdlePools) ----
+
+// Retire an idle 'available' row after this many hours without an allocation.
+// Overridable via deps.poolRetireIdleHours (env POOL_RETIRE_IDLE_HOURS);
+// 0 disables auto-shrink entirely. 24h comfortably clears every late-payment
+// watch window (1h expired-poll, 24h processing grace, merchant cooldown is
+// gated separately below).
+const DEFAULT_POOL_RETIRE_IDLE_HOURS = 24;
+
+// Never shrink a family below this many 'available' rows — the standing
+// buffer that absorbs normal traffic without borrow/refill churn. Must stay
+// above REFILL_TRIGGER_THRESHOLD or every allocation near the floor would
+// kick a (reactivating) refill. Overridable via deps.poolMinAvailable
+// (env POOL_MIN_AVAILABLE).
+const DEFAULT_POOL_MIN_AVAILABLE = 5;
+
+// Cadence of the shrink sweep, enforced with a cache-TTL throttle so the
+// per-minute cron tick only pays a putIfAbsent the other 59 minutes.
+const POOL_SHRINK_RUN_INTERVAL_SECONDS = 60 * 60;
+
+// Cap retirements per run so a huge post-spike backlog can't blow the cron
+// CPU budget. The hourly cadence drains any realistic backlog within a day.
+const POOL_SHRINK_MAX_PER_RUN = 200;
+
+// Daily RPC safety-net rescan over retired (deregistered) rows — a stray
+// deposit to an unwatched address must never go dark. Overridable via
+// deps.poolRetiredRescanHours (env POOL_RETIRED_RESCAN_HOURS); 0 disables.
+const DEFAULT_POOL_RETIRED_RESCAN_HOURS = 24;
+
+// Hard budget of getAccountBalances RPC calls per rescan run. This is the
+// real cap (not an address count): one EVM address costs one probe per
+// active chain, and Workers has a per-invocation subrequest budget the whole
+// cron tick shares — the repo convention is ~200 external calls per sweep.
+// Rows beyond the budget are NOT starved: the cursor below resumes where
+// this run stopped and wraps at the end of the set.
+const RESCAN_MAX_RPC_PROBES_PER_RUN = 200;
+
+// Max rows fetched per run (upper bound on the cursor page; the probe
+// budget is what actually limits work for multi-chain families).
+const RESCAN_MAX_ADDRESSES_PER_RUN = 200;
+
+// Rotation cursor so successive runs walk the ENTIRE retired set instead of
+// re-probing the same oldest rows forever. Cleared when a run reaches the
+// end of the set (wrap to start).
+const RESCAN_CURSOR_CACHE_KEY = "pool:retired-rescan-cursor";
+const RESCAN_CURSOR_TTL_SECONDS = 14 * 24 * 60 * 60;
+
+interface RescanCursor {
+  retiredAt: number;
+  id: string;
+}
 
 // ---- Public API ----
 
@@ -83,7 +147,12 @@ export async function initializePool(
       results.push({ family, outcome: "skipped-no-adapter", priorCount: 0, added: 0 });
       continue;
     }
-    const prior = await countPool(deps, family);
+    // Count only ACTIVE rows (retired_at NULL): refill satisfies `needed` by
+    // reactivating retired rows before minting, which adds zero total rows —
+    // counting retired rows as "present" would report topped-up while active
+    // capacity stayed below the target. Retired rows count as capacity only
+    // once reactivation brings them back.
+    const prior = await countActivePool(deps, family);
     const needed = Math.max(0, opts.initialSize - prior);
     if (needed === 0) {
       results.push({ family, outcome: "already-sufficient", priorCount: prior, added: 0 });
@@ -212,15 +281,21 @@ export async function allocateForInvoice(
   }
   // No 'available' rows after the retry budget. Before refilling (which mints
   // NEW addresses — grows the pool, and on Tron re-pays ~1 TRX activation per
-  // fresh account), try to BORROW a parked (operator-disabled) address back
-  // into rotation. This is the "auto re-enable when everything is occupied"
-  // path: an operator disable is a soft preference we honor right up until the
-  // pool would otherwise be exhausted. The borrowed row keeps `disabledAt`
-  // set, so `releaseFromInvoice` re-parks it once the invoice ends — the pool
+  // fresh account), try to BORROW a parked address back into rotation:
+  // auto-retired rows first (they were parked purely as a cost measure — a
+  // spike is exactly when we want them back), operator-disabled rows last
+  // (that park is explicit intent, honored right up until the pool would
+  // otherwise be exhausted). A borrowed disabled row keeps `disabledAt` set,
+  // so `releaseFromInvoice` re-parks it once the invoice ends — the pool
   // self-balances back down without manual intervention.
+  //
+  // SELECT-then-CAS (two round-trips) instead of the hot path's collapsed
+  // form: we need the row's PRIOR retired_at to know whether its watcher
+  // registration was removed and must be re-published. Borrow only fires
+  // under exhaustion, so the extra read is off the common path.
   for (let attempt = 0; attempt < ALLOCATE_RETRY_LIMIT; attempt += 1) {
-    const parkedSubquery = deps.db
-      .select({ id: addressPool.id })
+    const [parked] = await deps.db
+      .select({ id: addressPool.id, retiredAt: addressPool.retiredAt })
       .from(addressPool)
       .where(
         and(
@@ -230,11 +305,15 @@ export async function allocateForInvoice(
         )
       )
       .orderBy(
+        // Retired-first: rows with disabled_at NULL (auto-retired) sort before
+        // operator-disabled ones.
+        sql`(${addressPool.disabledAt} IS NULL) DESC`,
         asc(addressPool.totalAllocations),
         asc(addressPool.lastReleasedAt),
         asc(addressPool.addressIndex)
       )
       .limit(1);
+    if (!parked) break;
 
     const [borrowed] = await deps.db
       .update(addressPool)
@@ -243,13 +322,21 @@ export async function allocateForInvoice(
         allocatedToInvoiceId: invoiceId,
         allocatedAt: now,
         cooldownUntil: null,
-        lastReleasedByMerchantId: null
+        lastReleasedByMerchantId: null,
+        // Back in service — re-watched below when it had been deregistered.
+        retiredAt: null
         // disabledAt intentionally preserved — release re-parks this row.
       })
       .where(
         and(
-          inArray(addressPool.id, parkedSubquery),
-          eq(addressPool.status, "quarantined")
+          eq(addressPool.id, parked.id),
+          eq(addressPool.status, "quarantined"),
+          // CAS on the retired-state the publish decision below is based on:
+          // shrink pass 2 stamps retired_at WITHOUT touching status, so a
+          // status-only guard would let a deregistration slip in between the
+          // SELECT and this UPDATE and the re-add publish would be skipped
+          // for an invoice-bound address. A miss just loops and re-reads.
+          parked.retiredAt === null ? isNull(addressPool.retiredAt) : isNotNull(addressPool.retiredAt)
         )
       )
       .returning();
@@ -263,13 +350,30 @@ export async function allocateForInvoice(
         invoiceId,
         allocatedAt: now
       });
-      deps.logger.info("pool.borrowed_disabled_under_pressure", {
+      if (parked.retiredAt !== null) {
+        // The row had been deregistered from push watchers — re-register it
+        // and kick an immediate sync so the detection gap for the invoice we
+        // just bound is seconds, not a full cron tick. (publish awaits the
+        // tracker's enqueue, so the kick can't outrun the pending `add` row.)
+        await publishPoolAddressCreated(deps, {
+          poolAddressId: borrowed.id,
+          family,
+          address: borrowed.address,
+          addressIndex: borrowed.addressIndex,
+          atMs: now
+        });
+        kickAlchemySync(deps);
+      }
+      deps.logger.info("pool.borrowed_parked_under_pressure", {
         family,
         address: borrowed.address,
-        invoiceId
+        invoiceId,
+        wasRetired: parked.retiredAt !== null
       });
       // Still kick a refill so the next request finds a true 'available' row
-      // and we stop borrowing parked addresses.
+      // and we stop borrowing parked addresses. Refill reactivates remaining
+      // retired rows before minting, so this doesn't regrow the pool while
+      // parked capacity remains.
       scheduleRefill(deps, family);
       return drizzleRowToPoolAddress(borrowed);
     }
@@ -459,6 +563,10 @@ export async function reacquireForInvoice(
   let reacquired = 0;
   let collided = 0;
   for (const address of addresses) {
+    // 'available' OR 'quarantined': a demotion can arrive up to the 24h reorg
+    // recheck window after release, by which time the shrink sweep may have
+    // already retired the row. A retired row is still THE address the demoted
+    // invoice's payer used — re-claim it and re-register its watchers.
     const updated = await deps.db
       .update(addressPool)
       .set({
@@ -466,10 +574,21 @@ export async function reacquireForInvoice(
         allocatedToInvoiceId: invoiceId,
         allocatedAt: now,
         cooldownUntil: null,
-        lastReleasedByMerchantId: null
+        lastReleasedByMerchantId: null,
+        retiredAt: null
       })
-      .where(and(eq(addressPool.address, address), eq(addressPool.status, "available")))
-      .returning({ id: addressPool.id, family: addressPool.family, address: addressPool.address });
+      .where(
+        and(
+          eq(addressPool.address, address),
+          inArray(addressPool.status, ["available", "quarantined"])
+        )
+      )
+      .returning({
+        id: addressPool.id,
+        family: addressPool.family,
+        address: addressPool.address,
+        addressIndex: addressPool.addressIndex
+      });
     if (updated.length > 0) {
       reacquired += 1;
       // Reorg re-claim re-opens ownership for this invoice: append a fresh
@@ -484,6 +603,19 @@ export async function reacquireForInvoice(
         invoiceId,
         allocatedAt: now
       });
+      // Re-publish the watcher registration unconditionally: RETURNING gives
+      // post-update state, so we can't see whether the row had been retired
+      // (deregistered). A duplicate `add` for a still-registered address is
+      // harmless (sweep dedupes, Alchemy add is idempotent) and reorg
+      // demotions are rare.
+      await publishPoolAddressCreated(deps, {
+        poolAddressId: row.id,
+        family: row.family,
+        address: row.address,
+        addressIndex: row.addressIndex,
+        atMs: now
+      });
+      kickAlchemySync(deps);
       continue;
     }
     // Nothing changed — either this invoice already holds the row (safe) or
@@ -500,10 +632,13 @@ export async function reacquireForInvoice(
   return { reacquired, collided };
 }
 
-// Derive `count` new addresses for `family`, insert as 'available', emit
-// pool.address.created per row. Idempotent under contention via the cache
-// mutex — if another refill is mid-flight, this call is a no-op and returns 0.
-// Returns the number of rows actually inserted.
+// Grow the family's ACTIVE pool by `count`: first REACTIVATE auto-retired
+// rows (cheapest — the address exists, and on Tron its account activation is
+// already paid), then derive new HD addresses for the remainder and insert
+// as 'available'. Emits pool.address.created per row either way so the
+// Alchemy tracker (re-)registers the watchers. Idempotent under contention
+// via the cache mutex — if another refill is mid-flight, this call is a
+// no-op and returns 0. Returns the number of rows brought into service.
 export async function refillFamily(
   deps: AppDeps,
   family: ChainFamily,
@@ -519,13 +654,74 @@ export async function refillFamily(
       deps.logger.warn("pool refill skipped: no chain adapter wired for family", { family });
       return 0;
     }
+    const now = deps.clock.now().getTime();
+
+    // Reactivation-first: pull back the most-recently-retired rows (their
+    // watcher `remove` may still be pending, so the re-`add` merges cleanly
+    // in the sync queue). Operator-disabled rows are NOT touched — that park
+    // is explicit intent, honored except via the exhaustion borrow path.
+    const reactivateSubquery = deps.db
+      .select({ id: addressPool.id })
+      .from(addressPool)
+      .where(
+        and(
+          eq(addressPool.family, family),
+          eq(addressPool.status, "quarantined"),
+          isNotNull(addressPool.retiredAt),
+          isNull(addressPool.disabledAt)
+        )
+      )
+      .orderBy(sql`${addressPool.retiredAt} DESC`)
+      .limit(count);
+    const reactivated = await deps.db
+      .update(addressPool)
+      .set({
+        status: "available",
+        retiredAt: null,
+        // Fresh idle reference: without it a reactivated-but-unallocated row
+        // keeps its ancient COALESCE(last_released_at, created_at) and the
+        // very next hourly shrink re-retires it — a perpetual add/remove
+        // watcher flap. Stamping "now" grants the same idle grace a released
+        // row gets. (Also pushes it behind genuinely-dormant rows in the
+        // allocator's fairness ordering — acceptable.)
+        lastReleasedAt: now
+      })
+      .where(
+        and(inArray(addressPool.id, reactivateSubquery), eq(addressPool.status, "quarantined"))
+      )
+      .returning({
+        id: addressPool.id,
+        address: addressPool.address,
+        addressIndex: addressPool.addressIndex
+      });
+    for (const row of reactivated) {
+      await publishPoolAddressCreated(deps, {
+        poolAddressId: row.id,
+        family,
+        address: row.address,
+        addressIndex: row.addressIndex,
+        atMs: now
+      });
+    }
+
+    const mintCount = count - reactivated.length;
+    if (mintCount <= 0) {
+      kickAlchemySync(deps);
+      deps.logger.info("pool refilled", {
+        family,
+        count: reactivated.length,
+        reactivated: reactivated.length,
+        minted: 0
+      });
+      return reactivated.length;
+    }
+
     const seed = deps.secrets.getRequired("MASTER_SEED");
     const [maxRow] = await deps.db
       .select({ maxIdx: max(addressPool.addressIndex) })
       .from(addressPool)
       .where(eq(addressPool.family, family));
     const startIdx = (maxRow?.maxIdx ?? -1) + 1;
-    const now = deps.clock.now().getTime();
 
     // Derive addresses synchronously (local crypto, no I/O), then insert in
     // one batch so a partial failure doesn't leave the pool in a half-built
@@ -533,7 +729,7 @@ export async function refillFamily(
     // where a second refill slipped through the cache mutex.
     type DerivedRow = { id: string; address: string; index: number };
     const derived: DerivedRow[] = [];
-    for (let i = 0; i < count; i += 1) {
+    for (let i = 0; i < mintCount; i += 1) {
       const index = startIdx + i;
       const { address } = adapter.deriveAddress(seed, index);
       derived.push({ id: globalThis.crypto.randomUUID(), address, index });
@@ -556,21 +752,26 @@ export async function refillFamily(
     }
 
     // Publish pool.address.created events so the Alchemy subscription
-    // tracker can enqueue per-chain `add` rows. Publish is fire-and-forget
-    // at the bus layer — subscribers run async via the event handler.
+    // tracker can enqueue per-chain `add` rows.
     for (const d of derived) {
-      await deps.events.publish({
-        type: "pool.address.created",
+      await publishPoolAddressCreated(deps, {
         poolAddressId: d.id,
         family,
         address: d.address,
         addressIndex: d.index,
-        at: new Date(now)
+        atMs: now
       });
     }
+    kickAlchemySync(deps);
 
-    deps.logger.info("pool refilled", { family, count: derived.length, startIndex: startIdx });
-    return derived.length;
+    deps.logger.info("pool refilled", {
+      family,
+      count: reactivated.length + derived.length,
+      reactivated: reactivated.length,
+      minted: derived.length,
+      startIndex: startIdx
+    });
+    return reactivated.length + derived.length;
   } catch (err) {
     deps.logger.error("pool refill failed", {
       family,
@@ -617,6 +818,14 @@ export async function getStats(deps: AppDeps): Promise<readonly PoolFamilyStats[
     })
     .from(addressPool)
     .groupBy(addressPool.family, addressPool.status);
+  // Auto-retired (watcher-deregistered) subset of 'quarantined' — surfaced so
+  // operators can see the shrink sweep working.
+  const retiredRows = await deps.db
+    .select({ family: addressPool.family, cnt: count() })
+    .from(addressPool)
+    .where(isNotNull(addressPool.retiredAt))
+    .groupBy(addressPool.family);
+  const retiredByFamily = new Map(retiredRows.map((r) => [r.family, r.cnt]));
 
   const byFamily = new Map<ChainFamily, PoolFamilyStats>();
   for (const row of rows) {
@@ -625,6 +834,7 @@ export async function getStats(deps: AppDeps): Promise<readonly PoolFamilyStats[
       available: 0,
       allocated: 0,
       quarantined: 0,
+      retired: retiredByFamily.get(row.family) ?? 0,
       total: 0,
       highestIndex: null as number | null
     };
@@ -656,6 +866,8 @@ export interface PoolAddressAdminView {
   readonly addressIndex: number;
   readonly status: "available" | "allocated" | "quarantined";
   readonly disabledAt: number | null;
+  // Auto-shrink watcher-deregistration marker; non-null = not push-watched.
+  readonly retiredAt: number | null;
   readonly allocatedToInvoiceId: string | null;
 }
 
@@ -666,6 +878,7 @@ function toAdminView(row: typeof addressPool.$inferSelect): PoolAddressAdminView
     addressIndex: row.addressIndex,
     status: row.status,
     disabledAt: row.disabledAt,
+    retiredAt: row.retiredAt,
     allocatedToInvoiceId: row.allocatedToInvoiceId
   };
 }
@@ -678,6 +891,11 @@ function toAdminView(row: typeof addressPool.$inferSelect): PoolAddressAdminView
 // stays in the pool, is still swept by consolidation, and follows the same
 // late-payment cooldown/orphan path as any released address; account-model
 // keys are HD-derived so funds are always recoverable.
+//
+// Watcher deregistration is deliberately NOT immediate: the row may still be
+// inside a late-payment cooldown (or serving an invoice, on the allocated
+// branch). The hourly shrinkIdlePools pass 2 removes the watchers once the
+// row has been parked + idle past the retire window.
 export async function disablePoolAddress(
   deps: AppDeps,
   args: { family: ChainFamily; address: string }
@@ -709,7 +927,9 @@ export async function disablePoolAddress(
 // Re-ENABLE a previously disabled pool address: clears the disable intent and
 // un-parks an idle row (status quarantined → available). An allocated row will
 // simply release to 'available' as normal now that disabledAt is cleared.
-// Idempotent.
+// If the row had been watcher-deregistered (retired_at set — either
+// auto-retired or deregistered by the shrink sweep after an operator park),
+// re-publishes the watcher registration. Idempotent.
 export async function enablePoolAddress(
   deps: AppDeps,
   args: { family: ChainFamily; address: string }
@@ -718,21 +938,54 @@ export async function enablePoolAddress(
   if (!adapter) throw new PoolAddressNotFoundError(args.family, args.address);
   const canonical = adapter.canonicalizeAddress(args.address);
 
-  const [updated] = await deps.db
-    .update(addressPool)
-    .set({
-      disabledAt: null,
-      status: sql`CASE WHEN ${addressPool.status} = 'quarantined' THEN 'available' ELSE ${addressPool.status} END`
-    })
-    .where(and(eq(addressPool.family, args.family), eq(addressPool.address, canonical)))
-    .returning();
-  if (!updated) throw new PoolAddressNotFoundError(args.family, canonical);
-  deps.logger.info("pool.address_enabled", {
-    family: args.family,
-    address: canonical,
-    status: updated.status
-  });
-  return toAdminView(updated);
+  // Pre-read + CAS loop: RETURNING reflects post-update state, so the
+  // re-publish decision must come from a pre-read — and the UPDATE must
+  // assert that same retired-state so a shrink pass stamping retired_at
+  // between the two can't produce a cleared-but-never-republished row.
+  // Admin path — the extra reads are off any hot path.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const [prior] = await deps.db
+      .select({ retiredAt: addressPool.retiredAt })
+      .from(addressPool)
+      .where(and(eq(addressPool.family, args.family), eq(addressPool.address, canonical)))
+      .limit(1);
+    if (!prior) throw new PoolAddressNotFoundError(args.family, canonical);
+
+    const [updated] = await deps.db
+      .update(addressPool)
+      .set({
+        disabledAt: null,
+        retiredAt: null,
+        status: sql`CASE WHEN ${addressPool.status} = 'quarantined' THEN 'available' ELSE ${addressPool.status} END`
+      })
+      .where(
+        and(
+          eq(addressPool.family, args.family),
+          eq(addressPool.address, canonical),
+          prior.retiredAt === null ? isNull(addressPool.retiredAt) : isNotNull(addressPool.retiredAt)
+        )
+      )
+      .returning();
+    if (!updated) continue; // retired-state changed underneath us — re-read
+    if (prior.retiredAt !== null) {
+      await publishPoolAddressCreated(deps, {
+        poolAddressId: updated.id,
+        family: args.family,
+        address: updated.address,
+        addressIndex: updated.addressIndex,
+        atMs: deps.clock.now().getTime()
+      });
+      kickAlchemySync(deps);
+    }
+    deps.logger.info("pool.address_enabled", {
+      family: args.family,
+      address: canonical,
+      status: updated.status,
+      rewatched: prior.retiredAt !== null
+    });
+    return toAdminView(updated);
+  }
+  throw new PoolAddressNotFoundError(args.family, canonical);
 }
 
 // List every disabled (parked or borrowed-under-pressure) pool address,
@@ -794,7 +1047,532 @@ export async function listPoolAddresses(
   return { addresses: rows.map(toAdminView), total: countRow?.cnt ?? 0, limit, offset };
 }
 
+// ---- Automatic pool shrink + retired-address safety rescan ----
+
+export interface ShrinkIdlePoolsResult {
+  // False when the run was skipped (feature off, or the hourly throttle
+  // said another tick already ran it).
+  ran: boolean;
+  // 'available' rows retired this run (parked + watchers deregistered).
+  retired: number;
+  // Already-'quarantined' (operator-parked) rows whose watchers were
+  // deregistered this run.
+  deregisteredParked: number;
+  // Idle candidates left active because the ledger shows a nonzero balance
+  // or an in-flight reservation. Consolidation empties them; a later run
+  // retires them.
+  skippedWithBalance: number;
+}
+
+// Hourly cost-control sweep. A demand spike mints pool addresses; when demand
+// drops the surplus sits 'available' forever — each one registered on every
+// per-chain Alchemy webhook and touched by consolidation scans. This sweep
+// retires the surplus:
+//
+//   Pass 1 — for each account-model family, 'available' rows that are
+//     (a) beyond the POOL_MIN_AVAILABLE floor,
+//     (b) idle past POOL_RETIRE_IDLE_HOURS (never allocated, or last
+//         released, before the cutoff),
+//     (c) past any merchant cooldown (the late-payment attribution window),
+//     (d) not operator-disabled (that flavor is handled by pass 2), and
+//     (e) provably zero-balance in the ledger with no active reservation
+//     flip to 'quarantined' + retired_at, and publish
+//     pool.address.quarantined → the Alchemy tracker enqueues per-chain
+//     `remove` rows → the sync sweep PATCHes them off the webhooks.
+//
+//   Pass 2 — operator-parked 'quarantined' rows that never had their
+//     watchers deregistered (retired_at NULL — including rows parked by
+//     disablePoolAddress and borrow-returns re-parked by release) get the
+//     same deregistration once equally idle. Balance is NOT gated here:
+//     ledger funds on a parked row are already recorded, consolidation
+//     discovers sources by ledger history, and the daily rescan alerts on
+//     stray on-chain deposits.
+//
+// Retirement is reversible by design: refill reactivates retired rows
+// before minting new indices, exhaustion borrows them retired-first, and a
+// reorg reacquire or operator enable pulls a specific one back — every such
+// path clears retired_at and re-publishes the watcher registration. Keys
+// are HD-derived, so a retired address can never strand funds.
+//
+// Steady-state cost: one cache putIfAbsent per tick; on the hourly run with
+// no idle surplus, one COUNT per family. The ledger verification only runs
+// for rows actually about to retire (bounded by POOL_SHRINK_MAX_PER_RUN).
+export async function shrinkIdlePools(
+  deps: AppDeps,
+  opts: { force?: boolean } = {}
+): Promise<ShrinkIdlePoolsResult> {
+  const skipped: ShrinkIdlePoolsResult = {
+    ran: false,
+    retired: 0,
+    deregisteredParked: 0,
+    skippedWithBalance: 0
+  };
+  const idleHours = deps.poolRetireIdleHours ?? DEFAULT_POOL_RETIRE_IDLE_HOURS;
+  if (idleHours <= 0) return skipped;
+  if (!opts.force) {
+    const acquired = await deps.cache.putIfAbsent("pool:shrink-throttle", "1", {
+      ttlSeconds: POOL_SHRINK_RUN_INTERVAL_SECONDS
+    });
+    if (!acquired) return skipped;
+  }
+
+  // Clamp: Workers/Deno/Vercel knob parsing accepts any non-negative number
+  // (only the Node path goes through the zod schema), and a floor of 0 would
+  // let the sweep retire the entire standing buffer.
+  const minAvailable = Math.max(
+    1,
+    Math.floor(deps.poolMinAvailable ?? DEFAULT_POOL_MIN_AVAILABLE)
+  );
+  const now = deps.clock.now().getTime();
+  const idleCutoff = now - idleHours * 60 * 60 * 1000;
+  // Idle reference: last release, or creation for never-allocated rows.
+  const idleExpr = sql`COALESCE(${addressPool.lastReleasedAt}, ${addressPool.createdAt})`;
+
+  const result: ShrinkIdlePoolsResult = { ran: true, retired: 0, deregisteredParked: 0, skippedWithBalance: 0 };
+
+  for (const [family, adapters] of accountModelAdaptersByFamily(deps)) {
+    // Pass 1: retire the idle surplus above the floor.
+    const availableCount = await countAvailable(deps, family);
+    const excess = availableCount - minAvailable;
+    if (excess > 0) {
+      const candidates = await deps.db
+        .select({ id: addressPool.id, address: addressPool.address })
+        .from(addressPool)
+        .where(
+          and(
+            eq(addressPool.family, family),
+            eq(addressPool.status, "available"),
+            isNull(addressPool.disabledAt),
+            sql`${idleExpr} < ${idleCutoff}`,
+            or(isNull(addressPool.cooldownUntil), lte(addressPool.cooldownUntil, now))
+          )
+        )
+        // Longest-idle first — the floor keeps the most recently active rows.
+        .orderBy(sql`${idleExpr} ASC`)
+        .limit(Math.min(excess, POOL_SHRINK_MAX_PER_RUN));
+
+      if (candidates.length > 0) {
+        const zeroBalance = await filterZeroLedgerBalance(
+          deps,
+          adapters,
+          candidates.map((c) => c.address)
+        );
+        result.skippedWithBalance += candidates.length - zeroBalance.size;
+        let retireIds = candidates.filter((c) => zeroBalance.has(c.address)).map((c) => c.id);
+        // Re-count right before retiring: the ledger check above is several
+        // round-trips, and allocations in that window shrink the available
+        // set — without this, a stale excess could retire down past the
+        // floor (or two throttle-racing runs could retire the floor itself).
+        const freshAvailable = await countAvailable(deps, family);
+        retireIds = retireIds.slice(0, Math.max(0, freshAvailable - minAvailable));
+        if (retireIds.length > 0) {
+          // CAS re-asserts the FULL candidate predicate, not just status: a
+          // row that cycled allocate→release during the ledger check is
+          // 'available' again but carries a fresh lastReleasedAt (and
+          // possibly a merchant cooldown) — it must survive this round, not
+          // get deregistered inside its late-payment attribution window.
+          const retiredRows = await deps.db
+            .update(addressPool)
+            .set({ status: "quarantined", retiredAt: now })
+            .where(
+              and(
+                inArray(addressPool.id, retireIds),
+                eq(addressPool.status, "available"),
+                isNull(addressPool.disabledAt),
+                sql`${idleExpr} < ${idleCutoff}`,
+                or(isNull(addressPool.cooldownUntil), lte(addressPool.cooldownUntil, now))
+              )
+            )
+            .returning({ id: addressPool.id, address: addressPool.address });
+          for (const row of retiredRows) {
+            await publishPoolAddressQuarantined(deps, {
+              poolAddressId: row.id,
+              family,
+              address: row.address,
+              atMs: now
+            });
+          }
+          result.retired += retiredRows.length;
+        }
+      }
+    }
+
+    // Pass 2: deregister watchers for operator-parked rows (idle + past
+    // cooldown) that are still registered.
+    const parkedRows = await deps.db
+      .update(addressPool)
+      .set({ retiredAt: now })
+      .where(
+        and(
+          eq(addressPool.family, family),
+          eq(addressPool.status, "quarantined"),
+          isNull(addressPool.retiredAt),
+          sql`${idleExpr} < ${idleCutoff}`,
+          or(isNull(addressPool.cooldownUntil), lte(addressPool.cooldownUntil, now))
+        )
+      )
+      .returning({ id: addressPool.id, address: addressPool.address });
+    for (const row of parkedRows) {
+      await publishPoolAddressQuarantined(deps, {
+        poolAddressId: row.id,
+        family,
+        address: row.address,
+        atMs: now
+      });
+    }
+    result.deregisteredParked += parkedRows.length;
+  }
+
+  if (result.retired > 0 || result.deregisteredParked > 0) {
+    // Flush the `remove` rows promptly rather than waiting a full tick.
+    kickAlchemySync(deps);
+    deps.logger.info("pool.shrink", {
+      retired: result.retired,
+      deregisteredParked: result.deregisteredParked,
+      skippedWithBalance: result.skippedWithBalance
+    });
+  }
+  return result;
+}
+
+export interface RescanRetiredAddressesResult {
+  ran: boolean;
+  scanned: number;
+  straysFound: number;
+  errors: number;
+}
+
+// Daily RPC safety net for deregistered addresses. Once a row is retired its
+// push watchers are removed and it is outside every invoice-scoped poll set —
+// a stray deposit (someone re-paying a long-expired invoice URI) would land
+// silently. This sweep walks retired rows, asks each chain for on-chain
+// balances (RPC only — zero DB read amplification), and on any balance the
+// ledger can't account for it: alerts loudly, un-retires the row, and
+// re-registers its watchers so subsequent activity is seen again. Ledger
+// credit itself stays an explicit admin action (POST /admin/balances/
+// reconcile writes the signed adjustment), matching how all other
+// out-of-band funds are handled.
+export async function rescanRetiredAddresses(
+  deps: AppDeps,
+  opts: { force?: boolean } = {}
+): Promise<RescanRetiredAddressesResult> {
+  const skipped: RescanRetiredAddressesResult = { ran: false, scanned: 0, straysFound: 0, errors: 0 };
+  const rescanHours = deps.poolRetiredRescanHours ?? DEFAULT_POOL_RETIRED_RESCAN_HOURS;
+  if (rescanHours <= 0) return skipped;
+  if (!opts.force) {
+    const acquired = await deps.cache.putIfAbsent("pool:retired-rescan-throttle", "1", {
+      ttlSeconds: rescanHours * 60 * 60
+    });
+    if (!acquired) return skipped;
+  }
+
+  // Resume after the last fully-processed row from the previous run; wrap to
+  // the start when the end of the set is reached. Without this, a retired
+  // population above one run's budget would starve the tail forever — the
+  // exact silent blind spot this sweep exists to prevent.
+  const cursor = await deps.cache.getJSON<RescanCursor>(RESCAN_CURSOR_CACHE_KEY);
+  const conds = [isNotNull(addressPool.retiredAt)];
+  if (cursor !== null) {
+    conds.push(
+      sql`(${addressPool.retiredAt} > ${cursor.retiredAt} OR (${addressPool.retiredAt} = ${cursor.retiredAt} AND ${addressPool.id} > ${cursor.id}))`
+    );
+  }
+  const rows = await deps.db
+    .select({
+      id: addressPool.id,
+      family: addressPool.family,
+      address: addressPool.address,
+      addressIndex: addressPool.addressIndex,
+      retiredAt: addressPool.retiredAt
+    })
+    .from(addressPool)
+    .where(and(...conds))
+    .orderBy(asc(addressPool.retiredAt), asc(addressPool.id))
+    .limit(RESCAN_MAX_ADDRESSES_PER_RUN);
+  if (rows.length === 0) {
+    // End of set (or empty set): clear the cursor so the next run starts over.
+    if (cursor !== null) await deps.cache.delete(RESCAN_CURSOR_CACHE_KEY);
+    return { ran: true, scanned: 0, straysFound: 0, errors: 0 };
+  }
+
+  const adaptersByFamily = accountModelAdaptersByFamily(deps);
+  const result: RescanRetiredAddressesResult = { ran: true, scanned: 0, straysFound: 0, errors: 0 };
+  let probesLeft = RESCAN_MAX_RPC_PROBES_PER_RUN;
+  let lastProcessed: RescanCursor | null = null;
+  let exhaustedBudget = false;
+
+  for (const row of rows) {
+    const adapters = adaptersByFamily.get(row.family as ChainFamily) ?? [];
+    if (adapters.length === 0) {
+      // No wired adapter (family removed from config) — skip but advance the
+      // cursor so these rows don't permanently occupy the page.
+      lastProcessed = { retiredAt: row.retiredAt ?? 0, id: row.id };
+      continue;
+    }
+    const probesNeeded = adapters.reduce((n, a) => n + a.supportedChainIds.length, 0);
+    if (probesNeeded > probesLeft) {
+      exhaustedBudget = true;
+      break; // never half-scan an address — resume it next run
+    }
+    result.scanned += 1;
+    let stray = false;
+    for (const adapter of adapters) {
+      for (const chainId of adapter.supportedChainIds) {
+        probesLeft -= 1;
+        let balances;
+        try {
+          balances = await adapter.getAccountBalances({
+            chainId: chainId as ChainId,
+            address: row.address as Address
+          });
+        } catch (err) {
+          result.errors += 1;
+          deps.logger.warn("pool.retired_rescan.balance_failed", {
+            chainId,
+            address: row.address,
+            error: err instanceof Error ? err.message : String(err)
+          });
+          continue;
+        }
+        for (const b of balances) {
+          const onChain = BigInt(b.amountRaw);
+          if (onChain <= 0n) continue;
+          // Nonzero on-chain — compare against what the ledger already knows
+          // (a retired row normally reads 0 everywhere; an adjustment written
+          // after retirement is the accounted-for exception).
+          const ledger = await computeSpendable(deps, {
+            chainId,
+            address: row.address,
+            token: b.token as string
+          });
+          if (onChain <= ledger) continue;
+          // Transient surpluses the system already tracks are NOT strays:
+          // an unreleased reservation (in-flight consolidation sweep from
+          // this parked row) or a detected-awaiting-confirm credit both
+          // resolve via their own sweeps — alerting would page the on-call
+          // for funds that are fully accounted for.
+          const [activeReservation] = await deps.db
+            .select({ id: payoutReservations.id })
+            .from(payoutReservations)
+            .where(
+              and(
+                isNull(payoutReservations.releasedAt),
+                eq(payoutReservations.address, row.address)
+              )
+            )
+            .limit(1);
+          if (activeReservation !== undefined) continue;
+          const [pendingCredit] = await deps.db
+            .select({ id: transactions.id })
+            .from(transactions)
+            .where(
+              and(
+                sql`${transactions.status} = 'detected'`,
+                eq(transactions.chainId, chainId),
+                eq(transactions.toAddress, row.address)
+              )
+            )
+            .limit(1);
+          if (pendingCredit !== undefined) continue;
+          stray = true;
+          deps.logger.error("pool.retired_address_stray_funds", {
+            chainId,
+            family: row.family,
+            address: row.address,
+            token: b.token,
+            onChainRaw: onChain.toString(),
+            ledgerRaw: ledger.toString(),
+            action:
+              "address re-watched; run POST /admin/balances/reconcile to credit the ledger"
+          });
+        }
+        if (stray) break;
+      }
+      if (stray) break;
+    }
+    lastProcessed = { retiredAt: row.retiredAt ?? 0, id: row.id };
+    if (stray) {
+      result.straysFound += 1;
+      // Un-retire: back to 'available' unless the operator parked it (then it
+      // stays 'quarantined' but gets re-watched), or it was borrowed while we
+      // scanned (then it's already 'allocated' and watched — publish is a
+      // harmless duplicate). lastReleasedAt is stamped so the next hourly
+      // shrink's idle gate doesn't immediately re-retire an address KNOWN to
+      // receive out-of-band funds (the ledger still reads zero until the
+      // admin reconciles — without the stamp this would flap daily and sit
+      // unwatched ~23h/day).
+      await deps.db
+        .update(addressPool)
+        .set({
+          retiredAt: null,
+          lastReleasedAt: deps.clock.now().getTime(),
+          status: sql`CASE WHEN ${addressPool.disabledAt} IS NULL AND ${addressPool.status} = 'quarantined' THEN 'available' ELSE ${addressPool.status} END`
+        })
+        .where(eq(addressPool.id, row.id));
+      await publishPoolAddressCreated(deps, {
+        poolAddressId: row.id,
+        family: row.family as ChainFamily,
+        address: row.address,
+        addressIndex: row.addressIndex,
+        atMs: deps.clock.now().getTime()
+      });
+    }
+  }
+
+  // Persist the rotation point: resume mid-set when the budget stopped us,
+  // clear when a full page was processed AND the page wasn't full (end of
+  // set). A full page with budget to spare resumes from its last row.
+  const reachedEnd = !exhaustedBudget && rows.length < RESCAN_MAX_ADDRESSES_PER_RUN;
+  if (reachedEnd) {
+    if (cursor !== null) await deps.cache.delete(RESCAN_CURSOR_CACHE_KEY);
+  } else if (lastProcessed !== null) {
+    await deps.cache.putJSON(RESCAN_CURSOR_CACHE_KEY, lastProcessed, {
+      ttlSeconds: RESCAN_CURSOR_TTL_SECONDS
+    });
+  }
+
+  if (result.straysFound > 0) kickAlchemySync(deps);
+  deps.logger.info("pool.retired_rescan", { ...result });
+  return result;
+}
+
+// Ledger-side zero-balance proof for retire candidates. Returns the subset of
+// `addresses` that (a) hold no active payout reservation and (b) compute to
+// zero spendable for every registered token + native on every chain of the
+// family. Uses the same computeSpendableBatch arithmetic as the payout
+// planner, so "zero" here means exactly what "unfundable" means there.
+async function filterZeroLedgerBalance(
+  deps: AppDeps,
+  adapters: readonly ChainAdapter[],
+  addresses: readonly string[]
+): Promise<Set<string>> {
+  const zero = new Set(addresses);
+  if (zero.size === 0) return zero;
+
+  // Any active (unreleased) reservation — even one that nets spendable to
+  // zero — means an in-flight payout touches this address. Leave it alone.
+  const resRows = await deps.db
+    .select({ address: payoutReservations.address })
+    .from(payoutReservations)
+    .where(
+      and(
+        isNull(payoutReservations.releasedAt),
+        inArray(payoutReservations.address, [...zero])
+      )
+    );
+  for (const r of resRows) zero.delete(r.address);
+
+  // Spendable counts only CONFIRMED credits — but a 'detected' credit is
+  // funds mid-confirmation and an 'orphaned' one is funds the DB KNOWS
+  // landed here (a payer re-using an old invoice URI — the strongest signal
+  // this address will see MORE deposits). Retiring either would deregister
+  // an address holding recorded value and set up a daily rescan-alert flap.
+  // Both populations are small (detected drains within confirmations;
+  // orphans sit in the admin queue), so the status-led seek stays cheap.
+  const pendingRows = await deps.db
+    .selectDistinct({ address: transactions.toAddress })
+    .from(transactions)
+    .where(
+      and(
+        sql`${transactions.status} IN ('detected','orphaned')`,
+        inArray(transactions.toAddress, [...zero])
+      )
+    );
+  for (const r of pendingRows) {
+    if (r.address !== null) zero.delete(r.address);
+  }
+
+  for (const adapter of adapters) {
+    for (const chainId of adapter.supportedChainIds) {
+      if (zero.size === 0) return zero;
+      const tokens = [
+        adapter.nativeSymbol(chainId as ChainId) as string,
+        ...TOKEN_REGISTRY.filter((t) => t.chainId === chainId).map((t) => t.symbol as string)
+      ];
+      const balances = await computeSpendableBatch(deps, {
+        chainId,
+        addresses: [...zero],
+        tokens: [...new Set(tokens)]
+      });
+      for (const [address, byToken] of balances) {
+        for (const value of byToken.values()) {
+          if (value > 0n) {
+            zero.delete(address);
+            break;
+          }
+        }
+      }
+    }
+  }
+  return zero;
+}
+
+// Account-model families (the pooled ones) with their wired adapters. UTXO
+// allocates fresh-per-invoice and Monero has its own subaddress pool — both
+// outside address_pool lifecycle management.
+function accountModelAdaptersByFamily(deps: AppDeps): Map<ChainFamily, ChainAdapter[]> {
+  const byFamily = new Map<ChainFamily, ChainAdapter[]>();
+  for (const adapter of deps.chains) {
+    if (adapter.family === "utxo" || adapter.family === "monero") continue;
+    const list = byFamily.get(adapter.family) ?? [];
+    list.push(adapter);
+    byFamily.set(adapter.family, list);
+  }
+  return byFamily;
+}
+
 // ---- Internals ----
+
+// Watcher (re-)registration publish. The in-memory bus awaits subscribers, so
+// when this resolves the Alchemy tracker's per-chain `add` rows are enqueued.
+async function publishPoolAddressCreated(
+  deps: AppDeps,
+  args: { poolAddressId: string; family: ChainFamily; address: string; addressIndex: number; atMs: number }
+): Promise<void> {
+  await deps.events.publish({
+    type: "pool.address.created",
+    poolAddressId: args.poolAddressId,
+    family: args.family,
+    address: args.address,
+    addressIndex: args.addressIndex,
+    at: new Date(args.atMs)
+  });
+}
+
+// Watcher deregistration publish (tracker enqueues per-chain `remove` rows).
+async function publishPoolAddressQuarantined(
+  deps: AppDeps,
+  args: { poolAddressId: string; family: ChainFamily; address: string; atMs: number }
+): Promise<void> {
+  await deps.events.publish({
+    type: "pool.address.quarantined",
+    poolAddressId: args.poolAddressId,
+    family: args.family,
+    address: args.address,
+    at: new Date(args.atMs)
+  });
+}
+
+// Nudge the Alchemy sync sweep to flush freshly-enqueued add/remove rows now
+// instead of on the next cron tick — shrinks the detection gap after a
+// reactivation to seconds. Best-effort: a lost kick is healed by the
+// per-minute scheduled sweep.
+function kickAlchemySync(deps: AppDeps): void {
+  const alchemy = deps.alchemy;
+  if (alchemy === undefined) return;
+  deps.jobs.defer(
+    async () => {
+      try {
+        await alchemy.syncAddresses();
+      } catch (err) {
+        deps.logger.warn("pool.alchemy_sync_kick.failed", {
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+    },
+    { name: "alchemy-sync-kick" }
+  );
+}
 
 function drizzleRowToPoolAddress(row: typeof addressPool.$inferSelect): PoolAddress {
   return {
@@ -814,11 +1592,13 @@ function findAdapterForFamily(deps: AppDeps, family: ChainFamily): ChainAdapter 
   return deps.chains.find((c) => c.family === family) ?? null;
 }
 
-async function countPool(deps: AppDeps, family: ChainFamily): Promise<number> {
+// Rows currently in service (not watcher-deregistered). Used by initialize's
+// idempotent top-up so retired rows don't masquerade as capacity.
+async function countActivePool(deps: AppDeps, family: ChainFamily): Promise<number> {
   const [row] = await deps.db
     .select({ cnt: count() })
     .from(addressPool)
-    .where(eq(addressPool.family, family));
+    .where(and(eq(addressPool.family, family), isNull(addressPool.retiredAt)));
   return row?.cnt ?? 0;
 }
 

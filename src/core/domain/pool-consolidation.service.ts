@@ -1,13 +1,13 @@
 import { z } from "zod";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import { ChainIdSchema, type ChainId } from "../types/chain.js";
 import { AmountRawSchema } from "../types/money.js";
 import { TokenSymbolSchema, type TokenSymbol } from "../types/token.js";
-import { addressPool, payouts } from "../../db/schema.js";
+import { addressPool, balanceAdjustments, payouts, transactions } from "../../db/schema.js";
 import { findChainAdapter } from "./chain-lookup.js";
 import { findToken } from "../types/token-registry.js";
-import { computeSpendable } from "./balance-snapshot.service.js";
+import { computeSpendableBatch } from "./balance-snapshot.service.js";
 import { planPayout, PayoutError } from "./payout.service.js";
 
 // Pool consolidation defragments a token balance that's split across many
@@ -239,15 +239,69 @@ export async function planPoolConsolidation(
     );
   }
 
-  // Discover sources with token balance > 0. Cross-check against the
-  // ledger via computeSpendable (same source of truth selectSource uses)
-  // so we don't try to consolidate a balance that's already pre-reserved
-  // by another in-flight payout. Loaded sequentially to keep DB pressure
-  // bounded; pool sizes are O(100s), not millions.
+  // Discover sources with token balance > 0. Cross-checked against the
+  // ledger via computeSpendableBatch (same arithmetic selectSource uses) so
+  // we don't try to consolidate a balance that's already pre-reserved by
+  // another in-flight payout.
+  //
+  // Pre-filter first: spendable is LEDGER-derived (confirmed inbound txs +
+  // intra-pool payout credits + signed adjustments are its only positive
+  // terms), so an address that appears in none of those can only compute to
+  // zero. Pre-spike pools accumulate hundreds of never-funded addresses;
+  // walking computeSpendable over every one (~5 queries each) was the
+  // single biggest Turso read amplifier on every consolidation fire. Three
+  // DISTINCT probes over the credit-side tables bound the expensive batch
+  // arithmetic to addresses that have ever seen funds. Status is inlined as
+  // a SQL LITERAL (not a bound param) so the partial indexes
+  // idx_transactions_confirmed_to_balance / idx_payouts_internal_credit_
+  // balance stay provable (see the gas-burn reconcilers for the full
+  // rationale — Turso forbids ANALYZE, literals + matching DDL text are
+  // what make these seeks deterministic).
   const allPoolRows = await deps.db
     .select({ address: addressPool.address })
     .from(addressPool)
     .where(eq(addressPool.family, family));
+  const poolAddressSet = new Set(allPoolRows.map((r) => r.address));
+
+  const [creditedRows, internalCreditRows, adjustedRows] = await Promise.all([
+    deps.db
+      .selectDistinct({ address: transactions.toAddress })
+      .from(transactions)
+      .where(
+        and(
+          sql`${transactions.status} = 'confirmed'`,
+          eq(transactions.chainId, parsed.chainId),
+          eq(transactions.token, parsed.token)
+        )
+      ),
+    deps.db
+      .selectDistinct({ address: payouts.destinationAddress })
+      .from(payouts)
+      .where(
+        and(
+          sql`${payouts.status} = 'confirmed'`,
+          sql`${payouts.kind} IN ('consolidation_sweep','gas_top_up')`,
+          eq(payouts.chainId, parsed.chainId),
+          eq(payouts.token, parsed.token)
+        )
+      ),
+    deps.db
+      .selectDistinct({ address: balanceAdjustments.address })
+      .from(balanceAdjustments)
+      .where(
+        and(
+          eq(balanceAdjustments.chainId, parsed.chainId),
+          eq(balanceAdjustments.token, parsed.token)
+        )
+      )
+  ]);
+  const everFunded = new Set<string>();
+  for (const rows of [creditedRows, internalCreditRows, adjustedRows]) {
+    for (const r of rows) {
+      if (r.address !== null && poolAddressSet.has(r.address)) everFunded.add(r.address);
+    }
+  }
+  everFunded.delete(parsed.targetAddress);
 
   // Fee tier for internal sweeps (Lever 1). These move funds between
   // addresses we own — no merchant SLA — so we ride the cheapest tier by
@@ -350,14 +404,19 @@ export async function planPoolConsolidation(
   // dropping empty addresses). Merged into the returned `skipped` list below.
   const dustSkipped: ConsolidationSkip[] = [];
 
+  // Batch the ledger arithmetic over the ever-funded candidates: 5 queries
+  // per ≤200-address chunk instead of ~5 per address. Semantics identical to
+  // per-address computeSpendable (documented on computeSpendableBatch).
+  const candidateAddresses = [...everFunded];
+  const spendableByAddress = await computeSpendableBatch(deps, {
+    chainId: parsed.chainId,
+    addresses: candidateAddresses,
+    tokens: [parsed.token]
+  });
+
   const sources: { address: string; amountRaw: bigint }[] = [];
-  for (const row of allPoolRows) {
-    if (row.address === parsed.targetAddress) continue;
-    const balance = await computeSpendable(deps, {
-      chainId: parsed.chainId,
-      address: row.address,
-      token: parsed.token
-    });
+  for (const address of candidateAddresses) {
+    const balance = spendableByAddress.get(address)?.get(parsed.token) ?? 0n;
     // For native: deduct the per-source gas + reserve buffer so the amount we
     // hand to planPayout is actually sweepable. For token consolidation the
     // source's gas comes from a separate sponsor / fee wallet, so the full
@@ -366,14 +425,14 @@ export async function planPoolConsolidation(
       ? (balance > nativeSweepBuffer ? balance - nativeSweepBuffer : 0n)
       : balance;
     if (sweepable >= minSourceBalance) {
-      sources.push({ address: row.address, amountRaw: sweepable });
+      sources.push({ address, amountRaw: sweepable });
     } else if (sweepable >= staticFloor && balance > 0n) {
       // Excluded specifically by the gas-aware DYNAMIC floor (it cleared the
       // static floor but isn't worth the gas to sweep). Surfaced so the
       // operator sees a balance was deliberately left. Sources below the
       // static floor are dropped silently as before (unchanged behavior).
       dustSkipped.push({
-        sourceAddress: row.address,
+        sourceAddress: address,
         amountRaw: sweepable.toString(),
         reason: `BELOW_DYNAMIC_DUST_FLOOR: token value below ${minSourceBalance.toString()} (smallest unit) ≈ ${dustMultiplier}× sweep gas`
       });

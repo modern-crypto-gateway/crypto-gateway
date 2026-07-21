@@ -924,6 +924,17 @@ export const addressPool = sqliteTable(
     // Persisting intent here (not just via status) survives the transient
     // 'allocated' state during an under-pressure borrow.
     disabledAt: integer("disabled_at"),
+    // Watch-intent marker (epoch ms), set by the auto-shrink sweep when it
+    // retires an idle zero-balance row. NULL ⟺ this address SHOULD be
+    // push-watched; the Alchemy sync sweep converges the actual webhook
+    // membership to this column (queue rows are dirty markers, this is the
+    // source of truth — see poolWatchIntentResolver). Cleared (with a
+    // pool.address.created re-publish) by every path that returns the row to
+    // service: refill reactivation, under-pressure borrow, reorg reacquire,
+    // operator enable, stray-funds rescan. Distinct from `disabledAt`:
+    // retirement is an automatic cost measure, disable is operator intent —
+    // a row can carry both.
+    retiredAt: integer("retired_at"),
     createdAt: integer("created_at").notNull()
   },
   (t) => [

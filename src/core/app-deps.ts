@@ -138,6 +138,20 @@ export interface AppDeps {
   // From CONSOLIDATION_TOPUP_CUSHION_PERCENT.
   readonly consolidationTopUpCushionPercent?: number;
 
+  // ---- Address-pool auto-shrink tuning (see shrinkIdlePools) ----
+  // Retire an idle zero-balance 'available' pool row after this many hours
+  // without an allocation (watchers deregistered, row parked as
+  // 'quarantined'). 0 = auto-shrink disabled. Unset = 24.
+  // From POOL_RETIRE_IDLE_HOURS.
+  readonly poolRetireIdleHours?: number;
+  // Floor of 'available' rows per family the shrink sweep always preserves.
+  // Unset = 5. From POOL_MIN_AVAILABLE.
+  readonly poolMinAvailable?: number;
+  // Cadence of the RPC safety-net rescan over retired (deregistered)
+  // addresses — catches stray deposits that land after deregistration.
+  // 0 = rescan disabled. Unset = 24. From POOL_RETIRED_RESCAN_HOURS.
+  readonly poolRetiredRescanHours?: number;
+
   // Reusable Monero subaddress pool tuning (see monero-pool.service.ts).
   // Both optional — the service falls back to its built-in defaults (60-min
   // cooldown, initial size 20) when an entrypoint doesn't thread them through.

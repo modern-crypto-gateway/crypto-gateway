@@ -104,6 +104,10 @@ describe("runScheduledJobs invokes deps.alchemy?.syncAddresses when present", ()
       secretsOverrides: { CRON_SECRET: "s3cret" }
     });
     try {
+      // Boot's pool init refill kicks an immediate best-effort sync of the
+      // freshly-enqueued `add` rows (eager in tests). Reset so the assertion
+      // below isolates the CRON TICK's own syncAddresses call.
+      syncCalled = 0;
       const res = await booted.app.fetch(
         new Request("http://test.local/internal/cron/tick", {
           method: "POST",

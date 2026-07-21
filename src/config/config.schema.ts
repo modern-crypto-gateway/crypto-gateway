@@ -254,6 +254,25 @@ export const AppConfigSchema = z
     // is free.) Override via CONSOLIDATION_TOPUP_CUSHION_PERCENT.
     consolidationTopUpCushionPercent: z.coerce.number().int().min(0).max(100).default(20),
 
+    // ---- Address-pool auto-shrink (cost control after demand spikes) ----
+    // Retire an idle zero-balance pool address after this many hours without
+    // an allocation: parked as 'quarantined' and deregistered from the
+    // per-chain Alchemy webhooks, so a spike-inflated pool shrinks back to
+    // the floor instead of billing forever. Refill reactivates retired rows
+    // before minting new ones. 0 = auto-shrink OFF.
+    // Override via POOL_RETIRE_IDLE_HOURS.
+    poolRetireIdleHours: z.coerce.number().min(0).default(24),
+    // 'available' floor per family the shrink sweep always preserves. Keep
+    // above the internal refill trigger (3) to avoid borrow/refill churn.
+    // min(0) so a "0" doesn't crash Node boot — the shrink job itself clamps
+    // the effective floor to >=1 (matching the non-Node entrypoints, which
+    // bypass this schema). Override via POOL_MIN_AVAILABLE.
+    poolMinAvailable: z.coerce.number().int().min(0).max(10_000).default(5),
+    // Cadence (hours) of the RPC safety-net rescan over retired addresses —
+    // a stray deposit to a deregistered address alerts + re-watches instead
+    // of going dark. 0 = rescan OFF. Override via POOL_RETIRED_RESCAN_HOURS.
+    poolRetiredRescanHours: z.coerce.number().min(0).default(24),
+
     // Ops alerting: when set, error-level log lines are fan-out POSTed to this
     // URL (Slack/Discord/PagerDuty-compatible JSON body). Normal logs still
     // flow to stdout/stderr; this is the page-the-oncall channel only.
@@ -394,6 +413,9 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     internalConsolidationFeeTier: env["INTERNAL_CONSOLIDATION_FEE_TIER"],
     consolidationDustGasMultiplier: env["CONSOLIDATION_DUST_GAS_MULTIPLIER"],
     consolidationTopUpCushionPercent: env["CONSOLIDATION_TOPUP_CUSHION_PERCENT"],
+    poolRetireIdleHours: env["POOL_RETIRE_IDLE_HOURS"],
+    poolMinAvailable: env["POOL_MIN_AVAILABLE"],
+    poolRetiredRescanHours: env["POOL_RETIRED_RESCAN_HOURS"],
     trustedIpHeaders: env["TRUSTED_IP_HEADERS"],
     alertWebhookUrl: env["ALERT_WEBHOOK_URL"],
     alertWebhookAuthHeader: env["ALERT_WEBHOOK_AUTH_HEADER"]

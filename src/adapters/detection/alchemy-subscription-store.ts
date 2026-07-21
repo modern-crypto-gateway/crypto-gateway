@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "../../db/client.js";
-import { alchemyAddressSubscriptions } from "../../db/schema.js";
+import { addressPool, alchemyAddressSubscriptions } from "../../db/schema.js";
 
 // Alchemy address-subscription queue store. Each row is one pending/synced/failed
 // `add` or `remove` operation against a webhook's watched-addresses set. The
@@ -168,5 +168,29 @@ export function dbAlchemySubscriptionStore(db: Db): AlchemySubscriptionStore {
       }
       return out;
     }
+  };
+}
+
+// Source-of-truth watch-intent resolver for the sync sweep: an address SHOULD
+// be watched iff its address_pool row exists with retired_at NULL. Addresses
+// not in the pool (e.g. bootstrap placeholders) resolve to unwatched. One
+// chunked indexed lookup per sweep — uq_address_pool_family_address serves
+// the IN() seek. See the dirty-marker rationale in alchemy-sync-sweep.ts.
+export function poolWatchIntentResolver(
+  db: Db
+): (addresses: readonly string[]) => Promise<ReadonlySet<string>> {
+  return async (addresses) => {
+    const watched = new Set<string>();
+    const CHUNK = 400; // stay under SQLite's default 999 bound params
+    for (let i = 0; i < addresses.length; i += CHUNK) {
+      const chunk = addresses.slice(i, i + CHUNK);
+      if (chunk.length === 0) continue;
+      const rows = await db
+        .select({ address: addressPool.address })
+        .from(addressPool)
+        .where(and(inArray(addressPool.address, chunk as string[]), isNull(addressPool.retiredAt)));
+      for (const r of rows) watched.add(r.address);
+    }
+    return watched;
   };
 }

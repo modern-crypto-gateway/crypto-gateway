@@ -39,7 +39,7 @@ import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
 import { readAlchemyNotifyTokenFromEnv } from "../adapters/detection/alchemy-token.js";
-import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
+import { dbAlchemySubscriptionStore, poolWatchIntentResolver } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { createDb, createLibsqlClient } from "../db/client.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
@@ -422,7 +422,13 @@ export async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<Ap
       adminClient: alchemyAdminClient({ authToken: alchemyNotifyToken }),
       registryStore: dbAlchemyRegistryStore(db),
       subscriptionStore: dbAlchemySubscriptionStore(db),
-      logger
+      logger,
+      // Sync each claimed address to the address_pool watch intent (not row
+      // order) and serialize sweep runs — pool auto-shrink retires/reactivates
+      // addresses, so op-log replay could apply a stale remove after a newer
+      // add. See the dirty-marker rationale in alchemy-sync-sweep.ts.
+      resolveWatchIntent: poolWatchIntentResolver(db),
+      cache
     });
     alchemy = { syncAddresses: sweep };
   }
@@ -544,6 +550,15 @@ export async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<Ap
       : {}),
     ...(parseNonNegNumberEnv(env["CONSOLIDATION_TOPUP_CUSHION_PERCENT"]) !== undefined
       ? { consolidationTopUpCushionPercent: parseNonNegNumberEnv(env["CONSOLIDATION_TOPUP_CUSHION_PERCENT"])! }
+      : {}),
+    ...(parseNonNegNumberEnv(env["POOL_RETIRE_IDLE_HOURS"]) !== undefined
+      ? { poolRetireIdleHours: parseNonNegNumberEnv(env["POOL_RETIRE_IDLE_HOURS"])! }
+      : {}),
+    ...(parseNonNegNumberEnv(env["POOL_MIN_AVAILABLE"]) !== undefined
+      ? { poolMinAvailable: parseNonNegNumberEnv(env["POOL_MIN_AVAILABLE"])! }
+      : {}),
+    ...(parseNonNegNumberEnv(env["POOL_RETIRED_RESCAN_HOURS"]) !== undefined
+      ? { poolRetiredRescanHours: parseNonNegNumberEnv(env["POOL_RETIRED_RESCAN_HOURS"])! }
       : {})
   };
 }

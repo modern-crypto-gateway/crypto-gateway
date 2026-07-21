@@ -50,7 +50,7 @@ import { rpcPollDetection } from "../adapters/detection/rpc-poll.adapter.js";
 import { alchemyAdminClient } from "../adapters/detection/alchemy-admin-client.js";
 import { dbAlchemyRegistryStore } from "../adapters/detection/alchemy-registry-store.js";
 import { readAlchemyNotifyToken } from "../adapters/detection/alchemy-token.js";
-import { dbAlchemySubscriptionStore } from "../adapters/detection/alchemy-subscription-store.js";
+import { dbAlchemySubscriptionStore, poolWatchIntentResolver } from "../adapters/detection/alchemy-subscription-store.js";
 import { makeAlchemySyncSweep } from "../adapters/detection/alchemy-sync-sweep.js";
 import { utxoMempoolWsWatcher } from "../adapters/detection/utxo-mempool-ws.js";
 import { moneroBlockScanDetection } from "../adapters/detection/monero-block-scan.adapter.js";
@@ -342,7 +342,13 @@ async function main(): Promise<void> {
       adminClient: admin,
       registryStore: dbAlchemyRegistryStore(db),
       subscriptionStore: dbAlchemySubscriptionStore(db),
-      logger
+      logger,
+      // Sync each claimed address to the address_pool watch intent (not row
+      // order) and serialize sweep runs — pool auto-shrink retires/reactivates
+      // addresses, so op-log replay could apply a stale remove after a newer
+      // add. See the dirty-marker rationale in alchemy-sync-sweep.ts.
+      resolveWatchIntent: poolWatchIntentResolver(db),
+      cache
     });
     alchemy = { syncAddresses: sweep };
   }
@@ -414,6 +420,9 @@ async function main(): Promise<void> {
     internalConsolidationFeeTier: config.internalConsolidationFeeTier,
     consolidationDustGasMultiplier: config.consolidationDustGasMultiplier,
     consolidationTopUpCushionPercent: config.consolidationTopUpCushionPercent,
+    poolRetireIdleHours: config.poolRetireIdleHours,
+    poolMinAvailable: config.poolMinAvailable,
+    poolRetiredRescanHours: config.poolRetiredRescanHours,
     moneroPoolCooldownSeconds: config.moneroPoolCooldownSeconds,
     moneroPoolInitialSize: config.moneroPoolInitialSize
   };

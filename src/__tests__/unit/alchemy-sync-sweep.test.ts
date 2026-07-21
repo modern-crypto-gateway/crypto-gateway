@@ -116,6 +116,67 @@ describe("makeAlchemySyncSweep", () => {
     expect(await h.subscriptionStore.countByStatus()).toEqual({ pending: 0, synced: 3, failed: 0 });
   });
 
+  it("resolves each claimed address against the watch-intent source of truth, not row order", async () => {
+    await h.registryStore.upsert({
+      chainId: 1,
+      webhookId: "wh_eth",
+      signingKeyCiphertext: "whsec",
+      webhookUrl: "https://x",
+      now: 1_000
+    });
+    // 0xa: stale `remove` enqueued AFTER a reactivation `add` (retire→
+    // reactivate flap) — row order would deregister an address the DB says
+    // is watched. 0xb: genuinely retired.
+    await h.subscriptionStore.insertPending({ chainId: 1, address: "0xa", action: "add", now: 1_000 });
+    await h.subscriptionStore.insertPending({ chainId: 1, address: "0xa", action: "remove", now: 1_500 });
+    await h.subscriptionStore.insertPending({ chainId: 1, address: "0xb", action: "remove", now: 1_500 });
+
+    const sweep = makeAlchemySyncSweep({
+      adminClient: h.fakeClient.client,
+      registryStore: h.registryStore,
+      subscriptionStore: h.subscriptionStore,
+      logger: bufferingLogger(),
+      now: () => 2_000,
+      resolveWatchIntent: async () => new Set(["0xa"])
+    });
+    const result = await sweep();
+
+    expect(h.fakeClient.calls).toHaveLength(1);
+    expect(h.fakeClient.calls[0]).toEqual({
+      webhookId: "wh_eth",
+      addressesToAdd: ["0xa"],
+      addressesToRemove: ["0xb"]
+    });
+    expect(result).toMatchObject({ claimed: 3, syncedChains: 1 });
+    expect(await h.subscriptionStore.countByStatus()).toEqual({ pending: 0, synced: 3, failed: 0 });
+  });
+
+  it("skips the run (leaving rows pending) when the advisory sweep lock is held", async () => {
+    const { memoryCacheAdapter } = await import("../../adapters/cache/memory.adapter.js");
+    const cache = memoryCacheAdapter();
+    await cache.put("alchemy:sync-sweep-lock", "1", { ttlSeconds: 60 });
+    await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKeyCiphertext: "k", webhookUrl: "u", now: 1_000 });
+    await h.subscriptionStore.insertPending({ chainId: 1, address: "0xa", action: "add", now: 1_000 });
+
+    const sweep = makeAlchemySyncSweep({
+      adminClient: h.fakeClient.client,
+      registryStore: h.registryStore,
+      subscriptionStore: h.subscriptionStore,
+      logger: bufferingLogger(),
+      now: () => 2_000,
+      cache
+    });
+    const blocked = await sweep();
+    expect(blocked.claimed).toBe(0);
+    expect(h.fakeClient.calls).toHaveLength(0);
+
+    // Lock released → the same sweep drains the row.
+    await cache.delete("alchemy:sync-sweep-lock");
+    const drained = await sweep();
+    expect(drained.claimed).toBe(1);
+    expect(h.fakeClient.calls).toHaveLength(1);
+  });
+
   it("makes one API call per chain when multiple chains have pending rows", async () => {
     await h.registryStore.upsert({ chainId: 1, webhookId: "wh_eth", signingKeyCiphertext: "k", webhookUrl: "u", now: 1_000 });
     await h.registryStore.upsert({ chainId: 137, webhookId: "wh_poly", signingKeyCiphertext: "k", webhookUrl: "u", now: 1_000 });

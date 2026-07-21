@@ -32,6 +32,9 @@ export interface PoolFamilyStats {
   available: number;
   allocated: number;
   quarantined: number;
+  // Rows auto-retired by the shrink sweep (watcher-deregistered until demand
+  // pulls them back). Counted independently of `status`.
+  retired: number;
   total: number;
   highestIndex: number | null;
 }

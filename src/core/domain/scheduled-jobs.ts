@@ -11,7 +11,11 @@ import {
   sweepStuckPayoutReservations
 } from "./payout.service.js";
 import { pollPayments } from "./poll-payments.js";
-import { reconcileOrphanedAllocations } from "./pool.service.js";
+import {
+  reconcileOrphanedAllocations,
+  rescanRetiredAddresses,
+  shrinkIdlePools
+} from "./pool.service.js";
 import { reconcileOrphanedMoneroAllocations } from "./monero-pool.service.js";
 import { warmRateCache } from "./rate-window.js";
 import { sweepWebhookDeliveries } from "./webhook-subscriber.js";
@@ -51,6 +55,15 @@ export interface ScheduledJobsResult {
   reconcileOrphanedAllocations: JobOutcome;
   // Same defense-in-depth sweep for the dedicated Monero subaddress pool.
   reconcileOrphanedMoneroAllocations: JobOutcome;
+  // Pool auto-shrink: hourly (self-throttled via cache TTL) retire of idle
+  // zero-balance pool addresses left over from demand spikes — parks the
+  // rows and deregisters their Alchemy watchers. Off when
+  // POOL_RETIRE_IDLE_HOURS=0.
+  shrinkIdlePools: JobOutcome;
+  // Daily (self-throttled) RPC rescan of retired addresses so a stray
+  // deposit to a deregistered address alerts + re-watches instead of going
+  // dark. Off when POOL_RETIRED_RESCAN_HOURS=0.
+  rescanRetiredAddresses: JobOutcome;
   sweepWebhookDeliveries: JobOutcome;
   // Auto-consolidation: fires due `(chainId, token)` consolidation
   // schedules. No env gate — table-driven; with no schedules configured
@@ -142,6 +155,13 @@ async function runScheduledJobsOnce(deps: AppDeps): Promise<ScheduledJobsResult>
     // invoice is terminal/missing and re-stamps the cooldown floor (so the
     // reuse-safety window survives the sweeper path, unlike the shared pool).
     reconcileOrphanedMoneroAllocations: await run(() => reconcileOrphanedMoneroAllocations(deps)),
+    // Pool auto-shrink runs AFTER the orphan sweep so rows it just released
+    // are visible with a fresh last_released_at (and correctly NOT retired
+    // this run). Hourly via internal cache throttle; other ticks pay one
+    // putIfAbsent.
+    shrinkIdlePools: await run(() => shrinkIdlePools(deps)),
+    // Daily retired-address safety rescan (internal throttle). RPC-only.
+    rescanRetiredAddresses: await run(() => rescanRetiredAddresses(deps)),
     sweepWebhookDeliveries: await run(() => sweepWebhookDeliveries(deps)),
     // Runs AFTER reconcileOrphanedAllocations so any address just freed
     // up by the orphan sweep is visible to the consolidation source-

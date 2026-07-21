@@ -485,8 +485,15 @@ export async function computeSpendable(
       .from(payouts)
       .where(
         and(
-          eq(payouts.status, "confirmed"),
-          inArray(payouts.kind, ["consolidation_sweep", "gas_top_up"]),
+          // status/kind as SQL LITERALS (not bound params): SQLite only uses
+          // the partial index idx_payouts_internal_credit_balance when the
+          // query provably implies its WHERE, and a parameterized `kind IN
+          // (?, ?)` can never prove `kind IN ('consolidation_sweep',
+          // 'gas_top_up')` — with bound params this leg fell back to scanning
+          // the whole confirmed-payout population on every spendable check.
+          // Literal text must stay identical to the index DDL in schema.ts.
+          sql`${payouts.status} = 'confirmed'`,
+          sql`${payouts.kind} IN ('consolidation_sweep','gas_top_up')`,
           eq(payouts.chainId, chainId),
           eq(payouts.token, token),
           sql`${payouts.destinationAddress} = ${address}`
@@ -606,8 +613,10 @@ export async function computeSpendableBatch(
         .from(payouts)
         .where(
           and(
-            eq(payouts.status, "confirmed"),
-            inArray(payouts.kind, ["consolidation_sweep", "gas_top_up"]),
+            // Literals, not bound params — required for the partial-index
+            // implication proof; see the single-address variant above.
+            sql`${payouts.status} = 'confirmed'`,
+            sql`${payouts.kind} IN ('consolidation_sweep','gas_top_up')`,
             eq(payouts.chainId, chainId),
             inArray(payouts.token, tokens),
             inArray(payouts.destinationAddress, chunk)

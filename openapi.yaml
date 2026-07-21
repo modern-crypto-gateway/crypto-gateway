@@ -2333,10 +2333,13 @@ paths:
         `POOL_EXHAUSTED` fires on a live invoice-create.
 
         `quarantined` counts parked rows — operator-disabled addresses (see
-        `POST /admin/pool/addresses/disable`) — which the allocator only
-        borrows back under pool-exhaustion pressure. `highestIndex` is the
-        highest HD `address_index` ever derived for the family; it grows
-        monotonically and is never reused.
+        `POST /admin/pool/addresses/disable`) AND rows auto-retired by the
+        hourly shrink sweep — which the allocator only borrows back under
+        pool-exhaustion pressure. `retired` counts the auto-retired
+        (watcher-deregistered) subset; refill reactivates those before
+        minting new indices, so a post-spike pool breathes instead of only
+        growing. `highestIndex` is the highest HD `address_index` ever
+        derived for the family; it grows monotonically and is never reused.
 
         Monero is NOT included here — its subaddress pool lives in a
         separate table. Use `GET /admin/monero-pool/stats`.
@@ -2355,7 +2358,7 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [family, available, allocated, quarantined, total, highestIndex]
+                      required: [family, available, allocated, quarantined, retired, total, highestIndex]
                       properties:
                         family: { type: string, enum: [evm, tron, solana, utxo] }
                         available:
@@ -2364,7 +2367,10 @@ paths:
                         allocated: { type: integer }
                         quarantined:
                           type: integer
-                          description: Operator-parked (disabled) rows.
+                          description: Parked rows — operator-disabled plus auto-retired.
+                        retired:
+                          type: integer
+                          description: Auto-retired (watcher-deregistered) rows, counted independently of status. Reactivated by refill before any new index is minted.
                         total: { type: integer }
                         highestIndex:
                           type: [integer, "null"]
@@ -5592,7 +5598,7 @@ components:
 
     PoolAddressAdminView:
       type: object
-      required: [family, address, addressIndex, status, disabledAt, allocatedToInvoiceId]
+      required: [family, address, addressIndex, status, disabledAt, retiredAt, allocatedToInvoiceId]
       properties:
         family: { type: string, enum: [evm, tron, solana, utxo] }
         address: { type: string }
@@ -5601,6 +5607,14 @@ components:
         disabledAt:
           type: [integer, "null"]
           description: Epoch ms when disabled; null = not disabled.
+        retiredAt:
+          type: [integer, "null"]
+          description: |
+            Epoch ms when the auto-shrink sweep deregistered this address
+            from push watchers; null = actively watched. Cleared (and the
+            watcher re-registered) whenever the row returns to service —
+            refill reactivation, exhaustion borrow, enable, or the daily
+            stray-funds rescan.
         allocatedToInvoiceId:
           type: [string, "null"]
 
