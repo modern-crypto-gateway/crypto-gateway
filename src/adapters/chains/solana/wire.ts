@@ -28,11 +28,6 @@ export interface SolanaWiringResult {
 // receive path (alchemy-notify.adapter.ts) is stateless and doesn't need RPC,
 // but the sweeper calls `getConfirmationStatus` which DOES — so we still
 // require a URL when wiring.
-//
-// SPL payouts (buildTransfer / signAndBroadcast for non-SOL tokens) remain
-// DEFERRED: the adapter throws on them today. Receiving SPL USDC/USDT works
-// via the webhook path; sending requires the ATA + SPL Token Program
-// instruction encoding, which is a separate piece of work.
 export function wireSolana(input: SolanaWiringInput): SolanaWiringResult {
   const chainId = input.network === "devnet" ? SOLANA_DEVNET_CHAIN_ID : SOLANA_MAINNET_CHAIN_ID;
 

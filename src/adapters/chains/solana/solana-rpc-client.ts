@@ -5,6 +5,7 @@
 //   - getSignatureStatuses
 //   - sendTransaction
 //   - getSlot
+//   - getBlockHeight
 //   - getBalance
 //   - getTokenAccountsByOwner
 //
@@ -91,6 +92,12 @@ export interface SolanaPrioritizationFeeSample {
 
 export interface SolanaRpcClient {
   getSlot(): Promise<number>;
+  // Current BLOCK height at finalized commitment — the value blockhash
+  // expiry (`lastValidBlockHeight`) is measured against. Distinct from
+  // getSlot(): slots advance even when skipped, so slot number runs tens of
+  // millions ahead of block height on mainnet; comparing lastValidBlockHeight
+  // to a slot would declare blockhashes expired that are still live.
+  getBlockHeight(): Promise<number>;
   getLatestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }>;
   getSignaturesForAddress(address: string, opts?: { limit?: number; before?: string; until?: string }): Promise<readonly SolanaSignatureInfo[]>;
   getTransaction(signature: string): Promise<SolanaTransactionResponse | null>;
@@ -155,6 +162,13 @@ export function solanaRpcClient(config: SolanaRpcConfig): SolanaRpcClient {
   return {
     async getSlot() {
       return rpc<number>("getSlot", []);
+    },
+
+    async getBlockHeight() {
+      // Finalized commitment: the finalized height lags the confirmed tip,
+      // so expiry checks built on it err toward declaring a blockhash dead
+      // LATER than the earliest possible moment — never prematurely.
+      return rpc<number>("getBlockHeight", [{ commitment: "finalized" }]);
     },
 
     async getLatestBlockhash() {

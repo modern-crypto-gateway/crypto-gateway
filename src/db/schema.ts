@@ -645,6 +645,16 @@ export const payouts = sqliteTable(
     // double-send. The landed-but-unrecorded case is exactly why this exists.
     preBroadcastNonce: integer("pre_broadcast_nonce"),
 
+    // Tx-expiry watermark for chains whose txs EXPIRE (Solana today): the
+    // block height after which the broadcast tx's blockhash is no longer
+    // valid, copied from the adapter's UnsignedTx at submit time. The
+    // payout confirm sweep fails a chain-absent `submitted` row once the
+    // finalized tip is safely past this height — the tx can never land, so
+    // releasing its reservations cannot double-pay. NULL on chains without
+    // tx expiry and on rows submitted before this column existed (those
+    // fall back to the sweep's age-based proof).
+    lastValidBlockHeight: integer("last_valid_block_height"),
+
     // Confirmation count required for this payout's tx to flip from
     // `submitted` to `confirmed`. Snapshotted at PLAN time by resolving
     // the merchant's per-chain override for the payout's chainId — frozen

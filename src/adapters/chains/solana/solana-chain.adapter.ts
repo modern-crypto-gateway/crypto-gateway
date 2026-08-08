@@ -86,6 +86,21 @@ const SPL_TOKEN_ACCOUNT_RENT_EXEMPT_LAMPORTS = 2_039_280n;
 // well within the finalized vs current-slot bookkeeping we actually need.
 const SLOT_CACHE_TTL_MS = 10_000;
 
+// Post-broadcast confirm-or-resend window. A single sendTransaction only
+// hands the tx to one RPC node; if that node's forward to the leader is
+// lost (congestion, leader rotation, QUIC drop) the tx silently dies and
+// the signature never appears on chain. Re-sending the identical signed
+// bytes is idempotent — ed25519 is deterministic, so the wire tx and its
+// signature are byte-for-byte the same and validators dedupe it — and each
+// interval spans several leader rotations (4 slots × ~400ms per leader).
+// The window runs DETACHED from the signAndBroadcast call (fire-and-
+// forget): the caller gets the txHash immediately so the executor can
+// persist it, and the window keeps re-pushing in the background for as
+// long as the runtime lets it. Wholly best-effort — the confirmPayouts
+// sweep owns the final verdict.
+const BROADCAST_RESEND_INTERVAL_MS = 3_000;
+const BROADCAST_MAX_RESENDS = 3;
+
 export interface SolanaChainConfig {
   chainIds?: readonly number[];
   // Per-chain RPC configuration. Required unless `clients` is provided (tests).
@@ -94,6 +109,10 @@ export interface SolanaChainConfig {
   clients?: Readonly<Record<number, SolanaRpcClient>>;
   // Bound on how far back scanIncoming looks; Solana RPCs vary in what they keep.
   scanSignatureLimit?: number;
+  // Overrides for the post-broadcast confirm-or-resend window (for tests:
+  // shrink intervalMs so the loop doesn't sleep for real; maxResends 0
+  // disables the window entirely).
+  broadcastResend?: { intervalMs?: number; maxResends?: number };
 }
 
 export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter {
@@ -126,6 +145,29 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
     const slot = await client.getSlot().catch(() => 0);
     slotCache.set(chainId, { value: slot, fetchedAt: now });
     return slot;
+  }
+
+  // Same coalescing as the slot cache, with two differences. (1) Failures
+  // PROPAGATE instead of caching a sentinel: getBlockHeight feeds tx-expiry
+  // proofs in the confirm sweep, where a fabricated 0 would silently mean
+  // "nothing ever expires" for 10s — an error must instead make the caller
+  // skip the row. (2) The IN-FLIGHT promise is cached, not just the
+  // resolved value: the confirm sweep fans out up to 16 concurrent rows,
+  // and value-only caching would let the whole first wave miss an empty
+  // cache simultaneously and fire 16 identical RPC calls.
+  const blockHeightCache = new Map<number, { value: Promise<number>; fetchedAt: number }>();
+  function getCachedBlockHeight(chainId: number, client: SolanaRpcClient): Promise<number> {
+    const now = Date.now();
+    const entry = blockHeightCache.get(chainId);
+    if (entry && now - entry.fetchedAt < SLOT_CACHE_TTL_MS) return entry.value;
+    const inFlight = client.getBlockHeight();
+    blockHeightCache.set(chainId, { value: inFlight, fetchedAt: now });
+    // A rejected probe must not poison the cache for the TTL — evict so the
+    // next caller retries immediately. (Callers still see this rejection.)
+    inFlight.catch(() => {
+      if (blockHeightCache.get(chainId)?.value === inFlight) blockHeightCache.delete(chainId);
+    });
+    return inFlight;
   }
 
   return {
@@ -417,6 +459,10 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       };
     },
 
+    async getBlockHeight(chainId: ChainId): Promise<number> {
+      return getCachedBlockHeight(chainId, getClient(chainId));
+    },
+
     async getConsumedNativeFee(chainId: ChainId, txHash: TxHash): Promise<AmountRaw | null> {
       // Solana charges the signature fee on every tx that lands on chain,
       // even when execution reverts. `meta.fee` on getTransaction returns
@@ -437,7 +483,10 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       }
 
       const client = getClient(args.chainId);
-      const { blockhash } = await client.getLatestBlockhash();
+      // lastValidBlockHeight rides the UnsignedTx to the executor, which
+      // persists it on the payout row at submit time — the confirm sweep's
+      // proof that a chain-absent tx has expired and can never land.
+      const { blockhash, lastValidBlockHeight } = await client.getLatestBlockhash();
 
       // Translate the caller's fee tier into a ComputeBudget config. We only
       // bind ComputeBudget when a tier is requested — without it, the tx
@@ -493,6 +542,7 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
         });
         return {
           chainId: args.chainId as ChainId,
+          lastValidBlockHeight,
           raw: {
             message,
             recentBlockhash: blockhash,
@@ -540,6 +590,7 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
 
       return {
         chainId: args.chainId as ChainId,
+        lastValidBlockHeight,
         raw: {
           message,
           recentBlockhash: blockhash,
@@ -733,8 +784,47 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
         ? [ed25519.sign(raw.message, feePayerKey), sourceSig]
         : [sourceSig];
       const encoded = encodeSignedTransaction(raw.message, signatures);
-      const txHash = await client.sendTransaction(encoded);
-      return txHash as TxHash;
+      // The on-chain txid IS the first signature — derive it locally rather
+      // than trusting sendTransaction's echoed string. A buggy proxy echoing
+      // the wrong signature would otherwise get PERSISTED as the row's
+      // txHash, and the confirm sweep's expiry proof would then auto-fail a
+      // payout whose real tx landed. Same untrusted-echo stance as the UTXO
+      // adapter's txid cross-check; we don't throw on mismatch because the
+      // tx is already live once the send resolves.
+      const txHash = base58.encode(signatures[0]!) as TxHash;
+      await client.sendTransaction(encoded);
+
+      // Confirm-or-resend window (see BROADCAST_RESEND_INTERVAL_MS),
+      // deliberately DETACHED: the executor must persist status='submitted'
+      // + txHash immediately after the first send — blocking here would
+      // stretch the funds-live-but-row-unrecorded crash gap from
+      // milliseconds to seconds and stall the shared cron tick (Vercel edge
+      // awaits the whole tick in one invocation). The window re-pushes the
+      // identical signed bytes until the RPC sees the signature: ed25519 is
+      // deterministic, so every resend carries the same signature and
+      // validators dedupe it — a resend can never double-spend. Best-effort
+      // by construction: if the runtime dies or the platform cancels the
+      // floating promise mid-window, nothing is lost — the confirmPayouts
+      // sweep owns the final verdict, including expiry.
+      const resendIntervalMs = config.broadcastResend?.intervalMs ?? BROADCAST_RESEND_INTERVAL_MS;
+      const maxResends = config.broadcastResend?.maxResends ?? BROADCAST_MAX_RESENDS;
+      if (maxResends > 0) {
+        void (async () => {
+          for (let attempt = 0; attempt < maxResends; attempt++) {
+            await sleep(resendIntervalMs);
+            try {
+              const [status] = await client.getSignatureStatuses([txHash]);
+              if (status) return; // RPC sees it — propagation succeeded.
+              await client.sendTransaction(encoded);
+            } catch {
+              // Expected failure modes: "already processed" once the tx
+              // lands between poll and resend, "Blockhash not found" once
+              // it expires, or a transient RPC flap. Non-actionable here.
+            }
+          }
+        })().catch(() => {});
+      }
+      return txHash;
     },
 
     // ---- Fees ----
@@ -880,6 +970,10 @@ export function solanaChainAdapter(config: SolanaChainConfig = {}): ChainAdapter
       return out;
     }
   };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---- Local byte helpers ----

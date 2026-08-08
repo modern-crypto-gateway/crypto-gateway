@@ -3,12 +3,16 @@ import {
   solanaChainAdapter,
   SOLANA_MAINNET_CHAIN_ID
 } from "../../../../adapters/chains/solana/solana-chain.adapter.js";
+import { solanaRpcClient } from "../../../../adapters/chains/solana/solana-rpc-client.js";
 import type { SolanaRpcClient } from "../../../../adapters/chains/solana/solana-rpc-client.js";
 
 function fakeClient(overrides: Partial<SolanaRpcClient>): SolanaRpcClient {
   const base: SolanaRpcClient = {
     async getSlot() {
       throw new Error("unexpected getSlot");
+    },
+    async getBlockHeight() {
+      throw new Error("unexpected getBlockHeight");
     },
     async getLatestBlockhash() {
       throw new Error("unexpected getLatestBlockhash");
@@ -364,5 +368,77 @@ describe("solanaChainAdapter.getConfirmationStatus", () => {
     });
     const status = await adapter.getConfirmationStatus(SOLANA_MAINNET_CHAIN_ID, "sig");
     expect(status).toEqual({ blockNumber: null, confirmations: 0, reverted: false });
+  });
+});
+
+describe("solanaChainAdapter.getBlockHeight", () => {
+  it("coalesces CONCURRENT callers onto one in-flight RPC call", async () => {
+    // The confirm sweep fans out up to 16 rows at once; value-only caching
+    // (store after resolve) would let the whole first wave miss an empty
+    // cache simultaneously. The in-flight PROMISE must be shared.
+    let calls = 0;
+    let release!: (height: number) => void;
+    const gate = new Promise<number>((resolve) => { release = resolve; });
+    const client = fakeClient({
+      getBlockHeight() {
+        calls += 1;
+        return gate;
+      }
+    });
+    const adapter = solanaChainAdapter({
+      chainIds: [SOLANA_MAINNET_CHAIN_ID],
+      clients: { [SOLANA_MAINNET_CHAIN_ID]: client }
+    });
+    const first = adapter.getBlockHeight!(SOLANA_MAINNET_CHAIN_ID);
+    const second = adapter.getBlockHeight!(SOLANA_MAINNET_CHAIN_ID);
+    release(340_000_000);
+    expect(await Promise.all([first, second])).toEqual([340_000_000, 340_000_000]);
+    expect(calls).toBe(1);
+    // And the resolved value keeps serving later callers within the TTL.
+    expect(await adapter.getBlockHeight!(SOLANA_MAINNET_CHAIN_ID)).toBe(340_000_000);
+    expect(calls).toBe(1);
+  });
+
+  it("propagates RPC failures without caching them — the next call retries immediately", async () => {
+    // Expiry proofs must skip on outage, not conclude "nothing expires" —
+    // so unlike the slot cache there is no error→sentinel mapping. And a
+    // rejected probe must be EVICTED, not served to every confirm-sweep
+    // caller for the 10s TTL after one flap.
+    let calls = 0;
+    const client = fakeClient({
+      async getBlockHeight() {
+        calls += 1;
+        if (calls === 1) throw new Error("rpc down");
+        return 340_000_777;
+      }
+    });
+    const adapter = solanaChainAdapter({
+      chainIds: [SOLANA_MAINNET_CHAIN_ID],
+      clients: { [SOLANA_MAINNET_CHAIN_ID]: client }
+    });
+    await expect(adapter.getBlockHeight!(SOLANA_MAINNET_CHAIN_ID)).rejects.toThrow(/rpc down/);
+    expect(await adapter.getBlockHeight!(SOLANA_MAINNET_CHAIN_ID)).toBe(340_000_777);
+    expect(calls).toBe(2);
+  });
+});
+
+describe("solanaRpcClient.getBlockHeight (wire shape)", () => {
+  it("POSTs getBlockHeight at finalized commitment and unwraps the numeric result", async () => {
+    let capturedBody: { method?: string; params?: unknown[] } = {};
+    const client = solanaRpcClient({
+      url: "https://rpc.example.test",
+      fetch: async (_url, init) => {
+        capturedBody = JSON.parse(String(init?.body)) as typeof capturedBody;
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 341_234_567 }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+    });
+    expect(await client.getBlockHeight()).toBe(341_234_567);
+    expect(capturedBody.method).toBe("getBlockHeight");
+    // Finalized commitment: expiry math must err toward declaring a
+    // blockhash dead LATER than the earliest possible moment.
+    expect(capturedBody.params).toEqual([{ commitment: "finalized" }]);
   });
 });

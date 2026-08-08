@@ -106,6 +106,19 @@ export interface ChainAdapter {
     reverted: boolean;
   }>;
 
+  // OPTIONAL — current chain-tip block height, implemented only by families
+  // whose txs EXPIRE (Solana today: a tx references a recent blockhash that
+  // is valid for ~150 blocks; past `UnsignedTx.lastValidBlockHeight` the tx
+  // can never be included). The payout confirm sweep compares this against
+  // the row's persisted watermark to distinguish "still propagating" from
+  // "permanently dropped" for submitted rows absent from chain. On Solana
+  // this is the BLOCK height (finalized commitment), NOT the slot — slots
+  // run far ahead of block height because skipped slots produce no block.
+  // Implementations should throw on RPC failure (callers skip and retry
+  // next tick) rather than return a guess. Families whose txs don't expire
+  // (EVM / UTXO) omit it.
+  getBlockHeight?(chainId: ChainId): Promise<number>;
+
   // Query the actual native-fee consumed by a previously-broadcast tx.
   // Called on the fail path so the gateway can debit what the chain
   // actually spent even when the tx reverted — EVM charges the full

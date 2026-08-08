@@ -19,6 +19,7 @@ const SOL_ADDR_B = "11111111111111111111111111111113";
 function fakeClient(overrides: Partial<SolanaRpcClient>): SolanaRpcClient {
   const base: SolanaRpcClient = {
     async getSlot() { throw new Error("unexpected getSlot"); },
+    async getBlockHeight() { throw new Error("unexpected getBlockHeight"); },
     async getLatestBlockhash() { return { blockhash: ZERO_BLOCKHASH, lastValidBlockHeight: 0 }; },
     async getSignaturesForAddress() { throw new Error("unexpected getSignaturesForAddress"); },
     async getTransaction() { throw new Error("unexpected getTransaction"); },

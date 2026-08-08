@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { base58 } from "@scure/base";
 import {
@@ -13,6 +13,7 @@ const HARDHAT_MNEMONIC = "test test test test test test test test test test test
 function fakeClient(overrides: Partial<SolanaRpcClient>): SolanaRpcClient {
   const base: SolanaRpcClient = {
     async getSlot() { throw new Error("unexpected getSlot"); },
+    async getBlockHeight() { throw new Error("unexpected getBlockHeight"); },
     async getLatestBlockhash() { throw new Error("unexpected getLatestBlockhash"); },
     async getSignaturesForAddress() { throw new Error("unexpected getSignaturesForAddress"); },
     async getTransaction() { throw new Error("unexpected getTransaction"); },
@@ -55,7 +56,7 @@ describe("solanaChainAdapter.buildTransfer (native SOL)", () => {
       clients: {
         [SOLANA_MAINNET_CHAIN_ID]: fakeClient({
           async getLatestBlockhash() {
-            return { blockhash: base58.encode(new Uint8Array(32).fill(7)), lastValidBlockHeight: 1 };
+            return { blockhash: base58.encode(new Uint8Array(32).fill(7)), lastValidBlockHeight: 350_000_123 };
           }
         })
       }
@@ -73,6 +74,9 @@ describe("solanaChainAdapter.buildTransfer (native SOL)", () => {
     });
 
     expect(unsigned.chainId).toBe(SOLANA_MAINNET_CHAIN_ID);
+    // Tx-expiry watermark rides the UnsignedTx so the executor can persist
+    // it — the confirm sweep's proof that an absent tx is dead, not slow.
+    expect(unsigned.lastValidBlockHeight).toBe(350_000_123);
     const raw = unsigned.raw as { message: Uint8Array; fromAddress: string; recentBlockhash: string };
     expect(raw.fromAddress).toBe(from);
     expect(raw.message).toBeInstanceOf(Uint8Array);
@@ -94,7 +98,7 @@ describe("solanaChainAdapter.buildTransfer (native SOL)", () => {
       clients: {
         [SOLANA_MAINNET_CHAIN_ID]: fakeClient({
           async getLatestBlockhash() {
-            return { blockhash: base58.encode(new Uint8Array(32).fill(9)), lastValidBlockHeight: 1 };
+            return { blockhash: base58.encode(new Uint8Array(32).fill(9)), lastValidBlockHeight: 350_000_456 };
           }
         })
       }
@@ -108,6 +112,7 @@ describe("solanaChainAdapter.buildTransfer (native SOL)", () => {
       token: "USDC",
       amountRaw: "1000000"
     });
+    expect(unsigned.lastValidBlockHeight).toBe(350_000_456);
     const raw = unsigned.raw as { message: Uint8Array; fromAddress: string };
     expect(raw.fromAddress).toBe(from);
     // Header: 1 required signer, 0 readonly signed, 5 readonly unsigned.
@@ -127,6 +132,9 @@ describe("solanaChainAdapter.signAndBroadcast", () => {
     let sentEncoded: string | null = null;
     const adapter = solanaChainAdapter({
       chainIds: [SOLANA_MAINNET_CHAIN_ID],
+      // This test is about signing/encoding — disable the confirm-or-resend
+      // window so signAndBroadcast returns after the first send.
+      broadcastResend: { maxResends: 0 },
       clients: {
         [SOLANA_MAINNET_CHAIN_ID]: fakeClient({
           async getLatestBlockhash() {
@@ -152,7 +160,6 @@ describe("solanaChainAdapter.signAndBroadcast", () => {
     });
 
     const txHash = await adapter.signAndBroadcast(unsigned, privateKey);
-    expect(txHash).toBe("signatureReturnedByRpc");
     expect(sentEncoded).not.toBeNull();
 
     // Decode the sent tx: 1-byte sig count (=1), 64-byte signature, then the message.
@@ -160,6 +167,10 @@ describe("solanaChainAdapter.signAndBroadcast", () => {
     expect(decoded[0]).toBe(1); // compact-u16 count of signatures = 1
     const signature = decoded.slice(1, 65);
     const message = decoded.slice(65);
+
+    // The returned txHash is the LOCALLY-derived first signature — the RPC's
+    // echoed string ("signatureReturnedByRpc" above) is untrusted and ignored.
+    expect(txHash).toBe(base58.encode(signature));
 
     // Verify ed25519 signature against the `from` public key.
     const rawUnsigned = unsigned.raw as { message: Uint8Array };
@@ -194,6 +205,122 @@ describe("solanaChainAdapter.signAndBroadcast", () => {
     });
     const wrongKeyPair = adapter.deriveAddress(HARDHAT_MNEMONIC, 99);
     await expect(adapter.signAndBroadcast(unsigned, wrongKeyPair.privateKey)).rejects.toThrow(/does not match/i);
+  });
+});
+
+describe("solanaChainAdapter.signAndBroadcast confirm-or-resend window", () => {
+  const recentBlockhash = base58.encode(new Uint8Array(32).fill(7));
+
+  // Builds an adapter whose sendTransaction records every submission and
+  // whose getSignatureStatuses is scripted per poll. intervalMs=1 so the
+  // (detached, fire-and-forget) window elapses almost instantly; tests
+  // vi.waitFor the background loop's terminal effects. Omitting maxResends
+  // exercises the adapter's production default (BROADCAST_MAX_RESENDS).
+  function resendHarness(args: {
+    statusPerPoll: ReadonlyArray<{ seen: boolean } | "throw">;
+    resendError?: Error;
+    maxResends?: number;
+  }) {
+    const sends: string[] = [];
+    const polled: string[] = [];
+    let polls = 0;
+    const adapter = solanaChainAdapter({
+      chainIds: [SOLANA_MAINNET_CHAIN_ID],
+      broadcastResend:
+        args.maxResends === undefined
+          ? { intervalMs: 1 }
+          : { intervalMs: 1, maxResends: args.maxResends },
+      clients: {
+        [SOLANA_MAINNET_CHAIN_ID]: fakeClient({
+          async getLatestBlockhash() {
+            return { blockhash: recentBlockhash, lastValidBlockHeight: 1 };
+          },
+          async sendTransaction(encoded) {
+            if (sends.length > 0 && args.resendError) throw args.resendError;
+            sends.push(encoded);
+            return "rpcEchoDeliberatelyWrong"; // ignored — txHash is derived locally
+          },
+          async getSignatureStatuses(signatures) {
+            polled.push(signatures[0]!);
+            const script = args.statusPerPoll[polls] ?? { seen: false };
+            polls += 1;
+            if (script === "throw") throw new Error("rpc flap");
+            return script.seen
+              ? [{ slot: 1, confirmations: 0, err: null, confirmationStatus: "processed" }]
+              : [null];
+          }
+        })
+      }
+    });
+    return { adapter, sends, polled, pollCount: () => polls };
+  }
+
+  async function broadcastOnce(adapter: ReturnType<typeof solanaChainAdapter>) {
+    const { address: from, privateKey } = adapter.deriveAddress(HARDHAT_MNEMONIC, 0);
+    const { address: to } = adapter.deriveAddress(HARDHAT_MNEMONIC, 1);
+    const unsigned = await adapter.buildTransfer({
+      chainId: SOLANA_MAINNET_CHAIN_ID,
+      fromAddress: from,
+      toAddress: to,
+      token: "SOL",
+      amountRaw: "500"
+    });
+    return adapter.signAndBroadcast(unsigned, privateKey);
+  }
+
+  // The locally-derived txid: first signature of the encoded wire tx.
+  function signatureOf(encodedTx: string): string {
+    return base58.encode(base58.decode(encodedTx).slice(1, 65));
+  }
+
+  it("returns the local txHash immediately, then re-sends identical bytes until the RPC sees the signature", async () => {
+    // Poll 1: unseen → resend. Poll 2: seen → stop with a resend budget left.
+    const h = resendHarness({ statusPerPoll: [{ seen: false }, { seen: true }] });
+    const txHash = await broadcastOnce(h.adapter);
+    // Returned before the window ran to completion (fire-and-forget) with
+    // the locally-derived signature, not the RPC's (wrong) echo.
+    expect(h.sends).toHaveLength(1);
+    expect(txHash).toBe(signatureOf(h.sends[0]!));
+    await vi.waitFor(() => expect(h.pollCount()).toBe(2));
+    expect(h.sends).toHaveLength(2);
+    // Idempotency contract: every resend is byte-for-byte the first send,
+    // and every poll queries the locally-derived signature.
+    expect(h.sends[1]).toBe(h.sends[0]);
+    expect(h.polled).toEqual([txHash, txHash]);
+  });
+
+  it("gives up after maxResends and leaves the original txHash standing", async () => {
+    const h = resendHarness({
+      statusPerPoll: [{ seen: false }, { seen: false }, { seen: false }],
+      maxResends: 2
+    });
+    const txHash = await broadcastOnce(h.adapter);
+    expect(txHash).toBe(signatureOf(h.sends[0]!));
+    await vi.waitFor(() => expect(h.sends).toHaveLength(3)); // initial + 2 resends
+    expect(h.pollCount()).toBe(2);
+  });
+
+  it("runs the production default of 3 resends when broadcastResend.maxResends is not configured", async () => {
+    // Pins the `?? BROADCAST_MAX_RESENDS` fallback — every other test passes
+    // an explicit maxResends, so a regression of the default (e.g. to 0)
+    // would otherwise go unnoticed while silently disabling the window.
+    const h = resendHarness({ statusPerPoll: [] }); // every poll: unseen
+    await broadcastOnce(h.adapter);
+    await vi.waitFor(() => expect(h.sends).toHaveLength(4)); // initial + 3 resends
+    expect(h.pollCount()).toBe(3);
+  });
+
+  it("swallows poll and resend errors — the first successful send owns the txHash", async () => {
+    const h = resendHarness({
+      statusPerPoll: ["throw", { seen: false }, { seen: false }],
+      resendError: new Error("Transaction simulation failed: This transaction has already been processed")
+    });
+    const txHash = await broadcastOnce(h.adapter);
+    expect(txHash).toBe(signatureOf(h.sends[0]!));
+    // Loop runs its full default budget: poll 1 throws (no resend), polls
+    // 2-3 unseen with resends throwing — all swallowed, nothing recorded.
+    await vi.waitFor(() => expect(h.pollCount()).toBe(3));
+    expect(h.sends).toHaveLength(1);
   });
 });
 

@@ -2059,7 +2059,15 @@ async function startTopUpFromReservation(
     await runWithBusyRetry(deps, async () => {
       await deps.db
         .update(payouts)
-        .set({ status: "submitted", txHash: topUpTxHash, submittedAt: now2, updatedAt: now2 })
+        .set({
+          status: "submitted",
+          txHash: topUpTxHash,
+          // Tx-expiry watermark (Solana) — lets executeTopUp prove a
+          // chain-absent top-up tx is dropped, mirroring broadcastMain.
+          lastValidBlockHeight: unsignedTopUp.lastValidBlockHeight ?? null,
+          submittedAt: now2,
+          updatedAt: now2
+        })
         .where(eq(payouts.id, topUpId));
       // Status is already 'topping-up' from the CAS at the start; just fill in
       // the broadcast metadata so the next executor tick's polling has the
@@ -2148,10 +2156,24 @@ async function executeTopUp(
   // The sibling is the gas_top_up payout row; on revert we cascade-fail it
   // alongside the parent so it doesn't sit in `submitted` forever (the
   // sweep watchdog would otherwise WARN about it indefinitely).
+  // MUST match on txHash, not just (parent, kind): the re-top-up rail can
+  // create several gas_top_up children per parent (one per round, bounded
+  // by MAX_TOPUP_ATTEMPTS), and an unfiltered LIMIT 1 returns the OLDEST —
+  // round 2 would then cascade-fail round 1's already-CONFIRMED sibling and
+  // feed the Solana expiry proof a watermark from one whole top-up
+  // lifecycle ago. The sibling's txHash and the parent's topUpTxHash are
+  // written together at the post-broadcast persist, so this always selects
+  // the row for the tx we are actually polling.
   const [sibling] = await deps.db
     .select()
     .from(payouts)
-    .where(and(eq(payouts.parentPayoutId, row.id), eq(payouts.kind, "gas_top_up")))
+    .where(
+      and(
+        eq(payouts.parentPayoutId, row.id),
+        eq(payouts.kind, "gas_top_up"),
+        eq(payouts.txHash, row.topUpTxHash)
+      )
+    )
     .limit(1);
 
   const status = await chainAdapter.getConfirmationStatus(row.chainId, row.topUpTxHash);
@@ -2171,6 +2193,51 @@ async function executeTopUp(
   // reduction: if a freak reorg un-confirms the top-up, the main broadcast
   // fails "insufficient native balance" and the re-top-up rail recovers.
   if (status.confirmations < INTERNAL_PAYOUT_CONFIRMATIONS) {
+    // Dropped-top-up detection (Solana): a chain-absent top-up whose
+    // blockhash expired will never confirm, so "deferred" would recur
+    // forever — the same stuck-forever bug confirmPayouts' expiry branch
+    // fixes for main txs, one rail over. Same proofs (height, else age),
+    // read from the gas_top_up SIBLING row (it carries the watermark and
+    // submit timestamps for the top-up tx). No debounce here: the blast
+    // radius of a rare false positive is internal sponsor SOL that stays
+    // recoverable on the source, not merchant funds, and failPayout
+    // cascades parent + sibling + reservations atomically.
+    const topUpAbsent =
+      status.blockNumber === null && status.confirmations === 0 && !status.reverted;
+    if (topUpAbsent && chainAdapter.family === "solana" && sibling !== undefined) {
+      const heightProof = await solanaTxExpiryHeightProof(
+        chainAdapter,
+        row.chainId,
+        sibling.lastValidBlockHeight
+      );
+      const ageAnchor = solanaTxExpiryAgeAnchor(sibling);
+      const nowExpiry = deps.clock.now().getTime();
+      const topUpExpired =
+        heightProof === "expired" ||
+        (heightProof === "unavailable" && nowExpiry - ageAnchor > TX_EXPIRY_FALLBACK_MS);
+      if (topUpExpired) {
+        const outcome = await failPayout(
+          deps,
+          row,
+          "TOP_UP_BROADCAST_FAILED",
+          `Top-up tx ${row.topUpTxHash} expired before inclusion (blockhash no longer valid); ` +
+            "it never landed on-chain and can no longer confirm.",
+          sibling.id
+        );
+        // The top-up tx provably never landed → consumed fee is exactly
+        // zero. Tombstone the SIBLING's gas-burn candidacy now (it is the
+        // failed row carrying the txHash) so reconcileFailedPayoutGasBurns
+        // doesn't probe a receipt that can never appear on every tick for
+        // 7 days — mirrors the confirmPayouts expiry branch.
+        await insertGasBurnTombstone(
+          deps,
+          sibling,
+          chainAdapter.nativeSymbol(row.chainId as ChainId),
+          "top-up tx expired before inclusion; consumed fee is provably zero"
+        );
+        return outcome;
+      }
+    }
     // Not confirmed yet — leave payout in topping-up; next tick re-checks.
     return "deferred";
   }
@@ -2600,8 +2667,17 @@ async function broadcastMain(
         .update(payouts)
         // Persist the amount we actually broadcast — for a re-sized
         // consolidation sweep this is the real on-chain balance, so the ledger
-        // debit on confirmation matches what truly moved.
-        .set({ status: "submitted", txHash, amountRaw: effectiveAmountRaw, submittedAt: now2, updatedAt: now2 })
+        // debit on confirmation matches what truly moved. The tx-expiry
+        // watermark (chains whose txs expire; Solana today) rides along so the
+        // confirm sweep can prove a chain-absent tx is dead, not propagating.
+        .set({
+          status: "submitted",
+          txHash,
+          amountRaw: effectiveAmountRaw,
+          lastValidBlockHeight: unsigned.lastValidBlockHeight ?? null,
+          submittedAt: now2,
+          updatedAt: now2
+        })
         .where(eq(payouts.id, row.id))
     );
   } catch (err) {
@@ -4357,6 +4433,67 @@ export interface ConfirmPayoutsOptions {
   maxBatch?: number;
 }
 
+// Blocks past a row's `last_valid_block_height` before the confirm sweep
+// declares its tx dropped. ~150 blocks ≈ 60s of Solana slots: absorbs RPC
+// tip skew and signature-index lag for a tx that landed in the last
+// eligible block. Below the margin an absent tx is merely "not provably
+// dead yet" and the row waits for the next tick.
+const TX_EXPIRY_SAFETY_BLOCKS = 150;
+// Age-based fallback proof, applied ONLY when the height proof cannot
+// answer (NULL watermark on pre-column rows, or getBlockHeight erroring):
+// a Solana blockhash lives ~2 minutes of block production, so a tx still
+// absent 15 minutes after its age anchor cannot land — unless block
+// production itself stalled, which is exactly why a SUCCESSFUL height
+// proof saying "still valid" must override this clock (during a cluster
+// halt wall-time passes while blockhash validity is frozen). Deliberately
+// matches the reasoning behind UNKNOWN_BROADCAST_REBROADCAST_AFTER_MS.
+const TX_EXPIRY_FALLBACK_MS = 15 * 60_000;
+// Debounce marker for the expiry verdict. A terminal fail from ABSENCE
+// evidence (unlike reverted/confirmed, which are positive facts every RPC
+// node agrees on) must never rest on a single getSignatureStatuses null —
+// lagging history replicas behind provider load balancers do return
+// spurious nulls for landed txs. First tick that proves expiry writes this
+// marker and leaves the row submitted; only a SECOND tick that
+// independently re-proves expiry (fresh status read, fresh height read)
+// flips it to failed. The marker write deliberately does NOT bump
+// updatedAt — updatedAt is the expiry age anchor for rows whose
+// submittedAt was backdated by the unknown-broadcast reconciler.
+const TX_EXPIRY_SUSPECT_PREFIX = "[TX_EXPIRY_SUSPECTED]";
+
+// Tri-state blockhash-expiry proof for a Solana row absent from chain.
+//   "expired"     — finalized tip is safely past the watermark; the tx can
+//                   never be included in any future block.
+//   "alive"       — tip is at or below watermark + margin; the tx could
+//                   still land, NOTHING may fail it (overrides age).
+//   "unavailable" — no watermark persisted or the height RPC errored; the
+//                   caller may fall back to the age proof.
+async function solanaTxExpiryHeightProof(
+  chainAdapter: ChainAdapter,
+  chainId: number,
+  lastValidBlockHeight: number | null
+): Promise<"expired" | "alive" | "unavailable"> {
+  if (lastValidBlockHeight === null || chainAdapter.getBlockHeight === undefined) {
+    return "unavailable";
+  }
+  try {
+    const tipHeight = await chainAdapter.getBlockHeight(chainId as ChainId);
+    return tipHeight > lastValidBlockHeight + TX_EXPIRY_SAFETY_BLOCKS ? "expired" : "alive";
+  } catch {
+    return "unavailable";
+  }
+}
+
+// Expiry age anchor: max(submittedAt, updatedAt). Plain broadcasts set both
+// to the same submit instant, but the unknown-broadcast reconciler and
+// recoverHeldPayout promote held rows with submittedAt BACKDATED to the
+// original broadcast attempt (possibly >15 min ago) while stamping
+// updatedAt = promotion time — and those rows only get promoted because
+// their tx was positively seen on-chain. Anchoring on updatedAt gives them
+// a fresh observation window instead of an instantly-satisfied age proof.
+function solanaTxExpiryAgeAnchor(row: { submittedAt: number | null; updatedAt: number }): number {
+  return Math.max(row.submittedAt ?? 0, row.updatedAt);
+}
+
 // Cron-triggered: move submitted payouts (standard + consolidation_sweep)
 // to confirmed or failed based on the chain's view of the tx. gas_top_up
 // siblings are confirmed in `executeTopUp` synchronously and stay out of
@@ -4420,6 +4557,124 @@ export async function confirmPayouts(
       if (updated) {
         await deps.events.publish({ type: "payout.failed", payoutId: updated.id, payout: updated, at: new Date(now) });
       }
+      counts.failed += 1;
+      return;
+    }
+
+    // Dropped-tx detection for expiring-tx chains (Solana). An absent
+    // signature ({blockNumber: null, 0 confs, not reverted}) is normally
+    // indistinguishable from "still propagating" — EXCEPT once the tx's
+    // blockhash can no longer be referenced by any new block, after which
+    // the tx is permanently dead. Proof order matters:
+    //   1. Height proof (tri-state, see solanaTxExpiryHeightProof). An
+    //      affirmative "alive" means the tx could still land — e.g. block
+    //      production stalled while wall-clocks kept running — and VETOES
+    //      the age proof below.
+    //   2. Age proof, only when the height proof is unavailable: absent for
+    //      far longer than any blockhash can live (15 min vs ~2 min),
+    //      measured from the age anchor (see solanaTxExpiryAgeAnchor).
+    // A proof alone doesn't fail the row: the verdict is debounced across
+    // two consecutive sweep ticks (TX_EXPIRY_SUSPECT_PREFIX marker) so one
+    // spurious null from a lagging history replica can't terminally fail a
+    // landed tx. Failing is safe ONLY on chains whose txs expire — an
+    // expired Solana tx can never land later, so releasing reservations
+    // cannot double-pay. EVM/UTXO absents (tx may still sit in a mempool)
+    // never enter this branch.
+    const absentFromChain =
+      status.blockNumber === null && status.confirmations === 0 && !status.reverted;
+    const suspected = row.lastError?.startsWith(TX_EXPIRY_SUSPECT_PREFIX) === true;
+    // Any positively-SEEN status exonerates a suspected row: the debounce
+    // demands two CONSECUTIVE absence proofs, so a sighting in between
+    // resets it (a later absence starts a fresh two-tick cycle). Clearing
+    // also keeps the scary marker text out of the merchant-visible
+    // lastError of a row that goes on to confirm below.
+    const clearSuspicionStmt = () =>
+      deps.db
+        .update(payouts)
+        .set({ lastError: null })
+        .where(and(eq(payouts.id, row.id), eq(payouts.status, "submitted")));
+    if (!absentFromChain && suspected) {
+      await clearSuspicionStmt();
+    }
+    if (absentFromChain && chainAdapter.family === "solana") {
+      const heightProof = await solanaTxExpiryHeightProof(
+        chainAdapter,
+        row.chainId,
+        row.lastValidBlockHeight
+      );
+      const ageAnchor = solanaTxExpiryAgeAnchor(row);
+      const expired =
+        heightProof === "expired" ||
+        (heightProof === "unavailable" && now - ageAnchor > TX_EXPIRY_FALLBACK_MS);
+      if (!expired) {
+        // Absent but not provably dead. If a previous tick suspected the
+        // row, this tick's evidence no longer supports the verdict —
+        // reset the debounce rather than letting a stale first strike
+        // pair with a much later second one.
+        if (suspected) await clearSuspicionStmt();
+        return;
+      }
+
+      if (!suspected) {
+        // First strike: record the suspicion, keep the row submitted. No
+        // updatedAt bump — it anchors the age proof (see the marker
+        // comment). CAS on status so a racing confirm isn't scribbled on.
+        await deps.db
+          .update(payouts)
+          .set({
+            lastError:
+              `${TX_EXPIRY_SUSPECT_PREFIX} Tx absent from chain and past its blockhash ` +
+              "validity; fails on the next sweep tick unless the tx appears."
+          })
+          .where(and(eq(payouts.id, row.id), eq(payouts.status, "submitted")));
+        return;
+      }
+
+      // Second strike on a fresh status + height read — terminal. CAS on
+      // status='submitted' so a concurrent sweep that CONFIRMED the row
+      // (fresh node saw the tx) wins; batching the release alongside is
+      // safe either way, because every transition out of `submitted`
+      // (confirmed/failed) releases reservations itself and the release is
+      // idempotent (WHERE released_at IS NULL).
+      deps.logger.warn("payout.tx_expired", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        txHash: row.txHash,
+        lastValidBlockHeight: row.lastValidBlockHeight,
+        heightProof,
+        submittedAt: row.submittedAt
+      });
+      const failStmt = deps.db
+        .update(payouts)
+        .set({
+          status: "failed",
+          lastError:
+            "[TX_EXPIRED] Transaction expired before inclusion (blockhash no longer valid); " +
+            "it never landed on-chain and can no longer confirm. Funds did not move.",
+          updatedAt: now
+        })
+        .where(and(eq(payouts.id, row.id), eq(payouts.status, "submitted")))
+        .returning({ id: payouts.id });
+      const releaseStmt = releaseReservationsStmt(deps, row.id);
+      const [failedRows] = await deps.db.batch([failStmt, releaseStmt] as [
+        typeof failStmt,
+        typeof releaseStmt
+      ]);
+      if (failedRows.length === 0) return; // lost the race — the other verdict stands
+      const updated = await fetchPayout(deps, row.id);
+      if (updated) {
+        await deps.events.publish({ type: "payout.failed", payoutId: updated.id, payout: updated, at: new Date(now) });
+      }
+      // The tx provably never landed, so the consumed fee is exactly zero.
+      // Tombstone the gas-burn candidacy NOW instead of letting
+      // reconcileFailedPayoutGasBurns re-probe a receipt that can never
+      // appear on every tick for 7 days (see insertGasBurnTombstone).
+      await insertGasBurnTombstone(
+        deps,
+        { ...row, status: "failed" },
+        chainAdapter.nativeSymbol(row.chainId as ChainId),
+        "tx expired before inclusion; consumed fee is provably zero"
+      );
       counts.failed += 1;
       return;
     }

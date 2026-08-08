@@ -11,6 +11,13 @@ import type { TokenSymbol } from "./token.js";
 export const UnsignedTxSchema = z.object({
   chainId: ChainIdSchema,
   raw: z.unknown(),
+  // Block height after which this tx can no longer be included on-chain.
+  // Set by adapters whose txs EXPIRE (Solana: getLatestBlockhash's
+  // lastValidBlockHeight, ~150 blocks ≈ 60–90s after build). The executor
+  // persists it on the payout row at submit time so the confirm sweep can
+  // prove a chain-absent tx is permanently dropped rather than still
+  // propagating. Families without tx expiry (EVM / UTXO) leave it unset.
+  lastValidBlockHeight: z.number().int().nonnegative().optional(),
   // Human-readable summary for logging / admin display. Never used for dispatch.
   summary: z.string().max(1024).optional()
 });
