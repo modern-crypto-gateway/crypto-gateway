@@ -46,7 +46,12 @@ describe("tronSaveProvider", () => {
 
     const estimate = await provider.estimateEnergyOrder({ receiver: RECEIVER, energyAmount: 65000, durationSec: 3600 });
 
-    expect(estimate).toEqual({ unitPriceSun: 64, totalCostSun: 4160000n, availableEnergy: 900000 });
+    expect(estimate).toEqual({
+      unitPriceSun: 64,
+      totalCostSun: 4160000n,
+      availableEnergy: 900000,
+      effectiveEnergyAmount: 65000
+    });
     expect(requests[0]!.url).toBe(`${TRONSAVE_MAINNET_URL}/v2/estimate-buy-resource`);
     expect(requests[0]!.headers["apikey"]).toBe("k-123");
     expect(requests[0]!.body).toMatchObject({
@@ -93,6 +98,35 @@ describe("tronSaveProvider", () => {
         maxPriceAccepted: 90
       }
     });
+  });
+
+  it("clamps sub-minimum orders up to TronSave's 32k floor in both estimate and create", async () => {
+    // The executor rents only its shortfall; a source with leftover
+    // delegation can need e.g. 20k, which TronSave won't fill. Without the
+    // clamp the order is rejected and the whole shortfall burns as TRX.
+    const { fetch, requests } = fakeFetch([
+      { body: { error: false, data: { unitPrice: 64, estimateTrx: 2048000, availableResource: 900000 } } },
+      { body: { error: false, data: { orderId: "ord-clamped" } } }
+    ]);
+    const provider = tronSaveProvider({ apiKey: "k", fetch });
+
+    const estimate = await provider.estimateEnergyOrder({
+      receiver: RECEIVER,
+      energyAmount: 20_000,
+      durationSec: 600
+    });
+    // The estimate prices the CLAMPED amount and says so, keeping the
+    // caller's rent-vs-burn comparison honest.
+    expect(estimate.effectiveEnergyAmount).toBe(32_000);
+    expect(requests[0]!.body).toMatchObject({ resourceAmount: 32_000 });
+
+    await provider.createEnergyOrder({
+      receiver: RECEIVER,
+      energyAmount: 20_000,
+      durationSec: 600,
+      maxUnitPriceSun: 90
+    });
+    expect(requests[1]!.body).toMatchObject({ resourceAmount: 32_000 });
   });
 
   it("reads order status with the actual paid amount", async () => {

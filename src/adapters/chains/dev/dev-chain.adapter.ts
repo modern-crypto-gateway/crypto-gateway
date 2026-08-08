@@ -1,4 +1,4 @@
-import type { ChainAdapter, FeeTierQuote } from "../../../core/ports/chain.port.ts";
+import type { ChainAdapter, FeeTierQuote, GasPrepResult } from "../../../core/ports/chain.port.ts";
 import type { Address, ChainId, TxHash } from "../../../core/types/chain.js";
 import type { AmountRaw } from "../../../core/types/money.js";
 import type { TokenSymbol } from "../../../core/types/token.js";
@@ -21,6 +21,16 @@ export interface DevChainConfig {
   // Default status returned by `getConfirmationStatus` when a tx hash is not
   // in `confirmationStatuses`. Defaults to { null, 0, false }.
   defaultConfirmationStatus?: { blockNumber: number | null; confirmations: number; reverted: boolean };
+  // Per-address balance overrides for `getBalance`, keyed by address. Tests
+  // use this to drive the executor's pre-broadcast balance gate (sweep
+  // re-size / fail-cheap paths). Addresses absent from the map fall back to
+  // the huge default so unrelated tests keep passing their gates.
+  balancesByAddress?: ReadonlyMap<string, AmountRaw>;
+  // Optional passthrough for ChainAdapter.prepareGasForBroadcast so
+  // executor-level tests can observe and script the gas-prep hook (the only
+  // real implementation lives in the Tron adapter). When absent, the
+  // adapter exposes NO hook — matching every non-Tron family.
+  prepareGasForBroadcast?: (args: BuildTransferArgs) => Promise<GasPrepResult>;
 }
 
 // Dev / loopback chain adapter. Deterministic HD-like derivation via HMAC-SHA256
@@ -35,6 +45,9 @@ export function devChainAdapter(config: DevChainConfig = {}): ChainAdapter {
   return {
     family: "evm",
     supportedChainIds: chainIds,
+    ...(config.prepareGasForBroadcast !== undefined
+      ? { prepareGasForBroadcast: config.prepareGasForBroadcast }
+      : {}),
 
     deriveAddress(seed: string, index: number) {
       // HMAC-SHA256(seed, "dev-chain/{index}") -> 32 bytes.
@@ -148,10 +161,12 @@ export function devChainAdapter(config: DevChainConfig = {}): ChainAdapter {
       };
     },
 
-    async getBalance(_args): Promise<AmountRaw> {
-      // Dev adapter doesn't model balances. Return a large number so the
-      // payout executor's pre-flight check always passes and the test can
-      // focus on the state machine without fixture balance bookkeeping.
+    async getBalance(args): Promise<AmountRaw> {
+      // Per-address overrides first (balance-gate tests); otherwise a large
+      // number so the payout executor's pre-flight check always passes and
+      // tests can focus on the state machine without balance bookkeeping.
+      const override = config.balancesByAddress?.get(args.address);
+      if (override !== undefined) return override;
       return "1000000000000000000000" as AmountRaw;
     },
 

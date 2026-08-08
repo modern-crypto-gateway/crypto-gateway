@@ -638,9 +638,14 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
               quote.reason instanceof Error ? quote.reason.message : String(quote.reason);
             continue;
           }
-          if (quote.value.estimate.availableEnergy < shortfall) {
+          // Supply must cover what the provider would ACTUALLY order — a
+          // sub-minimum shortfall gets clamped up to the market's floor
+          // (TronSave 32k / TEM 20k), and an all-or-nothing order for the
+          // clamped amount against thinner supply would just be rejected.
+          const orderAmount = quote.value.estimate.effectiveEnergyAmount ?? shortfall;
+          if (quote.value.estimate.availableEnergy < orderAmount) {
             skippedProviders[quote.value.candidate.name] =
-              `supply ${quote.value.estimate.availableEnergy} below shortfall ${shortfall}`;
+              `supply ${quote.value.estimate.availableEnergy} below order amount ${orderAmount}`;
             continue;
           }
           viable.push(quote.value);
@@ -668,6 +673,34 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
           return { kind: "none" };
         }
 
+        // A CLAMPED order (market minimum above our shortfall) breaks the
+        // per-unit ceiling's total-cost proof: worst-case fill used to be
+        // bounded by shortfall × ceiling < shortfall × burnRate = burn cost,
+        // but the clamp inflates the quantity while the burn alternative
+        // still only costs the shortfall. Re-derive the ceiling from the
+        // TOTAL bound — orderAmount × ceiling ≤ burn − minSavings — so a
+        // fill can never cost more than the burn it replaces no matter how
+        // the market moves between estimate and create. When no whole-SUN
+        // unit price satisfies that bound, no clamped fill can beat burning
+        // this small a shortfall — skip rental.
+        const orderAmount = estimate.effectiveEnergyAmount ?? shortfall;
+        let orderUnitCeilingSun = maxUnitPriceSun;
+        if (orderAmount > shortfall) {
+          orderUnitCeilingSun = Math.min(
+            orderUnitCeilingSun,
+            Math.floor(Number(burnCostSun - minSavingsSun) / orderAmount)
+          );
+          if (orderUnitCeilingSun < 1) {
+            log?.info("tron energy rental skipped: clamped order can't beat burning", {
+              provider: provider.name,
+              shortfall,
+              orderAmount,
+              burnCostSun: burnCostSun.toString()
+            });
+            return { kind: "none" };
+          }
+        }
+
         // Buy. The provider enforces all-or-nothing + the unit-price ceiling
         // server-side, so a created order is already guaranteed cheaper than
         // the burn it replaces.
@@ -678,7 +711,7 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
             receiver: args.fromAddress,
             energyAmount: shortfall,
             durationSec,
-            maxUnitPriceSun
+            maxUnitPriceSun: orderUnitCeilingSun
           }));
         } catch (err) {
           // Ambiguity guard: a transport error here can't tell us whether
@@ -756,7 +789,11 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
             log?.info("tron energy rented for broadcast", {
               provider: provider.name,
               orderId,
-              energyRented: shortfall,
+              // What the provider actually delegated and charged for — for a
+              // clamped order this exceeds the shortfall, and dividing cost
+              // by the shortfall would misread as an above-burn unit price.
+              energyRented: orderAmount,
+              shortfall,
               rentalCostSun: costSun.toString(),
               burnCostSun: burnCostSun.toString(),
               savedSun: (burnCostSun - costSun).toString()
@@ -902,6 +939,20 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
                 `Energy rental did not cover this broadcast; a gas top-up is required.`
             );
           }
+          // The source CAN afford the burn, so the broadcast proceeds by
+          // design — but a burn on a rental-enabled deployment is exactly
+          // the cost the operator pays a market to avoid, and it is
+          // otherwise invisible (confirmed payouts get no gas_burn row).
+          // Say the quiet part out loud, with numbers.
+          config.energyRental?.logger?.warn?.("tron payout burning TRX for an energy gap", {
+            fromAddress: args.fromAddress,
+            token: args.token,
+            energyGap,
+            neededEnergy,
+            energyAvailable: resources.energyAvailable,
+            estBurnSun: burnNeededSun.toString(),
+            sizedByRentalPrep: sized !== null
+          });
         }
       }
 

@@ -87,6 +87,26 @@ describe("tronEnergyMarketProvider", () => {
     // ceil(35 × 20000 × 87000/86400) — priced at the clamped 20k, so the
     // caller's rent-vs-burn comparison sees the true cost.
     expect(estimate.totalCostSun).toBe(704_862n);
+    // And the clamped amount is reported so the caller's supply check
+    // compares the market's depth against what would actually be ordered.
+    expect(estimate.effectiveEnergyAmount).toBe(20_000);
+  });
+
+  it("clamps a sub-minimum createEnergyOrder to the same floor the estimate priced", async () => {
+    // The executor passes the raw shortfall to create; estimate and create
+    // must clamp identically or the cost comparison priced a different
+    // order than the one placed.
+    const { provider: tem, requests } = provider([
+      { body: INFO_BODY },
+      { body: { order: 777 } }
+    ]);
+    await tem.createEnergyOrder({
+      receiver: RECEIVER,
+      energyAmount: 5_000,
+      durationSec: 600,
+      maxUnitPriceSun: 90
+    });
+    expect((requests[1]!.body as { amount: number }).amount).toBe(20_000);
   });
 
   it("creates an all-or-nothing instant order paid from credit", async () => {

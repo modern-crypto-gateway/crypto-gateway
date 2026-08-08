@@ -2332,96 +2332,7 @@ async function broadcastMain(
     return "deferred";
   }
 
-  // ---- (a0) Optional pre-broadcast gas acquisition (Tron energy rental
-  // today; see ChainAdapter.prepareGasForBroadcast). Runs AFTER the CAS so
-  // only the claim winner can spend rental money, and BEFORE buildTransfer
-  // because Tron txs expire ~60s after build — waiting out a rental fill on
-  // an already-built tx would let it lapse. Adapters without the hook (every
-  // family but Tron) skip this block entirely.
-  if (typeof chainAdapter.prepareGasForBroadcast === "function") {
-    let prep: GasPrepResult;
-    try {
-      prep = await chainAdapter.prepareGasForBroadcast({
-        chainId: row.chainId,
-        fromAddress: source.address,
-        toAddress: row.destinationAddress,
-        token: row.token,
-        amountRaw: row.amountRaw as AmountRaw,
-        ...(row.feeTier !== null
-          ? { feeTier: row.feeTier as "low" | "medium" | "high" }
-          : {})
-      });
-    } catch (err) {
-      // The hook's contract is "never throw"; treat a violation as "none"
-      // (standard burn path) — rental is an optimization, not a liveness
-      // dependency, and the planner's reservations cover the burn case.
-      deps.logger.warn("payout.gas_prep_threw", {
-        payoutId: row.id,
-        chainId: row.chainId,
-        error: err instanceof Error ? err.message : String(err)
-      });
-      prep = { kind: "none" };
-    }
-    if (prep.kind === "deferred") {
-      // Rental money is committed but the delegation isn't usable on-chain
-      // yet. Broadcasting now would burn native ON TOP of the paid rental,
-      // so step back instead: nothing has reached the network (we're
-      // strictly before build/sign), which makes releasing the CAS claim
-      // safe — next tick re-runs prep, finds the landed delegation
-      // ("covered") and broadcasts without re-buying.
-      const reason = prep.reason;
-      try {
-        await runWithBusyRetry(deps, () =>
-          deps.db
-            .update(payouts)
-            .set({
-              broadcastAttemptedAt: null,
-              lastError: `[GAS_PREP_DEFERRED] ${reason}`.slice(0, 1024),
-              updatedAt: deps.clock.now().getTime()
-            })
-            .where(eq(payouts.id, row.id))
-        );
-      } catch (err) {
-        // Claim stays held until the next operator touch — log loudly so
-        // the funded-but-waiting payout is visible. Deliberately NOT
-        // broadcasting here: the whole point of the defer is to avoid
-        // paying the burn rail on top of the rental rail.
-        deps.logger.error("payout.gas_prep_defer_persist_failed", {
-          payoutId: row.id,
-          reason,
-          error: err instanceof Error ? err.message : String(err)
-        });
-      }
-      return "deferred";
-    }
-    if (prep.kind === "rented") {
-      // Audit trail. Best-effort: the rented energy is already delegated to
-      // the source, so a failed bookkeeping write must not block the
-      // broadcast that the rental was bought for.
-      const orderRef = `${prep.provider}:${prep.orderId}`;
-      const costNative = prep.costNativeRaw;
-      try {
-        await runWithBusyRetry(deps, () =>
-          deps.db
-            .update(payouts)
-            .set({
-              gasRentalOrderId: orderRef,
-              gasRentalCostNative: costNative,
-              updatedAt: deps.clock.now().getTime()
-            })
-            .where(eq(payouts.id, row.id))
-        );
-      } catch (err) {
-        deps.logger.warn("payout.gas_rental_audit_persist_failed", {
-          payoutId: row.id,
-          orderRef,
-          error: err instanceof Error ? err.message : String(err)
-        });
-      }
-    }
-  }
-
-  // ---- (a0.5) Pre-broadcast on-chain balance gate. The chain — not our
+  // ---- (a0) Pre-broadcast on-chain balance gate. The chain — not our
   // derived ledger — is the source of truth for what we can actually send.
   // Broadcasting a transfer the source can't cover is how doomed sweeps burn
   // gas on reverts (and how a drifted ledger turns into real loss). The
@@ -2499,6 +2410,99 @@ async function broadcastMain(
           deps, row, "SOURCE_BROADCAST_FAILED",
           `Source ${row.token} balance ${onChainToken} is below the payout amount ${row.amountRaw}; not broadcasting.`
         );
+      }
+    }
+  }
+
+  // ---- (a0.5) Optional pre-broadcast gas acquisition (Tron energy rental
+  // today; see ChainAdapter.prepareGasForBroadcast). Runs AFTER the CAS so
+  // only the claim winner can spend rental money, AFTER the balance gate so
+  // (1) doomed payouts fail cheap before any rental spend and (2) a re-sized
+  // consolidation sweep preps with the EFFECTIVE amount — sizing off the
+  // drifted-high planned amount made the prep's transfer simulation revert,
+  // which silently dropped the rental and burned TRX for the whole transfer.
+  // Still BEFORE buildTransfer because Tron txs expire ~60s after build —
+  // waiting out a rental fill on an already-built tx would let it lapse.
+  // Adapters without the hook (every family but Tron) skip this block.
+  if (typeof chainAdapter.prepareGasForBroadcast === "function") {
+    let prep: GasPrepResult;
+    try {
+      prep = await chainAdapter.prepareGasForBroadcast({
+        chainId: row.chainId,
+        fromAddress: source.address,
+        toAddress: row.destinationAddress,
+        token: row.token,
+        amountRaw: effectiveAmountRaw as AmountRaw,
+        ...(row.feeTier !== null
+          ? { feeTier: row.feeTier as "low" | "medium" | "high" }
+          : {})
+      });
+    } catch (err) {
+      // The hook's contract is "never throw"; treat a violation as "none"
+      // (standard burn path) — rental is an optimization, not a liveness
+      // dependency, and the planner's reservations cover the burn case.
+      deps.logger.warn("payout.gas_prep_threw", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      prep = { kind: "none" };
+    }
+    if (prep.kind === "deferred") {
+      // Rental money is committed but the delegation isn't usable on-chain
+      // yet. Broadcasting now would burn native ON TOP of the paid rental,
+      // so step back instead: nothing has reached the network (we're
+      // strictly before build/sign), which makes releasing the CAS claim
+      // safe — next tick re-runs prep, finds the landed delegation
+      // ("covered") and broadcasts without re-buying.
+      const reason = prep.reason;
+      try {
+        await runWithBusyRetry(deps, () =>
+          deps.db
+            .update(payouts)
+            .set({
+              broadcastAttemptedAt: null,
+              lastError: `[GAS_PREP_DEFERRED] ${reason}`.slice(0, 1024),
+              updatedAt: deps.clock.now().getTime()
+            })
+            .where(eq(payouts.id, row.id))
+        );
+      } catch (err) {
+        // Claim stays held until the next operator touch — log loudly so
+        // the funded-but-waiting payout is visible. Deliberately NOT
+        // broadcasting here: the whole point of the defer is to avoid
+        // paying the burn rail on top of the rental rail.
+        deps.logger.error("payout.gas_prep_defer_persist_failed", {
+          payoutId: row.id,
+          reason,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+      return "deferred";
+    }
+    if (prep.kind === "rented") {
+      // Audit trail. Best-effort: the rented energy is already delegated to
+      // the source, so a failed bookkeeping write must not block the
+      // broadcast that the rental was bought for.
+      const orderRef = `${prep.provider}:${prep.orderId}`;
+      const costNative = prep.costNativeRaw;
+      try {
+        await runWithBusyRetry(deps, () =>
+          deps.db
+            .update(payouts)
+            .set({
+              gasRentalOrderId: orderRef,
+              gasRentalCostNative: costNative,
+              updatedAt: deps.clock.now().getTime()
+            })
+            .where(eq(payouts.id, row.id))
+        );
+      } catch (err) {
+        deps.logger.warn("payout.gas_rental_audit_persist_failed", {
+          payoutId: row.id,
+          orderRef,
+          error: err instanceof Error ? err.message : String(err)
+        });
       }
     }
   }

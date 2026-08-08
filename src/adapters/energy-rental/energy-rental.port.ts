@@ -24,12 +24,18 @@
 export interface EnergyRentalEstimate {
   // SUN per energy unit the market would currently fill at.
   readonly unitPriceSun: number;
-  // Total cost in SUN for the requested amount + duration.
+  // Total cost in SUN for the EFFECTIVE amount + duration.
   readonly totalCostSun: bigint;
   // Energy units available on the market right now. When below the
-  // requested amount, an all-or-nothing order would be rejected — callers
+  // effective amount, an all-or-nothing order would be rejected — callers
   // should skip rental instead of trying.
   readonly availableEnergy: number;
+  // The energy amount the provider would actually order — differs from the
+  // requested amount when the market enforces a minimum order size and the
+  // adapter clamps up to it (TEM 20k floor, TronSave 32k). `totalCostSun`
+  // prices THIS amount, so rent-vs-burn comparisons stay honest for
+  // sub-minimum shortfalls. Absent = the requested amount was used as-is.
+  readonly effectiveEnergyAmount?: number;
 }
 
 export interface EnergyRentalOrderStatus {

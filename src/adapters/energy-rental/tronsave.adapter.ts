@@ -26,6 +26,19 @@ import type {
 export const TRONSAVE_MAINNET_URL = "https://api.tronsave.io";
 export const TRONSAVE_NILE_URL = "https://api-dev.tronsave.io";
 
+// Smallest energy order TronSave fills. Their API reference doesn't publish
+// a hard validation floor, but 32k is the bottom of their own UI/examples
+// and matches the market-wide minimum other aggregators advertise; smaller
+// orders come back as INVALID_PARAMS rejections or sit unmatched. Requests
+// below it are clamped UP (mirrors the TEM adapter's clamp to its
+// advertised minOrderEnergy): the executor rents only its shortfall, and a
+// source with leftover delegation can need e.g. 20k — without the clamp
+// that order is rejected and the whole shortfall burns as TRX despite a
+// healthy rental market. Extra energy above the shortfall is simply unused
+// (or covers sizing drift); the estimate prices the clamped amount, so the
+// rent-vs-burn comparison stays honest.
+export const TRONSAVE_MIN_ORDER_ENERGY = 32_000;
+
 export type TronSaveFetch = (input: string, init?: RequestInit) => Promise<Response>;
 
 export interface TronSaveConfig {
@@ -84,6 +97,7 @@ export function tronSaveProvider(config: TronSaveConfig): EnergyRentalProvider {
     name: "tronsave",
 
     async estimateEnergyOrder(args): Promise<EnergyRentalEstimate> {
+      const effectiveEnergyAmount = Math.max(args.energyAmount, TRONSAVE_MIN_ORDER_ENERGY);
       // unitPrice "MEDIUM" = TronSave's "lowest price that maximizes fill".
       // SLOW risks a no-fill on an order we need within one executor tick;
       // FAST never prices below MEDIUM. The maxPriceAccepted cap at order
@@ -98,7 +112,7 @@ export function tronSaveProvider(config: TronSaveConfig): EnergyRentalProvider {
           resourceType: "ENERGY",
           receiver: args.receiver,
           durationSec: args.durationSec,
-          resourceAmount: args.energyAmount,
+          resourceAmount: effectiveEnergyAmount,
           unitPrice: "MEDIUM"
         })
       });
@@ -112,7 +126,8 @@ export function tronSaveProvider(config: TronSaveConfig): EnergyRentalProvider {
       return {
         unitPriceSun,
         totalCostSun: BigInt(Math.ceil(totalCostSun)),
-        availableEnergy: data.availableResource ?? 0
+        availableEnergy: data.availableResource ?? 0,
+        effectiveEnergyAmount
       };
     },
 
@@ -123,7 +138,7 @@ export function tronSaveProvider(config: TronSaveConfig): EnergyRentalProvider {
           resourceType: "ENERGY",
           receiver: args.receiver,
           durationSec: args.durationSec,
-          resourceAmount: args.energyAmount,
+          resourceAmount: Math.max(args.energyAmount, TRONSAVE_MIN_ORDER_ENERGY),
           unitPrice: "MEDIUM",
           options: {
             // All-or-nothing: reject (CANNOT_FULFILLED) instead of partially

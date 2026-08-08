@@ -291,6 +291,59 @@ describe("tronChainAdapter.prepareGasForBroadcast", () => {
     expect(calls.create).toHaveLength(0);
   });
 
+  it("skips a provider whose supply covers the shortfall but not the CLAMPED order amount", async () => {
+    // Sub-minimum shortfalls get clamped up to the market's floor; an
+    // all-or-nothing order for the clamped amount against thinner supply
+    // would just be rejected — prep must not even try. The estimate is
+    // priced CHEAP (35 SUN × 32k = 1_120_000, within min-savings of the
+    // 1_630_000 burn) so the pre-fix code would have proceeded to create —
+    // the supply skip is the only thing stopping this order.
+    const { provider, calls } = scriptedProvider({
+      estimate: async () => ({
+        unitPriceSun: 35,
+        totalCostSun: 1_120_000n,
+        availableEnergy: 20_000, // >= 16_300 shortfall, < 32_000 clamped order
+        effectiveEnergyAmount: 32_000
+      })
+    });
+    const client = fakeClient({
+      triggerConstantContract: constantContract({ receiverHoldsToken: true }),
+      getAccountResources: resourcesQueue([50_000])
+    });
+
+    const result = await prep(client, rentalConfig(provider));
+
+    expect(result).toEqual({ kind: "none" });
+    expect(calls.create).toHaveLength(0);
+  });
+
+  it("tightens the unit-price ceiling on clamped orders so a fill can never cost more than the burn", async () => {
+    // Shortfall 16_300 → burn 1_630_000 SUN, but the market's 32k floor
+    // inflates the order. The per-unit 90-SUN ceiling would allow a
+    // 32_000 × 90 = 2_880_000 SUN fill — MORE than burning. The ceiling
+    // must be re-derived from the total bound:
+    // floor((1_630_000 − 500_000 minSavings) / 32_000) = 35 SUN/unit.
+    const { provider, calls } = scriptedProvider({
+      estimate: async () => ({
+        unitPriceSun: 30,
+        totalCostSun: 960_000n, // 32_000 × 30 — comfortably beats the burn
+        availableEnergy: 900_000,
+        effectiveEnergyAmount: 32_000
+      }),
+      create: async () => ({ orderId: "ord-clamped" }),
+      status: async () => ({ fulfilledPercent: 100, paidSun: 960_000n })
+    });
+    const client = fakeClient({
+      triggerConstantContract: constantContract({ receiverHoldsToken: true }),
+      getAccountResources: resourcesQueue([50_000, 200_000])
+    });
+
+    const result = await prep(client, rentalConfig(provider));
+
+    expect(result).toMatchObject({ kind: "rented", orderId: "ord-clamped" });
+    expect(calls.create[0]!.maxUnitPriceSun).toBe(35);
+  });
+
   it("falls back to burn when the rental doesn't beat burning by the minimum savings", async () => {
     // Burn = 7_020_000 SUN; rental at 6_900_000 + 500_000 min savings > burn → skip.
     const { provider, calls } = scriptedProvider({
@@ -634,6 +687,47 @@ describe("tronChainAdapter.buildTransfer — burn-coverage guard", () => {
     });
     const unsigned = await adapter.buildTransfer(buildArgs());
     expect((unsigned.raw as { txID: string }).txID).toBe("ab".repeat(32));
+  });
+
+  it("warns with numbers when a rental-enabled source knowingly burns TRX for an energy gap", async () => {
+    // The affordable-gap burn is allowed by design, but on a rental-enabled
+    // deployment it is the exact cost the operator pays a market to avoid —
+    // and confirmed payouts get no gas_burn ledger row, so this warning is
+    // the only visibility. Pin that it fires and carries the numbers.
+    const warns: Array<{ msg: string; data?: Record<string, unknown> }> = [];
+    const logger = {
+      debug() {},
+      info() {},
+      warn(msg: string, data?: Record<string, unknown>) {
+        warns.push({ msg, ...(data !== undefined ? { data } : {}) });
+      },
+      error() {},
+      child() {
+        return this;
+      }
+    };
+    const { provider } = scriptedProvider({});
+    const client = fakeClient({
+      triggerSmartContract: triggerSmartContractOk,
+      getAccountResources: resourcesQueue([40_000]), // gap = 135k floor − 40k
+      getAccount: async () => ({ balanceSun: "20000000", trc20: {} })
+    });
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: { [TRON_MAINNET_CHAIN_ID]: client },
+      energyRental: rentalConfig(provider, { logger })
+    });
+
+    const unsigned = await adapter.buildTransfer(buildArgs());
+    expect((unsigned.raw as { txID: string }).txID).toBe("ab".repeat(32));
+    const burnWarns = warns.filter((w) => /burning TRX for an energy gap/.test(w.msg));
+    expect(burnWarns).toHaveLength(1);
+    expect(burnWarns[0]!.data).toMatchObject({
+      energyGap: 95_000,
+      neededEnergy: 135_000,
+      energyAvailable: 40_000,
+      sizedByRentalPrep: false
+    });
   });
 
   it("accepts rental-sized delegation below the reservation floor via the prep handoff", async () => {

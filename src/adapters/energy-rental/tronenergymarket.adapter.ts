@@ -167,7 +167,14 @@ export function tronEnergyMarketProvider(config: TronEnergyMarketConfig): Energy
       // Effective SUN per unit INCLUDING the sub-day billing pad, so the
       // caller's price-ceiling check compares like with like.
       const unitPriceSun = (pricePerDay * paddedDuration(args.durationSec)) / SECONDS_PER_DAY;
-      return { unitPriceSun, totalCostSun, availableEnergy: Math.floor(availableEnergy) };
+      return {
+        unitPriceSun,
+        totalCostSun,
+        availableEnergy: Math.floor(availableEnergy),
+        // Sub-minimum requests are clamped to TEM's advertised floor — the
+        // caller's supply check must compare against what we'd truly order.
+        effectiveEnergyAmount: amount
+      };
     },
 
     async createEnergyOrder(args): Promise<{ orderId: string }> {
