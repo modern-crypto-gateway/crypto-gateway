@@ -13,8 +13,8 @@
 // The composite client routes per-method: every backend is tried in the
 // supplied order, and a backend that cannot service a given method is
 // silently skipped (not a failure). This lets an operator with BOTH keys
-// configure Alchemy as a /wallet failover while TronGrid carries detection
-// alone — which is a 3-5x capacity win under the 100k/day TronGrid free tier.
+// configure Alchemy as the `/wallet/*` primary while TronGrid carries indexed
+// detection alone, preserving the constrained TronGrid quota.
 
 export type TronFetch = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -231,7 +231,7 @@ export interface TronRpcBackend {
 
   listTrc20Transfers(
     address: string,
-    opts?: { minTimestamp?: number; contractAddress?: string; limit?: number }
+    opts?: { minTimestamp?: number; maxTimestamp?: number; contractAddress?: string; limit?: number }
   ): Promise<readonly TrongridTrc20Transfer[]>;
   // Address-indexed list of native TRX transfers crediting `address`. Backed
   // by TronGrid's `/v1/accounts/{addr}/transactions` endpoint, filtered to
@@ -241,7 +241,7 @@ export interface TronRpcBackend {
   // client falls through to a TronGrid backend when paired.
   listTrxTransfers(
     address: string,
-    opts?: { minTimestamp?: number; limit?: number }
+    opts?: { minTimestamp?: number; maxTimestamp?: number; limit?: number }
   ): Promise<readonly TrongridTrxTransfer[]>;
   getTransactionInfo(txId: string): Promise<TrongridTxInfo | null>;
   getNowBlock(): Promise<TrongridBlock>;
@@ -300,6 +300,22 @@ export class TronProviderNotSupportedError extends Error {
   }
 }
 
+// Structured HTTP failure surfaced by every Tron backend. Keeping the status
+// and provider-requested cooldown separate from the message lets the TronGrid
+// scheduler distinguish a quota response from a permanent 4xx without brittle
+// string matching at every call site.
+export class TronHttpError extends Error {
+  readonly status: number;
+  readonly retryAfterMs: number | null;
+
+  constructor(args: { path: string; status: number; body: string; retryAfterMs: number | null }) {
+    super(`Tron RPC ${args.path} returned ${args.status}: ${args.body.slice(0, 256)}`);
+    this.name = "TronHttpError";
+    this.status = args.status;
+    this.retryAfterMs = args.retryAfterMs;
+  }
+}
+
 // ---- Backends ----
 
 export interface TronGridBackendConfig {
@@ -309,15 +325,183 @@ export interface TronGridBackendConfig {
   apiKey?: string;
   fetch?: TronFetch;
   timeoutMs?: number;
+  // TronGrid's keyed public tier allows 15 QPS. Default to 10 request starts
+  // per second so confirmation/payout traffic has headroom alongside scans.
+  requestsPerSecond?: number;
+  // Number of retries after the first attempt for 429 / 5xx responses.
+  // Identical broadcast bodies are safe to retry because the txID is stable.
+  maxRetries?: number;
+  // Test hooks. Production callers should leave these undefined.
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  // Production defaults to a module-shared queue per base URL + API key so
+  // separately-created app dependency graphs in one process/isolate cooperate.
+  // Tests with injected transports default to isolated queues.
+  sharedRateLimit?: boolean;
+}
+
+const DEFAULT_TRONGRID_REQUESTS_PER_SECOND = 10;
+const DEFAULT_TRONGRID_MAX_RETRIES = 2;
+const DEFAULT_TRONGRID_429_COOLDOWN_MS = 30_000;
+const TRONGRID_429_COOLDOWN_PADDING_MS = 250;
+const TRONGRID_RETRY_BASE_MS = 500;
+
+interface TronGridSchedulerConfig {
+  readonly intervalMs: number;
+  readonly maxRetries: number;
+  readonly now: () => number;
+  readonly sleep: (ms: number) => Promise<void>;
+  readonly random: () => number;
+}
+
+class TronGridRequestScheduler {
+  private tail: Promise<void> = Promise.resolve();
+  private nextStartAt = 0;
+  private cooldownUntil = 0;
+
+  constructor(private readonly config: TronGridSchedulerConfig) {}
+
+  schedule<T>(operation: () => Promise<T>): Promise<T> {
+    // Serialize the complete retry lifecycle. A 429 therefore pauses the
+    // whole per-key queue instead of allowing already-enqueued siblings to
+    // hammer a provider that explicitly suspended the key.
+    const run = this.tail.then(
+      () => this.runWithRetry(operation),
+      () => this.runWithRetry(operation)
+    );
+    this.tail = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private async runWithRetry<T>(operation: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt += 1) {
+      await this.waitForStartSlot();
+      try {
+        return await operation();
+      } catch (err) {
+        if (!isRetryableTronHttpError(err)) throw err;
+
+        const retryDelayMs = retryDelayFor(err, attempt, this.config.random);
+        this.cooldownUntil = Math.max(this.cooldownUntil, this.config.now() + retryDelayMs);
+        // Even an exhausted request must publish its cooldown before it
+        // rejects; otherwise the next queued sibling would start ~100ms later
+        // while TronGrid still has the API key suspended.
+        if (attempt >= this.config.maxRetries) throw err;
+      }
+    }
+  }
+
+  private async waitForStartSlot(): Promise<void> {
+    const target = Math.max(this.nextStartAt, this.cooldownUntil);
+    const waitMs = Math.max(0, target - this.config.now());
+    if (waitMs > 0) await this.config.sleep(waitMs);
+
+    // Use the target as a floor as well as the post-sleep clock. This keeps
+    // deterministic injected clocks honest even when their sleep hook only
+    // records delays instead of advancing real wall time.
+    const startedAt = Math.max(target, this.config.now());
+    this.nextStartAt = startedAt + this.config.intervalMs;
+  }
+}
+
+const sharedTronGridSchedulers = new Map<string, TronGridRequestScheduler>();
+
+function tronGridScheduler(config: TronGridBackendConfig): TronGridRequestScheduler {
+  const requestsPerSecond = config.requestsPerSecond ?? DEFAULT_TRONGRID_REQUESTS_PER_SECOND;
+  if (!Number.isFinite(requestsPerSecond) || requestsPerSecond <= 0) {
+    throw new Error("TronGrid requestsPerSecond must be a positive finite number");
+  }
+  const maxRetries = config.maxRetries ?? DEFAULT_TRONGRID_MAX_RETRIES;
+  if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+    throw new Error("TronGrid maxRetries must be a non-negative integer");
+  }
+
+  const schedulerConfig: TronGridSchedulerConfig = {
+    intervalMs: Math.ceil(1000 / requestsPerSecond),
+    maxRetries,
+    now: config.now ?? (() => Date.now()),
+    sleep: config.sleep ?? sleep,
+    random: config.random ?? (() => Math.random())
+  };
+
+  const hasTestHooks =
+    config.fetch !== undefined ||
+    config.now !== undefined ||
+    config.sleep !== undefined ||
+    config.random !== undefined;
+  const shouldShare = config.sharedRateLimit ?? !hasTestHooks;
+  if (!shouldShare) return new TronGridRequestScheduler(schedulerConfig);
+
+  // The key never leaves process memory or appears in logs. Including it is
+  // necessary: two independent TronGrid keys have independent provider quotas.
+  const schedulerKey = `${config.baseUrl.replace(/\/+$/, "")}\u0000${config.apiKey ?? "<keyless>"}`;
+  const existing = sharedTronGridSchedulers.get(schedulerKey);
+  if (existing !== undefined) return existing;
+  const created = new TronGridRequestScheduler(schedulerConfig);
+  sharedTronGridSchedulers.set(schedulerKey, created);
+  return created;
+}
+
+function isRetryableTronHttpError(err: unknown): err is TronHttpError {
+  return err instanceof TronHttpError && (err.status === 429 || err.status >= 500);
+}
+
+function retryDelayFor(err: TronHttpError, attempt: number, random: () => number): number {
+  const exponentialWithFullJitter = Math.floor(TRONGRID_RETRY_BASE_MS * (2 ** attempt) * random());
+  if (err.status !== 429) return exponentialWithFullJitter;
+  const providerCooldown = (err.retryAfterMs ?? DEFAULT_TRONGRID_429_COOLDOWN_MS) +
+    TRONGRID_429_COOLDOWN_PADDING_MS;
+  return providerCooldown + exponentialWithFullJitter;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function tronGridBackend(config: TronGridBackendConfig): TronRpcBackend {
-  const base = makeHttp({
+  const rawHttp = makeHttp({
     baseUrl: config.baseUrl,
     fetch: config.fetch,
     timeoutMs: config.timeoutMs,
-    headers: config.apiKey !== undefined ? { "TRON-PRO-API-KEY": config.apiKey } : {}
+    headers: config.apiKey !== undefined ? { "TRON-PRO-API-KEY": config.apiKey } : {},
+    now: config.now
   });
+  const scheduler = tronGridScheduler(config);
+  const base = {
+    request<T>(path: string, init?: RequestInit): Promise<T> {
+      return scheduler.schedule(() => rawHttp.request<T>(path, init));
+    }
+  };
+
+  type V1Page<T> = {
+    data?: readonly T[];
+    meta?: { fingerprint?: string };
+  };
+
+  async function listAllPages<T>(path: string, baseParams: URLSearchParams): Promise<readonly T[]> {
+    const out: T[] = [];
+    const seenFingerprints = new Set<string>();
+    let fingerprint: string | undefined;
+
+    for (;;) {
+      const params = new URLSearchParams(baseParams);
+      if (fingerprint !== undefined) params.set("fingerprint", fingerprint);
+      const response = await base.request<V1Page<T>>(`${path}?${params.toString()}`);
+      out.push(...(response.data ?? []));
+
+      const next = response.meta?.fingerprint;
+      if (next === undefined || next.length === 0) return out;
+      if (seenFingerprints.has(next)) {
+        throw new Error(`Tron RPC ${path} returned a repeated pagination fingerprint`);
+      }
+      seenFingerprints.add(next);
+      fingerprint = next;
+    }
+  }
 
   return {
     name: "trongrid",
@@ -326,11 +510,12 @@ export function tronGridBackend(config: TronGridBackendConfig): TronRpcBackend {
       const params = new URLSearchParams({ only_to: "true" });
       if (opts.limit !== undefined) params.set("limit", String(opts.limit));
       if (opts.minTimestamp !== undefined) params.set("min_timestamp", String(opts.minTimestamp));
+      if (opts.maxTimestamp !== undefined) params.set("max_timestamp", String(opts.maxTimestamp));
       if (opts.contractAddress !== undefined) params.set("contract_address", opts.contractAddress);
-      const response = await base.request<{ data?: readonly TrongridTrc20Transfer[] }>(
-        `/v1/accounts/${address}/transactions/trc20?${params.toString()}`
+      return listAllPages<TrongridTrc20Transfer>(
+        `/v1/accounts/${address}/transactions/trc20`,
+        params
       );
-      return response.data ?? [];
     },
     async listTrxTransfers(address, opts = {}) {
       // `/v1/accounts/{addr}/transactions` returns full Tron txs (any type:
@@ -346,6 +531,7 @@ export function tronGridBackend(config: TronGridBackendConfig): TronRpcBackend {
       });
       if (opts.limit !== undefined) params.set("limit", String(opts.limit));
       if (opts.minTimestamp !== undefined) params.set("min_timestamp", String(opts.minTimestamp));
+      if (opts.maxTimestamp !== undefined) params.set("max_timestamp", String(opts.maxTimestamp));
       type RawTx = {
         txID?: string;
         blockNumber?: number;
@@ -357,11 +543,9 @@ export function tronGridBackend(config: TronGridBackendConfig): TronRpcBackend {
           }>;
         };
       };
-      const response = await base.request<{ data?: readonly RawTx[] }>(
-        `/v1/accounts/${address}/transactions?${params.toString()}`
-      );
+      const rows = await listAllPages<RawTx>(`/v1/accounts/${address}/transactions`, params);
       const out: TrongridTrxTransfer[] = [];
-      for (const tx of response.data ?? []) {
+      for (const tx of rows) {
         const contract = tx.raw_data?.contract?.[0];
         if (contract?.type !== "TransferContract") continue;
         const v = contract.parameter?.value;
@@ -556,7 +740,8 @@ export function alchemyTronBackend(config: AlchemyTronBackendConfig): TronRpcBac
     baseUrl: `https://${subdomain}.g.alchemy.com/v2/${config.apiKey}`,
     fetch: config.fetch,
     timeoutMs: config.timeoutMs,
-    headers: {}
+    headers: {},
+    now: undefined
   });
 
   return {
@@ -807,6 +992,7 @@ interface HttpConfig {
   fetch: TronFetch | undefined;
   timeoutMs: number | undefined;
   headers: Readonly<Record<string, string>>;
+  now: (() => number) | undefined;
 }
 
 function makeHttp(config: HttpConfig): {
@@ -831,8 +1017,17 @@ function makeHttp(config: HttpConfig): {
           }
         });
         if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          throw new Error(`Tron RPC ${path} returned ${res.status}: ${text.slice(0, 256)}`);
+          const body = await res.text().catch(() => "");
+          throw new TronHttpError({
+            path,
+            status: res.status,
+            body,
+            retryAfterMs: parseRetryAfterMs(
+              res.headers.get("retry-after"),
+              body,
+              config.now?.() ?? Date.now()
+            )
+          });
         }
         return (await res.json()) as T;
       } finally {
@@ -840,4 +1035,32 @@ function makeHttp(config: HttpConfig): {
       }
     }
   };
+}
+
+function parseRetryAfterMs(header: string | null, body: string, nowMs: number): number | null {
+  let headerDelayMs: number | null = null;
+  if (header !== null) {
+    const seconds = Number(header);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      headerDelayMs = Math.ceil(seconds * 1000);
+    }
+
+    if (headerDelayMs === null) {
+      const dateMs = Date.parse(header);
+      if (Number.isFinite(dateMs)) headerDelayMs = Math.max(0, dateMs - nowMs);
+    }
+  }
+
+  // Current TronGrid bodies use wording such as "suspended for 12 s" or
+  // "suspended for 30s". Match only a suspension duration so unrelated
+  // numbers (status codes, QPS limit, account ids) cannot become a cooldown.
+  const suspended = /suspended\s+for\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\b/i.exec(body);
+  let bodyDelayMs: number | null = null;
+  if (suspended?.[1] !== undefined) {
+    const seconds = Number(suspended[1]);
+    if (Number.isFinite(seconds) && seconds >= 0) bodyDelayMs = Math.ceil(seconds * 1000);
+  }
+  if (headerDelayMs === null) return bodyDelayMs;
+  if (bodyDelayMs === null) return headerDelayMs;
+  return Math.max(headerDelayMs, bodyDelayMs);
 }

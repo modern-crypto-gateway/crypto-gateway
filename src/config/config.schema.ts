@@ -64,9 +64,9 @@ export const AppConfigSchema = z
     //     transfer-history endpoint).
     //   - ALCHEMY_API_KEY alone: payouts only — detection is disabled with a
     //     startup warning.
-    //   - Both: TronGrid primary (detection + payouts), Alchemy fallback for
-    //     `/wallet/*` (build/broadcast/confirm). Frees up TronGrid's 100k/day
-    //     budget to spend almost entirely on detection.
+    //   - Both: Alchemy primary for `/wallet/*` (build/broadcast/confirm),
+    //     TronGrid fallback there and sole provider for indexed detection.
+    //     Preserves TronGrid's constrained quota for incoming scans.
     trongridApiKey: z.string().optional(),
     // mainnet (default) or nile. Shasta is Alchemy-only; operators using Shasta
     // should rely on the Alchemy backend and accept detection-disabled mode.

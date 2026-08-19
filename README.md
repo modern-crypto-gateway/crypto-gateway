@@ -159,6 +159,9 @@ for the full list. Highlights:
 | `CRON_SECRET`                     | optional        | —          | Enables `POST /internal/cron/tick`                   |
 | `ALCHEMY_API_KEY`                 | optional        | —          | Auto-wires a real EVM chain adapter + RPC-poll detection across the default mainnet set (ETH, OP, Polygon, Base, Arbitrum). See below. |
 | `ALCHEMY_CHAINS`                  | optional        | —          | Comma-separated chainIds to enable via Alchemy (e.g. `1,137`). Defaults to the mainnet set. |
+| `TRONGRID_API_KEY`                | optional        | —          | Enables indexed TRC-20/TRX deposit detection. Requests are paced at 10 QPS, paginated, and retried after provider throttling. With both provider keys, Alchemy handles Tron `/wallet/*` RPC and TronGrid is reserved for indexed history. |
+| `TRON_NETWORK`                    | no              | `mainnet`  | `mainnet` or `nile`. |
+| `TRON_POLL_INTERVAL_MS`           | no              | every cron tick | Minimum interval between Tron detection scans; raising it reduces TronGrid traffic at the cost of detection latency. |
 | `ALCHEMY_NOTIFY_TOKEN`            | required for webhook bootstrap | — | **NOT the same as `ALCHEMY_API_KEY`.** Webhook-management ("Notify") token at the top of [`dashboard.alchemy.com/apps/latest/webhooks`](https://dashboard.alchemy.com/apps/latest/webhooks) → "Auth Token". The JSON-RPC API key will return 401 from this endpoint; they look similar but are distinct strings. Old name `ALCHEMY_AUTH_TOKEN` still works for one release cycle with a deprecation warning. |
 | `GATEWAY_PUBLIC_URL`              | required for webhook bootstrap | — | Public origin of this gateway (e.g. `https://gateway.example.com`). Bootstrap appends per-provider paths like `/webhooks/alchemy`. Env-only to prevent ADMIN_KEY-leak redirect attacks. |
 | `TURSO_URL`                       | prod-ish        | `file:./local.db` | libSQL URL (Turso over HTTPS or local `file:` URL). `DATABASE_URL` still accepted as a legacy alias for one release cycle. |
@@ -381,10 +384,12 @@ Notes:
 - **Single-token invoices** (`amountRaw + token`) only credit the quoted
   token. Wrong-token transfers at the address still get logged for audit
   but don't satisfy the invoice.
-- **Tron native (TRX) detection** routes through TronGrid
-  (`/v1/accounts/{addr}/transactions`); Alchemy's Tron RPC has no indexed
-  address-history endpoints. Outbound (payouts) works through either
-  TronGrid or Alchemy.
+- **Tron deposit detection** routes through TronGrid's indexed TRC-20/TRX
+  history endpoints; Alchemy's Tron RPC has no indexed address-history API.
+  Scans use a shared 10-QPS queue, provider-directed 429 cooldowns, bounded
+  retries, and fingerprint pagination. When both keys are configured, Alchemy
+  is primary for `/wallet/*` RPC (including payouts) and TronGrid is the
+  fallback there, preserving its quota for incoming scans.
 - **UTXO chains (BTC + LTC)** use a fundamentally different model from the
   account-model EVM/Tron/Solana adapters — see the UTXO section below.
 

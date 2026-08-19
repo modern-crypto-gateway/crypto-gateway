@@ -403,58 +403,60 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
       const addressSet = new Set(addresses.map((a) => a));
       const symbolByContract = new Map(trc20Targets.map((t) => [t.contractAddress!, t.symbol]));
 
-      // Fan out: one listTrc20Transfers call per (address x contract). TronGrid
-      // doesn't offer a multi-contract filter, so this is the natural shape.
-      const calls: Array<Promise<readonly DetectedTransfer[]>> = [];
+      // One history request per (address x contract). Traverse the matrix in a
+      // controlled order instead of handing an unbounded Promise.all burst to
+      // the provider. The TronGrid backend also paces starts per API key, but
+      // keeping the adapter sequential protects injected/custom backends too.
+      const detected: DetectedTransfer[] = [];
       for (const addr of addresses) {
         for (const target of trc20Targets) {
-          calls.push(
-            client
-              .listTrc20Transfers(addr, {
-                minTimestamp,
-                contractAddress: target.contractAddress!,
-                limit: 200
+          const transfers = await client.listTrc20Transfers(addr, {
+            minTimestamp,
+            // Freeze the result set while the backend follows fingerprints;
+            // new blocks arriving mid-pagination belong to the next scan.
+            maxTimestamp: now,
+            contractAddress: target.contractAddress!,
+            limit: 200
+          });
+          detected.push(
+            ...transfers
+              .filter((t) => t.token_info?.address !== undefined && allowedContracts.has(t.token_info.address))
+              .filter((t) => addressSet.has(t.to))
+              // Drop dust TRC-20 address-poisoning spam. Common on Tron:
+              // attackers blast 0- or 1-unit USDT/USDC transfers (1 unit
+              // = 0.000001 stablecoin) to pollute wallet tx histories.
+              // A naive "> 0" filter is defeated by amount=1; threshold
+              // at 0.001 token (TRON_DUST_THRESHOLD) blocks the pattern
+              // without touching any plausible payment amount.
+              .filter((t) => {
+                try { return BigInt(t.value) >= TRON_DUST_THRESHOLD; }
+                catch { return false; }
               })
-              .then((transfers) =>
-                transfers
-                  .filter((t) => t.token_info?.address !== undefined && allowedContracts.has(t.token_info.address))
-                  .filter((t) => addressSet.has(t.to))
-                  // Drop dust TRC-20 address-poisoning spam. Common on Tron:
-                  // attackers blast 0- or 1-unit USDT/USDC transfers (1 unit
-                  // = 0.000001 stablecoin) to pollute wallet tx histories.
-                  // A naive "> 0" filter is defeated by amount=1; threshold
-                  // at 0.001 token (TRON_DUST_THRESHOLD) blocks the pattern
-                  // without touching any plausible payment amount.
-                  .filter((t) => {
-                    try { return BigInt(t.value) >= TRON_DUST_THRESHOLD; }
-                    catch { return false; }
-                  })
-                  .map<DetectedTransfer>((t) => ({
-                    chainId: chainId as ChainId,
-                    txHash: t.transaction_id,
-                    logIndex: null, // Tron TRC-20 transfers are 1 per tx in the v1 endpoint; no logIndex concept
-                    fromAddress: t.from,
-                    toAddress: t.to,
-                    token: symbolByContract.get(t.token_info.address) ?? target.symbol,
-                    amountRaw: t.value as AmountRaw,
-                    // TronGrid's /trc20 endpoint returns `block` undefined for
-                    // unconfirmed txs (it has no `only_confirmed` filter — that's
-                    // only on /transactions). Coerce to null so DetectedTransfer's
-                    // Zod schema (blockNumber: nullable number) accepts it; the
-                    // sweeper's getConfirmationStatus will fill in the real block
-                    // once the tx confirms. Without this, a single in-flight TRC-20
-                    // tx fails Zod and aborts the entire scan batch.
-                    blockNumber: t.block ?? null,
-                    // `v1/.../transactions/trc20` doesn't expose a confirmation count directly.
-                    // We record what we can see and let the sweeper call `getConfirmationStatus`
-                    // for authoritative depth on each tx.
-                    confirmations: 0,
-                    seenAt: new Date(t.block_timestamp),
-                    // block_timestamp is the real on-chain block time; trust it
-                    // only once the tx is in a block (block present).
-                    onchainTime: t.block != null ? new Date(t.block_timestamp) : null
-                  }))
-              )
+              .map<DetectedTransfer>((t) => ({
+                chainId: chainId as ChainId,
+                txHash: t.transaction_id,
+                logIndex: null, // Tron TRC-20 transfers are 1 per tx in the v1 endpoint; no logIndex concept
+                fromAddress: t.from,
+                toAddress: t.to,
+                token: symbolByContract.get(t.token_info.address) ?? target.symbol,
+                amountRaw: t.value as AmountRaw,
+                // TronGrid's /trc20 endpoint returns `block` undefined for
+                // unconfirmed txs (it has no `only_confirmed` filter — that's
+                // only on /transactions). Coerce to null so DetectedTransfer's
+                // Zod schema (blockNumber: nullable number) accepts it; the
+                // sweeper's getConfirmationStatus will fill in the real block
+                // once the tx confirms. Without this, a single in-flight TRC-20
+                // tx fails Zod and aborts the entire scan batch.
+                blockNumber: t.block ?? null,
+                // `v1/.../transactions/trc20` doesn't expose a confirmation count directly.
+                // We record what we can see and let the sweeper call `getConfirmationStatus`
+                // for authoritative depth on each tx.
+                confirmations: 0,
+                seenAt: new Date(t.block_timestamp),
+                // block_timestamp is the real on-chain block time; trust it
+                // only once the tx is in a block (block present).
+                onchainTime: t.block != null ? new Date(t.block_timestamp) : null
+              }))
           );
         }
       }
@@ -465,52 +467,54 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
       // back to base58check so they match invoice receive addresses.
       if (wantsNative) {
         for (const addr of addresses) {
-          calls.push(
-            client.listTrxTransfers(addr, { minTimestamp, limit: 200 }).then((transfers) =>
-              transfers.flatMap<DetectedTransfer>((t) => {
-                let toCanonical: string;
-                let fromCanonical: string;
-                try {
-                  toCanonical = hexAddressToTron(t.to);
-                  fromCanonical = hexAddressToTron(t.from);
-                } catch {
-                  return [];
+          const transfers = await client.listTrxTransfers(addr, {
+            minTimestamp,
+            maxTimestamp: now,
+            limit: 200
+          });
+          detected.push(
+            ...transfers.flatMap<DetectedTransfer>((t) => {
+              let toCanonical: string;
+              let fromCanonical: string;
+              try {
+                toCanonical = hexAddressToTron(t.to);
+                fromCanonical = hexAddressToTron(t.from);
+              } catch {
+                return [];
+              }
+              if (!addressSet.has(toCanonical as Address)) return [];
+              // Drop dust native TRX address-poisoning spam. The active
+              // spam pattern sends amountRaw="1" (1 sun) specifically to
+              // slip past a naive "> 0" filter. TRON_DUST_THRESHOLD pins
+              // the floor at 0.001 TRX — well below the smallest real
+              // checkout amount, well above the spam traffic.
+              let amount: bigint;
+              try { amount = BigInt(t.value); } catch { return []; }
+              if (amount < TRON_DUST_THRESHOLD) return [];
+              return [
+                {
+                  chainId: chainId as ChainId,
+                  txHash: t.txID,
+                  logIndex: null,
+                  fromAddress: fromCanonical,
+                  toAddress: toCanonical,
+                  token: "TRX" as TokenSymbol,
+                  amountRaw: t.value as AmountRaw,
+                  // Parallel to the TRC-20 branch: TronGrid's tx listing can
+                  // return undefined blockNumber for unconfirmed txs. Coerce
+                  // to null so Zod accepts it; sweeper fills later.
+                  blockNumber: t.blockNumber ?? null,
+                  confirmations: 0,
+                  seenAt: new Date(t.blockTimestamp),
+                  onchainTime: t.blockNumber != null ? new Date(t.blockTimestamp) : null
                 }
-                if (!addressSet.has(toCanonical as Address)) return [];
-                // Drop dust native TRX address-poisoning spam. The active
-                // spam pattern sends amountRaw="1" (1 sun) specifically to
-                // slip past a naive "> 0" filter. TRON_DUST_THRESHOLD pins
-                // the floor at 0.001 TRX — well below the smallest real
-                // checkout amount, well above the spam traffic.
-                let amount: bigint;
-                try { amount = BigInt(t.value); } catch { return []; }
-                if (amount < TRON_DUST_THRESHOLD) return [];
-                return [
-                  {
-                    chainId: chainId as ChainId,
-                    txHash: t.txID,
-                    logIndex: null,
-                    fromAddress: fromCanonical,
-                    toAddress: toCanonical,
-                    token: "TRX" as TokenSymbol,
-                    amountRaw: t.value as AmountRaw,
-                    // Parallel to the TRC-20 branch: TronGrid's tx listing can
-                    // return undefined blockNumber for unconfirmed txs. Coerce
-                    // to null so Zod accepts it; sweeper fills later.
-                    blockNumber: t.blockNumber ?? null,
-                    confirmations: 0,
-                    seenAt: new Date(t.blockTimestamp),
-                    onchainTime: t.blockNumber != null ? new Date(t.blockTimestamp) : null
-                  }
-                ];
-              })
-            )
+              ];
+            })
           );
         }
       }
 
-      const arrays = await Promise.all(calls);
-      return arrays.flat();
+      return detected;
     },
 
     async getConfirmationStatus(chainId: ChainId, txHash: TxHash) {
@@ -1311,4 +1315,3 @@ function hexToBytesLocal(hex: string): Uint8Array {
   }
   return out;
 }
-

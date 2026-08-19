@@ -171,7 +171,7 @@ async function main(): Promise<void> {
 
   // Tron wiring. See wireTron for provider-selection semantics:
   //   - TRONGRID_API_KEY alone: detection + payouts via TronGrid.
-  //   - + ALCHEMY_API_KEY: TronGrid primary, Alchemy fallback for /wallet/*.
+  //   - + ALCHEMY_API_KEY: Alchemy primary for /wallet/*; TronGrid detection.
   //   - ALCHEMY_API_KEY alone: payouts only; detection logs disabled.
   const tronWiringInput: Parameters<typeof wireTron>[0] = {
     network: config.tronNetwork,

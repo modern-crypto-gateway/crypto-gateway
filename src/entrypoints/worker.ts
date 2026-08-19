@@ -194,8 +194,8 @@ export async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<Ap
     logger.info("Alchemy EVM chains wired", { chainIds });
   }
 
-  // Tron wiring. Same selection logic as node.ts — trongrid primary,
-  // Alchemy fallback for /wallet/* when both keys are set.
+  // Tron wiring. Same selection logic as node.ts — Alchemy primary for
+  // `/wallet/*` and TronGrid reserved for indexed detection when both are set.
   const trongridApiKey = typeof env["TRONGRID_API_KEY"] === "string" ? env["TRONGRID_API_KEY"] : undefined;
   const tronNetwork = env["TRON_NETWORK"] === "nile" ? "nile" : "mainnet";
   const tronPollIntervalMsRaw = typeof env["TRON_POLL_INTERVAL_MS"] === "string" ? env["TRON_POLL_INTERVAL_MS"] : undefined;

@@ -26,10 +26,10 @@ export interface TronWiringInput {
   // Absent or empty => no Tron wiring at all.
   trongridApiKey?: string;
   // Alchemy API key (the same one used for EVM). When combined with
-  // trongridApiKey, `/wallet/*` requests fail over to Alchemy on provider
-  // error, keeping TronGrid budget reserved for detection. When passed
-  // WITHOUT trongridApiKey, Tron payouts still work but detection is
-  // silently disabled (Alchemy's Tron API has no paginated transfer-history
+  // trongridApiKey, supported `/wallet/*` requests use Alchemy first and
+  // fail over to TronGrid, keeping TronGrid budget reserved for detection.
+  // When passed WITHOUT trongridApiKey, Tron payouts still work but detection
+  // is silently disabled (Alchemy's Tron API has no paginated transfer-history
   // endpoint).
   alchemyApiKey?: string;
   // "mainnet" or "nile". Only TronGrid serves Nile — picking Nile together
@@ -92,13 +92,12 @@ export function wireTron(input: TronWiringInput): TronWiringResult {
   const baseUrl = input.network === "nile" ? "https://nile.trongrid.io" : "https://api.trongrid.io";
   const chainId = input.network === "nile" ? TRON_NILE_CHAIN_ID : TRON_MAINNET_CHAIN_ID;
 
-  if (input.trongridApiKey !== undefined && input.trongridApiKey.length > 0) {
-    backends.push(tronGridBackend({ baseUrl, apiKey: input.trongridApiKey }));
-  }
-
   // Alchemy only wires for mainnet — their Nile subdomain doesn't exist.
   // An operator targeting Nile without TronGrid ends up with an empty backend
-  // list; the caller treats that as "Tron not wired".
+  // list; the caller treats that as "Tron not wired". Keep Alchemy first on
+  // mainnet so supported `/wallet/*` calls use it and preserve TronGrid's
+  // quota for indexed transaction-history detection. Alchemy explicitly
+  // declines the list methods, so the composite falls through to TronGrid.
   if (
     input.alchemyApiKey !== undefined &&
     input.alchemyApiKey.length > 0 &&
@@ -107,12 +106,21 @@ export function wireTron(input: TronWiringInput): TronWiringResult {
     backends.push(alchemyTronBackend({ apiKey: input.alchemyApiKey }));
   }
 
+  if (input.trongridApiKey !== undefined && input.trongridApiKey.length > 0) {
+    backends.push(tronGridBackend({ baseUrl, apiKey: input.trongridApiKey }));
+  }
+
   if (backends.length === 0) return {};
 
   const client = backends.length === 1
     ? backends[0]!
     : tronCompositeClient(backends, {
-        onBackendSkipped: (ev) => input.logger.warn("tron backend failover", ev)
+        onBackendSkipped: (ev) => {
+          // Alchemy intentionally declines indexed history methods, so this
+          // is normal capability routing on every detection call—not a
+          // provider incident worth flooding WARN logs with.
+          if (ev.reason !== "not-supported") input.logger.warn("tron backend failover", ev);
+        }
       });
 
   // Energy rental markets. Wired only when the operator supplied

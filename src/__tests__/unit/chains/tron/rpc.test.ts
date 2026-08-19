@@ -83,6 +83,51 @@ describe("tronChainAdapter.scanIncoming", () => {
     expect(result).toEqual([]);
   });
 
+  it("traverses the address/token scan matrix without concurrent backend calls", async () => {
+    const first = "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL";
+    const second = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
+    let active = 0;
+    let maxActive = 0;
+    let calls = 0;
+    const maxTimestamps: Array<number | undefined> = [];
+    async function controlledCall(): Promise<[]> {
+      calls += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await Promise.resolve();
+      active -= 1;
+      return [];
+    }
+    const adapter = tronChainAdapter({
+      chainIds: [TRON_MAINNET_CHAIN_ID],
+      clients: {
+        [TRON_MAINNET_CHAIN_ID]: fakeClient({
+          async listTrc20Transfers(_address, opts) {
+            maxTimestamps.push(opts?.maxTimestamp);
+            return controlledCall();
+          },
+          async listTrxTransfers(_address, opts) {
+            maxTimestamps.push(opts?.maxTimestamp);
+            return controlledCall();
+          }
+        })
+      }
+    });
+
+    await adapter.scanIncoming({
+      chainId: TRON_MAINNET_CHAIN_ID,
+      addresses: [first, second],
+      tokens: ["USDT", "USDC", "TRX"],
+      sinceMs: Date.now() - 60_000
+    });
+
+    expect(calls).toBe(6);
+    expect(maxActive).toBe(1);
+    expect(maxTimestamps).toHaveLength(6);
+    expect(maxTimestamps.every((value) => value === maxTimestamps[0])).toBe(true);
+    expect(maxTimestamps[0]).toEqual(expect.any(Number));
+  });
+
   it("maps a TronGrid TRC-20 transfer to a DetectedTransfer with the right shape", async () => {
     const toAddr = "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL";
     const fromAddr = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
