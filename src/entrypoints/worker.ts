@@ -541,6 +541,9 @@ export async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<Ap
     ...(parsePayoutConcurrency(env["PAYOUT_CONCURRENCY_PER_CHAIN"]) !== undefined
       ? { payoutConcurrencyPerChain: parsePayoutConcurrency(env["PAYOUT_CONCURRENCY_PER_CHAIN"])! }
       : {}),
+    ...(parseOnFlagEnv(env["UTXO_SPEND_UNCONFIRMED_CHANGE"])
+      ? { utxoSpendUnconfirmedChange: true }
+      : {}),
     fastPayoutExecutionEnabled: true,
     ...(parseFeeTierEnv(env["INTERNAL_CONSOLIDATION_FEE_TIER"]) !== undefined
       ? { internalConsolidationFeeTier: parseFeeTierEnv(env["INTERNAL_CONSOLIDATION_FEE_TIER"])! }
@@ -561,6 +564,12 @@ export async function depsFor(env: WorkerEnv, ctx: ExecutionContext): Promise<Ap
       ? { poolRetiredRescanHours: parseNonNegNumberEnv(env["POOL_RETIRED_RESCAN_HOURS"])! }
       : {})
   };
+}
+
+// Opt-in boolean env flag: only "on"/"1"/"true" enables; anything else
+// (unset, "off", garbage) stays at the built-in default of false.
+function parseOnFlagEnv(raw: unknown): boolean {
+  return raw === "on" || raw === "1" || raw === "true";
 }
 
 // Validate an optional fee-tier env value; undefined when unset/invalid so the

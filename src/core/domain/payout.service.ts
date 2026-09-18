@@ -26,6 +26,7 @@ import { isUniqueViolation } from "./db-errors.js";
 import { decodeP2wpkhAddress } from "../../adapters/chains/utxo/bech32-address.js";
 import { computeSpendableBatch } from "./balance-snapshot.service.js";
 import { loadSpendableUtxos, selectCoins, type CoinSelectionResult } from "./utxo-coin-select.js";
+import { withUtxoChainLock } from "./utxo-broadcast-lock.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
 import { buildUtxoUnsignedTx } from "../../adapters/chains/utxo/utxo-chain.adapter.js";
 import {
@@ -522,7 +523,12 @@ export async function planPayout(deps: AppDeps, input: unknown): Promise<Payout>
   //      `broadcastUtxoMain` re-runs coinselect against the live spendable
   //      set (UTXOs may have moved between plan and broadcast).
   if (chainAdapter.family === "utxo") {
-    const spendable = await loadSpendableUtxos(deps, parsed.chainId as ChainId);
+    // Same spendability view as the executor's broadcastUtxoMain (including
+    // the unconfirmed-own-change knob), so plan-time feasibility matches
+    // what broadcast-time coinselect will actually see.
+    const spendable = await loadSpendableUtxos(deps, parsed.chainId as ChainId, {
+      includeUnconfirmedOwnChange: deps.utxoSpendUnconfirmedChange === true
+    });
     const totalSpendable = spendable.reduce((sum, u) => sum + BigInt(u.value), 0n);
 
     // Recover the sat/vB rate from the chosen tier — same inversion the
@@ -1187,7 +1193,11 @@ export async function estimatePayoutFees(
   // can't fit the amount + fee, throw MAX_AMOUNT_EXCEEDS_NET_SPENDABLE with
   // a suggested max — same UX contract as the account-model chains.
   if (chainAdapter.family === "utxo") {
-    const spendable = await loadSpendableUtxos(deps, parsed.chainId as ChainId);
+    // Same spendability view as planPayout/broadcastUtxoMain (including the
+    // unconfirmed-own-change knob) so the estimate matches what they'll do.
+    const spendable = await loadSpendableUtxos(deps, parsed.chainId as ChainId, {
+      includeUnconfirmedOwnChange: deps.utxoSpendUnconfirmedChange === true
+    });
     const totalSpendable = spendable.reduce((s, u) => s + BigInt(u.value), 0n);
 
     // If fee quoting failed upstream (esplora unreachable / rate-limited),
@@ -2899,16 +2909,10 @@ async function broadcastUtxoMain(
     return "deferred";
   }
 
-  // ---- (a) Pre-broadcast prep: fee quote, coinselect, output/tx build,
-  // per-input key derivation. Nothing reaches the network in this block,
-  // so failures here are safe to terminally fail.
+  // Fee-rate quote stays OUTSIDE the per-chain broadcast lock below: it's
+  // an external HTTP call with no dependence on the shared UTXO ledger, so
+  // serializing it would stretch every waiter's lock hold for nothing.
   let feeRate: number;
-  let selection: CoinSelectionResult;
-  let unsigned: UnsignedTx;
-  const inputPrivateKeys: Array<{ address: Address; privateKey: string }> = [];
-  let changeAddressIndex: number | null = null;
-  let changeAddress: string | null = null;
-  let changeVout: number | null = null;
   try {
     // Determine fee rate (sat/vB) from the merchant's chosen tier. The
     // adapter's quoteFeeTiers returns fee = TYPICAL_VBYTES × rate; we
@@ -2928,9 +2932,45 @@ async function broadcastUtxoMain(
       amountRaw: row.amountRaw as AmountRaw
     });
     feeRate = Math.max(1, Math.ceil(Number(tierQuote[tier].nativeAmountRaw) / TYPICAL_VBYTES));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+  }
 
-    // Load every spendable UTXO, run coinselect.
-    const spendable = await loadSpendableUtxos(deps, row.chainId as ChainId);
+  // Everything from coinselect through mark-spent runs under the per-chain
+  // broadcast lock: chosen inputs are only marked spent AFTER the network
+  // accepts the tx, so two concurrent broadcasts on one chain would select
+  // from identical spendable sets, pick overlapping inputs, and the later
+  // one would be rejected with `txn-mempool-conflict`. Serialized, each
+  // waiter re-selects against a ledger that already excludes the previous
+  // winner's inputs. See utxo-broadcast-lock.ts for the full rationale.
+  const locked = await withUtxoChainLock(Number(row.chainId), async (): Promise<
+    | { readonly outcome: "failed" | "deferred" }
+    | {
+        readonly outcome: "submitted";
+        readonly txHash: TxHash;
+        readonly selection: CoinSelectionResult;
+        readonly changeAddress: string | null;
+        readonly changeAddressIndex: number | null;
+      }
+  > => {
+  // ---- (a) Pre-broadcast prep: coinselect, output/tx build, per-input
+  // key derivation. Nothing reaches the network in this block, so failures
+  // here are safe to terminally fail.
+  let selection: CoinSelectionResult;
+  let unsigned: UnsignedTx;
+  const inputPrivateKeys: Array<{ address: Address; privateKey: string }> = [];
+  let changeAddressIndex: number | null = null;
+  let changeAddress: string | null = null;
+  let changeVout: number | null = null;
+  let changeScriptPubkey: string | null = null;
+  try {
+    // Load every spendable UTXO, run coinselect. Under the knob, the
+    // gateway's own unconfirmed change counts as spendable (mempool
+    // chaining) — third-party 0-conf deposits never do.
+    const spendable = await loadSpendableUtxos(deps, row.chainId as ChainId, {
+      includeUnconfirmedOwnChange: deps.utxoSpendUnconfirmedChange === true
+    });
     const picked = selectCoins(
       spendable,
       [{ address: row.destinationAddress, value: Number(row.amountRaw) }],
@@ -2940,10 +2980,12 @@ async function broadcastUtxoMain(
       // Funds were verified at plan time, but a concurrent payout could
       // have consumed them between then and now. Surface as a clean
       // failure; merchant can retry once balance recovers.
-      return failPayout(
-        deps, row, "SOURCE_BROADCAST_FAILED",
-        `coinselect could not assemble inputs at fee rate ${feeRate} sat/vB — UTXOs may have been spent by a concurrent payout`
-      );
+      return {
+        outcome: await failPayout(
+          deps, row, "SOURCE_BROADCAST_FAILED",
+          `coinselect could not assemble inputs at fee rate ${feeRate} sat/vB — UTXOs may have been spent by a concurrent payout`
+        )
+      };
     }
     selection = picked;
 
@@ -2972,8 +3014,9 @@ async function broadcastUtxoMain(
         // output's vout in the broadcast tx must match this exactly so the
         // post-confirmation backfill can locate it without re-fetching.
         changeVout = outputs.length;
+        changeScriptPubkey = destinationScriptPubkey(allocated.address, utxoCfg);
         outputs.push({
-          scriptPubkey: destinationScriptPubkey(allocated.address, utxoCfg),
+          scriptPubkey: changeScriptPubkey,
           value: BigInt(o.value)
         });
       } else {
@@ -3011,7 +3054,7 @@ async function broadcastUtxoMain(
 
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+    return { outcome: await failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message) };
   }
 
   // ---- (b) The broadcast itself. Definitive node rejections (bad-txns-*,
@@ -3029,7 +3072,7 @@ async function broadcastUtxoMain(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (classifyBroadcastError(err) === "definitive") {
-      return failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message);
+      return { outcome: await failPayout(deps, row, "SOURCE_BROADCAST_FAILED", message) };
     }
     deps.logger.error("payout.utxo.broadcast_outcome_unknown", {
       payoutId: row.id,
@@ -3056,7 +3099,7 @@ async function broadcastUtxoMain(
         error: breadcrumbErr instanceof Error ? breadcrumbErr.message : String(breadcrumbErr)
       });
     }
-    return "deferred";
+    return { outcome: "deferred" };
   }
 
   // ---- (c) Post-broadcast persistence: the tx is live on-chain from here
@@ -3148,7 +3191,74 @@ async function broadcastUtxoMain(
       utxoIds,
       error: err instanceof Error ? err.message : String(err)
     });
-    return "deferred";
+    return { outcome: "deferred" };
+  }
+
+  // Instant change re-spend (UTXO_SPEND_UNCONFIRMED_CHANGE): surface the
+  // change output in the ledger NOW — a 'detected' transactions row plus a
+  // utxos row with origin='change' — instead of waiting for the
+  // confirmation-time backfill. loadSpendableUtxos admits it under the
+  // knob, so the next payout in this chain's queue can chain off it while
+  // this tx is still in the mempool. Best-effort AFTER the critical (c)
+  // commit: if this insert fails, the only cost is that the change stays
+  // invisible until backfillChangeUtxo re-creates it at confirmation
+  // (which is idempotent against these rows and flips them to confirmed).
+  if (
+    deps.utxoSpendUnconfirmedChange === true &&
+    changeAddress !== null &&
+    changeAddressIndex !== null &&
+    changeVout !== null &&
+    changeScriptPubkey !== null &&
+    changeOutput !== undefined
+  ) {
+    try {
+      const changeTxRowId = globalThis.crypto.randomUUID();
+      const nativeSymbol = chainAdapter.nativeSymbol(row.chainId as ChainId);
+      await runWithBusyRetry(deps, () =>
+        deps.db.transaction(async (tx) => {
+          await tx.insert(transactions).values({
+            id: changeTxRowId,
+            invoiceId: null,
+            chainId: row.chainId,
+            txHash: String(txHash),
+            logIndex: changeVout,
+            fromAddress: selection.chosenInputs[0]!.address,
+            toAddress: changeAddress!,
+            token: nativeSymbol,
+            amountRaw: String(changeOutput.value),
+            blockNumber: null,
+            confirmations: 0,
+            status: "detected",
+            detectedAt: now2,
+            confirmedAt: null,
+            amountUsd: null,
+            usdRate: null
+          });
+          await tx.insert(utxos).values({
+            id: `${String(txHash)}:${changeVout}`,
+            transactionId: changeTxRowId,
+            chainId: row.chainId,
+            address: changeAddress!,
+            addressIndex: changeAddressIndex!,
+            vout: changeVout!,
+            valueSats: String(changeOutput.value),
+            scriptPubkey: changeScriptPubkey!,
+            spentInPayoutId: null,
+            spentAt: null,
+            origin: "change",
+            createdAt: now2
+          });
+        })
+      );
+    } catch (err) {
+      deps.logger.error("payout.utxo.pending_change_insert_failed", {
+        payoutId: row.id,
+        chainId: row.chainId,
+        txHash,
+        changeAddress,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
   }
 
   deps.logger.info("payout.utxo.broadcast", {
@@ -3162,8 +3272,16 @@ async function broadcastUtxoMain(
     changeAddressIndex
   });
 
+  return { outcome: "submitted", txHash, selection, changeAddress, changeAddressIndex };
+  });
+  if (locked.outcome !== "submitted") {
+    return locked.outcome;
+  }
+
   // Event publishing is observability, not state — never let it fail the
-  // payout after a successful broadcast + commit.
+  // payout after a successful broadcast + commit. It runs OUTSIDE the
+  // per-chain lock: bus handlers deliver merchant webhooks inline, and a
+  // slow endpoint must not serialize the whole chain's broadcast queue.
   try {
     const updated = await fetchPayout(deps, row.id);
     if (updated) {
@@ -3171,13 +3289,13 @@ async function broadcastUtxoMain(
         type: "payout.submitted",
         payoutId: updated.id,
         payout: updated,
-        at: new Date(now2)
+        at: deps.clock.now()
       });
     }
   } catch (err) {
     deps.logger.error("payout.submitted_event_publish_failed", {
       payoutId: row.id,
-      txHash,
+      txHash: locked.txHash,
       error: err instanceof Error ? err.message : String(err)
     });
   }
@@ -3300,11 +3418,13 @@ export async function backfillChangeUtxo(
       });
       return;
     }
-    // Existing row from a prior backfill run; pick up its id so the FK on
+    // Existing row from a prior backfill run — or from the broadcast-time
+    // pending-change insert (UTXO_SPEND_UNCONFIRMED_CHANGE), which writes
+    // it as status='detected'. Pick up its id so the FK on
     // utxos.transaction_id resolves. Only one row can match (chain_id,
     // tx_hash, log_index) is unique.
     const existing = await deps.db
-      .select({ id: transactions.id })
+      .select({ id: transactions.id, status: transactions.status })
       .from(transactions)
       .where(
         and(
@@ -3316,6 +3436,16 @@ export async function backfillChangeUtxo(
       .limit(1);
     if (!existing[0]) return;
     transactionId = existing[0].id;
+    // Converge the broadcast-time pending row: the payout is confirmed, so
+    // its change output is too. Without this flip the row would stay
+    // 'detected' forever (no detection scanner watches change addresses)
+    // and the change would drop out of coinselect once the knob turns off.
+    if (existing[0].status === "detected") {
+      await deps.db
+        .update(transactions)
+        .set({ status: "confirmed", confirmedAt: now })
+        .where(eq(transactions.id, existing[0].id));
+    }
   }
 
   // Insert the utxos overlay. Outpoint-id format matches insertUtxoRow in
@@ -3333,6 +3463,7 @@ export async function backfillChangeUtxo(
       scriptPubkey,
       spentInPayoutId: null,
       spentAt: null,
+      origin: "change",
       createdAt: now
     });
   } catch (err) {

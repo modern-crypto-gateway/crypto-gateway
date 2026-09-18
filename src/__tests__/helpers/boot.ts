@@ -86,6 +86,9 @@ export interface BootTestAppOptions {
   internalConsolidationFeeTier?: AppDeps["internalConsolidationFeeTier"];
   consolidationDustGasMultiplier?: AppDeps["consolidationDustGasMultiplier"];
   consolidationTopUpCushionPercent?: AppDeps["consolidationTopUpCushionPercent"];
+  // UTXO family: allow coin selection to chain off the gateway's own
+  // unconfirmed change (mirrors UTXO_SPEND_UNCONFIRMED_CHANGE). Default off.
+  utxoSpendUnconfirmedChange?: AppDeps["utxoSpendUnconfirmedChange"];
 }
 
 export interface BootedTestApp {
@@ -288,6 +291,9 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
       : {}),
     ...(options.consolidationDustGasMultiplier !== undefined
       ? { consolidationDustGasMultiplier: options.consolidationDustGasMultiplier }
+      : {}),
+    ...(options.utxoSpendUnconfirmedChange !== undefined
+      ? { utxoSpendUnconfirmedChange: options.utxoSpendUnconfirmedChange }
       : {}),
     ...(options.consolidationTopUpCushionPercent !== undefined
       ? { consolidationTopUpCushionPercent: options.consolidationTopUpCushionPercent }

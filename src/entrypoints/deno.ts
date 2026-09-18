@@ -273,6 +273,9 @@ async function main(): Promise<void> {
     ...(parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN")) !== undefined
       ? { payoutConcurrencyPerChain: parsePayoutConcurrencyEnv(secrets.getOptional("PAYOUT_CONCURRENCY_PER_CHAIN"))! }
       : {}),
+    ...(parseOnFlagEnv(secrets.getOptional("UTXO_SPEND_UNCONFIRMED_CHANGE"))
+      ? { utxoSpendUnconfirmedChange: true }
+      : {}),
     fastPayoutExecutionEnabled: true,
     ...(parseFeeTierEnv(secrets.getOptional("INTERNAL_CONSOLIDATION_FEE_TIER")) !== undefined
       ? { internalConsolidationFeeTier: parseFeeTierEnv(secrets.getOptional("INTERNAL_CONSOLIDATION_FEE_TIER"))! }
@@ -323,6 +326,12 @@ function parsePayoutConcurrencyEnv(raw: string | undefined): number | undefined 
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 1 || n > 64 || !Number.isInteger(n)) return undefined;
   return n;
+}
+
+// Opt-in boolean env flag: only "on"/"1"/"true" enables; anything else
+// (unset, "off", garbage) stays at the built-in default of false.
+function parseOnFlagEnv(raw: string | undefined): boolean {
+  return raw === "on" || raw === "1" || raw === "true";
 }
 
 // Validate an optional fee-tier env value; undefined when unset/invalid so the

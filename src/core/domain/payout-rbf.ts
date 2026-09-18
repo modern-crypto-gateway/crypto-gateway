@@ -1,16 +1,17 @@
-import { desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import type { AppDeps } from "../app-deps.js";
 import type { Address, ChainId, TxHash } from "../types/chain.js";
 import type { AmountRaw } from "../types/money.js";
 import type { TokenSymbol } from "../types/token.js";
 import { findChainAdapter } from "./chain-lookup.js";
-import { payoutBroadcasts, payouts, utxos } from "../../db/schema.js";
+import { payoutBroadcasts, payouts, transactions, utxos } from "../../db/schema.js";
 import { loadSpendableUtxos, type SelectableUtxo } from "./utxo-coin-select.js";
 import { destinationScriptPubkey } from "../../adapters/chains/utxo/destination-script.js";
 import { utxoConfigForChainId } from "../../adapters/chains/utxo/utxo-config.js";
 import { allocateUtxoAddress } from "./utxo-address-allocator.js";
 import { buildUtxoUnsignedTx } from "../../adapters/chains/utxo/utxo-chain.adapter.js";
+import { withUtxoChainLock } from "./utxo-broadcast-lock.js";
 
 // RBF (Replace-By-Fee) for stuck UTXO payouts.
 //
@@ -147,6 +148,28 @@ export async function bumpPayoutFee(
     throw new BumpFeeError("INTERNAL", `Submitted payout ${payoutId} has no txHash`);
   }
 
+  // Everything from here reads the shared UTXO ledger (Step 3 can add
+  // spendable inputs) and broadcasts — run it under the same per-chain
+  // lock as broadcastUtxoMain so a bump can't race a concurrent payout's
+  // coinselect for the same coins. Admin-triggered and rare, so the wider
+  // hold (incl. the confirmation probe) is fine.
+  return withUtxoChainLock(Number(row.chainId), () =>
+    bumpPayoutFeeLocked(deps, row, chainAdapter, input, dryRun)
+  );
+}
+
+async function bumpPayoutFeeLocked(
+  deps: AppDeps,
+  row: typeof payouts.$inferSelect,
+  chainAdapter: NonNullable<ReturnType<typeof findChainAdapter>>,
+  input: BumpFeeInput,
+  dryRun: boolean
+): Promise<BumpFeeResult> {
+  const payoutId = row.id;
+  if (row.txHash === null) {
+    throw new BumpFeeError("INTERNAL", `Submitted payout ${payoutId} has no txHash`);
+  }
+
   // Verify the prior tx is still in mempool / unconfirmed. If it confirmed
   // between the admin's decision and our action, the bump is moot — refuse.
   const status = await chainAdapter.getConfirmationStatus(
@@ -178,6 +201,27 @@ export async function bumpPayoutFee(
   const priorInputs: ReadonlyArray<RbfInput> = JSON.parse(prior.inputsJson);
   const priorFeeSats = BigInt(prior.feeSats);
   const priorFeerate = Number(prior.feerateSatVb);
+
+  // Unconfirmed-change chaining guard: under UTXO_SPEND_UNCONFIRMED_CHANGE
+  // a later payout may already be spending THIS tx's change output while
+  // both sit in the mempool. Replacing this tx would erase that output and
+  // strand the child's broadcast forever. Refuse — the operator must wait
+  // for the chain to confirm (or resolve the child) before bumping.
+  if (prior.changeVout !== null) {
+    const [pendingChange] = await deps.db
+      .select({ spentInPayoutId: utxos.spentInPayoutId })
+      .from(utxos)
+      .where(eq(utxos.id, `${prior.txHash}:${prior.changeVout}`))
+      .limit(1);
+    if (pendingChange && pendingChange.spentInPayoutId !== null) {
+      throw new BumpFeeError(
+        "CONFLICT",
+        `Cannot bump payout ${payoutId}: its unconfirmed change output is already spent by ` +
+          `child payout ${pendingChange.spentInPayoutId} (mempool chaining). Replacing this tx ` +
+          `would invalidate the child's broadcast.`
+      );
+    }
+  }
 
   // Compute target feerate. For tier-based, query the adapter's current
   // recommendations and pick the requested level. For explicit sat/vB, use
@@ -269,7 +313,10 @@ export async function bumpPayoutFee(
     }
   }
 
-  // Try Step 3: add inputs.
+  // Try Step 3: add inputs. Deliberately confirmed-only (no
+  // includeUnconfirmedOwnChange): BIP125 rule 2 forbids a replacement from
+  // introducing unconfirmed inputs that the original didn't spend — relays
+  // would reject the bump outright.
   if (strategy === null) {
     const spendable = await loadSpendableUtxos(deps, row.chainId as ChainId);
     const priorIds = new Set(priorInputs.map((i) => i.utxoId));
@@ -531,6 +578,69 @@ export async function bumpPayoutFee(
       .where(eq(payouts.id, payoutId));
     // Note: augmented UTXOs (Step 3 strategy) were already claimed in the
     // pre-broadcast Step-1 transaction; nothing to mark here.
+
+    // Unconfirmed-change ledger upkeep (UTXO_SPEND_UNCONFIRMED_CHANGE):
+    // the replaced tx's pending change rows (written at its broadcast)
+    // describe an output the replacement just erased. The guard above
+    // proved nothing spends it, so drop the stale rows — and write the
+    // replacement's own pending change in their place when the knob is on.
+    // The utxos row can only exist from the broadcast-time pending insert;
+    // a confirmed backfill row is impossible here (the payout is still
+    // unconfirmed, ALREADY_CONFIRMED guarded above).
+    if (prior.changeVout !== null) {
+      await tx.delete(utxos).where(eq(utxos.id, `${prior.txHash}:${prior.changeVout}`));
+      await tx
+        .delete(transactions)
+        .where(
+          and(
+            eq(transactions.chainId, row.chainId),
+            eq(transactions.txHash, prior.txHash),
+            eq(transactions.logIndex, prior.changeVout),
+            eq(transactions.status, "detected")
+          )
+        );
+    }
+    if (
+      deps.utxoSpendUnconfirmedChange === true &&
+      changeAddress !== null &&
+      changeValueSats !== null &&
+      changeAddressIndex !== null &&
+      changeVout !== null
+    ) {
+      const changeTxRowId = globalThis.crypto.randomUUID();
+      await tx.insert(transactions).values({
+        id: changeTxRowId,
+        invoiceId: null,
+        chainId: row.chainId,
+        txHash,
+        logIndex: changeVout,
+        fromAddress: chosenInputs[0]!.address,
+        toAddress: changeAddress,
+        token: chainAdapter.nativeSymbol(row.chainId as ChainId),
+        amountRaw: changeValueSats.toString(),
+        blockNumber: null,
+        confirmations: 0,
+        status: "detected",
+        detectedAt: broadcastedAt,
+        confirmedAt: null,
+        amountUsd: null,
+        usdRate: null
+      });
+      await tx.insert(utxos).values({
+        id: `${txHash}:${changeVout}`,
+        transactionId: changeTxRowId,
+        chainId: row.chainId,
+        address: changeAddress,
+        addressIndex: changeAddressIndex,
+        vout: changeVout,
+        valueSats: changeValueSats.toString(),
+        scriptPubkey: destinationScriptPubkey(changeAddress, utxoCfg),
+        spentInPayoutId: null,
+        spentAt: null,
+        origin: "change",
+        createdAt: broadcastedAt
+      });
+    }
   });
 
   deps.logger.info("payout.utxo.fee_bump", {

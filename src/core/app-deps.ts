@@ -111,6 +111,17 @@ export interface AppDeps {
   // via env `PAYOUT_CONCURRENCY_PER_CHAIN`.
   readonly payoutConcurrencyPerChain?: number;
 
+  // UTXO family: when true, coin selection may spend the gateway's OWN
+  // change outputs while their parent payout tx is still unconfirmed
+  // (mempool chaining). Third-party 0-conf deposits are never spendable —
+  // only rows the broadcast path wrote with utxos.origin='change'. Raises
+  // burst payout throughput beyond one-payout-per-confirmed-UTXO-cluster;
+  // the trade-off is that a chained child is invalidated if its parent is
+  // ever RBF-replaced, so the fee-bump path refuses to bump a tx whose
+  // change a child already spends. Default false (confirmed-only).
+  // From UTXO_SPEND_UNCONFIRMED_CHANGE.
+  readonly utxoSpendUnconfirmedChange?: boolean;
+
   // When true, POST /payouts (single + batch) fires executeReservedPayouts
   // in the background immediately after planning, instead of letting the
   // fresh reservation wait for the next cron tick (where it would also

@@ -229,6 +229,18 @@ export const AppConfigSchema = z
     // Workers under heavy backlog.
     payoutConcurrencyPerChain: z.coerce.number().int().min(1).max(64).default(16),
 
+    // UTXO family: allow coin selection to spend the gateway's OWN change
+    // outputs while the parent payout tx is still in the mempool (chained
+    // 0-conf spends). Third-party unconfirmed deposits are never spendable.
+    // Raises burst payout throughput past one-payout-per-confirmed-UTXO;
+    // trade-off: a chained child dies if its parent is RBF-replaced, so
+    // fee bumps are refused while a child spends the parent's change.
+    // Default OFF. Enable with UTXO_SPEND_UNCONFIRMED_CHANGE=on|1|true.
+    utxoSpendUnconfirmedChange: z
+      .string()
+      .optional()
+      .transform((v) => v === "on" || v === "1" || v === "true"),
+
     // ---- Consolidation (pool defrag) fee optimization ----
     // Internal consolidation sweeps move funds between addresses we own; they
     // have no merchant SLA, so the cheapest fee tier is the right default. The
@@ -410,6 +422,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): A
     rateLimitWebhookIngestPerMinute: env["RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE"],
     rateLimitAdminPerMinute: env["RATE_LIMIT_ADMIN_PER_MINUTE"],
     payoutConcurrencyPerChain: env["PAYOUT_CONCURRENCY_PER_CHAIN"],
+    utxoSpendUnconfirmedChange: env["UTXO_SPEND_UNCONFIRMED_CHANGE"],
     internalConsolidationFeeTier: env["INTERNAL_CONSOLIDATION_FEE_TIER"],
     consolidationDustGasMultiplier: env["CONSOLIDATION_DUST_GAS_MULTIPLIER"],
     consolidationTopUpCushionPercent: env["CONSOLIDATION_TOPUP_CUSHION_PERCENT"],

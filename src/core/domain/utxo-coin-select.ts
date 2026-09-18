@@ -1,7 +1,7 @@
 // @ts-expect-error — coinselect ships its own types but vite-node sometimes
 //   resolves the JS file directly; the runtime shape is documented below.
 import coinselect from "coinselect";
-import { and, asc, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, isNull, or } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
 import type { ChainId } from "../types/chain.js";
 import { transactions, utxos } from "../../db/schema.js";
@@ -52,10 +52,26 @@ export interface CoinSelectionResult {
 // Load every spendable UTXO for the given chain. JOIN against transactions
 // to filter on `status='confirmed'` (the source of truth for inclusion).
 // Reverted/orphaned txs naturally drop out via the JOIN.
+//
+// `includeUnconfirmedOwnChange` additionally admits 'detected' (mempool)
+// rows whose origin is 'change' — outputs the gateway created for itself in
+// a payout it broadcast. Safe to chain off (we authored the parent tx;
+// third-party deposits stay confirmed-only because their sender could
+// RBF-replace them). Callers: the payout plan/broadcast path passes the
+// UTXO_SPEND_UNCONFIRMED_CHANGE knob here; the RBF bump path must NOT —
+// BIP125 rule 2 forbids a replacement from adding new unconfirmed inputs.
 export async function loadSpendableUtxos(
   deps: AppDeps,
-  chainId: ChainId
+  chainId: ChainId,
+  opts: { readonly includeUnconfirmedOwnChange?: boolean } = {}
 ): Promise<readonly SelectableUtxo[]> {
+  const confirmedOnly = eq(transactions.status, "confirmed");
+  const statusCondition = opts.includeUnconfirmedOwnChange === true
+    ? or(
+        confirmedOnly,
+        and(eq(transactions.status, "detected"), eq(utxos.origin, "change"))
+      )!
+    : confirmedOnly;
   const rows = await deps.db
     .select({
       utxoId: utxos.id,
@@ -72,7 +88,7 @@ export async function loadSpendableUtxos(
       and(
         eq(utxos.chainId, chainId),
         isNull(utxos.spentInPayoutId),
-        eq(transactions.status, "confirmed")
+        statusCondition
       )
     )
     .orderBy(asc(utxos.createdAt));

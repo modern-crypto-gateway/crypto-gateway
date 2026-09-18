@@ -437,6 +437,16 @@ export const utxos = sqliteTable(
     // FK to payouts.id when consumed. NULL = spendable.
     spentInPayoutId: text("spent_in_payout_id").references(() => payouts.id),
     spentAt: integer("spent_at"),
+    // Provenance. 'deposit' rows come from the detection ingest (customer
+    // payments — a third party authored the parent tx); 'change' rows are
+    // outputs the gateway created for itself in a payout broadcast. Only
+    // 'change' rows may be spent while their parent tx is still unconfirmed
+    // (UTXO_SPEND_UNCONFIRMED_CHANGE knob): we authored and broadcast the
+    // parent ourselves, so no third party can double-spend it out from
+    // under us. Historical change rows written before this column exists
+    // default to 'deposit' — harmless, they are already confirmed and
+    // confirmed rows are spendable regardless of origin.
+    origin: text("origin", { enum: ["deposit", "change"] }).notNull().default("deposit"),
     createdAt: integer("created_at").notNull()
   },
   (t) => [
