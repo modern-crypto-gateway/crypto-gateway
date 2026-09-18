@@ -75,6 +75,16 @@ const MAX_EXPECTED_TRANSFER_ENERGY = 250_000;
 // ~20 TRX per payout (×1.30 safety ×1.20 cushion = ~31 TRX top-up); high
 // for warm-slot transfers but the right floor for reliability.
 const MIN_EXPECTED_TRC20_ENERGY = 135_000;
+
+// Operator-policy floor every pool address keeps in liquid TRX, no matter
+// what. Tron itself has no rent-exempt minimum (an account may hold 0 SUN),
+// so this is NOT a chain rule — it is a deliberate keeper so a swept or
+// paid-out address never ends up fully drained. Flows through
+// `minimumNativeReserve`, which the payout picker adds to every source /
+// sponsor budget (native payouts must leave this behind after amount + gas;
+// token payouts must keep it on top of gas) and the consolidation planner
+// subtracts from each source before sizing the sweep leg. 1 TRX = 1e6 SUN.
+const TRON_MIN_NATIVE_RESERVE_SUN = 1_000_000n;
 const DEFAULT_ACCOUNT_INDEX = 0;
 const DEFAULT_CHANGE_INDEX = 0;
 
@@ -1032,8 +1042,9 @@ export function tronChainAdapter(config: TronChainConfig = {}): TronChainAdapter
     },
 
     minimumNativeReserve(_chainId: ChainId): bigint {
-      // Tron has no rent-exempt concept; accounts can hold any balance.
-      return 0n;
+      // Tron has no rent-exempt concept; accounts can hold any balance. The
+      // 1 TRX keeper is operator policy (see TRON_MIN_NATIVE_RESERVE_SUN).
+      return TRON_MIN_NATIVE_RESERVE_SUN;
     },
 
     gasSafetyFactor(_chainId: ChainId) {

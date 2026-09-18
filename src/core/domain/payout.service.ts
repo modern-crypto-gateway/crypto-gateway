@@ -1387,7 +1387,8 @@ export async function estimatePayoutFees(
 
   // Chain-specific minimum native reserve that must stay in the source after
   // the payout. Solana's rent-exempt floor (890 880 lamports) lives here;
-  // EVM/Tron return 0. Including it in the picker budget mirrors what
+  // EVM returns 0; Tron returns a 1 TRX operator-policy keeper. Including it
+  // in the picker budget mirrors what
   // `selectSource` does at plan time, so /payouts/estimate and POST /payouts
   // agree on whether a source is usable.
   const minNativeReserve = chainAdapter.minimumNativeReserve(parsed.chainId as ChainId);
@@ -5516,7 +5517,8 @@ async function selectSource(
   // Chain-specific minimum native reserve. Solana's 0-byte SystemProgram
   // accounts must hold ~890 880 lamports to remain rent-exempt; letting a
   // payout drain below that fails at broadcast with "Transaction results in
-  // an account (0) with insufficient funds for rent". EVM and Tron return 0.
+  // an account (0) with insufficient funds for rent". EVM returns 0; Tron
+  // returns a 1 TRX operator-policy keeper (no chain rule, never drain).
   const minNativeReserve = chainAdapter.minimumNativeReserve(args.chainId as ChainId);
 
   // Fee-wallet path. Three distinct topologies the picker honors:
@@ -5611,7 +5613,8 @@ async function selectSource(
   if (!tokenHolder) return { kind: "insufficient", aggregateTokenBalance, largestSingleHolding };
 
   // Token-holder needs native to cover gas AND the chain's rent-exempt
-  // reserve (Solana: 890 880 lamports; zero on EVM/Tron). Sponsor must cover
+  // reserve (Solana: 890 880 lamports; 1 TRX policy keeper on Tron; zero on
+  // EVM). Sponsor must cover
   // the shortfall + its own gas + its own reserve.
   const holderNeedNative = gasNeeded + minNativeReserve;
   const gap = holderNeedNative - tokenHolder.nativeBalance;

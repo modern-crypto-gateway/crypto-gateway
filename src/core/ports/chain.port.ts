@@ -204,8 +204,10 @@ export interface ChainAdapter {
   // Native-balance amount the source MUST retain after a payout completes.
   // Solana returns the rent-exempt minimum for a 0-byte SystemProgram account
   // (~890 880 lamports) — drain a Solana source below this and the tx fails
-  // simulation with "insufficient funds for rent". EVM and Tron have no such
-  // concept; both return 0n. Used by `selectSource` so the picker refuses
+  // simulation with "insufficient funds for rent". EVM has no such concept
+  // and returns 0n. Tron has no chain-level rule either, but the adapter
+  // returns a 1 TRX operator-policy keeper so pool addresses are never fully
+  // drained by a payout or consolidation sweep. Used by `selectSource` so the picker refuses
   // payouts that would violate the reserve, and by chain adapters' pre-
   // broadcast checks for defense in depth.
   minimumNativeReserve(chainId: ChainId): bigint;
