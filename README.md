@@ -180,7 +180,7 @@ for the full list. Highlights:
 | `COINGECKO_PLAN`                  | no              | `demo`     | `demo` → sends `x-cg-demo-api-key`; `pro` → `x-cg-pro-api-key`. |
 | `COINCAP_API_KEY`                 | no              | —          | Optional CoinCap (Messari) key. `/v2/assets` is keyless in practice. |
 | `DISABLE_COINGECKO` / `DISABLE_COINCAP` / `DISABLE_BINANCE` / `DISABLE_ALCHEMY` | no | — | Set `=1` to drop that provider from the fallback chain. Useful for jurisdiction constraints or incident-response. |
-| `ALERT_WEBHOOK_URL`               | no              | —          | When set, `error`/`fatal` logs are POSTed here (JSON body). Sliding-window rate-limited to 30/min; drops are piggybacked on the next delivery. |
+| `ALERT_WEBHOOK_URL`               | no              | —          | When set, `error`/`fatal` logs are POSTed here. A Discord webhook URL gets a native Discord message (headline + embed); anything else gets the raw JSON body. Sliding-window rate-limited to 30/min; drops are piggybacked on the next delivery. Carries the rate-oracle, dead-cron and boot-failure alerts described under "Log shipping + alerting". |
 | `ALERT_WEBHOOK_AUTH_HEADER`       | no              | —          | Value for the `Authorization` header when calling `ALERT_WEBHOOK_URL` (e.g. `Bearer xyz`). |
 
 ## Price oracle fallback chain
@@ -216,12 +216,40 @@ invoice creations against the same token hits the upstream once.
 ## Log shipping + alerting
 
 Setting `ALERT_WEBHOOK_URL` turns on a sync-fire-and-forget HTTP sink attached
-to the structured logger. Every `error` or `fatal` log is POSTed as a JSON
-body `{ ts, level, msg, ...fields }`. A 3s timeout protects the caller, a
-sliding-window rate limit caps deliveries at 30/min, and any drops caused by
-the rate limiter are reported on the `droppedSinceLast` field of the next
+to the structured logger. Every `error` or `fatal` log is POSTed to it. A 3s
+timeout protects the caller, a sliding-window rate limit caps deliveries at
+30/min, and any drops caused by the rate limiter are reported on the next
 successful delivery. If you need auth, set `ALERT_WEBHOOK_AUTH_HEADER`
 (e.g. `Bearer xyz`) and it's sent verbatim as `Authorization`.
+
+The body shape is picked from the URL:
+
+- **Discord webhook** (`https://discord.com/api/webhooks/…` or
+  `discordapp.com`): a native Discord message — a one-line headline
+  (`🚨 **crypto-gateway** ERROR: …`), an embed with the scalar fields as
+  inline columns and the full structured payload as a JSON code block. Red
+  for failures, green for recovery notices. `@everyone` / `@here` pings are
+  suppressed. Setting it on Workers:
+
+  ```sh
+  npx wrangler secret put ALERT_WEBHOOK_URL   # paste the Discord webhook URL
+  ```
+
+- **Anything else**: the raw JSON body `{ level, line, fields }` where
+  `line` is the redacted log line and `fields` is `{ ts, msg, ...fields }`.
+
+### Rate-oracle alerts (self-healing pricing)
+
+USD-pegged invoices are priced from a cron-warmed rate cache. The refresh
+path is designed to never fail silently and to keep repairing itself:
+
+| Alert | When | Auto-recovery already running |
+|---|---|---|
+| `[RATE_REFRESH_FAILED]` | The cron warm (3 attempts per tick, whole oracle chain each time) or an inline request-path refresh returned nothing. Fires on the **first** failure, then every 10 min while it persists. Payload names each upstream provider that failed and why (`providerFailures`), how old the cache is, and the exact time invoices will start failing. | Cron retries every minute; every USD invoice request also attempts an inline refresh. |
+| `[RATE_REFRESH_RECOVERED]` | First successful refresh after one or more failures. Green. | — |
+| `[RATE_CRON_STALE]` | An invoice request sees a cache entry older than 5 min with no recent refresh *attempt* recorded: the scheduled handler is not running at all. Also implies detection / payouts / webhook retries are stalled. Every 10 min while it persists. | Invoice pricing self-heals inline; the cron itself needs the operator. |
+| `[RATES_UNAVAILABLE]` | An invoice create actually returned `503 RATES_UNAVAILABLE`: cache empty or older than 6 h **and** the live chain failed. Deduped to one per 2 min. | Each request retries an inline refresh (60 s backoff). |
+| `worker boot failed` | `depsFor` threw on the Workers fetch or scheduled path (missing secret, bad env). | — |
 
 ## Enabling Alchemy (optional)
 

@@ -45,7 +45,7 @@ import { createDb, createLibsqlClient } from "../db/client.js";
 import { devCipher, makeSecretsCipher } from "../adapters/crypto/secrets-cipher.js";
 import { waitUntilJobs } from "../adapters/jobs/wait-until.adapter.js";
 import { consoleLogger } from "../adapters/logging/console.adapter.js";
-import { httpAlertSink } from "../adapters/logging/http-alert.adapter.js";
+import { httpAlertSink, postAlert } from "../adapters/logging/http-alert.adapter.js";
 import { selectPriceOracle } from "../adapters/price-oracle/select-oracle.js";
 import { cacheBackedRateLimiter } from "../adapters/rate-limit/cache-backed.adapter.js";
 import { cloudflareRateLimiter } from "../adapters/rate-limit/cloudflare.adapter.js";
@@ -636,23 +636,15 @@ async function reportBootFailure(err: unknown, env: WorkerEnv): Promise<void> {
   const alertUrl = typeof env["ALERT_WEBHOOK_URL"] === "string" ? env["ALERT_WEBHOOK_URL"] : undefined;
   if (alertUrl === undefined || alertUrl.length === 0) return;
   const authHeader = typeof env["ALERT_WEBHOOK_AUTH_HEADER"] === "string" ? env["ALERT_WEBHOOK_AUTH_HEADER"] : undefined;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3000);
-  try {
-    await fetch(alertUrl, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(authHeader !== undefined ? { authorization: authHeader } : {})
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-  } catch {
-    // fire-and-forget — already logged to console.
-  } finally {
-    clearTimeout(timer);
-  }
+  // Same URL-aware body selection as the logger's alert sink (Discord
+  // webhooks get a native Discord message; anything else the raw JSON).
+  await postAlert({
+    url: alertUrl,
+    ...(authHeader !== undefined ? { headers: { authorization: authHeader } } : {}),
+    level: "error",
+    line: JSON.stringify({ ...payload, alertKind: "failure" }),
+    fields: payload
+  });
 }
 
 export default {

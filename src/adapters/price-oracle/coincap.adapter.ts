@@ -1,5 +1,6 @@
 import type { PriceOracle } from "../../core/ports/price-oracle.port.ts";
 import type { CacheStore } from "../../core/ports/cache.port.ts";
+import { recordOracleFailure } from "../../core/ports/oracle-diagnostics.js";
 import type { Logger } from "../../core/ports/logger.port.ts";
 import type { FiatCurrency, Rate } from "../../core/types/money.js";
 import type { TokenSymbol } from "../../core/types/token.js";
@@ -155,6 +156,7 @@ export function coincapPriceOracle(config: CoincapConfig): PriceOracle {
           live[r.value[0]] = r.value[1];
         }
       }
+      recordSettledFailures("coincap", tokens, lookups);
       const missing = tokens.filter((t) => live[t] === undefined);
       const fromFallback = missing.length > 0 ? await fallback.getUsdRates(missing) : {};
       return { ...fromFallback, ...live };
@@ -177,3 +179,27 @@ function scaleDecimal(value: string, decimals: number): bigint {
   const frac = (fracStr + "0".repeat(decimals)).slice(0, decimals);
   return BigInt(wholeStr ?? "0") * BigInt(10) ** BigInt(decimals) + BigInt(frac || "0");
 }
+
+// Surface per-token lookup failures to the oracle diagnostics buffer so the
+// rate-window's failure alert can name the provider and the reason. One
+// record per call (first error + count), not one per token.
+function recordSettledFailures(
+  provider: string,
+  tokens: readonly TokenSymbol[],
+  lookups: ReadonlyArray<PromiseSettledResult<unknown>>
+): void {
+  const failed: string[] = [];
+  let firstError: string | null = null;
+  lookups.forEach((r, i) => {
+    if (r.status !== "rejected") return;
+    failed.push(tokens[i] ?? "?");
+    if (firstError === null) firstError = r.reason instanceof Error ? r.reason.message : String(r.reason);
+  });
+  if (failed.length === 0) return;
+  recordOracleFailure({
+    provider,
+    error: (firstError ?? "unknown") + (failed.length > 1 ? " (+" + (failed.length - 1) + " more)" : ""),
+    tokens: failed
+  });
+}
+

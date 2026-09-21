@@ -1,5 +1,6 @@
 import type { PriceOracle } from "../../core/ports/price-oracle.port.ts";
 import type { CacheStore } from "../../core/ports/cache.port.ts";
+import { recordOracleFailure } from "../../core/ports/oracle-diagnostics.js";
 import type { Logger } from "../../core/ports/logger.port.ts";
 import type { FiatCurrency, Rate } from "../../core/types/money.js";
 import type { TokenSymbol } from "../../core/types/token.js";
@@ -174,9 +175,12 @@ export function alchemyPriceOracle(config: AlchemyPriceConfig): PriceOracle {
       try {
         live = await fetchUsdRates(tokens);
       } catch (err) {
-        logger?.warn("alchemy getUsdRates failed; using fallback only", {
-          error: err instanceof Error ? err.message : String(err)
-        });
+        const error = err instanceof Error ? err.message : String(err);
+        logger?.warn("alchemy getUsdRates failed; using fallback only", { error });
+        recordOracleFailure({ provider: "alchemy", error, tokens });
+      }
+      if (tokens.length > 0 && Object.keys(live).length === 0) {
+        recordOracleFailure({ provider: "alchemy", error: "returned no usable rates for the requested symbols", tokens });
       }
       const missing = tokens.filter((t) => live[t] === undefined);
       const fromFallback = missing.length > 0 ? await fallback.getUsdRates(missing) : {};

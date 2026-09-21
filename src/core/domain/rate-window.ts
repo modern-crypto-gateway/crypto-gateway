@@ -1,5 +1,6 @@
 import { eq } from "drizzle-orm";
 import type { AppDeps } from "../app-deps.js";
+import { recentOracleFailures } from "../ports/oracle-diagnostics.js";
 import type { ChainFamily } from "../types/chain.js";
 import { chainEntry } from "../types/chain-registry.js";
 import { findToken, TOKEN_REGISTRY } from "../types/token-registry.js";
@@ -77,16 +78,16 @@ export function tokensForFamilies(families: readonly ChainFamily[]): readonly To
 }
 
 // Single shared cache key holding the latest USD rate map across every
-// token any wired family might price. The cron's `warmRateCache` writes
-// this entry every tick; `snapshotRates` reads it.
+// token any wired family might price. The cron's warmRateCache writes
+// this entry every tick; snapshotRates reads it.
 //
-// Freshness is enforced by the entry's own `updatedAt`, NOT by the cache
+// Freshness is enforced by the entry's own updatedAt, NOT by the cache
 // TTL. The TTL is purely hygiene (a very long ceiling so an abandoned
 // deployment doesn't keep a dead key forever). Before this split, the TTL
 // doubled as the freshness bound: a cron outage longer than the TTL wiped
 // the entry and invoice creation went down entirely with no way to recover
 // until the cron came back. Now the request path can refresh inline and,
-// failing that, serve a bounded-stale entry — see `snapshotRates`.
+// failing that, serve a bounded-stale entry — see snapshotRates.
 const WARMED_RATES_CACHE_KEY = "rates:usd:warmed";
 const WARMED_RATES_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -117,9 +118,58 @@ const INLINE_REFRESH_TIMEOUT_MS = 10_000;
 const INLINE_REFRESH_BACKOFF_KEY = "rates:usd:inline-refresh-failed";
 const INLINE_REFRESH_BACKOFF_SECONDS = 60;
 
+// ---- Refresh health, retries and alerting ----
+//
+// Rate refresh must never fail silently. Every refresh outcome is tracked
+// in a small cache-backed state record so that:
+//   - the FIRST failure after a healthy period alerts immediately (error-
+//     level log → ALERT_WEBHOOK_URL; Discord-formatted when that is a
+//     Discord webhook) with everything the on-call needs: which path
+//     failed (cron / inline), the error, per-provider failure reasons from
+//     the oracle diagnostics buffer, how old the cache is, exactly when
+//     invoices will start failing, and what auto-recovery is already doing;
+//   - continued failure re-alerts every RATE_ALERT_REPEAT_MS with the
+//     running outage duration instead of once a minute;
+//   - the first success after an outage sends a recovery notice.
+const REFRESH_STATE_KEY = "rates:usd:refresh-state";
+const REFRESH_STATE_TTL_SECONDS = 7 * 24 * 3600;
+export const RATE_ALERT_REPEAT_MS = 10 * 60 * 1000;
+
+// The cron rewrites the entry every minute. If the request path ever sees
+// an entry older than this while the refresh state shows no recent failed
+// attempt either, the scheduled handler is simply not running (deploy
+// misconfig, boot failure, cron trigger removed). Alert on that
+// specifically: a dead cron also stalls detection, payouts and webhooks.
+export const RATE_CRON_STALE_ALERT_MS = 5 * 60 * 1000;
+const CRON_STALE_ALERT_MARKER_KEY = "rates:usd:cron-stale-alerted";
+const CRON_STALE_ALERT_REPEAT_SECONDS = 10 * 60;
+
+// Dedupe marker for the per-request RATES_UNAVAILABLE alert so a burst of
+// failing invoice-creates produces one page, not thirty.
+const UNAVAILABLE_ALERT_MARKER_KEY = "rates:usd:unavailable-alerted";
+const UNAVAILABLE_ALERT_REPEAT_SECONDS = 120;
+
+// In-tick retry policy for the cron warm. The chain already falls through
+// four providers per attempt; retrying the whole chain covers transient
+// edge-network blips (DNS, connection reset) that hit every provider at
+// once. Mutable so tests can zero the backoff.
+export const RATE_REFRESH_RETRY_POLICY: { attempts: number; backoffMs: readonly number[] } = {
+  attempts: 3,
+  backoffMs: [250, 750]
+};
+
 interface WarmedRatesEntry {
   rates: Record<string, string>;
   updatedAt: number;
+}
+
+interface RefreshState {
+  consecutiveFailures: number;
+  firstFailedAt: number | null;
+  lastFailedAt: number | null;
+  lastAlertAt: number | null;
+  lastSuccessAt: number | null;
+  lastError: string | null;
 }
 
 // Thrown by snapshotRates when no usable rates exist: the cache is empty
@@ -133,7 +183,7 @@ export class RateUnavailableError extends Error {
   }
 }
 
-// Snapshot the current rates for `tokens`. Three tiers, cheapest first:
+// Snapshot the current rates for the given tokens. Three tiers, cheapest first:
 //
 //   1. Fresh cache (age ≤ RATES_FRESH_MS) — the steady-state path. The
 //      cron is the only thing touching the network; the merchant's request
@@ -159,6 +209,10 @@ export async function snapshotRates(
   let entry = await readWarmedRates(deps);
   const ageMs = entry === null ? Number.POSITIVE_INFINITY : now - entry.updatedAt;
 
+  if (ageMs > RATE_CRON_STALE_ALERT_MS) {
+    await watchCronStaleness(deps, entry, now);
+  }
+
   if (ageMs > RATES_FRESH_MS) {
     const refreshed = await inlineRefresh(deps, tokens);
     if (refreshed !== null) {
@@ -169,10 +223,7 @@ export async function snapshotRates(
         maxStaleSeconds: RATES_MAX_STALE_MS / 1000
       });
     } else {
-      deps.logger.error("snapshotRates: no usable rates — cache empty/too stale and live refresh failed", {
-        cachePresent: entry !== null,
-        ageSeconds: entry === null ? null : Math.round(ageMs / 1000)
-      });
+      await alertRatesUnavailable(deps, entry, ageMs, now);
       throw new RateUnavailableError(
         entry === null
           ? "Rate cache is empty and the live price oracles could not be reached. Retry shortly."
@@ -198,6 +249,17 @@ async function readWarmedRates(deps: AppDeps): Promise<WarmedRatesEntry | null> 
   return cached;
 }
 
+async function readRefreshState(deps: AppDeps): Promise<RefreshState | null> {
+  const cached = await deps.cache.getJSON<RefreshState>(REFRESH_STATE_KEY);
+  if (cached === null || typeof cached !== "object") return null;
+  if (typeof cached.consecutiveFailures !== "number") return null;
+  return cached;
+}
+
+async function writeRefreshState(deps: AppDeps, state: RefreshState): Promise<void> {
+  await deps.cache.putJSON(REFRESH_STATE_KEY, state, { ttlSeconds: REFRESH_STATE_TTL_SECONDS });
+}
+
 // Every token the cache entry should cover: the union of what every wired
 // family can price and whatever the caller asked for. The cron and the
 // inline refresh both use this so a request-path warm leaves the entry
@@ -210,32 +272,204 @@ function tokensToWarm(deps: AppDeps, extra: readonly TokenSymbol[] = []): readon
   return [...set];
 }
 
-// Call the oracle fallback chain and persist the result. Returns the new
-// entry, or null when the chain threw or returned nothing usable (in which
-// case the previous entry is deliberately left untouched — never overwrite
-// last-good with an empty map).
+// Call the oracle fallback chain (with in-tick retries for the cron) and
+// persist the result. Returns the new entry, or null when every attempt
+// threw or returned nothing usable — in which case the previous entry is
+// deliberately left untouched (never overwrite last-good with an empty
+// map) and the failure is recorded + alerted via noteRefreshFailure.
 async function fetchAndStoreLiveRates(
   deps: AppDeps,
   tokens: readonly TokenSymbol[],
   source: "cron" | "inline"
 ): Promise<WarmedRatesEntry | null> {
   if (tokens.length === 0) return null;
-  let live: Record<string, string> = {};
-  try {
-    live = { ...(await deps.priceOracle.getUsdRates(tokens)) };
-  } catch (err) {
-    deps.logger.warn("warmRateCache(" + source + "): oracle chain failed; preserving last good cache", {
-      error: err instanceof Error ? err.message : String(err)
+  const attempts = source === "cron" ? Math.max(1, RATE_REFRESH_RETRY_POLICY.attempts) : 1;
+  let lastError = "unknown";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let live: Record<string, string> | null = null;
+    try {
+      live = { ...(await deps.priceOracle.getUsdRates(tokens)) };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      deps.logger.warn("warmRateCache(" + source + "): oracle chain threw (attempt " + attempt + "/" + attempts + ")", {
+        error: lastError
+      });
+    }
+    if (live !== null && Object.keys(live).length === 0) {
+      lastError = "oracle chain returned no rates (every provider failed or every symbol unmapped)";
+      deps.logger.warn("warmRateCache(" + source + "): " + lastError + " (attempt " + attempt + "/" + attempts + ")");
+      live = null;
+    }
+    if (live !== null) {
+      const entry: WarmedRatesEntry = { rates: live, updatedAt: deps.clock.now().getTime() };
+      await deps.cache.putJSON(WARMED_RATES_CACHE_KEY, entry, { ttlSeconds: WARMED_RATES_TTL_SECONDS });
+      await noteRefreshSuccess(deps, source);
+      return entry;
+    }
+    if (attempt < attempts) await sleep(RATE_REFRESH_RETRY_POLICY.backoffMs[attempt - 1] ?? 0);
+  }
+  await noteRefreshFailure(deps, { source, tokens, error: lastError, attempts });
+  return null;
+}
+
+async function noteRefreshSuccess(deps: AppDeps, source: "cron" | "inline"): Promise<void> {
+  const now = deps.clock.now().getTime();
+  const state = await readRefreshState(deps);
+  if (state !== null && state.consecutiveFailures > 0) {
+    deps.logger.error("[RATE_REFRESH_RECOVERED] USD rate refresh is succeeding again", {
+      alertKind: "recovery",
+      source,
+      failedAttempts: state.consecutiveFailures,
+      outageSeconds: state.firstFailedAt !== null ? Math.round((now - state.firstFailedAt) / 1000) : null,
+      lastError: state.lastError,
+      note: "Invoice pricing is back on live rates. No action needed unless this keeps recurring."
     });
-    return null;
   }
-  if (Object.keys(live).length === 0) {
-    deps.logger.warn("warmRateCache(" + source + "): oracle chain returned no rates; preserving last good cache");
-    return null;
+  await writeRefreshState(deps, {
+    consecutiveFailures: 0,
+    firstFailedAt: null,
+    lastFailedAt: state?.lastFailedAt ?? null,
+    lastAlertAt: null,
+    lastSuccessAt: now,
+    lastError: null
+  });
+}
+
+async function noteRefreshFailure(
+  deps: AppDeps,
+  info: { source: "cron" | "inline"; tokens: readonly TokenSymbol[]; error: string; attempts: number }
+): Promise<void> {
+  const now = deps.clock.now().getTime();
+  const state: RefreshState = (await readRefreshState(deps)) ?? {
+    consecutiveFailures: 0,
+    firstFailedAt: null,
+    lastFailedAt: null,
+    lastAlertAt: null,
+    lastSuccessAt: null,
+    lastError: null
+  };
+  const consecutiveFailures = state.consecutiveFailures + 1;
+  const firstFailedAt = state.firstFailedAt ?? now;
+  const shouldAlert = state.lastAlertAt === null || now - state.lastAlertAt >= RATE_ALERT_REPEAT_MS;
+  let lastAlertAt = state.lastAlertAt;
+
+  if (shouldAlert) {
+    lastAlertAt = now;
+    const entry = await readWarmedRates(deps);
+    const cacheAgeMs = entry === null ? null : now - entry.updatedAt;
+    const servableUntil = entry === null ? null : entry.updatedAt + RATES_MAX_STALE_MS;
+    const impact =
+      entry === null || servableUntil === null || servableUntil <= now
+        ? "USD-pegged invoice creation is FAILING NOW with 503 RATES_UNAVAILABLE."
+        : "Invoices are currently priced from cached rates (" +
+          Math.round((cacheAgeMs ?? 0) / 60_000) +
+          " min old). Creation starts failing with 503 RATES_UNAVAILABLE at " +
+          new Date(servableUntil).toISOString() +
+          " unless a refresh succeeds first.";
+    deps.logger.error("[RATE_REFRESH_FAILED] USD rate refresh failed", {
+      alertKind: "failure",
+      source: info.source,
+      attempts: info.attempts,
+      error: info.error,
+      consecutiveFailures,
+      failingForSeconds: Math.round((now - firstFailedAt) / 1000),
+      lastSuccessAt: state.lastSuccessAt !== null ? new Date(state.lastSuccessAt).toISOString() : null,
+      impact,
+      cache: {
+        present: entry !== null,
+        ageSeconds: cacheAgeMs === null ? null : Math.round(cacheAgeMs / 1000),
+        tokenCount: entry === null ? 0 : Object.keys(entry.rates).length,
+        servableUntil: servableUntil === null ? null : new Date(servableUntil).toISOString()
+      },
+      tokensRequested: [...info.tokens],
+      providerFailures: recentOracleFailures(15 * 60 * 1000, now).map((f) => ({
+        provider: f.provider,
+        at: new Date(f.at).toISOString(),
+        error: f.error,
+        ...(f.tokens !== undefined ? { tokens: f.tokens } : {})
+      })),
+      autoRecovery:
+        "The cron retries the full oracle chain every minute (" +
+        RATE_REFRESH_RETRY_POLICY.attempts +
+        " attempts per tick) and every USD invoice request also attempts an inline refresh. Nothing to restart; a recovery notice follows the first success.",
+      investigate: [
+        "providerFailures names each upstream that failed and why: 429 = rate limit / key quota, 5xx = provider outage, AbortError = timeout, 'fetch failed' = DNS / egress.",
+        "If providerFailures is empty the chain never ran — check the scheduled handler is firing (wrangler tail) and whether a 'worker boot failed' alert preceded this.",
+        "Config knobs: PRICE_ADAPTER, DISABLE_COINGECKO / DISABLE_COINCAP / DISABLE_BINANCE / DISABLE_ALCHEMY, COINGECKO_API_KEY, COINCAP_API_KEY, ALCHEMY_API_KEY."
+      ]
+    });
   }
-  const entry: WarmedRatesEntry = { rates: live, updatedAt: deps.clock.now().getTime() };
-  await deps.cache.putJSON(WARMED_RATES_CACHE_KEY, entry, { ttlSeconds: WARMED_RATES_TTL_SECONDS });
-  return entry;
+
+  await writeRefreshState(deps, {
+    consecutiveFailures,
+    firstFailedAt,
+    lastFailedAt: now,
+    lastAlertAt,
+    lastSuccessAt: state.lastSuccessAt,
+    lastError: info.error
+  });
+}
+
+// Request-path watchdog for a dead cron. Only reached when the cache entry
+// is missing or older than RATE_CRON_STALE_ALERT_MS, so the steady-state
+// request path never pays for it.
+async function watchCronStaleness(deps: AppDeps, entry: WarmedRatesEntry | null, now: number): Promise<void> {
+  const state = await readRefreshState(deps);
+  const lastWrite = entry?.updatedAt ?? state?.lastSuccessAt ?? null;
+  // No history at all: a brand-new deployment before its first tick. The
+  // inline refresh handles that; nothing to alert on yet.
+  if (lastWrite === null) return;
+  if (now - lastWrite <= RATE_CRON_STALE_ALERT_MS) return;
+  // The cron IS running but the oracles are failing — that is covered by the
+  // RATE_REFRESH_FAILED alert with far better detail.
+  if (state?.lastFailedAt !== null && state?.lastFailedAt !== undefined && now - state.lastFailedAt <= RATE_CRON_STALE_ALERT_MS) {
+    return;
+  }
+  const acquired = await deps.cache.putIfAbsent(CRON_STALE_ALERT_MARKER_KEY, "1", {
+    ttlSeconds: CRON_STALE_ALERT_REPEAT_SECONDS
+  });
+  if (!acquired) return;
+  deps.logger.error("[RATE_CRON_STALE] scheduled rate warm has not run recently — the cron appears to be down", {
+    alertKind: "failure",
+    lastCacheWriteAt: new Date(lastWrite).toISOString(),
+    minutesSinceLastWrite: Math.round((now - lastWrite) / 60_000),
+    lastRefreshFailureAt: state?.lastFailedAt !== null && state?.lastFailedAt !== undefined ? new Date(state.lastFailedAt).toISOString() : null,
+    impact:
+      "Rates are being refreshed inline by invoice requests (self-healing), but a dead cron ALSO stalls payment detection, confirmations, payouts and webhook retries.",
+    investigate: [
+      "Workers: run wrangler tail and look for the scheduled handler firing or a 'worker boot failed' alert; confirm the crons trigger is still in wrangler.jsonc and the last deploy succeeded.",
+      "Node / Vercel / Deno: confirm the external scheduler is POSTing /internal/cron/tick every minute with the CRON_SECRET."
+    ]
+  });
+}
+
+async function alertRatesUnavailable(
+  deps: AppDeps,
+  entry: WarmedRatesEntry | null,
+  ageMs: number,
+  now: number
+): Promise<void> {
+  const acquired = await deps.cache.putIfAbsent(UNAVAILABLE_ALERT_MARKER_KEY, "1", {
+    ttlSeconds: UNAVAILABLE_ALERT_REPEAT_SECONDS
+  });
+  if (!acquired) return;
+  const state = await readRefreshState(deps);
+  deps.logger.error("[RATES_UNAVAILABLE] invoice creation is failing — no usable USD rates", {
+    alertKind: "failure",
+    cachePresent: entry !== null,
+    cacheAgeSeconds: entry === null ? null : Math.round(ageMs / 1000),
+    maxStaleSeconds: RATES_MAX_STALE_MS / 1000,
+    lastSuccessAt: state?.lastSuccessAt !== null && state?.lastSuccessAt !== undefined ? new Date(state.lastSuccessAt).toISOString() : null,
+    consecutiveRefreshFailures: state?.consecutiveFailures ?? null,
+    lastRefreshError: state?.lastError ?? null,
+    providerFailures: recentOracleFailures(15 * 60 * 1000, now).map((f) => ({
+      provider: f.provider,
+      at: new Date(f.at).toISOString(),
+      error: f.error
+    })),
+    impact: "Every USD-pegged invoice create is returning 503 RATES_UNAVAILABLE until a refresh succeeds. Raw-amount invoices are unaffected.",
+    autoRecovery: "Each request retries an inline refresh (60s backoff between attempts) and the cron retries every minute."
+  });
 }
 
 // Request-path refresh. Single-flight per deps instance so a burst of
@@ -275,7 +509,7 @@ async function inlineRefreshOnce(
   return result;
 }
 
-// Resolve to null if `promise` hasn't settled within `ms`. The underlying
+// Resolve to null if the promise hasn't settled within ms. The underlying
 // oracle call keeps running to completion in the background (its own fetch
 // timeouts bound it) and will still write the cache if it eventually
 // succeeds — which is exactly what we want for the next request.
@@ -289,16 +523,23 @@ function withTimeout<T>(promise: Promise<T | null>, ms: number): Promise<T | nul
   });
 }
 
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Cron-driven cache warmer. In steady state the ONLY thing that touches
 // upstream oracles — runs once per cron tick, calls the full fallback
-// chain (CoinGecko → Alchemy → CoinCap → Binance per `select-oracle.ts`),
-// and writes whatever the chain returned to the shared cache slot.
+// chain (CoinGecko → Alchemy → CoinCap → Binance per select-oracle.ts)
+// with in-tick retries, and writes whatever the chain returned to the
+// shared cache slot.
 //
 // If every live oracle is down, the existing (last good) entry is left in
-// place and we log; `snapshotRates` decides at read time whether that
-// entry is still young enough to serve (see RATES_MAX_STALE_MS).
+// place, the failure is alerted (see noteRefreshFailure), and
+// snapshotRates decides at read time whether that entry is still young
+// enough to serve (see RATES_MAX_STALE_MS).
 //
-// Family enumeration: read straight off `deps.chains` so a deployment
+// Family enumeration: read straight off deps.chains so a deployment
 // with only EVM wired doesn't waste calls warming BTC/LTC, and a
 // deployment that later adds UTXO automatically picks up the new
 // symbols on the next tick.
