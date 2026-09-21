@@ -321,8 +321,9 @@ export async function bootTestApp(options: BootTestAppOptions = {}): Promise<Boo
   }
 
   // Pre-warm the rate cache. In production this runs every cron tick;
-  // tests boot in a fresh state so without this initial warm, USD-pegged
-  // invoice creation would throw RATES_UNAVAILABLE on the first request.
+  // tests boot in a fresh state so without this initial warm, the first
+  // USD-pegged invoice creation would take the inline-refresh path
+  // (still correct, but it logs a warning and muddies assertions).
   // The default test oracle is `staticPegPriceOracle` which returns
   // hardcoded mid-range rates instantly, so this is a no-network call.
   await warmRateCache(deps);

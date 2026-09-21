@@ -498,11 +498,12 @@ export async function createInvoice(deps: AppDeps, input: unknown): Promise<Invo
       const winner = await loadInvoiceByExternalId(deps, parsed.merchantId, parsed.externalId);
       if (winner !== null) return winner;
     }
-    // Translate the rate-window's empty-cache error into a typed
+    // Translate the rate-window's no-usable-rates error into a typed
     // InvoiceError so the HTTP layer renders it as a clean 503 with a
-    // stable error code merchants can match on. Static-peg is intentionally
-    // not in the production chain — see select-oracle.ts — so this fires
-    // only when every live oracle is down longer than the cache TTL.
+    // stable error code merchants can match on. snapshotRates already tried
+    // the cron-warmed cache, an inline oracle-chain refresh, and a bounded-
+    // stale fallback (see rate-window.ts), so this fires only when every
+    // live oracle is down AND the last good rates are hours old.
     if (err instanceof RateUnavailableError) {
       throw new InvoiceError("RATES_UNAVAILABLE", err.message);
     }

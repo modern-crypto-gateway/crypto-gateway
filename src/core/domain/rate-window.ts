@@ -78,23 +78,54 @@ export function tokensForFamilies(families: readonly ChainFamily[]): readonly To
 
 // Single shared cache key holding the latest USD rate map across every
 // token any wired family might price. The cron's `warmRateCache` writes
-// this entry; `snapshotRates` reads it. TTL is intentionally long — the
-// cron rewrites it every minute, so the only time it can age out is a
-// genuine multi-hour cron outage, in which case the static-peg
-// in-memory fallback kicks in to keep invoice-create flowing.
+// this entry every tick; `snapshotRates` reads it.
+//
+// Freshness is enforced by the entry's own `updatedAt`, NOT by the cache
+// TTL. The TTL is purely hygiene (a very long ceiling so an abandoned
+// deployment doesn't keep a dead key forever). Before this split, the TTL
+// doubled as the freshness bound: a cron outage longer than the TTL wiped
+// the entry and invoice creation went down entirely with no way to recover
+// until the cron came back. Now the request path can refresh inline and,
+// failing that, serve a bounded-stale entry — see `snapshotRates`.
 const WARMED_RATES_CACHE_KEY = "rates:usd:warmed";
-const WARMED_RATES_TTL_SECONDS = 3600;
+const WARMED_RATES_TTL_SECONDS = 7 * 24 * 3600;
+
+// Age within which a warmed entry is served straight from cache with no
+// upstream call. The cron rewrites the entry every minute, so in steady
+// state the entry is never older than ~60s; anything past this bound means
+// the cron is dead or every oracle has been failing for an hour.
+export const RATES_FRESH_MS = 60 * 60 * 1000;
+
+// Absolute staleness ceiling. When the cache is past RATES_FRESH_MS AND an
+// inline refresh fails (every live oracle down), we still serve the last
+// good entry up to this age rather than refuse every invoice. Crypto can
+// move a few percent in six hours — that is a bounded, visible risk the
+// merchant's tolerance settings already absorb, whereas a hard outage of
+// invoice creation is unbounded lost revenue. Past this age we refuse.
+export const RATES_MAX_STALE_MS = 6 * 60 * 60 * 1000;
+
+// Wall-clock budget for the inline (request-path) refresh. Each oracle link
+// has its own 2.5s fetch timeout and the chain is four deep, so the worst
+// case is ~10s; bound it so an invoice-create never hangs past that.
+const INLINE_REFRESH_TIMEOUT_MS = 10_000;
+
+// After an inline refresh fails, park a short marker so the next requests
+// don't each pay the full oracle-chain timeout while providers are down.
+// While the marker is set we go straight to the bounded-stale path (or
+// the error). KV's minimum TTL is 60s, which is also the cron cadence, so
+// the marker never outlives the next scheduled attempt.
+const INLINE_REFRESH_BACKOFF_KEY = "rates:usd:inline-refresh-failed";
+const INLINE_REFRESH_BACKOFF_SECONDS = 60;
 
 interface WarmedRatesEntry {
   rates: Record<string, string>;
   updatedAt: number;
 }
 
-// Thrown by snapshotRates when the cron-warmed rates cache is empty —
-// either the gateway just booted and the cron hasn't run yet, or the
-// cron has been failing long enough for the previous good entry to age
-// out. Surface as a clear 503-style error so merchants retry rather
-// than getting silent mis-priced invoices from hardcoded fallbacks.
+// Thrown by snapshotRates when no usable rates exist: the cache is empty
+// or older than RATES_MAX_STALE_MS, AND an inline refresh through the live
+// oracle chain failed. Surfaces as a 503 with a stable code so merchants
+// retry rather than getting silently mis-priced invoices.
 export class RateUnavailableError extends Error {
   constructor(message: string) {
     super(message);
@@ -102,83 +133,179 @@ export class RateUnavailableError extends Error {
   }
 }
 
-// Snapshot the current rates for `tokens`. Reads ONLY the cron-warmed
-// shared cache — no upstream call, no fallback chain traversal, no
-// static-peg substitution. The invoice-create hot path stays sub-
-// millisecond regardless of which oracle is currently up: the cron is
-// the only thing that ever touches the network, and the merchant's
-// request just consults the prebuilt rate map.
+// Snapshot the current rates for `tokens`. Three tiers, cheapest first:
 //
-// Cold-start path: if the cache is empty, throw RateUnavailableError.
-// Mis-priced USD-pegged invoices (off by 30–50 % when a hardcoded
-// peg is stale) cause real financial loss; failing the request and
-// asking the merchant to retry once the cron warms the cache is the
-// safe answer. Raw-amount invoices don't need rates and are unaffected.
+//   1. Fresh cache (age ≤ RATES_FRESH_MS) — the steady-state path. The
+//      cron is the only thing touching the network; the merchant's request
+//      just reads the prebuilt map. Sub-millisecond.
+//   2. Inline refresh — cache missing or aged (fresh deploy before the
+//      first cron tick, cron dead, KV entry lost). Call the same oracle
+//      fallback chain the cron uses, bounded by INLINE_REFRESH_TIMEOUT_MS
+//      and single-flighted per deps instance, and write the result back so
+//      the next request is tier 1 again. This is what used to be a hard
+//      503 until the cron recovered.
+//   3. Bounded-stale — inline refresh failed (every live provider down).
+//      Serve the last good entry if it is younger than RATES_MAX_STALE_MS,
+//      logging loudly. Beyond that, throw RateUnavailableError: pricing
+//      against hours-old rates is worse than asking the merchant to retry.
+//
+// No static-peg substitution anywhere in this path — hardcoded numbers can
+// be off by 30–50 % and cause real financial loss.
 export async function snapshotRates(
   deps: AppDeps,
   tokens: readonly TokenSymbol[]
 ): Promise<RateSnapshot> {
   const now = deps.clock.now().getTime();
-  const cached = await deps.cache.getJSON<WarmedRatesEntry>(WARMED_RATES_CACHE_KEY);
-  if (cached === null) {
-    throw new RateUnavailableError(
-      "Rate cache is empty — the oracle cron has not warmed yet, or has been failing for longer than the cache TTL. Retry shortly."
-    );
+  let entry = await readWarmedRates(deps);
+  const ageMs = entry === null ? Number.POSITIVE_INFINITY : now - entry.updatedAt;
+
+  if (ageMs > RATES_FRESH_MS) {
+    const refreshed = await inlineRefresh(deps, tokens);
+    if (refreshed !== null) {
+      entry = refreshed;
+    } else if (entry !== null && ageMs <= RATES_MAX_STALE_MS) {
+      deps.logger.warn("snapshotRates: serving stale rates — cache aged and live refresh failed", {
+        ageSeconds: Math.round(ageMs / 1000),
+        maxStaleSeconds: RATES_MAX_STALE_MS / 1000
+      });
+    } else {
+      deps.logger.error("snapshotRates: no usable rates — cache empty/too stale and live refresh failed", {
+        cachePresent: entry !== null,
+        ageSeconds: entry === null ? null : Math.round(ageMs / 1000)
+      });
+      throw new RateUnavailableError(
+        entry === null
+          ? "Rate cache is empty and the live price oracles could not be reached. Retry shortly."
+          : "Cached rates are too stale to price safely and the live price oracles could not be reached. Retry shortly."
+      );
+    }
   }
+
   const out: Record<string, string> = {};
   for (const t of tokens) {
-    const rate = cached.rates[t];
+    const rate = entry!.rates[t];
     if (rate !== undefined) out[t] = rate;
   }
   return { rates: out, expiresAt: now + RATE_WINDOW_DURATION_MS };
 }
 
-// Cron-driven cache warmer. The ONLY place that touches upstream
-// oracles in steady state — runs once per cron tick, calls the full
-// fallback chain (CoinGecko → Alchemy → CoinCap → Binance per
-// `select-oracle.ts`), and writes whatever the chain returned to the
-// shared `WARMED_RATES_CACHE_KEY` slot.
+async function readWarmedRates(deps: AppDeps): Promise<WarmedRatesEntry | null> {
+  const cached = await deps.cache.getJSON<WarmedRatesEntry>(WARMED_RATES_CACHE_KEY);
+  if (cached === null || typeof cached !== "object") return null;
+  if (typeof cached.updatedAt !== "number" || cached.rates === null || typeof cached.rates !== "object") {
+    return null;
+  }
+  return cached;
+}
+
+// Every token the cache entry should cover: the union of what every wired
+// family can price and whatever the caller asked for. The cron and the
+// inline refresh both use this so a request-path warm leaves the entry
+// as complete as a cron warm would.
+function tokensToWarm(deps: AppDeps, extra: readonly TokenSymbol[] = []): readonly TokenSymbol[] {
+  const families = new Set<ChainFamily>();
+  for (const adapter of deps.chains) families.add(adapter.family);
+  const set = new Set<TokenSymbol>(tokensForFamilies([...families]));
+  for (const t of extra) set.add(t);
+  return [...set];
+}
+
+// Call the oracle fallback chain and persist the result. Returns the new
+// entry, or null when the chain threw or returned nothing usable (in which
+// case the previous entry is deliberately left untouched — never overwrite
+// last-good with an empty map).
+async function fetchAndStoreLiveRates(
+  deps: AppDeps,
+  tokens: readonly TokenSymbol[],
+  source: "cron" | "inline"
+): Promise<WarmedRatesEntry | null> {
+  if (tokens.length === 0) return null;
+  let live: Record<string, string> = {};
+  try {
+    live = { ...(await deps.priceOracle.getUsdRates(tokens)) };
+  } catch (err) {
+    deps.logger.warn("warmRateCache(" + source + "): oracle chain failed; preserving last good cache", {
+      error: err instanceof Error ? err.message : String(err)
+    });
+    return null;
+  }
+  if (Object.keys(live).length === 0) {
+    deps.logger.warn("warmRateCache(" + source + "): oracle chain returned no rates; preserving last good cache");
+    return null;
+  }
+  const entry: WarmedRatesEntry = { rates: live, updatedAt: deps.clock.now().getTime() };
+  await deps.cache.putJSON(WARMED_RATES_CACHE_KEY, entry, { ttlSeconds: WARMED_RATES_TTL_SECONDS });
+  return entry;
+}
+
+// Request-path refresh. Single-flight per deps instance so a burst of
+// invoice-creates against an empty cache makes one oracle round-trip, not
+// N. Honors the failure backoff marker and sets it on failure.
+const inlineRefreshInFlight = new WeakMap<AppDeps, Promise<WarmedRatesEntry | null>>();
+
+async function inlineRefresh(
+  deps: AppDeps,
+  tokens: readonly TokenSymbol[]
+): Promise<WarmedRatesEntry | null> {
+  const inFlight = inlineRefreshInFlight.get(deps);
+  if (inFlight !== undefined) return inFlight;
+  const run = inlineRefreshOnce(deps, tokens).finally(() => {
+    inlineRefreshInFlight.delete(deps);
+  });
+  inlineRefreshInFlight.set(deps, run);
+  return run;
+}
+
+async function inlineRefreshOnce(
+  deps: AppDeps,
+  tokens: readonly TokenSymbol[]
+): Promise<WarmedRatesEntry | null> {
+  if ((await deps.cache.get(INLINE_REFRESH_BACKOFF_KEY)) !== null) {
+    deps.logger.warn("snapshotRates: inline refresh skipped — recent attempt failed, in backoff");
+    return null;
+  }
+  deps.logger.warn("snapshotRates: rate cache missing or aged; refreshing inline from the oracle chain");
+  const result = await withTimeout(
+    fetchAndStoreLiveRates(deps, tokensToWarm(deps, tokens), "inline"),
+    INLINE_REFRESH_TIMEOUT_MS
+  );
+  if (result === null) {
+    await deps.cache.put(INLINE_REFRESH_BACKOFF_KEY, "1", { ttlSeconds: INLINE_REFRESH_BACKOFF_SECONDS });
+  }
+  return result;
+}
+
+// Resolve to null if `promise` hasn't settled within `ms`. The underlying
+// oracle call keeps running to completion in the background (its own fetch
+// timeouts bound it) and will still write the cache if it eventually
+// succeeds — which is exactly what we want for the next request.
+function withTimeout<T>(promise: Promise<T | null>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+// Cron-driven cache warmer. In steady state the ONLY thing that touches
+// upstream oracles — runs once per cron tick, calls the full fallback
+// chain (CoinGecko → Alchemy → CoinCap → Binance per `select-oracle.ts`),
+// and writes whatever the chain returned to the shared cache slot.
 //
-// No static-peg layering: hardcoded fallback values can drift far
-// from market and quietly mis-price invoices. If every live oracle is
-// down, we leave the existing (last good) cache entry in place and
-// log; merchants requesting a USD-pegged invoice while the cache is
-// stale-but-present still get those last good rates, and once the
-// cache TTL elapses without a successful warm, snapshotRates will
-// throw RateUnavailableError instead of pricing against stale junk.
+// If every live oracle is down, the existing (last good) entry is left in
+// place and we log; `snapshotRates` decides at read time whether that
+// entry is still young enough to serve (see RATES_MAX_STALE_MS).
 //
 // Family enumeration: read straight off `deps.chains` so a deployment
 // with only EVM wired doesn't waste calls warming BTC/LTC, and a
 // deployment that later adds UTXO automatically picks up the new
 // symbols on the next tick.
 export async function warmRateCache(deps: AppDeps): Promise<void> {
-  const families = new Set<ChainFamily>();
-  for (const adapter of deps.chains) families.add(adapter.family);
-  if (families.size === 0) return;
-  const tokens = tokensForFamilies([...families]);
+  const tokens = tokensToWarm(deps);
   if (tokens.length === 0) return;
-
-  let live: Record<string, string> = {};
-  try {
-    live = { ...(await deps.priceOracle.getUsdRates(tokens)) };
-  } catch (err) {
-    deps.logger.warn("warmRateCache: oracle chain failed; preserving last good cache", {
-      error: err instanceof Error ? err.message : String(err)
-    });
-    return;
-  }
-  // If the chain returned nothing usable (every provider is down or every
-  // token is unmapped), don't overwrite the previous good entry with an
-  // empty map. Log and let the next tick try again.
-  if (Object.keys(live).length === 0) {
-    deps.logger.warn("warmRateCache: oracle chain returned no rates; preserving last good cache");
-    return;
-  }
-  await deps.cache.putJSON(
-    WARMED_RATES_CACHE_KEY,
-    { rates: live, updatedAt: deps.clock.now().getTime() },
-    { ttlSeconds: WARMED_RATES_TTL_SECONDS }
-  );
+  await fetchAndStoreLiveRates(deps, tokens, "cron");
 }
 
 // If the invoice's rate window has expired, re-query the oracle and persist a
